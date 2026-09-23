@@ -145,10 +145,21 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
     /// and the request body is byte-identical to pre-U1 behavior.
     /// `store:false` is intentionally NOT flipped.
     static func currentPromptCacheKey() -> String? {
-        guard let raw = LLMCallContext.sessionId?
-            .trimmingCharacters(in: .whitespacesAndNewlines),
-            !raw.isEmpty else { return nil }
+        guard let raw = cacheScopeID() else { return nil }
         return "nativeagent-session-\(raw)"
+    }
+
+    /// 2026-09-22: background ephemeral turns bind no session, so they fall
+    /// back to their run's turn id — repeats inside one tool loop then share
+    /// a cache node instead of reading 0 cached tokens every iteration.
+    private static func cacheScopeID() -> String? {
+        for candidate in [LLMCallContext.sessionId, TurnTraceContext.turnId] {
+            if let raw = candidate?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !raw.isEmpty {
+                return raw
+            }
+        }
+        return nil
     }
 
     // MARK: - session_id routing header (2026-09-11)
@@ -172,9 +183,7 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
     /// value is bounded. Nil when no session id is bound, which keeps the
     /// request byte-identical to pre-fix behavior for non-session callers.
     static func currentSessionRoutingID() -> String? {
-        guard let raw = LLMCallContext.sessionId?
-            .trimmingCharacters(in: .whitespacesAndNewlines),
-            !raw.isEmpty else { return nil }
+        guard let raw = cacheScopeID() else { return nil }
         let safe = raw.unicodeScalars
             .filter { scalar in
                 CharacterSet.alphanumerics.contains(scalar)

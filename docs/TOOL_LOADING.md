@@ -12,12 +12,21 @@ availability preview with empty `loaded`; it does not establish a session
 contract. Explicit promotion markers apply only to persisted active tools;
 turn-only availability must not create an empty session file.
 
-1. **Always on (20 names).** `SwiftToolDispatcher.alwaysOnCoreNames`. These are
+Native workspace (2026-09-21, User-requested): `workspace` replaces the compact
+`work_context` reader in the always-on set. Picking up work and following its
+offered actions needs no catalog step; Swift carries targets and navigation.
+The underlying work/artifact/source readers remain lazy. Every selected
+read/send enters the ordinary gates under its actual name and arguments.
+This replacement adds no always-on names or background reads.
+The current count includes `agent_contacts` and `agent_message` from the
+previous natural agent-conversation work.
+
+1. **Always on (22 names).** `SwiftToolDispatcher.alwaysOnCoreNames`. These are
    the only tools in every request. Agent's working-set ruling of 2026-09-11.
-   Four of the twenty are the Mac verbs (`screen`, `act`, `go`, `wait`), whose
+   Four are the Mac verbs (`screen`, `act`, `go`, `wait`), whose
    schemas are emitted only while Full Mac accessibility is active
    (`BuiltInToolSchemaFactory+MacSchemas.swift`, `SwiftToolDispatcher+Sandbox.swift`),
-   so an install without it rides sixteen.
+   so an install without it rides eighteen.
    The one addition: while an MCP server is mounted, its tool schemas ride the
    session contract automatically, without a `tool_load` or a preload
    (`ChatSessionActiveTools.swift`,
@@ -33,9 +42,9 @@ turn-only availability must not create an empty session file.
    same gate over its own set before delegating
    (`AppChatToolDispatcher.appOwnedLazyLoadingRefusal`). Its set is the notify
    pair, the browser/Chrome group, `doctor_status` / `telegram_status`,
-   `reflex_review`, and — since 0.4.14 — the six quiet self-administration
+   `reflex_review`, and — since 0.4.14 — the five quiet self-administration
    tools: `app_page_read`, `app_page_screenshot`, `app_settings_list`,
-   `app_setting_set`, `interaction_act`, `voice_render` (category `app`). None
+   `app_setting_set`, `interaction_act` (category `app`). None
    of them is always-on.
    `app_page_screenshot` renders offscreen, where a material has no backdrop to
    sample, so the composer shell and card surfaces substitute a solid slate fill
@@ -68,7 +77,7 @@ turn-only availability must not create an empty session file.
    An upgrade never requires Agent to unload and reload a native tool manually.
 
 The tool list itself is code, not this page: `SwiftToolDispatcher.alwaysOnCoreNames`
-is the twenty of rule 1, and `SwiftToolDispatcher.builtInToolNames` is the
+is the set in rule 1, and `SwiftToolDispatcher.builtInToolNames` is the
 catalog everything else is loaded from. A new tool joins the latter and nothing
 else — most recently `studio_journal_amend` and `dream_diary_read` (0.4.14),
 both lazy: the first like the rest of the studio lane, the second because

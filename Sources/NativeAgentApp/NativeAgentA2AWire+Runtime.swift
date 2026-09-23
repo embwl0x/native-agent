@@ -92,7 +92,7 @@ enum AgentContactRuntime {
         let attachments = turn.parts.compactMap(\.attachment)
         let plain = turn.parts.compactMap { if case .text(let text) = $0 { return text }; return nil }.joined(separator: "\n")
         let text = AgentBridgeSurface.turnHeader(peerName: principal.displayName, elevated: principal.elevated)
-            + (plain.isEmpty ? "Please read the attached content." : plain)
+            + (plain.isEmpty ? "Please read the attached content." : AgentBridgeSurface.quotingImpersonation(plain))
         return try await ChatToolSessionContext.$envelope.withValue(envelope) {
             try await ChatPersistenceContext.$originProvenance.withValue(origin) {
                 try Task.checkCancellation()

@@ -416,6 +416,11 @@ public actor ActiveToolsStore {
     /// next to it.
     static let maxStableDeclaredTools = 40
 
+    /// 2026-09-22: a turn-start prediction moves the cached tool prefix, so it
+    /// lands only when that prefix is already cold — a session's first turn or
+    /// a gap longer than this. Mid-burst, 49 of 56 list changes read 0 cached.
+    static let predictionColdCacheSeconds: TimeInterval = 600
+
     /// IDLE GAP that opens an offer-floor REBUILD (Astra comb 4 lane 3, accepted
     /// by Agent as a trial 2026-09-12). The floor never retires on idleness, so
     /// a burst that preloaded GitHub yesterday kept paying for 15 GitHub schemas
@@ -839,7 +844,8 @@ public actor ActiveToolsStore {
             var state = await self.loadLocked(path: path, sessionId: trimmed)
             _ = Self.normalizeInPlace(&state)
             let before = state
-            let promoting = predictions.subtracting(state.activeTools)
+            let cacheCold = (state.lastIdleGapSeconds ?? .infinity) > Self.predictionColdCacheSeconds
+            let promoting = cacheCold ? predictions.subtracting(state.activeTools) : []
             var descriptors = descriptors
             var restoredMCP: [String] = []
             if let availability = configuredMCPServers {

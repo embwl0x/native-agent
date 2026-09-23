@@ -28,15 +28,17 @@ struct MindCaringAppraiser: CaringAppraising {
         // so it goes verbatim (same contract as the memory-manager lane).
         let system = "# Background Personality Context\n"
             + "You judge one question about one conversational turn. Reply with JSON only, one object."
-        let raw = await IntraTurnContextCompaction.withDeadline(
-            seconds: CaringAppraisalLane.deadlineSeconds
-        ) {
-            try await BackgroundLoopsAssembly.makeSharedLLMClient().complete(
-                prompt: CaringAppraisalLane.prompt(request),
-                system: system,
-                model: model,
-                surface: surface
-            )
+        let raw = await ConversationPrefixTelemetry.withUnmeasuredRequestShape {
+            await IntraTurnContextCompaction.withDeadline(
+                seconds: CaringAppraisalLane.deadlineSeconds
+            ) {
+                try await BackgroundLoopsAssembly.makeSharedLLMClient().complete(
+                    prompt: CaringAppraisalLane.prompt(request),
+                    system: system,
+                    model: model,
+                    surface: surface
+                )
+            }
         }
         if Task.isCancelled { return nil }
         let verdict = raw.flatMap { CaringAppraisalLane.parse($0) }
@@ -194,8 +196,15 @@ actor CaringReceiptLog {
         let bytes = Data((line + "\n").utf8)
         if let handle = try? FileHandle(forWritingTo: url) {
             defer { try? handle.close() }
-            guard (try? handle.seekToEnd()) != nil else { return }
+            guard let end = try? handle.seekToEnd() else { return }
             try? handle.write(contentsOf: bytes)
+            // 2026-09-22: rows that never get amended still grow the file;
+            // past ~1MB keep the newest 2000 lines (~700KB).
+            if end + UInt64(bytes.count) > 1_000_000,
+               let text = try? String(contentsOf: url, encoding: .utf8) {
+                let kept = text.split(separator: "\n").suffix(2000).joined(separator: "\n") + "\n"
+                replace(with: Data(kept.utf8), at: url)
+            }
         } else {
             try? bytes.write(to: url, options: .atomic)
         }

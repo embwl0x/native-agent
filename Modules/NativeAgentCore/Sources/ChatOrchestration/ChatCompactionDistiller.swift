@@ -30,7 +30,10 @@ struct ChatCompactionDistiller: Sendable {
     let agentName: String?
 
     static let distillSurface = "compaction"
-    static let maxSummaryChars = 12_000
+    /// User 2026-09-23: every model (was 12K; 40K on verified 1M routes only).
+    static let maxSummaryChars = 40_000
+
+    static func maxSummaryChars(model: String?, providerID: String?) -> Int { maxSummaryChars }
     static let timeoutSeconds = 120.0
 
     /// System prompt for the distillation call. The output is stored as the
@@ -180,9 +183,11 @@ struct ChatCompactionDistiller: Sendable {
         backupPath: String,
         messagesReplaced: Int,
         turnModel: String,
+        providerID: String? = nil,
         surface: String,
         runId: String?
     ) async {
+        let summaryCap = Self.maxSummaryChars(model: turnModel, providerID: providerID)
         // 1. Recover the replaced content from the pre-compaction backup.
         let backupURL = URL(fileURLWithPath: backupPath)
         let backupRows: [JSONValue]
@@ -228,7 +233,8 @@ struct ChatCompactionDistiller: Sendable {
         //    raw turns chunked oldest-first into the model's own budget.
         let plan = Self.buildPlan(
             from: replaced,
-            budget: Self.promptBudgetChars(forModel: model, dataRoot: dataRoot)
+            budget: Self.promptBudgetChars(forModel: model, dataRoot: dataRoot),
+            summaryCap: summaryCap
         )
 
         // 4. One LLM call per chunk, oldest-first, each inside a bounded
@@ -279,14 +285,14 @@ struct ChatCompactionDistiller: Sendable {
             } else {
                 // The interim note enters the next pass as its pinned memory,
                 // so it obeys the same cap a stored recollection does.
-                carried = String(trimmed.prefix(Self.maxSummaryChars))
+                carried = String(trimmed.prefix(summaryCap))
             }
         }
         let promptChars = promptCharsPerPass.reduce(0, +)
 
         // 5. Trim + hard-cap; refuse to overwrite with nothing.
         let distilled = String(
-            raw.trimmingCharacters(in: .whitespacesAndNewlines).prefix(Self.maxSummaryChars)
+            raw.trimmingCharacters(in: .whitespacesAndNewlines).prefix(summaryCap)
         )
         guard !distilled.isEmpty else {
             await emitDistillTrace(
@@ -528,7 +534,9 @@ struct ChatCompactionDistiller: Sendable {
     /// The recollection row(s) are now pinned at the head and can only be
     /// truncated to their own `maxSummaryChars`; the raw turns are chunked
     /// oldest-first and chained, so nothing is dropped at all.
-    static func buildPlan(from rows: [JSONValue], budget: Int) -> PromptPlan {
+    static func buildPlan(
+        from rows: [JSONValue], budget: Int, summaryCap: Int = maxSummaryChars
+    ) -> PromptPlan {
         var pinnedLines: [String] = []
         var bodyLines: [String] = []
         var pinning = true
@@ -542,7 +550,8 @@ struct ChatCompactionDistiller: Sendable {
             // fallback the distilled recollection loses every trace of what ran.
             guard let body = ChatCompactionRowRendering.summaryBody(
                 obj,
-                collapseNewlines: false
+                collapseNewlines: false,
+                toolSummaryCap: ChatCompactionRowRendering.distillerToolResultSummaryMaximumCharacters
             ) else { continue }
             if pinning, ChatCompactionRowRendering.isRecollection(obj) {
                 // User, 2026-09-06: TAIL, not head. A legacy over-cap summary
@@ -551,7 +560,7 @@ struct ChatCompactionDistiller: Sendable {
                 // newly summarised history was cut off at the very moment it
                 // entered the prompt. Keep the newest, as the mechanical
                 // fallback and the in-turn fold both now do.
-                pinnedLines.append(String(body.suffix(maxSummaryChars)))
+                pinnedLines.append(String(body.suffix(summaryCap)))
                 continue
             }
             pinning = false
@@ -561,7 +570,7 @@ struct ChatCompactionDistiller: Sendable {
         // Room for a pin is reserved on EVERY pass, not just the ones that
         // start with one: pass k>1 carries the previous pass's interim note,
         // which we cap at maxSummaryChars ourselves.
-        let pinReserve = max(pinned?.count ?? 0, maxSummaryChars)
+        let pinReserve = max(pinned?.count ?? 0, summaryCap)
         let overhead = turnsHeader.count + pinnedGuidance.count + pinnedHeader.count + 200
         let chunkBudget = max(1_000, budget - pinReserve - overhead)
 

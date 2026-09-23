@@ -41,8 +41,32 @@ final class ClaudeBridgeDenyDispatcher: ToolDispatchClient, BuiltInAgentLaneProv
     }
 
     /// True iff `name` is an external MCP-bridged tool (`mcp__<server>__<tool>`).
+    /// 2026-09-22: the built-in SearXNG server is NativeAgent's own read-only
+    /// web search, not a third-party connector — bridge turns keep it.
     static func isExternalMcpTool(_ name: String) -> Bool {
-        name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased().hasPrefix("mcp__")
+        let lowered = name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return lowered.hasPrefix("mcp__")
+            && !(ToolPreloadHeuristics.webSearchTools.contains(lowered) && searxngIsBuiltIn())
+    }
+
+    /// The exemption holds only while `searxng-local` resolves (the same merge
+    /// MCPDispatcher does: saved servers.json keys over the built-in default)
+    /// to http on a loopback endpoint. A saved override that swaps transport
+    /// or points elsewhere is an ordinary external server again.
+    private static func searxngIsBuiltIn(dataRoot: URL = PersistenceCore.defaultDataRoot()) -> Bool {
+        func json(_ path: String) -> Any? {
+            (try? Data(contentsOf: dataRoot.appendingPathComponent(path)))
+                .flatMap { try? JSONSerialization.jsonObject(with: $0) }
+        }
+        let saved = (json("mcp/servers.json") as? [[String: Any]])?
+            .first { $0["id"] as? String == "searxng-local" } ?? [:]
+        let transport = saved["transport"] as? String ?? "http"
+        let endpoint = saved["endpoint"] as? String
+            ?? (json("research/config.json") as? [String: Any])?["searxng_base_url"] as? String ?? ""
+        guard transport == "http", let url = URL(string: endpoint),
+              ["http", "https"].contains(url.scheme?.lowercased() ?? ""),
+              let host = url.host?.lowercased() else { return false }
+        return ["127.0.0.1", "localhost", "::1", "[::1]"].contains(host)
     }
 
     /// Meta-tools whose RESULT enumerates the tool set / MCP list from the inner

@@ -9,6 +9,7 @@ import StandingBots
 import MemoryV2
 import Dispatcher
 @testable import ChatOrchestration
+import NativeAgentTestSupport
 
 // Coverage-ledger fence `core.chat.persistence`:
 //   * chat.persistence.toolReceiptRedaction (silent leak into an unencrypted,

@@ -2,6 +2,7 @@ import Foundation
 import BackgroundLoops
 import ChatOrchestration
 import PersistenceCore
+import ProviderRouting
 import SlackConnector
 
 /// One-way latch marking that a planned session recycle (not a failure)
@@ -1229,7 +1230,7 @@ struct SlackSocketModeLoop: LoopRunner {
                     // external effect and must not multiply on retry.
                     let detail = error is SlackSessionStorageError
                         ? "Slack conversation storage needs repair before this message can be answered. Existing conversation bindings were preserved."
-                        : "Couldn’t finish the reply."
+                        : ProviderRecoveryPolicy.personMessage(error) ?? "Couldn’t finish the reply."
                     reply = SlackSocketModeReply(text: (hydration.notice.map { $0 + "\n\n" } ?? "") + detail)
                 }
                 let uploads = Self.uploadableImageAttachments(reply.attachments).map {

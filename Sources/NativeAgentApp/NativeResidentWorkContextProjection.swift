@@ -21,6 +21,8 @@ enum ResidentWorkDecisionNeed: String, Sendable, Equatable {
         guard let execution else {
             if item.status.isTerminal { return .none }
             if item.status == .blocked { return .review }
+            // 2026-09-23: a watch item asks nothing of her; as `.action` it rode most turns.
+            if item.status == .watch || item.kind == .watch { return .none }
             return .action
         }
         switch execution.status.lowercased() {
@@ -312,6 +314,8 @@ private extension NativeResidentWorkContextProjection {
         let stop: Set<String> = [
             "about", "after", "before", "from", "into", "that", "the", "this",
             "with", "work", "task", "project", "agent", "assistant", "nativeagent",
+            // 2026-09-23: words in nearly every turn; they matched desk items to everything.
+            "user", "claude", "agent", "requested", "test",
         ]
         var seen: Set<String> = []
         var values: [String] = []

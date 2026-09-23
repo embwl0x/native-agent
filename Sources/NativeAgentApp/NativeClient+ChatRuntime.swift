@@ -13,7 +13,9 @@ enum ChatTurnNoticeDestination: Equatable {
 
 enum ChatTurnNoticePresentation {
     static func destination(for kind: String) -> ChatTurnNoticeDestination {
-        if kind == "slow_turn" {
+        // 2026-09-22 WHY: reconnect notices live in the turn's own lane, which
+        // clears when the turn ends, so a long-held one never outlives the retry.
+        if kind == "slow_turn" || kind == "provider_retry" {
             return .chatTop
         }
         if kind.contains("timeout") {

@@ -33,6 +33,7 @@ actor TelegramTurnProgressCardDriver {
         _ text: String,
         _ replyMarkup: JSONValue
     ) async throws -> Void
+    typealias DeleteCard = @Sendable (_ token: String, _ chatId: Int, _ messageId: Int) async throws -> Void
     typealias FailureRecorder = @Sendable (_ redactedError: String) async -> Void
     typealias PersistCard = @Sendable (_ record: TelegramPersistedTurnCard) async throws -> Void
     typealias RemovePersistedCard = @Sendable (_ turnId: UUID) async throws -> Void
@@ -47,6 +48,7 @@ actor TelegramTurnProgressCardDriver {
     private let sleeper: Sleeper
     private let sendCard: SendCard
     private let editCard: EditCard
+    private let deleteCard: DeleteCard?
     private let recordFailure: FailureRecorder
     private let persistCard: PersistCard
     private let removePersistedCard: RemovePersistedCard
@@ -78,6 +80,7 @@ actor TelegramTurnProgressCardDriver {
         sleeper: @escaping Sleeper,
         sendCard: @escaping SendCard,
         editCard: @escaping EditCard,
+        deleteCard: DeleteCard? = nil,
         recordFailure: @escaping FailureRecorder = { _ in },
         persistCard: @escaping PersistCard = { _ in },
         removePersistedCard: @escaping RemovePersistedCard = { _ in }
@@ -92,6 +95,7 @@ actor TelegramTurnProgressCardDriver {
         self.sleeper = sleeper
         self.sendCard = sendCard
         self.editCard = editCard
+        self.deleteCard = deleteCard
         self.recordFailure = recordFailure
         self.persistCard = persistCard
         self.removePersistedCard = removePersistedCard
@@ -152,7 +156,11 @@ actor TelegramTurnProgressCardDriver {
         state = next
         if state.isTerminal {
             detailsVisible = false
-            stopHeartbeat()
+            // 2026-09-22: release, don't cancel. Cancelling killed a heartbeat
+            // edit already on the wire (CancellationError), which marked the
+            // card broken and dropped the terminal edit — the card stuck on
+            // "Still on it." The loop exits on its own once it sees terminal.
+            heartbeatTask = nil
             resolveTerminalWaiters(state.phase)
             let now = clock()
             let terminalText = renderedText(at: now)
@@ -290,6 +298,24 @@ actor TelegramTurnProgressCardDriver {
             return
         }
 
+        // 2026-09-22: a delivered reply is the whole story, so the card goes
+        // instead of leaving "Done." above it. A failed delete falls back to
+        // the terminal edit below.
+        if renderedIsTerminal, state.phase == .completed, let deleteCard {
+            do {
+                try await deleteCard(token, destination.chatId, messageId)
+                lastRenderedText = rendered
+                lastEditAt = now
+                editInFlight = false
+                pendingFlush = false
+                pendingForcedFlush = false
+                await removeTerminalLedgerRow(ifSentTerminal: true)
+                return
+            } catch {
+                await reportFailure(step: "delete", error: error)
+            }
+        }
+
         let markup = state.isTerminal
             ? TelegramTurnControlCallback.clearedReplyMarkup
             : TelegramTurnControlCallback.replyMarkup(turnId: turnId)
@@ -336,7 +362,7 @@ actor TelegramTurnProgressCardDriver {
         let forcePending = pendingForcedFlush || state.isTerminal
         pendingFlush = false
         pendingForcedFlush = false
-        await flushIfDue(force: forcePending)
+        await flushIfDue(force: forcePending, bypassThrottle: state.isTerminal)
     }
 
     /// 2026-09-06: drop the restart-repair ledger row only once the terminal

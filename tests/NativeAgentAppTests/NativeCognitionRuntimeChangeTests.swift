@@ -20,7 +20,7 @@ import PersistenceCore
     await runtime.bootstrap()
     let stream = await runtime.changes()
     let next = Task { () -> NativeCognitionRuntimeChange? in
-        for await change in stream { return change }
+        for await change in stream where change.reason == "event:userMessageReceived" { return change }
         return nil
     }
 
@@ -101,7 +101,7 @@ import PersistenceCore
     await runtime.bootstrap()
     let stream = await runtime.changes()
     let next = Task { () -> NativeCognitionRuntimeChange? in
-        for await change in stream { return change }
+        for await change in stream where change.reason == "experiment:ablation" { return change }
         return nil
     }
 
@@ -127,7 +127,7 @@ import PersistenceCore
     await runtime.bootstrap()
     let stream = await runtime.changes()
     let next = Task { () -> NativeCognitionRuntimeChange? in
-        for await change in stream { return change }
+        for await change in stream where change.reason == "somatic:providerFailed" { return change }
         return nil
     }
 

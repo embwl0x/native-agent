@@ -342,7 +342,7 @@ struct TelegramView: View {
                                 label: "Voice",
                                 value: voice.enabled ? "\(voice.model) via \(voice.backend)" : "Disabled"
                             )
-                            if voice.enabled && TelegramVoiceTranscriptionBackends.isAppleSpeech(voice.backend) {
+                            if voice.enabled {
                                 Text("Allow speech recognition on this Mac to transcribe Telegram voice messages. Microphone access is not needed.")
                                     .font(ShellType.caption)
                                 Button("Set up Telegram voice") {
@@ -368,14 +368,6 @@ struct TelegramView: View {
                                 if let voicePermissionMessage {
                                     Text(voicePermissionMessage).font(ShellType.caption)
                                 }
-                            }
-                            if voice.enabled && !voice.backendSupported {
-                                TelegramNote(
-                                    text: "Voice backend \(voice.backend) is not supported by the Swift Telegram runtime.",
-                                    tone: .trouble
-                                )
-                            } else if voice.enabled && voice.requiresAPIKey == true && !voice.keyConfigured {
-                                TelegramNote(text: "Voice transcription needs an OpenAI platform key.", tone: .trouble)
                             }
                         }
                         if status.isTransientPollInterruption {

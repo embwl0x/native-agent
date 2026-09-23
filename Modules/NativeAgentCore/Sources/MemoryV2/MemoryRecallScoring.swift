@@ -129,10 +129,10 @@ public enum MemoryRecallScoring {
     ) -> [Candidates.Element] {
         let cappedLimit = max(0, limit)
         guard cappedLimit > 0 else { return [] }
-        // Skills are discovery hints, not the answer corpus. Preserve the
-        // existing one-third share while filling scarce-fact / skill-only
-        // results from deferred hints rather than losing discovery entirely.
-        let preferredSkillLimit = cappedLimit == 1 ? 1 : max(1, cappedLimit / 3)
+        // Skills are discovery hints, not the answer corpus. One preferred
+        // slot (2026-09-22: a third took 4 of 12 recall slots); scarce-fact /
+        // skill-only results still fill from deferred hints.
+        let preferredSkillLimit = 1
         var out: [Candidates.Element] = []
         var deferredSkills: [Candidates.Element] = []
         var skillCount = 0

@@ -161,7 +161,8 @@ extension NativeClient {
     func macControlNotify(title: String, message: String) async throws -> Bool {
         let impl = makeMacControl(
             policyProvider: macControlPolicyProvider,
-            auditAppendPath: macControlAuditPath
+            auditAppendPath: macControlAuditPath,
+            notificationCenterAdapter: NativeAgentMacControlNotificationAdapter()
         )
         let r = try await impl.dispatch(action: "notify", body: [
             "title": .string(title),
@@ -191,7 +192,7 @@ extension NativeClient {
     /// Zero-daemon path: if the body is empty or a JSON object, dispatch through
     /// SwiftNativeMacControl. Non-object bodies are rejected locally because
     /// there is no daemon fallback to validate them.
-    func macControlRun(path: String, bodyData: Data, timeout: TimeInterval = 90) async throws -> MacControlRunResult {
+    func macControlRun(path: String, bodyData: Data, timeout: TimeInterval = 90, localWorkbench: Bool = false) async throws -> MacControlRunResult {
         // CORRECTNESS (R3-4): the Swift path requires a JSON-object body so
         // it can be re-emitted via JSONValue.object(...). If bodyData is
         // non-empty AND does not parse as an object (e.g. a top-level array,
@@ -219,8 +220,12 @@ extension NativeClient {
                 return MacControlRunResult(statusCode: 404, json: dict, rawData: raw)
             }
             let impl = makeMacControl(
-                policyProvider: macControlPolicyProvider,
-                auditAppendPath: macControlAuditPath
+                policyProvider: TrustCenterMacControlPolicyProvider(
+                    dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot(),
+                    operatorOrigin: localWorkbench ? SecurityOriginContext(surface: "native_actions") : nil
+                ),
+                auditAppendPath: macControlAuditPath,
+                notificationCenterAdapter: NativeAgentMacControlNotificationAdapter()
             )
             let bodyDict: [String: JSONValue]
             if bodyData.isEmpty {

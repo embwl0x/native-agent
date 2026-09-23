@@ -894,15 +894,9 @@ public enum ChatSessionRetention {
         )
         var line = try record.serialize(pretty: false)
         line += "\n"
-        let bytes = Data(line.utf8)
-        if FileManager.default.fileExists(atPath: path.path) {
-            let handle = try FileHandle(forWritingTo: path)
-            defer { try? handle.close() }
-            try handle.seekToEnd()
-            try handle.write(contentsOf: bytes)
-        } else {
-            try bytes.write(to: path, options: .atomic)
-        }
+        // The shared append: torn-line repair and O_APPEND. The caller holds
+        // the index lock.
+        try SwiftNativePersistenceCore.appendBytes(Data(line.utf8), to: path)
     }
 
     private static func relativePath(_ url: URL, under root: URL) -> String {

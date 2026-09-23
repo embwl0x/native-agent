@@ -43,7 +43,7 @@ extension MacFourVerbs {
     /// it is in front decides whether she may act on it: `act` and `go` are
     /// still frontmost verbs, and a background sighting is a LOOK, not a
     /// license.
-    public func screen(part: String? = nil, app: String? = nil) async -> MacFourVerbsReply {
+    public func screen(part: String? = nil, app: String? = nil, structured: Bool = false) async -> MacFourVerbsReply {
         switch await sight(part: part, app: app) {
         case .blind(let reply):
             return reply
@@ -58,7 +58,9 @@ extension MacFourVerbs {
             return MacFourVerbsReply(
                 ok: true,
                 text: lead + "\n" + sighting.render,
-                detail: sighting.detail
+                detail: structured
+                    ? sighting.detail.merging(["controls": sighting.controls]) { _, new in new }
+                    : sighting.detail
             )
         }
     }
@@ -204,6 +206,9 @@ extension MacFourVerbs {
         let targets: [ActTarget]
         let frameId: String
         let zoomNote: String?
+        /// Already-redacted canonical handles, used by the workspace to bind
+        /// selections. Normal prose screen calls do not emit this extra data.
+        let controls: JSONValue
         let detail: [String: JSONValue]
     }
 
@@ -677,6 +682,14 @@ extension MacFourVerbs {
             targets: targets,
             frameId: frameId,
             zoomNote: zoom?.note,
+            controls: .object([
+                "frame_id": .string(frameId),
+                "app": output["app"] ?? .null,
+                "front": output["front"] ?? .bool(false),
+                "affordances": output["affordances"] ?? .array([]),
+                "affordances_truncated": output["affordances_truncated"] ?? .bool(false),
+                "affordances_omitted": output["affordances_omitted"] ?? .int(0),
+            ]),
             detail: [
                 "bytes": .int(Int64(renderedText.utf8.count)),
                 "rows_dropped": .int(Int64(rendering.rowsDropped)),

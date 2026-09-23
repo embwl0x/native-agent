@@ -58,11 +58,34 @@ public enum ToolNotRunStatus: String, Sendable, Equatable {
         }
     }
 
-    public func reporting(_ value: JSONValue, location: String = "Mac chat or on your phone") -> JSONValue {
+    public func reporting(_ value: JSONValue, location: String = "Mac chat or on your phone", tool: String? = nil) -> JSONValue {
         guard case .object(var fields) = value else { return value }
         fields["not_run_status"] = .string(rawValue)
-        fields["detail"] = .string(sentence(location: location))
+        if self == .blocked {
+            func text(_ key: String) -> String? {
+                if case .string(let value)? = fields[key] { return value }
+                return nil
+            }
+            var named = tool
+            if named == nil { named = text("tool") }
+            fields["detail"] = .string(Self.blockedSentence(
+                reason: text("gate_reason") ?? text("detail") ?? text("message"), tool: named))
+        } else {
+            fields["detail"] = .string(sentence(location: location))
+        }
         return .object(fields)
+    }
+
+    /// 2026-09-22: most `toolDenied` throws are argument checks, and the
+    /// generic "access rule" sentence buried them. Say the real reason; a
+    /// real policy block names the tool and the Settings rule behind it.
+    public static func blockedSentence(reason: String?, tool: String? = nil) -> String {
+        let reason = reason?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if reason.isEmpty { return ToolNotRunStatus.blocked.sentence() }
+        if reason.hasPrefix("autonomy=") || reason.hasPrefix("fileAccess=") {
+            return "I can’t run \(tool ?? "this") — a rule in Settings blocks it."
+        }
+        return "Not run: \(reason)"
     }
 }
 
@@ -84,7 +107,8 @@ public enum AutonomyGateError: Error, LocalizedError, Equatable {
     }
 
     public var errorDescription: String? {
-        notRunStatus.sentence()
+        if case .toolDenied(let reason) = self { return ToolNotRunStatus.blockedSentence(reason: reason) }
+        return notRunStatus.sentence()
     }
 }
 

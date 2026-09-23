@@ -192,6 +192,25 @@ public enum MacControlGate {
         "osascript", "bash", "zsh", "sh",
     ]
 
+    /// Project current Full Mac authority into the legacy category policy for
+    /// this admitted call only. The caller must obtain `admitted` from the
+    /// canonical origin-aware authority check; a saved Full Mac bit is not
+    /// origin proof. Never persist this projection over lower-mode settings.
+    public static func policyForAdmittedFullMac(
+        _ policy: MacControlPolicy, admitted: Bool
+    ) -> MacControlPolicy {
+        guard admitted, let trust = policy.trustPolicy, fullMacActive(trust) else { return policy }
+        var effective = policy
+        effective.enabled = true
+        effective.remoteFromIOSAllowed = true
+        for key in MacControlPolicy.default.categoryAllowed.keys {
+            effective.categoryAllowed[key] = true
+        }
+        effective.trustPolicy?.developerMode = true
+        effective.trustPolicy?.allowDestructiveActions = true
+        return effective
+    }
+
     // MARK: master / remote / per-category
 
     /// Mirror of `_gate` master clause:

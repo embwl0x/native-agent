@@ -292,12 +292,6 @@ extension SwiftToolDispatcher {
         case "workshop_status": return try await impl_workshop_status(input: input)
         case "task_ledger_post": return try await impl_task_ledger_post(input: input)
         case "task_ledger_list": return try await impl_task_ledger_list(input: input)
-        // second_opinion (0.4.15): one call to the decision service carrying
-        // exactly the state and questions this call named. No store is
-        // touched, nothing is scheduled, and the native typed answers come
-        // back unchanged.
-        case "second_opinion":
-            return try await JevSecondOpinion.run(input: input, dataRoot: dataRoot)
         // delegation_status (W2, 2026-08-11): read-only projection over the
         // claude/codex wake-job stores. No write, no spawn, no network.
         case "delegation_status": return try await impl_delegation_status(input: input)
@@ -345,8 +339,15 @@ extension SwiftToolDispatcher {
             return await impl_release_view(input: input, surface: surface)
         case "search_kg":       return try await impl_search_kg(input: input)
         case "search_chat_history": return try await impl_search_chat_history(input: input, invokedAs: tool)
+        case "workspace":
+            // The outer verified-session facade consumes this preparation;
+            // Core alone never turns a button into an ungated nested action.
+            return .object(["status": .string("prepared"), "execution": .string("requires_workspace_runtime")])
+        case "work_context": return try await impl_work_context(input: input)
+        case "artifact_find": return try await impl_artifact_find(input: input)
         case "session_search": return try await impl_search_chat_history(input: input, invokedAs: tool)
         case "read_chat_message": return try await impl_read_chat_message(input: input, invokedAs: tool)
+        case "chat_conversations": return try await impl_chat_conversations(input: input)
         case "get_persona_doc": return try await impl_get_persona_doc(input: input)
         case "persona_read": return try await impl_persona_read(input: input)
         case "persona_write": return try await impl_persona_write(input: input)
@@ -596,13 +597,14 @@ extension SwiftToolDispatcher {
                 dataRoot: dataRoot
             )
         case "image_generate":
-            return Self.studioImageInvitation(await impl_image_generate(input: input))
+            return Self.studioImageInvitation(await impl_image_generate(input: input, surface: surface))
         // ── Mac integration chat tools (2026-06-07) ──
         // Each tool is permission-gated through MacIntegrationPermissionStore.
         // The real backend (EventKit / UserNotifications / Spotlight) is
         // injected as a MacIntegrationToolBridge — see protocol at top of file.
         case "mac_calendar_list_upcoming":
             return try await dispatchMacIntegrationTool(
+                tool: tool, surface: surface,
                 integration: MacIntegrationID.calendar,
                 mode: .read,
                 fixHint: "Toggle Read ON for Calendar in Settings → Mac Integration.",
@@ -611,6 +613,7 @@ extension SwiftToolDispatcher {
             )
         case "mac_reminders_list_due_today":
             return try await dispatchMacIntegrationTool(
+                tool: tool, surface: surface,
                 integration: MacIntegrationID.reminders,
                 mode: .read,
                 fixHint: "Toggle Read ON for Reminders in Settings → Mac Integration.",
@@ -619,6 +622,7 @@ extension SwiftToolDispatcher {
             )
         case "mac_notify":
             return try await dispatchMacIntegrationTool(
+                tool: tool, surface: surface,
                 integration: MacIntegrationID.notifyMac,
                 mode: .write,
                 fixHint: "Toggle Write ON for Mac Notifications in Settings → Mac Integration.",
@@ -664,6 +668,7 @@ extension SwiftToolDispatcher {
             return try await Self.runInvokeCodex(input: input, dataRoot: dataRoot)
         case "mobile_notify":
             return try await dispatchMacIntegrationTool(
+                tool: tool, surface: surface,
                 integration: MacIntegrationID.notifyMobile,
                 mode: .write,
                 fixHint: "Toggle Write ON for iPhone Notifications in Settings → Mac Integration.",
@@ -672,6 +677,7 @@ extension SwiftToolDispatcher {
             )
         case "mac_spotlight_search":
             return try await dispatchMacIntegrationTool(
+                tool: tool, surface: surface,
                 integration: MacIntegrationID.spotlight,
                 mode: .read,
                 fixHint: "Toggle Read ON for Spotlight Search in Settings → Mac Integration.",
@@ -685,6 +691,7 @@ extension SwiftToolDispatcher {
         // OFF until the user flips them in Settings → Mac Integration.
         case "contacts_search":
             return try await dispatchMacIntegrationTool(
+                tool: tool, surface: surface,
                 integration: MacIntegrationID.contacts,
                 mode: .read,
                 fixHint: "Toggle Read ON for Contacts in Settings → Mac Integration.",
@@ -693,6 +700,7 @@ extension SwiftToolDispatcher {
             )
         case "contacts_create_or_update":
             return try await dispatchMacIntegrationTool(
+                tool: tool, surface: surface,
                 integration: MacIntegrationID.contacts,
                 mode: .write,
                 fixHint: "Toggle Write ON for Contacts in Settings → Mac Integration.",
@@ -701,6 +709,7 @@ extension SwiftToolDispatcher {
             )
         case "mail_list_recent":
             return try await dispatchMacIntegrationTool(
+                tool: tool, surface: surface,
                 integration: MacIntegrationID.mail,
                 mode: .read,
                 fixHint: "Toggle Read ON for Mail in Settings → Mac Integration.",
@@ -709,6 +718,7 @@ extension SwiftToolDispatcher {
             )
         case "mail_search":
             return try await dispatchMacIntegrationTool(
+                tool: tool, surface: surface,
                 integration: MacIntegrationID.mail,
                 mode: .read,
                 fixHint: "Toggle Read ON for Mail in Settings → Mac Integration.",
@@ -717,6 +727,7 @@ extension SwiftToolDispatcher {
             )
         case "mail_send":
             return try await dispatchMacIntegrationTool(
+                tool: tool, surface: surface,
                 integration: MacIntegrationID.mail,
                 mode: .write,
                 fixHint: "Toggle Write ON for Mail in Settings → Mac Integration.",
@@ -725,6 +736,7 @@ extension SwiftToolDispatcher {
             )
         case "messages_recent_threads":
             return try await dispatchMacIntegrationTool(
+                tool: tool, surface: surface,
                 integration: MacIntegrationID.messages,
                 mode: .read,
                 fixHint: "Toggle Read ON for Messages in Settings → Mac Integration.",
@@ -733,6 +745,7 @@ extension SwiftToolDispatcher {
             )
         case "messages_send":
             return try await dispatchMacIntegrationTool(
+                tool: tool, surface: surface,
                 integration: MacIntegrationID.messages,
                 mode: .write,
                 fixHint: "Toggle Write ON for Messages in Settings → Mac Integration.",
@@ -741,6 +754,7 @@ extension SwiftToolDispatcher {
             )
         case "notes_search":
             return try await dispatchMacIntegrationTool(
+                tool: tool, surface: surface,
                 integration: MacIntegrationID.notes,
                 mode: .read,
                 fixHint: "Toggle Read ON for Notes in Settings → Mac Integration.",
@@ -749,6 +763,7 @@ extension SwiftToolDispatcher {
             )
         case "notes_create":
             return try await dispatchMacIntegrationTool(
+                tool: tool, surface: surface,
                 integration: MacIntegrationID.notes,
                 mode: .write,
                 fixHint: "Toggle Write ON for Notes in Settings → Mac Integration.",
@@ -757,6 +772,7 @@ extension SwiftToolDispatcher {
             )
         case "music_now_playing":
             return try await dispatchMacIntegrationTool(
+                tool: tool, surface: surface,
                 integration: MacIntegrationID.music,
                 mode: .read,
                 fixHint: "Toggle Read ON for Music in Settings → Mac Integration.",
@@ -765,6 +781,7 @@ extension SwiftToolDispatcher {
             )
         case "music_control":
             return try await dispatchMacIntegrationTool(
+                tool: tool, surface: surface,
                 integration: MacIntegrationID.music,
                 mode: .write,
                 fixHint: "Toggle Write ON for Music in Settings → Mac Integration.",
@@ -776,6 +793,7 @@ extension SwiftToolDispatcher {
         // Sensitive writes default OFF in MacIntegrationPermissionStore.
         case "mac_calendar_create_event":
             return try await dispatchMacIntegrationTool(
+                tool: tool, surface: surface,
                 integration: MacIntegrationID.calendar,
                 mode: .write,
                 fixHint: "Toggle Write ON for Calendar in Settings → Mac Integration.",
@@ -784,6 +802,7 @@ extension SwiftToolDispatcher {
             )
         case "mac_calendar_modify_event":
             return try await dispatchMacIntegrationTool(
+                tool: tool, surface: surface,
                 integration: MacIntegrationID.calendar,
                 mode: .write,
                 fixHint: "Toggle Write ON for Calendar in Settings → Mac Integration.",
@@ -792,6 +811,7 @@ extension SwiftToolDispatcher {
             )
         case "mac_calendar_delete_event":
             return try await dispatchMacIntegrationTool(
+                tool: tool, surface: surface,
                 integration: MacIntegrationID.calendar,
                 mode: .write,
                 fixHint: "Toggle Write ON for Calendar in Settings → Mac Integration.",
@@ -800,6 +820,7 @@ extension SwiftToolDispatcher {
             )
         case "mac_reminders_create":
             return try await dispatchMacIntegrationTool(
+                tool: tool, surface: surface,
                 integration: MacIntegrationID.reminders,
                 mode: .write,
                 fixHint: "Toggle Write ON for Reminders in Settings → Mac Integration.",
@@ -808,6 +829,7 @@ extension SwiftToolDispatcher {
             )
         case "mac_reminders_complete":
             return try await dispatchMacIntegrationTool(
+                tool: tool, surface: surface,
                 integration: MacIntegrationID.reminders,
                 mode: .write,
                 fixHint: "Toggle Write ON for Reminders in Settings → Mac Integration.",
@@ -816,6 +838,7 @@ extension SwiftToolDispatcher {
             )
         case "mail_mark_read":
             return try await dispatchMacIntegrationTool(
+                tool: tool, surface: surface,
                 integration: MacIntegrationID.mail,
                 mode: .write,
                 fixHint: "Toggle Write ON for Mail in Settings → Mac Integration.",
@@ -824,6 +847,7 @@ extension SwiftToolDispatcher {
             )
         case "mail_archive":
             return try await dispatchMacIntegrationTool(
+                tool: tool, surface: surface,
                 integration: MacIntegrationID.mail,
                 mode: .write,
                 fixHint: "Toggle Write ON for Mail in Settings → Mac Integration.",
@@ -832,6 +856,7 @@ extension SwiftToolDispatcher {
             )
         case "mail_delete":
             return try await dispatchMacIntegrationTool(
+                tool: tool, surface: surface,
                 integration: MacIntegrationID.mail,
                 mode: .write,
                 fixHint: "Toggle Write ON for Mail in Settings → Mac Integration.",
@@ -840,6 +865,7 @@ extension SwiftToolDispatcher {
             )
         case "mail_reply":
             return try await dispatchMacIntegrationTool(
+                tool: tool, surface: surface,
                 integration: MacIntegrationID.mail,
                 mode: .write,
                 fixHint: "Toggle Write ON for Mail in Settings → Mac Integration.",
@@ -848,6 +874,7 @@ extension SwiftToolDispatcher {
             )
         case "notes_update":
             return try await dispatchMacIntegrationTool(
+                tool: tool, surface: surface,
                 integration: MacIntegrationID.notes,
                 mode: .write,
                 fixHint: "Toggle Write ON for Notes in Settings → Mac Integration.",
@@ -856,6 +883,7 @@ extension SwiftToolDispatcher {
             )
         case "music_search_library":
             return try await dispatchMacIntegrationTool(
+                tool: tool, surface: surface,
                 integration: MacIntegrationID.music,
                 mode: .read,
                 fixHint: "Toggle Read ON for Music in Settings → Mac Integration.",
@@ -864,6 +892,7 @@ extension SwiftToolDispatcher {
             )
         case "music_list_library":
             return try await dispatchMacIntegrationTool(
+                tool: tool, surface: surface,
                 integration: MacIntegrationID.music,
                 mode: .read,
                 fixHint: "Toggle Read ON for Music in Settings → Mac Integration.",
@@ -872,6 +901,7 @@ extension SwiftToolDispatcher {
             )
         case "music_list_playlists":
             return try await dispatchMacIntegrationTool(
+                tool: tool, surface: surface,
                 integration: MacIntegrationID.music,
                 mode: .read,
                 fixHint: "Toggle Read ON for Music in Settings → Mac Integration.",
@@ -880,6 +910,7 @@ extension SwiftToolDispatcher {
             )
         case "contacts_delete":
             return try await dispatchMacIntegrationTool(
+                tool: tool, surface: surface,
                 integration: MacIntegrationID.contacts,
                 mode: .write,
                 fixHint: "Toggle Write ON for Contacts in Settings → Mac Integration.",
@@ -891,6 +922,7 @@ extension SwiftToolDispatcher {
         // already defaults scheduler.write ON (the user trusts it).
         case "scheduler_list_jobs":
             return try await dispatchMacIntegrationTool(
+                tool: tool, surface: surface,
                 integration: MacIntegrationID.scheduler,
                 mode: .write,
                 fixHint: "Toggle Write ON for Scheduler in Settings → Mac Integration.",
@@ -899,6 +931,7 @@ extension SwiftToolDispatcher {
             )
         case "scheduler_create_job":
             return try await dispatchMacIntegrationTool(
+                tool: tool, surface: surface,
                 integration: MacIntegrationID.scheduler,
                 mode: .write,
                 fixHint: "Toggle Write ON for Scheduler in Settings → Mac Integration.",

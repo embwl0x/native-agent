@@ -100,7 +100,8 @@ public struct ContextMarkdownCompiler: Sendable {
     /// pure-HTML-comment paragraphs compiled to adaptive candidates whose
     /// static priors ranked #1-2 of the whole store — noise competing for
     /// packet slots.
-    static let compilerFormatVersion = "3"
+    /// v4 = one-time refresh so stale-fingerprint embeddings re-embed (2026-09-22).
+    static let compilerFormatVersion = "4"
 
     /// True when a parsed block's body is exactly one autogen marker comment
     /// (modulo surrounding whitespace). Such blocks are structural delimiters

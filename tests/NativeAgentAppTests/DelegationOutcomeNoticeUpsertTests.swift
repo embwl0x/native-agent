@@ -12,8 +12,8 @@ import PersistenceCore
 //
 //   • legacy unread successful per-job rows are archived in one reconciliation
 //     while handled history and attention-worthy rows remain untouched;
-//   • a CHANGED adverse outcome (finished → unconfirmed) lands as a fresh
-//     unread exact-job row beside the informational success rollup;
+//   • a CHANGED adverse outcome (finished → unconfirmed) lands in the per-agent
+//     adverse summary beside the informational success rollup;
 //   • the same outcome re-upserted keeps a non-unread status;
 //   • the backlog-cleared card lands already read.
 //
@@ -87,7 +87,7 @@ struct DelegationOutcomeNoticeUpsertTests {
         #expect(await BackgroundLoopsAssembly.fileDelegationOutcomeNotice(dataRoot: root, card: worsened))
         rows = try inboxRows(root)
         #expect(rows.count == 2)
-        #expect(rows.contains { $0["id"] == .string(worsened.cardId)
+        #expect(rows.contains { $0["id"] == .string("delegation-outcome:codex:adverse-rollup")
             && $0["severity"] == .string("actionable") })
     }
 
@@ -187,14 +187,14 @@ struct DelegationOutcomeNoticeUpsertTests {
         try Data((legacy + "\n").utf8).write(to: root.appendingPathComponent("notifications/inbox.jsonl"))
         #expect(await BackgroundLoopsAssembly.fileDelegationOutcomeNotice(dataRoot: root, card: preserved))
         let rows = try inboxRows(root)
-        #expect(rows.count == 1)
-        #expect(rows[0]["status"] == .string("unread"))
-        #expect(rows[0]["severity"] == .string("actionable"))
-        #expect(rows[0]["title"] == .string("Codex outcome is unconfirmed"))
-        #expect(rows[0]["error_signature"] == .string(preserved.signature))
+        #expect(rows.count == 2)
+        let summary = try #require(rows.first { $0["id"] == .string("delegation-outcome:codex:adverse-rollup") })
+        #expect(summary["status"] == .string("unread"))
+        #expect(summary["severity"] == .string("actionable"))
+        #expect(summary["title"] == .string("Codex: 1 unconfirmed"))
     }
 
-    @Test("an adverse outcome lands as a fresh exact-job row beside the success rollup")
+    @Test("an adverse outcome lands in the per-agent summary beside the success rollup")
     func changedOutcomeResetsToUnread() async throws {
         let root = try tmpDataRoot()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -208,22 +208,23 @@ struct DelegationOutcomeNoticeUpsertTests {
         try Data((try JSONValue.object(dismissed).serialize(pretty: false) + "\n").utf8)
             .write(to: root.appendingPathComponent("notifications/inbox.jsonl"))
 
-        // … then the bridge preserved the reply: the adverse event gets exact
-        // job identity and must not be hidden inside the success rollup.
+        // … then the bridge preserved the reply: the adverse event lands in the
+        // per-agent adverse summary, never hidden inside the success rollup.
         let preserved = try #require(DelegationOutcomeCard.make(from: codexJob(undelivered: true), now: now))
         #expect(await BackgroundLoopsAssembly.fileDelegationOutcomeNotice(dataRoot: root, card: preserved))
         rows = try inboxRows(root)
         #expect(rows.count == 2)
-        var adverse = try #require(rows.first { $0["id"] == .string(finished.cardId) })
+        let summaryID = JSONValue.string("delegation-outcome:codex:adverse-rollup")
+        var adverse = try #require(rows.first { $0["id"] == summaryID })
         #expect(adverse["status"] == .string("unread"))
         #expect(adverse["severity"] == .string("actionable"))
-        #expect(adverse["title"] == .string("Codex outcome is unconfirmed"))
-        #expect(adverse["error_signature"] == .string("codex:cx-1:unknown"))
+        #expect(adverse["title"] == .string("Codex: 1 unconfirmed"))
+        #expect(adverse["error_signature"] == .string("delegation_outcome.adverse.codex"))
 
         // Same outcome again (a retried upsert) after the user read it: sticky.
         adverse["status"] = .string("read")
         let rewritten = rows.map { row in
-            row["id"] == .string(finished.cardId) ? adverse : row
+            row["id"] == summaryID ? adverse : row
         }
         let encoded = try rewritten.map {
             try JSONValue.object($0).serialize(pretty: false)
@@ -233,7 +234,7 @@ struct DelegationOutcomeNoticeUpsertTests {
         #expect(await BackgroundLoopsAssembly.fileDelegationOutcomeNotice(dataRoot: root, card: preserved))
         rows = try inboxRows(root)
         #expect(rows.count == 2)
-        let retried = try #require(rows.first { $0["id"] == .string(finished.cardId) })
+        let retried = try #require(rows.first { $0["id"] == summaryID })
         #expect(retried["status"] == .string("read"))
     }
 

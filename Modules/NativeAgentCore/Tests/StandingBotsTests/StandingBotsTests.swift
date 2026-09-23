@@ -47,6 +47,22 @@ private struct Fixture {
     #expect(throws: StandingBotsError.alreadyExists(original.id)) { try fixture.definitions.create(original) }
 }
 
+@Test func shelfLatestEntriesKeepsFailedBackdatedResultsAndExactHelperScope() throws {
+    let fixture = Fixture(); defer { fixture.clean() }
+    let watched = try fixture.bot("Watched"), other = try fixture.bot("Other")
+    let good = fixture.book(watched)
+    try fixture.shelf.append(good)
+    try fixture.shelf.append(fixture.book(other))
+    // First read upgrades the preexisting index; later writes maintain it.
+    #expect(try fixture.shelf.latestEntries(botIDs: [watched.id]).map(\.id) == [good.id])
+    let failure = fixture.book(watched, time: 500, health: .failed)
+    try fixture.shelf.append(failure)
+    let reopened = ShelfStore(dataRoot: fixture.root)
+    #expect(try reopened.latestEntries(botIDs: [watched.id]).map(\.id) == [failure.id])
+    #expect(try reopened.lastGood(bot: watched.id)?.id == good.id)
+    #expect(try reopened.readCursor(readerId: "agent").readEntryIds.isEmpty)
+}
+
 @Test func appendPaginateAndDrillDownKeepBackdatedCrossBotHistory() throws {
     let fixture = Fixture()
     defer { fixture.clean() }

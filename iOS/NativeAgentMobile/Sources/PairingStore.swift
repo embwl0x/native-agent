@@ -41,14 +41,6 @@ enum PhoneSigningIdentity {
     }
 }
 
-// iCloud pairing secret QR payload format (Mac side must produce matching JSON):
-// {"type": "icloud_pairing", "secret": "<base64-encoded-32-bytes>", "version": "1"}
-struct ICloudPairingPayload: Codable {
-    let type: String
-    let secret: String
-    let version: String
-}
-
 enum PairingKVSRefreshResult {
     static func installedNewMaterial(applied: Bool, previousSecret: Data?, currentSecret: Data?) -> Bool {
         applied && currentSecret != previousSecret
@@ -64,8 +56,6 @@ final class PairingStore: ObservableObject {
         static let retiredBearerToken = "mobile.pairing.bearerToken"
         // PATCH-2026-05-07: icloud-bridge iCloud pairing flag
         static let iCloudPaired = "mobile.pairing.iCloudPaired"
-        static let ignoredKVSPublishedAt = "mobile.pairing.ignoredKVSPublishedAt"
-        static let ignoredCloudKitSecretHash = "mobile.pairing.ignoredCloudKitSecretHash"
         // Legacy UserDefaults key — only read for one-time migration
         static let iCloudPairingSecretLegacy = "mobile.pairing.iCloudPairingSecret"
     }
@@ -121,18 +111,6 @@ final class PairingStore: ObservableObject {
         return errSecSuccess
     }
 
-    static func deleteSecretTransaction(
-        read: () -> (OSStatus, Data?),
-        delete: () -> OSStatus
-    ) -> OSStatus {
-        let deleteStatus = delete()
-        guard deleteStatus == errSecSuccess || deleteStatus == errSecItemNotFound else {
-            return deleteStatus
-        }
-        let verified = read()
-        return verified.0 == errSecItemNotFound ? errSecSuccess : errSecDecode
-    }
-
     @discardableResult
     private func saveSecretToKeychain(_ data: Data) -> OSStatus {
         Self.persistSecretTransaction(
@@ -163,28 +141,13 @@ final class PairingStore: ObservableObject {
         )
     }
 
-    @discardableResult
-    private func deleteSecretFromKeychain() -> OSStatus {
-        Self.deleteSecretTransaction(
-            read: { self.readSecretFromKeychain() },
-            delete: {
-                let query: [String: Any] = [
-                    kSecClass as String: kSecClassGenericPassword,
-                    kSecAttrService as String: Self.keychainService,
-                    kSecAttrAccount as String: Self.keychainAccount,
-                ]
-                return SecItemDelete(query as CFDictionary)
-            }
-        )
-    }
-
     // PATCH-2026-05-07: icloud-bridge true when user connected via iCloud (no bearer token needed)
     @Published var isICloudPaired: Bool {
         didSet { UserDefaults.standard.set(isICloudPaired, forKey: Keys.iCloudPaired) }
     }
     // 32-byte HMAC key shared with the Mac; nil until user scans or pastes the pairing key.
     // v1: stored in Keychain (kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly — device-local, no iCloud sync).
-    // Persistence is owned only by installPairingSecret/clearPairing. Keeping
+    // Persistence is owned only by installPairingSecret. Keeping
     // the published value free of a side-effecting observer prevents a failed
     // Keychain mutation from being represented as committed UI/runtime state.
     @Published var iCloudPairingSecret: Data? = nil
@@ -209,7 +172,6 @@ final class PairingStore: ObservableObject {
 
     private enum KVSPairingKey {
         static let hmacSecret   = "NativeAgent.pairing.hmacSecret"
-        static let publishedAt  = "NativeAgent.pairing.publishedAt"
         // Phase 14e-iCloud HMAC self-heal: monotonic pairing_secret_version
         // stamped by Mac on every re-publish. iOS uses it to detect a stale
         // cached secret and force a re-fetch.
@@ -334,13 +296,8 @@ final class PairingStore: ObservableObject {
     @discardableResult
     func applyKVSPairingMaterialIfNeeded() -> Bool {
         let kvs = NSUbiquitousKeyValueStore.default
-        let publishedAt = kvs.string(forKey: KVSPairingKey.publishedAt)
-        let ignoredPublishedAt = UserDefaults.standard.string(forKey: Keys.ignoredKVSPublishedAt)
         guard let secretData = Self.validatedKVSPairingSecret(
-            base64: kvs.string(forKey: KVSPairingKey.hmacSecret),
-            publishedAt: publishedAt,
-            ignoredPublishedAt: ignoredPublishedAt,
-            ignoredSecretHash: UserDefaults.standard.string(forKey: Keys.ignoredCloudKitSecretHash)
+            base64: kvs.string(forKey: KVSPairingKey.hmacSecret)
         ) else {
             // KVS has no pairing material yet — nothing to do.
             return false
@@ -366,84 +323,8 @@ final class PairingStore: ObservableObject {
         return installPairingSecret(secretData, source: "KVS")
     }
 
-    static func validatedKVSPairingSecret(
-        base64: String?,
-        publishedAt: String?,
-        ignoredPublishedAt: String?,
-        ignoredSecretHash: String? = nil
-    ) -> Data? {
+    static func validatedKVSPairingSecret(base64: String?) -> Data? {
         guard let base64, let data = Data(base64Encoded: base64), data.count == 32 else { return nil }
-        // Both transports honor the same deliberate unpair, independent of
-        // publication timestamps or clock changes on either device.
-        if let ignoredSecretHash {
-            return secretHash(data) == ignoredSecretHash ? nil : data
-        }
-        let published = publishedAt ?? ""
-        let ignored = ignoredPublishedAt ?? ""
-        guard ignored.isEmpty || (!published.isEmpty && published > ignored) else { return nil }
-        return data
-    }
-
-    /// The Mac's current pairing material, used only to verify an explicitly
-    /// pasted fallback key before it can become active on this phone. Unlike
-    /// auto-bootstrap, an explicit re-pair may compare material that was
-    /// deliberately ignored during a prior unpair; the comparison itself does
-    /// not mutate pairing state.
-    func publishedICloudPairingSecretForVerification() -> Data? {
-        if let base64 = NSUbiquitousKeyValueStore.default.string(forKey: KVSPairingKey.hmacSecret),
-           let data = Data(base64Encoded: base64),
-           data.count == 32 {
-            return data
-        }
-        // 2026-09-06: KVS is not the only publication route. A Mac signed with
-        // the CloudKit-only entitlements has no ubiquity key-value store at all,
-        // so this used to return nil for every manual key on those builds — and
-        // since Re-pair records the cleared key's hash and CloudKit re-delivery
-        // of that same key is then refused, the phone had no way back.
-        //
-        // 2026-09-06: an expired peek is no material at all. The transport
-        // record this came from is the role-level singleton `pairing.mac`, so a
-        // retained value cannot be told apart from the current one — an old key
-        // that still matched here would install and leave the phone signing
-        // with authority the Mac has already rotated away from.
-        guard let peeked = cloudKitPublishedPairingSecret,
-              Date().timeIntervalSince(peeked.fetchedAt) < Self.peekedPairingSecretLifetime else {
-            cloudKitPublishedPairingSecret = nil
-            return nil
-        }
-        return peeked.data
-    }
-
-    /// The pairing secret read straight from the device transport for ONE
-    /// verification attempt, with the moment it was read. Never persisted,
-    /// never installed from here — `applyICloudSecret` remains the only manual
-    /// install path.
-    private struct PeekedPairingSecret {
-        var data: Data
-        var fetchedAt: Date
-    }
-
-    private var cloudKitPublishedPairingSecret: PeekedPairingSecret?
-
-    /// How long a peeked secret may back a comparison. Long enough for the
-    /// paste that follows the peek, short enough that it cannot outlive a Mac
-    /// rotation the phone never saw.
-    static let peekedPairingSecretLifetime: TimeInterval = 5 * 60
-
-    /// Ask the device transport for the Mac's published pairing material so the
-    /// verification that immediately follows has something to compare against.
-    ///
-    /// 2026-09-06: this ALWAYS replaces the held value — a failed or empty peek
-    /// clears it. Keeping the previous read meant a key the Mac no longer
-    /// publishes could still verify and install on the next paste.
-    @discardableResult
-    func refreshPublishedPairingSecretForVerification() async -> Data? {
-        guard let data = await iCloudBridge.shared.publishedPairingSecretFromTransport(),
-              data.count == 32 else {
-            cloudKitPublishedPairingSecret = nil
-            return nil
-        }
-        cloudKitPublishedPairingSecret = PeekedPairingSecret(data: data, fetchedAt: Date())
         return data
     }
 
@@ -455,22 +336,11 @@ final class PairingStore: ObservableObject {
         _ data: Data,
         persist: ((Data) -> OSStatus)? = nil
     ) -> Bool {
-        guard shouldAcceptCloudKitPairingSecret(data) else {
-            return false
-        }
+        guard data.count == 32 else { return false }
         if iCloudPairingSecret == data, isICloudPaired {
             return true
         }
         return installPairingSecret(data, source: "CloudKit", persist: persist)
-    }
-
-    /// A deliberate unpair ignores only the exact secret that was cleared.
-    /// Rotating the Mac secret produces a new hash and is therefore accepted,
-    /// restoring public CloudKit re-pair without an unsigned/manual fallback.
-    func shouldAcceptCloudKitPairingSecret(_ data: Data) -> Bool {
-        guard data.count == 32 else { return false }
-        let ignored = UserDefaults.standard.string(forKey: Keys.ignoredCloudKitSecretHash)
-        return ignored != Self.secretHash(data)
     }
 
     /// Keychain-first pairing transaction. Published/UI state changes only
@@ -495,15 +365,12 @@ final class PairingStore: ObservableObject {
         }
         iCloudPairingSecret = data
         isICloudPaired = true
-        UserDefaults.standard.removeObject(forKey: Keys.ignoredCloudKitSecretHash)
-        UserDefaults.standard.removeObject(forKey: Keys.ignoredKVSPublishedAt)
         NSLog("[PairingStore] \(source) pairing installed transactionally")
         return true
     }
 
-    /// Re-read HMAC material from KVS without weakening deliberate-unpair
-    /// suppression. Returns true only when a different secret is durably
-    /// installed in Keychain.
+    /// Re-read HMAC material from KVS. Returns true only when a different
+    /// secret is durably installed in Keychain.
     @discardableResult
     func refreshFromKVS() async -> Bool {
         // Synchronize first so we get the freshest KVS state — but under the
@@ -543,60 +410,5 @@ final class PairingStore: ObservableObject {
     // PATCH-2026-05-07: icloud-bridge set iCloud as the active transport
     func applyICloudPairing() {
         isICloudPaired = true
-    }
-
-    /// A manually supplied secret is eligible only when it exactly matches
-    /// pairing material the Mac has already published. Shape alone cannot
-    /// prove that two devices share the same HMAC authority.
-    static func isVerifiedManualICloudSecret(_ candidate: Data, publishedMacSecret: Data?) -> Bool {
-        candidate.count == 32 && candidate == publishedMacSecret
-    }
-
-    /// Apply an iCloud HMAC pairing secret decoded from a QR code or pasted key.
-    /// Returns false if the key is malformed, cannot be verified against the
-    /// Mac's published material, or the Keychain write fails.
-    @discardableResult
-    func applyICloudSecret(base64 string: String) -> Bool {
-        guard let data = Data(base64Encoded: string), data.count == 32 else { return false }
-        guard Self.isVerifiedManualICloudSecret(
-            data,
-            publishedMacSecret: publishedICloudPairingSecretForVerification()
-        ) else { return false }
-        return installPairingSecret(data, source: "manual")
-    }
-
-    @discardableResult
-    func clearPairing(deleteSecret: (() -> OSStatus)? = nil) -> Bool {
-        let deleteStatus = deleteSecret?() ?? deleteSecretFromKeychain()
-        guard deleteStatus == errSecSuccess else {
-            NSLog("[PairingStore] clear pairing refused: Keychain delete/read-back failed (status=\(deleteStatus))")
-            return false
-        }
-        let publishedAt = NSUbiquitousKeyValueStore.default.string(forKey: KVSPairingKey.publishedAt) ?? ISO8601DateFormatter().string(from: Date())
-        UserDefaults.standard.set(publishedAt, forKey: Keys.ignoredKVSPublishedAt)
-        if let secret = iCloudPairingSecret {
-            UserDefaults.standard.set(
-                Self.secretHash(secret),
-                forKey: Keys.ignoredCloudKitSecretHash
-            )
-        }
-        isICloudPaired = false
-        iCloudPairingSecret = nil
-        return true
-    }
-
-    private static func secretHash(_ data: Data) -> String {
-        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
-    }
-
-    /// R11-N29: Computed property so it recomputes from current expiry whenever
-    /// observed. Previously a static `var = false` that was never updated.
-    /// Uses the last runtime expiry snapshot when one exists; falls back to
-    /// false when unknown. iCloud pairing currently has no TTL handshake.
-    @Published var lastKnownExpiresAt: Date? = nil
-
-    var pairingNearExpiry: Bool {
-        guard let exp = lastKnownExpiresAt else { return false }
-        return exp.timeIntervalSinceNow < 14 * 24 * 3600  // < 14 days
     }
 }

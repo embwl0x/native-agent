@@ -69,32 +69,13 @@ extension SwiftToolDispatcher {
     /// second hand-maintained spelling of these names.
     public static let skillReaderToolNames: Set<String> = ["list_skills", "read_skill"]
 
-    /// Tools that are the agent MANAGING ITSELF, not acting on the request.
-    ///
-    /// Loading a tool, reading the catalog, paging a result or looking at its
-    /// own state are bookkeeping: they have no target the request could
-    /// disagree with, so asking "does this call match what was asked" has
-    /// nothing to compare and answers noise. On the drive they scored
-    /// `mismatch 0.64` against ordinary requests. The tool-call lane skips
-    /// these names outright.
-    ///
-    /// This is not a permission gate and grants nothing. It only decides what
-    /// an advisory check is pointless on.
-    public static let selfManagementToolNames: Set<String> = [
-        "tool_catalog", "tool_load", "tool_unload", "list_tools",
-        "tool_result_page", "inner_state", "context_expand",
-        // second_opinion is here for a second reason as well as the first: it
-        // IS the decision service, so a tool-call check on it would ask the
-        // service whether asking the service matched the request. The lane
-        // skipping this name is what keeps the recursion from existing.
-        "second_opinion",
-    ]
-
     public static let alwaysOnCoreNames: Set<String> = [
         "agent_contacts", "agent_message",
         "tool_catalog", "tool_load", "tool_unload", "tool_result_page",
         "list_skills", "read_skill",
-        "recall_memory", "search_chat_history",
+        // One compact workspace entry carries work, documents and discussions.
+        // Detailed readers remain lazy behind their normal permission gates.
+        "recall_memory", "workspace",
         // commit_memory — the memory WRITE counterpart to recall_memory.
         // Daemon parity (always_on + AUTO). Must be hot/always-loaded so the
         // model can durably save a fact mid-turn WITHOUT a tool_load dance —
@@ -142,7 +123,7 @@ extension SwiftToolDispatcher {
         "agent_contacts", "agent_connect", "agent_message", "agent_read",
         "bot_create", "bot_update", "bot_pause", "bot_run_once", "bot_list", "shelf_read", "shelf_entry", "bot_ask", "bot_delete",
         "read_page", "read_file", "list_dir", "write_file", "recall_memory", "recall_search", "commit_memory", "search_kg",
-        "search_chat_history", "session_search",
+        "search_chat_history", "session_search", "workspace", "work_context", "artifact_find",
         "get_persona_doc", "persona_read", "persona_write", "persona_append_section",
         "agent_introspect", "daemon_introspect", "tool_catalog",
         "list_tools", "tool_load", "tool_unload", "tool_result_page", "request_interaction", "list_skills", "read_skill", "save_skill",
@@ -219,11 +200,6 @@ extension SwiftToolDispatcher {
         // task_ledger_list is a read. Claude/Codex write the same feed via
         // script/task_ledger.sh -> Swift task-ledger.
         "task_ledger_post", "task_ledger_list",
-        // 0.4.15 — second_opinion: the agent's own typed questions to the
-        // decision service. Catalog-visible + lazy-loaded (NOT in
-        // alwaysOnCoreNames), and present only while a key is on file. Pure
-        // ask-and-read: no store is written and no follow-up is triggered.
-        "second_opinion",
         // W2 (2026-08-11) — delegation_status: the READ counterpart to
         // claude_message / codex_message. Catalog-visible + lazy-loaded (NOT
         // in alwaysOnCoreNames). Pure local read over the two wake-job stores
@@ -292,8 +268,8 @@ extension SwiftToolDispatcher {
         "list_memories", "rewrite_memory", "forget_memory", "rebuild_knowledge_graph",
         // Agent, 2026-09-06: the whole of one message search only previewed.
         // LAZY — reaching past a preview is a deliberate follow-up to a search,
-        // not per-turn business, and search_chat_history (always-on) names it.
-        "read_chat_message",
+        // not per-turn business; work_context and history return exact locators.
+        "read_chat_message", "chat_conversations",
     ]
 
     /// The READ half of the Full-Mac file surface. Every entry only observes:
@@ -431,10 +407,9 @@ extension SwiftToolDispatcher {
 
     /// W7 (2026-08-14) — the ambient activity watcher's query tool.
     ///
-    /// Its own list, and deliberately NOT under any Full Mac flag: this reads a
-    /// local SQLite rollup, not the live screen, so borrowing the accessibility
-    /// category would tie it to a gate that has nothing to do with it and would
-    /// let an active Full Mac window imply consent the user never gave.
+    /// Its own list: this reads a local SQLite rollup, not the live screen.
+    /// Capture must be enabled; agent access comes from its separate preference
+    /// or checked Full Mac admission, never the accessibility category.
     ///
     /// Its gate is `ActivityPolicy.captureEnabled` — the Trust Center toggle,
     /// OFF by default. `listAvailableTools()` surfaces it only when that toggle
@@ -677,7 +652,7 @@ extension SwiftToolDispatcher {
         "tool_catalog", "tool_load", "tool_unload", "tool_result_page", "request_interaction",
         "list_skills", "read_skill", "save_skill", "recall_memory",
         "recall_search", "commit_memory", "search_kg", "search_chat_history",
-        "session_search", "get_persona_doc", "persona_read", "persona_write",
+        "session_search", "workspace", "work_context", "artifact_find", "get_persona_doc", "persona_read", "persona_write",
         "persona_append_section", "agent_introspect", "inner_state", "daemon_introspect",
         "list_tools", "context_lookup", "context_expand", "scratchpad_read",
         "recent_trace_summary", "time_now", "claude_message", "invoke_claude",
@@ -695,7 +670,6 @@ extension SwiftToolDispatcher {
         "slack_list_channels", "slack_search_messages", "slack_post_message",
         "agentmail_list", "agentmail_read", "agentmail_send", "image_generate",
         "workshop_submit", "workshop_status", "task_ledger_post", "task_ledger_list",
-        "second_opinion",
         // Activity history is a Trust Center-gated local query; it belongs in
         // the reviewed core/runtime bucket, never an implicit catalog fallback.
         "delegation_status", "activity_query", "desk_read", "desk_add_item", "desk_set_status",
@@ -711,7 +685,7 @@ extension SwiftToolDispatcher {
         "hold_view", "release_view",
         "memory_moments_pending", "memory_moment_review",
         "list_memories", "rewrite_memory", "forget_memory", "rebuild_knowledge_graph",
-        "read_chat_message",
+        "read_chat_message", "chat_conversations",
     ]
 
 }

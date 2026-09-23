@@ -42,7 +42,7 @@ public enum BotRunnerError: Error, CustomStringConvertible {
 /// The one gate a bot passes before a turn is spent on it. Injected rather than
 /// imported: StandingBots owns scheduling and accounting, not provider
 /// catalogs, so the app installs the live check (readiness + the route's
-/// catalog) at startup and the shape test stands in until it does.
+/// catalog) at startup. Runs wait until that check is installed.
 public actor BotRunGate {
     public typealias LiveCheck = @Sendable (BotDefinition, URL) async -> String?
     private static let shared = BotRunGate()
@@ -51,6 +51,10 @@ public actor BotRunGate {
     private func install(_ check: @escaping LiveCheck) { liveCheck = check }
     private func run(_ bot: BotDefinition, _ dataRoot: URL) async -> String? {
         await liveCheck?(bot, dataRoot)
+    }
+
+    public static func isReady() async -> Bool {
+        await shared.liveCheck != nil
     }
 
     /// Set once by the app: `SwiftNativeProviderRouting.botChoiceRejection`.
@@ -141,6 +145,7 @@ public actor BotRunner {
         }
         let bot = try await queue.claimWhenAvailable(bot: id, requestID: nil, manual: true).bot
         defer { queue.finish(bot: id) }
+        guard await BotRunGate.isReady() else { throw BotRunnerError.cannotRun("Provider check is not ready yet.") }
         if let problem = await BotRunGate.problem(for: bot, dataRoot: dataRoot) {
             throw BotRunnerError.cannotRun(problem)
         }

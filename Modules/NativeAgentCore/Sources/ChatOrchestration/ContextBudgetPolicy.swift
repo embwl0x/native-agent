@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentCore
 import ProviderRouting
 
 /// SINGLE SOURCE OF TRUTH for every prompt-assembly character budget.
@@ -77,6 +78,17 @@ public enum ContextBudgetPolicy {
     ///   ≤ 60% of the 128k catalog minimum.
     /// starts buying latency and cost.
     static let maximumHistoryCharacters = 96_000
+
+    /// User 2026-09-23: history follows each model's own compaction point. The
+    /// session compacts at min(configured threshold, 60% of the window), so
+    /// replaying up to that point already fits the window it was sized for.
+    static func compactionHistoryCharacters(windowTokens: Int) -> Int {
+        let config = ChatSessionAutocompactionConfig.productionDefault()
+        let tokens = min(config.thresholdTokens,
+                         Int(Double(windowTokens) * ChatSessionAutocompactionConfig.maximumContextWindowFraction))
+        return Int(Double(tokens) * charactersPerToken)
+    }
+
     static let maximumMemoryBlockCharacters = 24_000
     static let maximumRelevantCharacters = 24_000
     static let maximumCapsuleCharacters = 8_000
@@ -308,16 +320,17 @@ public enum ContextBudgetPolicy {
         )
 
         return Resolved(
-            historyChars: min(maximumHistoryCharacters, grow(floors.historyChars, scale)),
+            historyChars: max(
+                min(maximumHistoryCharacters, grow(floors.historyChars, scale)),
+                compactionHistoryCharacters(windowTokens: windowTokens)
+            ),
             userCap: grow(floors.userCap, rowScale),
             assistantCap: grow(floors.assistantCap, rowScale),
             systemCap: grow(floors.systemCap, rowScale),
             // The distiller never writes more than maxSummaryChars, so more
             // room than that buys literally nothing.
-            compactionSummaryCap: min(
-                ChatCompactionDistiller.maxSummaryChars,
-                grow(floors.compactionSummaryCap, rowScale)
-            ),
+            // The whole recollection renders; per-surface floors would cut it.
+            compactionSummaryCap: ChatCompactionDistiller.maxSummaryChars,
             toolCap: grow(floors.toolCap, rowScale),
             continuityCap: grow(floors.continuityCap, rowScale),
             relevantChars: min(maximumRelevantCharacters, grow(floors.relevantChars, scale)),

@@ -431,10 +431,14 @@ func swiftToolDispatcher_alwaysOnCoreNames_staysWithinLazyLoadBudget() async thr
     // Agent's working-set ruling of 2026-09-11 dropped scratchpad_read,
     // save_skill, search_kg, omp_message and codex_message off the floor —
     // zero to two real calls in eleven days each, all still loadable.
-    #expect(alwaysOn.count == 20)
+    // The native workspace replaces its work_context reader without
+    // adding another always-on entry.
+    #expect(alwaysOn.count == 22)
     #expect(alwaysOn.contains("tool_load"))
     #expect(alwaysOn.contains("tool_result_page"))
-    #expect(alwaysOn.contains("search_chat_history"))
+    #expect(alwaysOn.contains("workspace"))
+    #expect(!alwaysOn.contains("work_context"))
+    #expect(!alwaysOn.contains("search_chat_history"))
     #expect(!alwaysOn.contains("session_search"))
     #expect(alwaysOn.contains("claude_message"))
     #expect(!alwaysOn.contains("invoke_claude"))

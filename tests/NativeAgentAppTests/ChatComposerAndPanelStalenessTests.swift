@@ -334,40 +334,9 @@ func compactReaderFreshnessPreservesLastGoodAndCannotClearPanelState() {
     #expect(failed.lastSuccessAt == first)
 
     model.recordPanelRefresh(.chat, failedEndpoints: ["health"])
-    model.whatsRunningRefreshStatus = failed
     model.sidebarActivityRefreshStatus = clean
     #expect(model.isPanelStale(.chat))
-    #expect(model.whatsRunningRefreshStatus?.isStale == true)
     #expect(model.sidebarActivityRefreshStatus?.isStale == false)
-}
-
-@MainActor
-@Test
-func whatsRunningPresentationReservesIdleForASuccessfulEmptyRead() {
-    let checking = WhatsRunningPresentation.make(snapshot: nil, status: nil)
-    #expect(checking.title == "Checking…")
-    #expect(checking.title != "Idle")
-
-    let successAt = Date(timeIntervalSince1970: 2_000)
-    let clean = AppModel.nextRefreshStatus(previous: nil, failedEndpoints: [], at: successAt)
-    let empty = WhatsRunningPresentation.make(snapshot: WhatsRunning(items: [], count: 0), status: clean)
-    #expect(empty.title == "Idle")
-
-    let row = WhatsRunningItem(
-        id: "run-1", kind: "workflow", label: "Build", startedAt: nil,
-        startsAt: nil, cancellable: false, cancelHint: nil
-    )
-    let failed = AppModel.nextRefreshStatus(
-        previous: clean,
-        failedEndpoints: ["running work"],
-        at: successAt.addingTimeInterval(60)
-    )
-    let stale = WhatsRunningPresentation.make(
-        snapshot: WhatsRunning(items: [row], count: 1),
-        status: failed
-    )
-    #expect(stale.title == "Running: 1 · stale")
-    #expect(stale.isStale)
 }
 
 @MainActor

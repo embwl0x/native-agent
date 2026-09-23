@@ -218,6 +218,9 @@ public struct AgentDiscoveryCandidate: Sendable, Equatable, Identifiable {
             // Seeing an installed host does not prove a usable connection.
             fields["can_start_turn"] = .bool(false)
             fields["can_answer_back"] = .bool(false)
+            if row.route == .desktopChat {
+                fields["setup"] = .string("agent_connect with name \"\(row.displayName)\" sets this one up. Messages go to a chat of its own in the app, and the answer comes back in the same call.")
+            }
             if let acp = row.acp {
                 fields["setup"] = .string("Connect \(row.displayName) by name to review its executable and starting folder. It runs as you; this app asks only when the agent asks it.")
                 fields["reference_version"] = .string(acp.referenceVersion)

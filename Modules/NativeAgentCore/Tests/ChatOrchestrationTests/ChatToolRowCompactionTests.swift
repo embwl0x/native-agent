@@ -169,7 +169,7 @@ struct ChatToolRowCompactionTests {
         let summary = try #require(try fixture.summaryContent())
         #expect(summary.contains("web_search"))
         #expect(summary.contains("run_tests"))
-        #expect(summary.contains("(failed)"), "a failed tool call must stay legible as a failure")
+        #expect(summary.contains("run_tests failed"), "a failed tool call must stay legible as a failure")
         #expect(summary.contains("result summary 0"))
     }
 

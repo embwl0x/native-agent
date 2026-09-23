@@ -4,6 +4,12 @@ import NativeAgentChromeRelayCore
 import PersistenceCore
 import TrustCenter
 
+// No origin is a transport-level caller, never permission for a Chrome effect.
+enum ChromeControlInvocationContext {
+    @TaskLocal static var origin: SecurityOriginContext? = nil
+    @TaskLocal static var tool: String = "browser.chrome"
+}
+
 enum ChromeControlRuntimeError: Error, LocalizedError, Sendable, Equatable {
     case disabled
     case unavailable
@@ -22,6 +28,7 @@ enum ChromeControlRuntimeError: Error, LocalizedError, Sendable, Equatable {
     case socketPathTooLong
     case relayUnavailable
     case unsafeSocketPath
+    case conversationContext(String)
 
     var errorDescription: String? {
         switch self {
@@ -39,6 +46,7 @@ enum ChromeControlRuntimeError: Error, LocalizedError, Sendable, Equatable {
         case .socketPathTooLong: return "Chrome control socket path is too long."
         case .relayUnavailable: return "The bundled NativeAgent Chrome relay is unavailable."
         case .unsafeSocketPath: return "Chrome control refused to replace a non-socket filesystem entry."
+        case .conversationContext(let message): return message
         case .leaseEnded(let leaseID, let event, let reason):
             return "\(ChromeLeaseEndReason.words(event: event, reason: reason)) The Chrome tab lease "
                 + "\(leaseID) is gone, so nothing was sent. Acquire a fresh lease and take a new "
@@ -235,6 +243,12 @@ actor ChromeControlChannel {
     private var readTask: Task<Void, Never>?
     private var pending: [String: Pending] = [:]
     private var activeLeaseIDs: Set<String> = []
+    private struct LeaseActivityWindow {
+        let expiresAt: Date
+        let durationMS: Int
+        let userSequence: Int64
+    }
+    private var leaseActivityWindows: [String: LeaseActivityWindow] = [:]
     /// leaseId -> (event, reason) for leases Chrome has ENDED, kept so the
     /// next call naming a dead lease gets the cause instead of a bare
     /// `lease_not_found` from the extension. Bounded.
@@ -323,6 +337,7 @@ actor ChromeControlChannel {
         }
         closed = true
         activeLeaseIDs.removeAll()
+        leaseActivityWindows.removeAll()
         closeSocket(drainingWrites: releaseLeases)
         readTask?.cancel()
         readTask = nil
@@ -330,6 +345,40 @@ actor ChromeControlChannel {
     }
 
     func activeLeaseCount() -> Int { activeLeaseIDs.count }
+
+    /// Work renews a still-live lease near its deadline. No heartbeat keeps an
+    /// idle tab alive, and neither an expired lease nor a user yield is reclaimed.
+    func activityRenewalPayload(
+        for effect: ChromeControlEffect, payload: [String: JSONValue], now: Date = Date()
+    ) -> [String: JSONValue]? {
+        guard effect != .acquire, effect != .renew, effect != .release,
+              case .string(let id)? = payload["leaseId"],
+              activeLeaseIDs.contains(id), endedLeases[id] == nil,
+              let window = leaseActivityWindows[id] else { return nil }
+        let remaining = window.expiresAt.timeIntervalSince(now)
+        guard remaining > 0, remaining <= min(60, Double(window.durationMS) / 2_000) else { return nil }
+        return [
+            "leaseId": .string(id),
+            "expectedUserSequence": payload["expectedUserSequence"] ?? .int(window.userSequence),
+            "leaseDurationMs": .int(Int64(window.durationMS)),
+        ]
+    }
+
+    private func recordActivityWindow(_ result: [String: JSONValue]) {
+        guard case .string(let id)? = result["leaseId"],
+              case .string(let expiry)? = result["expiresAt"],
+              case .string(let renewed)? = result["renewedAt"],
+              case .int(let sequence)? = result["userSequence"] else { return }
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        guard let expiresAt = formatter.date(from: expiry),
+              let renewedAt = formatter.date(from: renewed) else { return }
+        let duration = expiresAt.timeIntervalSince(renewedAt) * 1_000
+        guard duration.isFinite, duration >= 30_000, duration <= 300_000 else { return }
+        leaseActivityWindows[id] = LeaseActivityWindow(
+            expiresAt: expiresAt, durationMS: Int(duration.rounded()), userSequence: sequence
+        )
+    }
 
     private func receive(_ data: Data) {
         guard let value = try? JSONValue.parse(data),
@@ -358,14 +407,18 @@ actor ChromeControlChannel {
         pending.removeValue(forKey: id)
         row.timeout.cancel()
         if ok {
-            if row.expectedAction == .acquire,
+            if (row.expectedAction == .acquire || row.expectedAction == .renew),
                case .object(let result)? = object["result"],
                case .string(let leaseID)? = result["leaseId"] {
-                activeLeaseIDs.insert(leaseID)
+                if endedLeases[leaseID] == nil {
+                    activeLeaseIDs.insert(leaseID)
+                    recordActivityWindow(result)
+                }
             } else if row.expectedAction == .release,
                       case .object(let result)? = object["result"],
                       case .string(let leaseID)? = result["leaseId"] {
                 activeLeaseIDs.remove(leaseID)
+                leaseActivityWindows.removeValue(forKey: leaseID)
             }
             row.continuation.resume(returning: value)
         } else {
@@ -394,12 +447,18 @@ actor ChromeControlChannel {
         guard case .string(let event)? = object["event"],
               case .object(let payload)? = object["payload"],
               case .string(let leaseID)? = payload["leaseId"] else { return }
-        if event == "lease.granted" {
+        if event == "lease.renewed" {
+            if activeLeaseIDs.contains(leaseID), endedLeases[leaseID] == nil {
+                recordActivityWindow(payload)
+            }
+        } else if event == "lease.granted" {
+            recordActivityWindow(payload)
             activeLeaseIDs.insert(leaseID)
             endedLeases.removeValue(forKey: leaseID)
             endedLeaseOrder.removeAll { $0 == leaseID }
         } else if event == "lease.yielded" || event == "lease.released" {
             activeLeaseIDs.remove(leaseID)
+            leaseActivityWindows.removeValue(forKey: leaseID)
             // ITEM 10a. The extension told us WHY. Keep it, and spend it: on
             // the call already in flight against this lease, and on the next
             // one that names it.
@@ -570,6 +629,7 @@ actor ChromeControlChannel {
         guard !closed else { return }
         closed = true
         activeLeaseIDs.removeAll()
+        leaseActivityWindows.removeAll()
         closeSocket(drainingWrites: false)
         readTask?.cancel()
         readTask = nil
@@ -815,8 +875,8 @@ enum ChromeControlConnectionState: Sendable, Equatable {
     func status(enabled: Bool) -> String {
         guard enabled else { return "Chrome control is off" }
         switch self {
-        case .extensionNotLoaded: return "On, but the extension is not loaded in Chrome yet - press Set up Chrome"
-        case .disconnected: return "On, extension loaded, Chrome is closed or not connected right now"
+        case .extensionNotLoaded: return "On, but no Chrome extension connection has been confirmed yet — press Set up Chrome"
+        case .disconnected: return "On, previously connected; Chrome is not connected right now"
         case .connected: return "Connected"
         }
     }
@@ -836,6 +896,11 @@ actor ChromeControlRuntime {
     private var acceptTask: Task<Void, Never>?
     private var channel: ChromeControlChannel?
     private var extensionHasConnected: Bool
+    // Routing convenience only. Chrome still owns every lease and validates
+    // every effect. Never persist this across app launches or reclaim a tab.
+    private var conversationTabs: [String: ChromeConversationTab] = [:]
+    private var conversationTabOrder: [String] = []
+    private var busyConversations: Set<String> = []
     private var connectionObservers: [UUID: AsyncStream<ChromeControlConnectionState>.Continuation] = [:]
 
     private var connectionState: ChromeControlConnectionState {
@@ -853,6 +918,10 @@ actor ChromeControlRuntime {
         return stream
     }
 
+    func setupConnectionStatus() async -> (state: ChromeControlConnectionState, enabled: Bool) {
+        (connectionState, await transportAvailable())
+    }
+
     private func removeConnectionObserver(_ id: UUID) {
         connectionObservers.removeValue(forKey: id)
     }
@@ -864,6 +933,8 @@ actor ChromeControlRuntime {
     private func connectionEnded(installation: UInt64) {
         guard installation == installationGeneration else { return }
         channel = nil
+        conversationTabs.removeAll()
+        conversationTabOrder.removeAll()
         publishConnectionState()
     }
     /// 2026-09-06: which listener a descriptor was accepted under. An accept
@@ -894,7 +965,7 @@ actor ChromeControlRuntime {
         reconnectTimeout: Duration = .seconds(40),
         authority: @escaping Authority = {
             await SwiftNativeTrustCenter(dataRoot: NativeAgentPaths.dataRoot)
-                .chromeControlEnabledChecked()
+                .chromeControlEnabledChecked(tool: ChromeControlInvocationContext.tool, origin: ChromeControlInvocationContext.origin)
         }
     ) {
         self.socketPath = socketPath
@@ -906,10 +977,19 @@ actor ChromeControlRuntime {
         self.extensionHasConnected = (try? String(contentsOfFile: socketPath + ".extension-connected", encoding: .utf8)) == "connected\n"
     }
 
+    /// Listener availability is local app administration, not an agent effect.
+    /// Every effect below still evaluates the concrete calling turn separately.
+    private func transportAvailable() async -> Bool {
+        let origin = SecurityOriginContext(surface: "chat", source: "chrome_transport", isRemote: false)
+        return await ChromeControlInvocationContext.$origin.withValue(origin) {
+            await authority()
+        }
+    }
+
     func reconcilePolicy() async {
         policyGeneration &+= 1
         let generation = policyGeneration
-        let enabled = await authority()
+        let enabled = await transportAvailable()
         guard generation == policyGeneration else { return }
         guard enabled else {
             await stopLocked(releaseLeases: true)
@@ -925,16 +1005,66 @@ actor ChromeControlRuntime {
         }
     }
 
+    func performInConversation(
+        _ effect: ChromeControlEffect, payload: [String: JSONValue], verifiedSessionID: String?
+    ) async throws -> JSONValue {
+        guard let session = verifiedSessionID?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !session.isEmpty else { return try await perform(effect, payload: payload) }
+        guard busyConversations.insert(session).inserted else {
+            throw ChromeControlRuntimeError.conversationContext(
+                "Another Chrome action is still running in this conversation. Nothing was sent; wait for its result before continuing.")
+        }
+        defer { busyConversations.remove(session) }
+        let resolved = try ChromeConversationTab.resolve(
+            effect: effect, payload: payload, current: conversationTabs[session])
+        let generation = installationGeneration
+        do {
+            let response = try await perform(effect, payload: resolved)
+            if generation == installationGeneration, case .object(let envelope) = response,
+               case .object(let result)? = envelope["result"] {
+                if effect == .release || result["status"] == .string("yielded") {
+                    if conversationTabs[session]?.leaseID == resolved["leaseId"] {
+                        conversationTabs.removeValue(forKey: session)
+                    }
+                } else if channel != nil, let tab = ChromeConversationTab(result: result) {
+                    conversationTabs[session] = tab
+                    conversationTabOrder.removeAll { $0 == session }
+                    conversationTabOrder.append(session)
+                    while conversationTabOrder.count > 64 {
+                        conversationTabs.removeValue(forKey: conversationTabOrder.removeFirst())
+                    }
+                }
+            }
+            return response
+        } catch {
+            if case ChromeControlRuntimeError.leaseEnded = error {
+                conversationTabs.removeValue(forKey: session)
+            }
+            throw error
+        }
+    }
+
     func perform(_ effect: ChromeControlEffect, payload: [String: JSONValue]) async throws -> JSONValue {
         if effect.requiresEffectTimeAuthorization {
             guard await authority() else {
-                await stopLocked(releaseLeases: true)
                 throw ChromeControlRuntimeError.disabled
             }
         }
         let previous = channel
         do {
             guard let previous else { throw ChromeControlRuntimeError.disconnected }
+            if let renewal = await previous.activityRenewalPayload(for: effect, payload: payload) {
+                // Re-enter the authority boundary for renewal, then check it
+                // again before the original action after the suspension.
+                let response = try await perform(.renew, payload: renewal)
+                if case .object(let envelope) = response,
+                   case .object(let result)? = envelope["result"],
+                   case .string("yielded")? = result["status"] { return response }
+                try Task.checkCancellation()
+                guard await authority() else {
+                    throw ChromeControlRuntimeError.disabled
+                }
+            }
             return try await previous.request(action: effect, payload: payload)
         } catch ChromeControlRuntimeError.disconnected {
             // Chrome owns host launch. Make its destination ready, then await
@@ -952,7 +1082,6 @@ actor ChromeControlRuntime {
             }
             try Task.checkCancellation()
             guard await authority() else {
-                await stopLocked(releaseLeases: true)
                 throw ChromeControlRuntimeError.disabled
             }
             return try await next.request(action: effect, payload: payload)
@@ -1090,7 +1219,7 @@ actor ChromeControlRuntime {
 
     private func installAcceptedDescriptor(_ descriptor: Int32, generation: UInt64) async {
         guard generation == listenerGeneration,
-              await authority(),
+              await transportAvailable(),
               listenerDescriptor >= 0 || !manageNativeHostRegistration,
               generation == listenerGeneration else {
             Darwin.close(descriptor)
@@ -1098,6 +1227,8 @@ actor ChromeControlRuntime {
         }
         installationGeneration &+= 1
         let installation = installationGeneration
+        conversationTabs.removeAll()
+        conversationTabOrder.removeAll()
         if let channel { await channel.shutdown(releaseLeases: true) }
         // Shutdown suspends: a stop or a newer accepted connection retires
         // this installation before it can publish a channel.
@@ -1121,6 +1252,8 @@ actor ChromeControlRuntime {
     }
 
     private func stopLocked(releaseLeases: Bool) async {
+        conversationTabs.removeAll()
+        conversationTabOrder.removeAll()
         let waiters = connectionWaiters.values
         connectionWaiters.removeAll()
         for waiter in waiters { waiter.resume(throwing: ChromeControlRuntimeError.disabled) }
@@ -1165,6 +1298,40 @@ actor ChromeControlRuntime {
 
     static func defaultSocketPath() -> String {
         InstallPaths.current.chromeSocket.path
+    }
+}
+
+/// A remembered exact tab within a verified chat. Snapshot identity remains
+/// explicit: n1 in two snapshots can refer to entirely different controls.
+struct ChromeConversationTab: Sendable {
+    let leaseID: JSONValue
+    let userSequence: JSONValue
+
+    init?(result: [String: JSONValue]) {
+        guard case .string(let lease)? = result["leaseId"], !lease.isEmpty,
+              case .int(let sequence)? = result["userSequence"], sequence >= 0 else { return nil }
+        leaseID = .string(lease)
+        userSequence = .int(sequence)
+    }
+
+    static func resolve(
+        effect: ChromeControlEffect, payload: [String: JSONValue], current: Self?
+    ) throws -> [String: JSONValue] {
+        guard effect != .acquire else { return payload }
+        var resolved = payload
+        if resolved["leaseId"] == .string("") || resolved["leaseId"] == nil {
+            guard let current else {
+                throw ChromeControlRuntimeError.conversationContext(
+                    "This conversation has no current Chrome tab. Open one with browser.chrome_acquire; later calls retain it automatically. Nothing was sent.")
+            }
+            resolved["leaseId"] = current.leaseID
+        }
+        if effect != .snapshot, effect != .release,
+           resolved["expectedUserSequence"] == nil,
+           let current, resolved["leaseId"] == current.leaseID {
+            resolved["expectedUserSequence"] = current.userSequence
+        }
+        return resolved
     }
 }
 

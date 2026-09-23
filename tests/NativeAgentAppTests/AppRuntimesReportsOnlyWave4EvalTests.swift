@@ -70,27 +70,25 @@ struct AppRuntimesReportsOnlyWave4EvalTests {
 
     private func withOrganismDefault(
         _ enabled: Bool,
-        _ body: () async throws -> Void
+        _ body: (NativeCognitionPreferenceDefaults) async throws -> Void
     ) async rethrows {
-        let defaults = UserDefaults.standard
+        let suite = "wave4-organism-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
         let key = NativeCognitionRuntime.organismKernelEnabledKey
-        let prior = defaults.object(forKey: key)
         defaults.set(enabled, forKey: key)
-        defer {
-            if let prior { defaults.set(prior, forKey: key) }
-            else { defaults.removeObject(forKey: key) }
-        }
-        try await body()
+        defer { defaults.removePersistentDomain(forName: suite) }
+        try await body(NativeCognitionPreferenceDefaults(defaults: defaults))
     }
 
     @Test("organism enable changes the live kernel and remains true after a relaunch")
     func organismEnableReconfiguresTheLiveRuntimeAndPersists() async throws {
-        try await withOrganismDefault(false) {
+        try await withOrganismDefault(false) { preferences in
             let dataRoot = try root("organism-enabled")
             defer { try? FileManager.default.removeItem(at: dataRoot) }
             let runtime = NativeCognitionRuntime(
                 dataRoot: dataRoot,
                 configurationOverride: configuration(),
+                preferenceDefaults: preferences,
                 microcycleSchedulingMode: .manuallyFlushed,
                 installedPhysiologySoakEnabled: false
             )
@@ -102,7 +100,7 @@ struct AppRuntimesReportsOnlyWave4EvalTests {
             let enabled = await runtime.organismSnapshot()
             #expect(enabled.enabled)
             #expect((await runtime.organismBehaviorPosture())?.enabled == true)
-            #expect(UserDefaults.standard.bool(forKey: NativeCognitionRuntime.organismKernelEnabledKey))
+            #expect(preferences.defaults.bool(forKey: NativeCognitionRuntime.organismKernelEnabledKey))
             #expect(FileManager.default.fileExists(
                 atPath: dataRoot.appendingPathComponent("cognition/organism_state.json").path
             ))
@@ -110,6 +108,7 @@ struct AppRuntimesReportsOnlyWave4EvalTests {
             let relaunched = NativeCognitionRuntime(
                 dataRoot: dataRoot,
                 configurationOverride: configuration(),
+                preferenceDefaults: preferences,
                 microcycleSchedulingMode: .manuallyFlushed,
                 installedPhysiologySoakEnabled: false
             )

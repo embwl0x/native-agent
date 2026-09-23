@@ -1,4 +1,3 @@
-import CryptoKit
 import Foundation
 import XCTest
 import Security
@@ -50,50 +49,6 @@ final class CloudKitPairingBoundaryTests: XCTestCase {
         XCTAssertTrue(store.isPaired)
     }
 
-    func testClearIgnoresSameSecretButAllowsRotatedSecret() {
-        let store = PairingStore()
-        let previousSecret = store.iCloudPairingSecret
-        let previousPaired = store.isICloudPaired
-        let previousSuppression = UserDefaults.standard.object(forKey: suppressionKey)
-        let oldSecret = Data(repeating: 0x41, count: 32)
-        let rotatedSecret = Data(repeating: 0x42, count: 32)
-        defer {
-            store.iCloudPairingSecret = previousSecret
-            store.isICloudPaired = previousPaired
-            restoreSuppression(previousSuppression)
-        }
-
-        UserDefaults.standard.removeObject(forKey: suppressionKey)
-        store.iCloudPairingSecret = oldSecret
-        store.isICloudPaired = true
-        XCTAssertTrue(store.clearPairing { errSecSuccess })
-
-        XCTAssertFalse(store.shouldAcceptCloudKitPairingSecret(oldSecret))
-        XCTAssertTrue(store.shouldAcceptCloudKitPairingSecret(rotatedSecret))
-    }
-
-    func testClearFailurePreservesPublishedStateAndSuppression() {
-        let store = PairingStore()
-        let previousSecret = store.iCloudPairingSecret
-        let previousPaired = store.isICloudPaired
-        let previousSuppression = UserDefaults.standard.object(forKey: suppressionKey)
-        let oldSecret = Data(repeating: 0x45, count: 32)
-        defer {
-            store.iCloudPairingSecret = previousSecret
-            store.isICloudPaired = previousPaired
-            restoreSuppression(previousSuppression)
-        }
-
-        UserDefaults.standard.removeObject(forKey: suppressionKey)
-        store.iCloudPairingSecret = oldSecret
-        store.isICloudPaired = true
-
-        XCTAssertFalse(store.clearPairing { errSecInteractionNotAllowed })
-        XCTAssertEqual(store.iCloudPairingSecret, oldSecret)
-        XCTAssertTrue(store.isICloudPaired)
-        XCTAssertNil(UserDefaults.standard.string(forKey: suppressionKey))
-    }
-
     func testUpdateFailureNeverDeletesOrReplacesExistingSecret() {
         let old = Data(repeating: 0x11, count: 32)
         let replacement = Data(repeating: 0x22, count: 32)
@@ -135,41 +90,11 @@ final class CloudKitPairingBoundaryTests: XCTestCase {
         XCTAssertNil(durable)
     }
 
-    func testDeleteFailurePreservesDurableSecret() {
-        let old = Data(repeating: 0x44, count: 32)
-        let durable: Data? = old
-        let status = PairingStore.deleteSecretTransaction(
-            read: { durable.map { (errSecSuccess, $0) } ?? (errSecItemNotFound, nil) },
-            delete: { errSecInteractionNotAllowed }
-        )
-        XCTAssertEqual(status, errSecInteractionNotAllowed)
-        XCTAssertEqual(durable, old)
-    }
-
-    func testKVSPairingAcceptsOnlyFreshExact32ByteMaterial() {
+    func testKVSPairingAcceptsOnlyExact32ByteMaterial() {
         let secret = Data(repeating: 7, count: 32)
-        let encoded = secret.base64EncodedString()
-        XCTAssertEqual(PairingStore.validatedKVSPairingSecret(base64: encoded, publishedAt: "2026-08-24T01:00:00Z", ignoredPublishedAt: "2026-08-24T00:00:00Z"), secret)
-        XCTAssertNil(PairingStore.validatedKVSPairingSecret(base64: encoded, publishedAt: "2026-08-24T00:00:00Z", ignoredPublishedAt: "2026-08-24T00:00:00Z"))
-        XCTAssertNil(PairingStore.validatedKVSPairingSecret(base64: Data(repeating: 1, count: 31).base64EncodedString(), publishedAt: nil, ignoredPublishedAt: nil))
-        XCTAssertNil(PairingStore.validatedKVSPairingSecret(base64: "bad", publishedAt: nil, ignoredPublishedAt: nil))
-    }
-
-    func testKVSUnpairSuppressionUsesTheKeyAcrossClockChanges() {
-        let cleared = Data(repeating: 7, count: 32)
-        let rotated = Data(repeating: 8, count: 32)
-        let hash = SHA256.hash(data: cleared).map { String(format: "%02x", $0) }.joined()
-        for timestamp in [nil, "2027-01-01T00:00:00Z"] as [String?] {
-            XCTAssertNil(PairingStore.validatedKVSPairingSecret(
-                base64: cleared.base64EncodedString(), publishedAt: timestamp,
-                ignoredPublishedAt: "2026-08-24T00:00:00Z", ignoredSecretHash: hash))
-        }
-        XCTAssertEqual(PairingStore.validatedKVSPairingSecret(
-            base64: rotated.base64EncodedString(), publishedAt: "2025-01-01T00:00:00Z",
-            ignoredPublishedAt: "2026-08-24T00:00:00Z", ignoredSecretHash: hash), rotated)
-        XCTAssertNil(PairingStore.validatedKVSPairingSecret(
-            base64: cleared.base64EncodedString(), publishedAt: nil,
-            ignoredPublishedAt: "2026-08-24T00:00:00Z"))
+        XCTAssertEqual(PairingStore.validatedKVSPairingSecret(base64: secret.base64EncodedString()), secret)
+        XCTAssertNil(PairingStore.validatedKVSPairingSecret(base64: Data(repeating: 1, count: 31).base64EncodedString()))
+        XCTAssertNil(PairingStore.validatedKVSPairingSecret(base64: "bad"))
     }
 
     func testRejectedMessagesAlwaysGiveAPairingRecoveryLever() {
@@ -202,8 +127,7 @@ final class CloudKitPairingBoundaryTests: XCTestCase {
 // closure, so no test touches the Keychain.
 //
 // Ledger rows: ios.pairing.gate, ios.pairing.legacyCredentialPurge,
-// ios.pairing.knownSecretVersion, ios.pairing.applyICloudSecret,
-// ios.pairing.applyCloudKitPairingSecret, ios.pairing.pairingNearExpiry.
+// ios.pairing.knownSecretVersion, ios.pairing.applyCloudKitPairingSecret.
 @MainActor
 final class PairingGateFenceTests: XCTestCase {
 
@@ -346,36 +270,6 @@ final class PairingGateFenceTests: XCTestCase {
         }
     }
 
-    // MARK: ios.pairing.applyICloudSecret
-
-    /// The QR / paste path. Every rejection below currently returns false
-    /// BEFORE any durable write, which is why this test is hermetic — and
-    /// that ordering is itself the property: a guard that moved after the
-    /// Keychain write would half-pair the device.
-    func testMalformedPairingKeysAreRefusedWithoutTouchingPairedState() {
-        withRestoredDefaults([pairedKey, cloudKitSuppressionKey]) {
-            let store = PairingStore()
-            store.isICloudPaired = false
-            store.iCloudPairingSecret = nil
-
-            let tooShort = Data(repeating: 0x22, count: 31).base64EncodedString()
-            let tooLong = Data(repeating: 0x22, count: 33).base64EncodedString()
-            // The exact silent-failure the ledger names: a QR/clipboard round
-            // trip that picked up a newline. Foundation's default base64
-            // decoder rejects it, so the scan "works" and nothing pairs.
-            let withNewline = Data(repeating: 0x22, count: 32).base64EncodedString() + "\n"
-
-            for bad in [tooShort, tooLong, withNewline, "", "not base64 at all", "   "] {
-                XCTAssertFalse(
-                    store.applyICloudSecret(base64: bad),
-                    "\(bad.debugDescription) must be refused"
-                )
-                XCTAssertNil(store.iCloudPairingSecret, "a refused key must not reach published state")
-                XCTAssertFalse(store.isICloudPaired, "a refused key must not flip the paired gate")
-            }
-        }
-    }
-
     // MARK: ios.pairing.applyCloudKitPairingSecret
 
     /// The CloudKit pairing lane, driven entirely through the injected
@@ -433,101 +327,7 @@ final class PairingGateFenceTests: XCTestCase {
                 }
                 XCTAssertFalse(accepted, "\(count)-byte secret must be refused")
                 XCTAssertEqual(persistCalls, 0, "\(count)-byte secret reached the Keychain writer")
-                XCTAssertFalse(store.shouldAcceptCloudKitPairingSecret(Data(repeating: 0x44, count: count)))
-            }
-            XCTAssertTrue(store.shouldAcceptCloudKitPairingSecret(Data(repeating: 0x44, count: 32)))
-        }
-    }
-
-    /// A deliberate unpair suppresses ONLY the exact secret that was cleared.
-    /// Suppressing by device (or forever) is the shape that makes re-pairing
-    /// impossible with no error; accepting everything is the shape that makes
-    /// an unpair not stick.
-    func testUnpairSuppressionIsScopedToTheExactClearedSecret() {
-        withRestoredDefaults([cloudKitSuppressionKey, pairedKey]) {
-            let cleared = Data(repeating: 0x55, count: 32)
-            let rotated = Data(repeating: 0x56, count: 32)
-            let clearedHash = SHA256.hash(data: cleared).map { String(format: "%02x", $0) }.joined()
-            UserDefaults.standard.set(clearedHash, forKey: cloudKitSuppressionKey)
-
-            let store = PairingStore()
-            XCTAssertFalse(store.shouldAcceptCloudKitPairingSecret(cleared),
-                           "the exact unpaired secret must stay suppressed")
-            XCTAssertTrue(store.shouldAcceptCloudKitPairingSecret(rotated),
-                          "a rotated Mac secret must re-pair without a manual fallback")
-
-            // Installing the rotated secret clears the suppression so the
-            // latch cannot outlive the pairing it was about.
-            var persisted: Data?
-            XCTAssertTrue(store.applyCloudKitPairingSecret(rotated) { persisted = $0; return errSecSuccess })
-            XCTAssertEqual(persisted, rotated)
-            XCTAssertNil(
-                UserDefaults.standard.string(forKey: cloudKitSuppressionKey),
-                "a successful install must clear the unpair suppression latch"
-            )
-        }
-    }
-
-    // MARK: ios.pairing.pairingNearExpiry — a DEAD surface, pinned dead
-
-    /// `pairingNearExpiry` reads a value nothing ever assigns, so it is
-    /// constant-false in the shipped app. That is fine today (iCloud pairing
-    /// has no TTL handshake) but the verdict is undated and unguarded: the day
-    /// someone wires `lastKnownExpiresAt`, a live expiry warning appears with
-    /// zero coverage. This test holds the verdict AND fails the moment it
-    /// stops being true, forcing a real eval at that point.
-    func testPairingExpiryIsProvablyDormantInTheShippedApp() throws {
-        withRestoredDefaults([pairedKey]) {
-            let store = PairingStore()
-            XCTAssertNil(store.lastKnownExpiresAt)
-            XCTAssertFalse(store.pairingNearExpiry, "with no expiry known, nothing is near expiry")
-
-            // The predicate itself is correct — it is the INPUT that is dead.
-            store.lastKnownExpiresAt = Date().addingTimeInterval(60 * 24 * 3600)
-            XCTAssertFalse(store.pairingNearExpiry)
-            store.lastKnownExpiresAt = Date().addingTimeInterval(3 * 24 * 3600)
-            XCTAssertTrue(store.pairingNearExpiry)
-        }
-
-        // …and nothing in the shipped sources assigns it.
-        let sources = try Self.mobileSourcesRoot()
-        var assignments: [String] = []
-        let walker = FileManager.default.enumerator(at: sources, includingPropertiesForKeys: nil)
-        for case let url as URL in walker! where url.pathExtension == "swift" {
-            guard let text = try? String(contentsOf: url, encoding: .utf8) else { continue }
-            for line in text.split(separator: "\n") {
-                let trimmed = line.trimmingCharacters(in: .whitespaces)
-                guard trimmed.contains("lastKnownExpiresAt") else { continue }
-                // The declaration itself is not an assignment.
-                if trimmed.hasPrefix("@Published var lastKnownExpiresAt") { continue }
-                if trimmed.hasPrefix("///") || trimmed.hasPrefix("//") { continue }
-                if trimmed.contains("guard let exp = lastKnownExpiresAt") { continue }
-                assignments.append("\(url.lastPathComponent): \(trimmed)")
             }
         }
-        XCTAssertTrue(
-            assignments.isEmpty,
-            "lastKnownExpiresAt is now written — the expiry banner is live and needs its own eval: \(assignments)"
-        )
-    }
-
-    private static func mobileSourcesRoot() throws -> URL {
-        var directory = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
-        for _ in 0..<6 {
-            let sources = directory.appendingPathComponent("Sources", isDirectory: true)
-            let project = directory.appendingPathComponent("project.yml")
-            if FileManager.default.fileExists(atPath: sources.path),
-               FileManager.default.fileExists(atPath: project.path) {
-                return sources
-            }
-            let parent = directory.deletingLastPathComponent()
-            if parent.path == directory.path { break }
-            directory = parent
-        }
-        throw NSError(
-            domain: "PairingGateFenceTests",
-            code: 1,
-            userInfo: [NSLocalizedDescriptionKey: "Could not locate NativeAgentMobile/Sources from \(#filePath)"]
-        )
     }
 }

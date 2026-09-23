@@ -259,7 +259,7 @@ import PersistenceCore
     ))
     let before = await substrate.affectSnapshot()
     clock.advance(60 * 60)
-    let after = await substrate.decayAffect()
+    let after = await substrate.affectSnapshot()
 
     #expect(after.arousal < before.arousal)
     #expect(after.uncertainty < before.uncertainty)
@@ -308,7 +308,7 @@ import PersistenceCore
 
     // Honest per-axis decay: after long quiet, arousal collapses well below the slower warmth.
     clock.advance(3 * 60 * 60)
-    let cooled = await substrate.decayAffect()
+    let cooled = await substrate.affectSnapshot()
     #expect(cooled.arousal < active.arousal)
     #expect(cooled.socialWarmth < active.socialWarmth)
     #expect(cooled.arousal < cooled.socialWarmth)

@@ -493,7 +493,7 @@ actor BuilderWorktreeAllocator {
                 }
                 removed += 1
             }
-            appendRetirementReceipt([
+            await appendRetirementReceipt([
                 "at": Self.iso8601(now),
                 "agent": agent.rawValue,
                 "worktree": worktreeRoot.path,
@@ -513,21 +513,17 @@ actor BuilderWorktreeAllocator {
         return formatter.string(from: date)
     }
 
-    private func appendRetirementReceipt(_ row: [String: Any], configRoot: URL) {
+    private func appendRetirementReceipt(_ row: [String: Any], configRoot: URL) async {
         let ledger = configRoot
             .appendingPathComponent("nativeagent-builder-worktrees", isDirectory: true)
             .appendingPathComponent("retirements.jsonl")
-        guard let data = try? JSONSerialization.data(withJSONObject: row, options: [.sortedKeys])
+        guard let data = try? JSONSerialization.data(withJSONObject: row, options: [.sortedKeys]),
+              let record = try? JSONValue.parse(data)
         else { return }
-        var line = data
-        line.append(0x0A)
-        if let handle = try? FileHandle(forWritingTo: ledger) {
-            defer { try? handle.close() }
-            _ = try? handle.seekToEnd()
-            try? handle.write(contentsOf: line)
-            return
+        let persistence = SwiftNativePersistenceCore()
+        _ = try? await persistence.withFileLock(ledger) {
+            try await persistence.appendJSONL(record, to: ledger)
         }
-        try? line.write(to: ledger, options: .atomic)
     }
 
     private func git(_ arguments: [String], cwd: URL) async -> GitResult {

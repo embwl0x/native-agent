@@ -82,7 +82,7 @@ struct MacChatAccessibilityAcceptanceTests {
             cursor = placed.upperBound
             placements += 1
             let modifiers = source[placed.upperBound...].prefix(1_000)
-            #expect(modifiers.contains(".opacity(isHovered ? 1 : 0)"),
+            #expect(source[..<placed.lowerBound].suffix(80).contains("isHovered {"),
                     "The action bar stays pointer-only; it must not appear unhovered.")
             #expect(modifiers.contains(".accessibilityHidden(true)"),
                     "Opacity-zero pointer controls must not remain phantom VoiceOver focus stops.")

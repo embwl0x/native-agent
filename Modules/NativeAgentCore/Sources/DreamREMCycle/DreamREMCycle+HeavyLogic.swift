@@ -360,23 +360,6 @@ public actor GrowthDocManager {
         }
         return evicted
     }
-
-    public func appendEntry(_ text: String, date: String) async throws {
-        let body = try readText()
-        var out = body
-        if !out.isEmpty && !out.hasSuffix("\n") { out += "\n" }
-        out += "\(date) \(text)\n"
-        try out.data(using: .utf8)!.write(to: path)
-    }
-
-    public func deleteSlice(_ slice: String) async throws {
-        guard !slice.isEmpty else { return }
-        let body = try readText()
-        guard let r = body.range(of: slice) else { return }
-        var out = body
-        out.removeSubrange(r)
-        try out.data(using: .utf8)!.write(to: path)
-    }
 }
 
 // MARK: - DreamArchiver

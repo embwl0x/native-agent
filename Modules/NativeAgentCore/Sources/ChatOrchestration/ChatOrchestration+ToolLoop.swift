@@ -80,7 +80,16 @@ enum SameTurnToolSchemaRefresh {
         calls: [ParsedToolCall],
         providerTools: ProviderToolNameMap
     ) -> Bool {
-        calls.contains { providerTools.internalName(forProviderName: $0.name) == "tool_load" }
+        calls.contains { call in
+            let name = providerTools.internalName(forProviderName: call.name)
+            if name == "tool_load" { return true }
+            guard name == "tool_catalog" || name == "list_tools" else { return false }
+            if call.input["load"] == .bool(true) { return true }
+            if case .string(let raw)? = call.input["load"] {
+                return raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "true"
+            }
+            return false
+        }
     }
 }
 
@@ -1118,7 +1127,8 @@ extension SwiftNativeTurnEngine {
                 throw CancellationError()
             }
             lastRawResponse = raw
-            if let violation = ToolCallParser.formattedToolCallViolation(in: raw) {
+            if let violation = ToolCallParser.formattedToolCallViolation(
+                in: raw, toolNames: Set(ctx.toolsAvailable)) {
                 lastProtocolViolation = violation
                 violationNudgeCount += 1
                 if violationNudgeCount > 2 { break }

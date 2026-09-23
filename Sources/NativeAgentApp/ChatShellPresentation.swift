@@ -371,6 +371,7 @@ enum ChatShellEnvelope {
             .map { $0.dropFirst("duration:".count).trimmingCharacters(in: .whitespaces) } ?? ""
         let seconds = Int(line.filter(\.isNumber)) ?? 0
         let lowered = content.lowercased()
+        if lowered.contains("[claude-wake] [notice]") { return "Delivered to Claude" }
         if lowered.contains("status: failed") || lowered.contains("was rejected") {
             return "The connected agent didn't finish"
         }

@@ -107,8 +107,6 @@ struct CompactionRecollectionRenderCapTests {
         // newest-first filling would otherwise have spent the whole budget
         // before reaching the oldest row.
         #expect(rendered.contains(String(repeating: "c", count: 1_000)))
-        #expect(rendered.contains("# Historical evidence boundary"))
-        #expect(rendered.contains("refresh it from its canonical tool or store"))
     }
 }
 

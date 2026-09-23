@@ -325,7 +325,6 @@ private func writeFile(_ url: URL, bytes: Int) throws {
         "Error Domain=NSURLErrorDomain Code=-1005 \"The network connection was lost.\""))
     #expect(SwiftNativeLoopScheduler.isOfflineError(
         "Error Domain=NSPOSIXErrorDomain Code=57 \"Socket is not connected\""))
-    #expect(SwiftNativeLoopScheduler.isOfflineError("Telegram long poll: unavailable"))
 }
 
 @Test func realFailuresDoNotClassifyAsOffline() {

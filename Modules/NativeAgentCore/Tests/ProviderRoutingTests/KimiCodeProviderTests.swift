@@ -323,7 +323,7 @@ private func kimiStubSession() -> URLSession {
         _ = try await adapter.complete(prompt: "hi", system: nil, model: "k3")
         Issue.record("403 must throw")
     } catch let error as LLMError {
-        #expect(ProviderFailure.classify(error) == .rateLimited(retryAfter: nil))
+        #expect(ProviderFailure.classify(error) == .rateLimited(retryAfter: 3600))
     }
 }
 

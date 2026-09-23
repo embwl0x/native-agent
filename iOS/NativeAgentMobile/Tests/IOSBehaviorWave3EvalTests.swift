@@ -27,29 +27,6 @@ final class IOSBehaviorWave3EvalTests: XCTestCase {
     private var defaultsSuite = ""
     private var defaults: UserDefaults!
 
-    func testRetiredMacHTTPMethodsFailLoudlyWithoutStartingAFallbackTransport() async {
-        let client = MacBridgeClient()
-        do {
-            let _: String = try await client.get("/v1/legacy")
-            XCTFail("retired iOS HTTP reads must not fall back to a live transport")
-        } catch let error as NSError {
-            XCTAssertEqual(error.domain, "NativeAgentMobile")
-            XCTAssertEqual(error.code, -42)
-        } catch {
-            XCTFail("unexpected retired-transport error: \(error)")
-        }
-
-        do {
-            _ = try await client.postDict("/v1/legacy", body: ["probe": true])
-            XCTFail("retired iOS HTTP writes must not fall back to a live transport")
-        } catch let error as NSError {
-            XCTAssertEqual(error.domain, "NativeAgentMobile")
-            XCTAssertEqual(error.code, -42)
-        } catch {
-            XCTFail("unexpected retired-transport error: \(error)")
-        }
-    }
-
     override func setUp() async throws {
         try await super.setUp()
         let sync = iCloudSyncEngine.shared
@@ -255,59 +232,11 @@ final class IOSBehaviorWave3EvalTests: XCTestCase {
         )
     }
 
-    func test_manualPairingPasteClaimsSuccessOnlyForTheMacPublishedKey() {
-        let macSecret = Data(repeating: 0xA1, count: 32)
-        let matchingKey = macSecret.base64EncodedString()
-        let wrongKey = Data(repeating: 0xB2, count: 32).base64EncodedString()
-
-        XCTAssertEqual(
-            ManualPairingKeyPaste.verdict(base64: matchingKey, publishedMacSecret: macSecret),
-            .verified
-        )
-        XCTAssertEqual(
-            ManualPairingKeyPaste.verdict(base64: wrongKey, publishedMacSecret: macSecret),
-            .doesNotMatchMac
-        )
-        XCTAssertEqual(
-            ManualPairingKeyPaste.verdict(base64: matchingKey, publishedMacSecret: nil),
-            .awaitingMacVerification
-        )
-        XCTAssertEqual(
-            ManualPairingKeyPaste.verdict(base64: String(repeating: "a", count: 64), publishedMacSecret: macSecret),
-            .looksLikeHex
-        )
-        XCTAssertEqual(
-            ManualPairingKeyPaste.verdict(base64: "too-short", publishedMacSecret: macSecret),
-            .invalidFormat
-        )
-    }
-
     func test_pairingCopyChecksForMacBeforeOfferingCorrection() {
         XCTAssertFalse(IOSPairingPresentation.manualSectionDetail.contains("does not scan a QR code yet"))
         XCTAssertTrue(IOSPairingPresentation.manualSectionDetail.contains("Check for Mac"))
-        XCTAssertTrue(IOSPairingPresentation.manualCorrectionDetail.contains("copy the pairing key"))
         XCTAssertTrue(IOSPairingPresentation.notSignedSyncMessage.contains("Check for Mac"))
         XCTAssertTrue(IOSPairingPresentation.signatureRetryMessage.contains("Check for Mac"))
-        XCTAssertEqual(IOSPairingPresentation.manualLengthDetail, "Copy the full pairing key from the Mac app.")
-    }
-
-    func test_manualCorrectionRequiresACheckAndCurrentMacMaterial() {
-        let secret = Data(repeating: 0xA1, count: 32)
-        XCTAssertFalse(IOSPairingPresentation.canCorrectManually(hasCheckedForMac: false, publishedMacSecret: secret))
-        XCTAssertFalse(IOSPairingPresentation.canCorrectManually(hasCheckedForMac: true, publishedMacSecret: nil))
-        XCTAssertFalse(IOSPairingPresentation.canCorrectManually(hasCheckedForMac: true, publishedMacSecret: Data()))
-        XCTAssertTrue(IOSPairingPresentation.canCorrectManually(hasCheckedForMac: true, publishedMacSecret: secret))
-        // A failed refresh clears the material; the previously revealed correction must close.
-        XCTAssertFalse(IOSPairingPresentation.canCorrectManually(hasCheckedForMac: true, publishedMacSecret: nil))
-    }
-
-    func test_manualSecretStoreRejectsWellFormedBytesFromAnotherMac() {
-        let macSecret = Data(repeating: 0xA1, count: 32)
-        let wrongSecret = Data(repeating: 0xB2, count: 32)
-
-        XCTAssertTrue(PairingStore.isVerifiedManualICloudSecret(macSecret, publishedMacSecret: macSecret))
-        XCTAssertFalse(PairingStore.isVerifiedManualICloudSecret(wrongSecret, publishedMacSecret: macSecret))
-        XCTAssertFalse(PairingStore.isVerifiedManualICloudSecret(macSecret, publishedMacSecret: nil))
     }
 
     func test_remoteActionLedgerKeepsApprovalHandoffThroughAnActionBurst() {

@@ -975,7 +975,8 @@ func textCompat_postToolEmptyExhaustionCarriesRetryUnsafeMarker(toolName: String
         }
         Issue.record("Expected exhausted provider recovery")
     } catch {
-        #expect(error is ProviderErrorAfterToolEffects)
+        let report = try #require(error as? ProviderFailure.Report)
+        #expect(report.work == .ranPartly)
         #expect(ProviderFailure.classify(error) == .network)
         #expect(!ProviderRecoveryPolicy.permitsWholeTurnRetry(error))
     }

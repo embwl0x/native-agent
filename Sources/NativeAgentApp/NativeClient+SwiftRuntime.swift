@@ -284,7 +284,9 @@ extension NativeClient {
     nonisolated static func chatApprovalOriginSessionId(_ payload: JSONValue) -> String? {
         guard case .object(let fields) = payload,
               case .string(let kind)? = fields["kind"],
-              kind == "chat_tool_approval",
+              // ACP questions belong to a live protocol request, not a tool
+              // replay. They share chat presentation only, never execution.
+              kind == "chat_tool_approval" || kind == "agent_acp_live_approval",
               case .object(let origin)? = fields["origin"],
               case .string(let sessionId)? = origin["sessionId"] else { return nil }
         let trimmed = sessionId.trimmingCharacters(in: .whitespacesAndNewlines)

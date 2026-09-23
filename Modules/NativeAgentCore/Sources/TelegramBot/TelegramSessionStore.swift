@@ -463,6 +463,55 @@ public struct TelegramSessionStore: Sendable {
         )
     }
 
+    /// 2026-09-22: the assistant reply already saved for a lost turn, if any.
+    /// A turn can finish and persist its reply, then die before the send.
+    /// Rows carry no Telegram update id, so the user row must be the newest
+    /// one, match the text, and postdate the claim; the reply must share its
+    /// runId and not be a mechanical (failure) row.
+    public func savedReply(
+        destination: TelegramDestination,
+        after userText: String,
+        claimedAt: String
+    ) async -> String? {
+        let needle = userText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !needle.isEmpty,
+              let claimed = Self.parseTimestamp(claimedAt),
+              let sessionId = try? await mappedSessionId(chatKey: Self.chatKey(destination)),
+              !sessionId.isEmpty,
+              let rows = try? await SwiftNativePersistenceCore().readJSONL(messagesPath(sessionId: sessionId))
+        else { return nil }
+        var replies: [(content: String, runId: String?)] = []
+        for row in rows.reversed() {
+            guard case .object(let obj) = row,
+                  case .string(let role)? = obj["role"],
+                  case .string(let content)? = obj["content"] else { continue }
+            var runId: String?
+            if case .string(let id)? = obj["runId"] { runId = id }
+            if role == "user" {
+                guard content.contains(needle),
+                      case .string(let createdAt)? = obj["createdAt"],
+                      let created = Self.parseTimestamp(createdAt),
+                      created >= claimed else { return nil }
+                return replies.first { $0.runId == runId }?.content
+            }
+            if role == "assistant",
+               !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                if case .object(let metadata)? = obj["metadata"],
+                   metadata["mechanicalKind"] != nil { continue }
+                replies.append((content, runId))
+            }
+        }
+        return nil
+    }
+
+    private static func parseTimestamp(_ value: String) -> Date? {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = formatter.date(from: value) { return date }
+        formatter.formatOptions = [.withInternetDateTime]
+        return formatter.date(from: value)
+    }
+
     public func recentSessions(limit: Int = 8) async throws -> [TelegramRecentSession] {
         let cappedLimit = max(1, min(limit, 25))
         let rows = await SwiftNativePersistenceCore().readJSON(sessionsPath, defaultValue: .array([]))

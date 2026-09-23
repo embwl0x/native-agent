@@ -60,6 +60,101 @@ public enum AgentHostConfigWriter {
 
     // MARK: - The two formats
 
+    /// Only this connection's two conversation tools, never an MCP wildcard.
+    static func antigravityMessagingRules(server: String) throws -> [String] {
+        guard !server.isEmpty, server.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "-" || $0 == "_") }) else {
+            throw Failure.unparsable("invalid messaging server name")
+        }
+        return ["mcp(\(server)/agent_message)", "mcp(\(server)/agent_reply)"]
+    }
+
+    static func grantAntigravityMessaging(path: String, server: String, peerID: String,
+                                          recordURL: URL) throws -> Outcome {
+        let rules = try antigravityMessagingRules(server: server)
+        // Existing ownership is not a reason to undo a person's later edit.
+        if let owner = try backupRecords(at: recordURL).last?.jsonOwnership {
+            guard owner.command == "antigravity-messaging", owner.peerID == peerID, owner.name == server else {
+                throw Failure.unparsable("messaging permission ownership belongs to another connection")
+            }
+            let (current, _) = try read(path: path)
+            try checkMessagingConflicts(current, server: server, rules: rules)
+            let allowed = try permissionRules(current, "allow")
+            guard rules.allSatisfy(allowed.contains) else {
+                throw Failure.unparsable("this connection's messaging allowances were changed or removed; review them in Antigravity. They were not restored automatically")
+            }
+            return Outcome(path: path, backupPath: nil, replacedExistingEntry: false, removed: false)
+        }
+        return try edit(path: path, backupRecordURL: recordURL, initial: Data("{}".utf8), ownership: { data in
+            JSONOwnership(command: "antigravity-messaging", peerID: peerID, name: server,
+                original: try permissionEntry(data, "allow"),
+                originalMember: try JSONEntrySplice.entry(data, name: "allow", containerKey: "permissions",
+                    comments: true, trailingCommas: true, wholeMember: true))
+        }) { data in
+            try checkMessagingConflicts(data, server: server, rules: rules)
+            let existing = try permissionRules(data, "allow")
+            let added = rules.filter { !existing.contains($0) }
+            guard !added.isEmpty else { return nil }
+            let json = String(decoding: try JSONSerialization.data(withJSONObject: existing + added, options: [.withoutEscapingSlashes]), as: UTF8.self)
+            return try JSONEntrySplice.upsert(data, name: "allow", entryJSON: json,
+                containerKey: "permissions", comments: true, trailingCommas: true, fragment: true)
+        }
+    }
+
+    static func removeAntigravityMessaging(path: String, server: String, peerID: String,
+                                           recordURL: URL) throws {
+        guard let owner = try backupRecords(at: recordURL).last?.jsonOwnership else { return }
+        guard owner.command == "antigravity-messaging", owner.peerID == peerID, owner.name == server else {
+            throw Failure.unparsable("messaging permission ownership does not match this connection")
+        }
+        let baseline = try permissionArray(owner.original)
+        let added = try antigravityMessagingRules(server: server).filter { !baseline.contains($0) }
+        _ = try edit(path: path, backupRecordURL: recordURL, removing: true) { data in
+            let current = try permissionRules(data, "allow")
+            let retained = current.filter { !added.contains($0) }
+            guard current != retained else { return nil }
+            if retained.isEmpty, owner.original == nil {
+                return try JSONEntrySplice.remove(data, name: "allow", containerKey: "permissions", comments: true, trailingCommas: true)
+            }
+            let json = String(decoding: try JSONSerialization.data(withJSONObject: retained, options: [.withoutEscapingSlashes]), as: UTF8.self)
+            return try JSONEntrySplice.upsert(data, name: "allow", entryJSON: json,
+                containerKey: "permissions", comments: true, trailingCommas: true,
+                originalMember: retained == baseline ? owner.originalMember : nil, fragment: true)
+        }
+        try removeBackups(path: path, recordURL: recordURL)
+    }
+
+    private static func permissionEntry(_ data: Data, _ key: String) throws -> String? {
+        try JSONEntrySplice.entry(data, name: key, containerKey: "permissions", comments: true, trailingCommas: true)
+    }
+
+    private static func checkMessagingConflicts(_ data: Data, server: String, rules: [String]) throws {
+        for key in ["deny", "ask"] {
+            let blocked = try permissionRules(data, key).map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            // The documented wildcards are mcp(*) and mcp(server/*). Refuse
+            // ambiguous broad spellings too, rather than assume they do not
+            // constrain this connection on a different CLI version.
+            guard !blocked.contains(where: {
+                ["*", "mcp", "mcp(\(server))", "mcp(*)", "mcp(\(server)/*)"].contains($0) || rules.contains($0)
+            }) else {
+                throw Failure.unparsable("an existing \(key) rule covers or ambiguously constrains this connection's messaging tools; leave that rule intact and review it in Antigravity")
+            }
+        }
+    }
+
+    private static func permissionRules(_ data: Data, _ key: String) throws -> [String] {
+        try permissionArray(permissionEntry(data, key))
+    }
+
+    private static func permissionArray(_ value: String?) throws -> [String] {
+        guard let value else { return [] }
+        let bytes = try JSONEntrySplice.validatedBytes(Data(("{\"value\":" + value + "}").utf8), comments: true, trailingCommas: true)
+        guard let object = try JSONSerialization.jsonObject(with: Data(bytes)) as? [String: Any],
+              let array = object["value"] as? [String] else {
+            throw Failure.unparsable("permission rules must be an array of strings")
+        }
+        return array
+    }
+
     /// `{ "mcpServers": { "<name>": { … } } }` — Claude Code's `~/.claude.json`,
     /// Claude Desktop's `claude_desktop_config.json`, and every host that copied
     /// that shape.
@@ -428,10 +523,10 @@ enum JSONEntrySplice {
 
     static func upsert(_ data: Data, name: String, entryJSON: String,
                        containerKey: String = "mcpServers", comments: Bool = false, trailingCommas: Bool = true,
-                       originalMember: String? = nil) throws
+                       originalMember: String? = nil, fragment: Bool = false) throws
         -> (data: Data, replaced: Bool, removed: Bool)? {
         let bytes = try validatedBytes(data, comments: comments, trailingCommas: trailingCommas)
-        _ = try validatedBytes(Data(entryJSON.utf8), comments: comments, trailingCommas: trailingCommas)
+        _ = try validatedBytes(Data((fragment ? "{\"value\":" + entryJSON + "}" : entryJSON).utf8), comments: comments, trailingCommas: trailingCommas)
         let original = [UInt8](data)
         let root = try members(bytes, from: try objectStart(bytes))
         guard let container = try unique(root.members, named: containerKey, called: "section") else {

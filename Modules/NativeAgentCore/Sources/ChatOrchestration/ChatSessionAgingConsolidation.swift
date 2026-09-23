@@ -311,6 +311,7 @@ extension SwiftNativeChatOrchestrationClient {
             backupPath: backupPath,
             messagesReplaced: outcome.messagesReplaced,
             turnModel: model,
+            providerID: providerID,
             surface: surface,
             runId: runId
         )

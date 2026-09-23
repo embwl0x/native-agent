@@ -219,7 +219,7 @@ public enum AgentPeerCredentials {
     public static func isAvailable(_ peer: AgentPeerContact, peers: [AgentPeerContact],
                                    readCredential: (String) throws -> String? = { try read(peerID: $0) }) -> Bool {
         // Local ACP sessions and desktop routes do not use a contact bearer.
-        if peer.credentialKey == nil && (peer.transport == .acp || peer.transport == .desktop) { return true }
+        if peer.credentialKey == nil && (peer.transport == .acp || peer.transport == .desktop || peer.transport == .desktopChat) { return true }
         guard let token = try? readCredential(peer.id) else { return false }
         return resolve(token, peers: peers, readCredential: readCredential)?.id == peer.id
     }

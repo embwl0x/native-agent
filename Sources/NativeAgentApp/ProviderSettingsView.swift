@@ -680,18 +680,6 @@ struct ProviderSettingsView: View {
                     }
                 }
 
-                // Jev is a decision service, not a chat account: it never
-                // serves a turn and is deliberately absent from the routing
-                // registry above. Its key is deliberately kept OUT of
-                // providers/ — membership of that directory is what MAKES
-                // something a provider, so a file there would have synthesized
-                // a "jev" row in the routing snapshot and the model picker. It
-                // lives at <dataRoot>/jev/credential.json instead, beside its
-                // own log, so it gets its own row here rather than a sheet.
-                ProviderSection(label: "Second opinion") {
-                    JevProviderRow()
-                }
-
                 DisclosureGroup("Sign in, reconnect or add an account") {
                     LazyVStack(alignment: .leading, spacing: 8) {
                         // A2.2 close-out (2026-07-24): title/copy said sign-in

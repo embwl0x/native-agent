@@ -164,7 +164,8 @@ struct AnalyticProjectionTests {
 
         clock.set(start.addingTimeInterval(4 * 60 * 60))
         let projectedAtCheckpoint = await projectedOnly.affectSnapshot()
-        let materialized = await checkpointed.decayAffect()
+        await checkpointed.decayAffectInMemory(to: clock.now())
+        let materialized = await checkpointed.affect
         #expect(projectedAtCheckpoint == materialized)
 
         clock.set(start.addingTimeInterval(8 * 60 * 60))
@@ -235,7 +236,7 @@ struct AnalyticProjectionTests {
         clock.set(start.addingTimeInterval(24 * 60 * 60))
         let oneDay = try #require((await projectedOnly.thoughtSeedSnapshot()).first)
         #expect(approximatelyEqual(oneDay.priority, 0.5))
-        await checkpointed.decayThoughtSeeds()
+        await checkpointed.decayThoughtSeedsInMemory(at: clock.now())
 
         clock.set(start.addingTimeInterval(48 * 60 * 60))
         let checkpointedSeed = try #require((await checkpointed.thoughtSeedSnapshot()).first)

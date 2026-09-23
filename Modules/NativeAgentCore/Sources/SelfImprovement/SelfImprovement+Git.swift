@@ -48,14 +48,6 @@ public actor SelfImprovementGitOps {
         return result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    public func isWorkTreeClean() async throws -> Bool {
-        let result = try await runGit(["status", "--porcelain"])
-        guard result.exit == 0 else {
-            throw SelfImprovementGitError.underlying("git status failed: \(result.stderr)")
-        }
-        return result.stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-    }
-
     public func applyDiffAndCommit(
         diffText: String,
         message: String,
@@ -175,39 +167,6 @@ public actor SelfImprovementGitOps {
         }
 
         return try await currentHead()
-    }
-
-    public func stashSnapshot(message: String) async throws -> String {
-        let result = try await runGit([
-            "-c", "user.name=NativeAgent",
-            "-c", "user.email=nativeagent@local",
-            "stash", "push", "-u", "-m", message,
-        ])
-        if result.exit != 0 {
-            throw SelfImprovementGitError.underlying("git stash push failed: \(result.stderr)")
-        }
-        // Resolve the most recent stash ref.
-        let list = try await runGit(["stash", "list", "-n", "1", "--format=%gd"])
-        let ref = list.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
-        return ref.isEmpty ? "stash@{0}" : ref
-    }
-
-    public func stashPop(ref: String) async throws {
-        let result = try await runGit(["stash", "pop", ref])
-        if result.exit != 0 {
-            let combined = result.stderr + "\n" + result.stdout
-            if isConflictOutput(combined) {
-                throw SelfImprovementGitError.mergeConflict(files: parseConflictFiles(combined))
-            }
-            throw SelfImprovementGitError.underlying("git stash pop failed: \(result.stderr)")
-        }
-    }
-
-    public func resetHard(toSha: String) async throws {
-        let result = try await runGit(["reset", "--hard", toSha])
-        if result.exit != 0 {
-            throw SelfImprovementGitError.underlying("git reset --hard failed: \(result.stderr)")
-        }
     }
 
     // MARK: - Internals

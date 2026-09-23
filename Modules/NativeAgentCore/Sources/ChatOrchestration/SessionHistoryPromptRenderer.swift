@@ -109,10 +109,9 @@ enum SessionHistoryPromptRenderer {
     /// see `ContextBudgetPolicy`.
     /// `includeConversationHistory: false` is the v2Prefix arm: the
     /// conversation rows leave the system block and become real
-    /// `[LLMMessage]` turns (see `SessionHistoryMessageProjection`), while the
-    /// three DERIVED blocks — evidence boundary, continuity state, middle
-    /// sampling, reply-reference hint — stay text in the volatile block. Every
-    /// other byte of the rendered block is identical to the v1 arm.
+    /// `[LLMMessage]` turns (see `SessionHistoryMessageProjection`), and only
+    /// middle sampling stays text in the volatile block — continuity state and
+    /// the reply-reference hint would restate those real turns.
     static func renderDetailed(
         messages: [ChatMessage],
         middleCandidates: [ChatMessage] = [],
@@ -129,13 +128,15 @@ enum SessionHistoryPromptRenderer {
         guard !renderables.isEmpty else { return RenderResult(historyBlock: nil) }
 
         let budget = budget(for: surface, windowTokens: windowTokens)
+        // 2026-09-22: one line, both arms — the turn engine's warning covers
+        // packet records only, and only when the packet has items.
         var sections: [String] = [
-            """
-            # Historical evidence boundary
-            Session continuity and conversation rows below preserve what was known when they were recorded; they are not live readings. Before stating that a status, count, health result, availability claim, or other changing fact is current/latest/live/present, refresh it from its canonical tool or store. If it is not refreshed, describe it as historical.
-            """
+            "Earlier messages are history, not live readings; recheck anything current before relying on it."
         ]
-        if cappedLimit >= 6,
+        // 2026-09-22: continuity state and the reply-reference hint restate
+        // rows v2 already sends as real messages — v1 (text history) only.
+        if includeConversationHistory,
+           cappedLimit >= 6,
            let continuity = continuityState(
             from: renderables,
             budget: budget
@@ -162,7 +163,8 @@ enum SessionHistoryPromptRenderer {
         ) {
             sections.append(history)
         }
-        if let hint = immediateReplyReferenceHint(
+        if includeConversationHistory,
+           let hint = immediateReplyReferenceHint(
             userMessage: userMessage,
             renderables: renderables,
             budget: budget
@@ -392,7 +394,7 @@ enum SessionHistoryPromptRenderer {
         if let openLoop {
             lines.append("Open loop: \(cap(openLoop.displayContent, 280))")
         }
-        lines.append("For older or elided wording, use search_chat_history/session_search scoped to the current session first, then broaden only if needed.")
+        lines.append("To pick up prior work, use workspace. For exact older wording, use search_chat_history scoped to this session first.")
 
         let rendered = lines.joined(separator: "\n")
         return rendered.count > budget.continuityCap
@@ -605,7 +607,7 @@ enum SessionHistoryPromptRenderer {
 
         var out: [String] = ["Conversation history:"]
         if omitted {
-            out.append("[NOTICE: Earlier session details are elided. Use search_chat_history/session_search for exact older wording.]")
+            out.append("[NOTICE: Earlier details are elided. Use workspace for prior work; load search_chat_history through tool_catalog for exact older wording.]")
         }
         out.append(contentsOf: lines)
         return out.joined(separator: "\n")
@@ -649,7 +651,8 @@ enum SessionHistoryPromptRenderer {
     // forward into later prompts at full length.
     static func toolSummary(
         content: String,
-        metadata: [String: JSONValue]?
+        metadata: [String: JSONValue]?,
+        resultCap: Int? = nil
     ) -> String {
         let recordedStatus = ChatTranscriptEvidenceRendering.recordedToolStatus(metadata)
         let normalizedContent = normalize(content)
@@ -683,7 +686,8 @@ enum SessionHistoryPromptRenderer {
         // `resultBody`; project THAT, bounded exactly like any other tool result.
         let rawResult = string(metadata?["resultBody"])
             ?? string(metadata?["resultSummary"]) ?? ""
-        let result = toolResultProjection(rawResult)
+        let result = resultCap.map { String(normalize(rawResult).prefix($0)) }
+            ?? toolResultProjection(rawResult)
         if result.isEmpty {
             return toolStatus
         }

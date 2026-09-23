@@ -9,6 +9,7 @@ import Testing
 import TrustCenter
 @testable import ChatOrchestration
 @testable import Context
+import NativeAgentTestSupport
 
 // MARK: - Stubs
 

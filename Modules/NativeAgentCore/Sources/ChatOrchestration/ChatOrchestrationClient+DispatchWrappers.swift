@@ -14,6 +14,7 @@ import Dispatcher
 import MacControl
 import SwarmRuns
 import MacIntegration
+import StandingBots
 
 // MARK: - Dotted-alias canonicalization (outermost)
 
@@ -30,25 +31,39 @@ public final class CanonicalToolNameDispatcher: ToolDispatchClient, @unchecked S
     private let inner: any ToolDispatchClient
     private let peerDataRoot: URL?
     private let builtInLanes: (any BuiltInAgentLaneProviding)?
+    private let conversationScope: String?
 
     public init(inner: any ToolDispatchClient, peerDataRoot: URL? = nil,
-                builtInLanes: (any BuiltInAgentLaneProviding)? = nil) {
+                builtInLanes: (any BuiltInAgentLaneProviding)? = nil, conversationScope: String? = nil) {
         self.inner = inner
         self.peerDataRoot = peerDataRoot
         self.builtInLanes = builtInLanes ?? (inner as? any BuiltInAgentLaneProviding)
+        self.conversationScope = conversationScope
     }
 
     /// Usable builder lanes retain their bare names; otherwise a saved contact owns its name.
-    private func namingSavedContact(_ tool: String, _ input: [String: JSONValue]) -> [String: JSONValue] {
+    private func namingSavedContact(_ tool: String, _ input: [String: JSONValue]) throws -> [String: JSONValue] {
         guard tool == "agent_message" || tool == "agent_read", let root = peerDataRoot,
-              case .string(let agent)? = input["agent"], !agent.contains(":"),
-              builtInLanes?.builtInAgentLaneUsable(agent.trimmingCharacters(in: .whitespaces).lowercased()) != true,
-              let named = try? AgentPeerStore(dataRoot: root).list().filter({
-                  $0.name.caseInsensitiveCompare(agent.trimmingCharacters(in: .whitespaces)) == .orderedSame }),
-              named.count == 1, let peer = named.first // two contacts with one name: no guessing
+              case .string(let agent)? = input["agent"], !agent.contains(":")
         else { return input }
         var input = input
-        input["agent"] = .string("peer:" + peer.id)
+        let name = agent.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lane = name.lowercased() == "claude" ? "claude" : name.lowercased()
+        if builtInLanes?.builtInAgentLaneUsable(lane) == true {
+            input["agent"] = .string(lane)
+            return input
+        }
+        var matches = try AgentPeerStore(dataRoot: root).list().filter {
+            $0.name.caseInsensitiveCompare(name) == .orderedSame
+        }.map { "peer:" + $0.id }
+        matches += try BotDefinitionStore(dataRoot: root).list().filter {
+            $0.name.caseInsensitiveCompare(name) == .orderedSame
+        }.map { "bot:" + $0.id.uuidString }
+        guard matches.count <= 1 else {
+            throw AgentConversationStore.Failure(message: "More than one contact is named \(name). Choose its exact contact from agent_contacts.")
+        }
+        if let exact = matches.first { input["agent"] = .string(exact) }
+        else if ["codex", "claude", "omp"].contains(lane) { input["agent"] = .string(lane) }
         return input
     }
 
@@ -62,17 +77,67 @@ public final class CanonicalToolNameDispatcher: ToolDispatchClient, @unchecked S
     }
 
     public func dispatch(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
-        try await inner.withToolArguments(tool: Self.canonical(tool), input: input) { input in
+        let result = try await inner.withToolArguments(tool: Self.canonical(tool), input: input) { input in
             try await dispatchNormalized(tool: tool, input: input, surface: surface)
         }
+        // Attach to structured owner results so every provider lane receives
+        // the same replayable receipt, without altering scalar/file contents,
+        // adding synthetic chat turns, or changing the cached prompt prefix.
+        guard !AgentWorkspaceArrivals.insideWorkspaceDispatch,
+              case .object(var fields) = result,
+              fields["workspace_arrivals"] == nil,
+              let notice = await AgentWorkspaceArrivals.pending(dataRoot: peerDataRoot,
+                scope: ChatToolSessionContext.verifiedSessionId ?? conversationScope) else { return result }
+        fields["workspace_arrivals"] = notice
+        return .object(fields)
     }
 
     private func dispatchNormalized(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
+        if Self.canonical(tool) == "workspace" {
+            guard let root = peerDataRoot,
+                  let scope = ChatToolSessionContext.verifiedSessionId ?? conversationScope, !scope.isEmpty else {
+                return .object(["status": .string("unavailable"), "message": .string("Workspace needs a verified chat session. No action was performed.")])
+            }
+            // Admission to the facade is checked first. Each selected read or
+            // send then re-enters the SAME complete chain under its real name
+            // and complete arguments; workspace cannot confer its authority.
+            let admission = try await dispatchExact(tool: tool, input: input, surface: surface)
+            guard case .object(let prepared) = admission,
+                  prepared["status"] == .string("prepared"),
+                  prepared["execution"] == .string("requires_workspace_runtime") else { return admission }
+            return try await AgentWorkspaceArrivals.$insideWorkspaceDispatch.withValue(true) {
+              try await AgentWorkspaceReadiness.withSnapshot(dataRoot: root) {
+              try await AgentWorkspace.dispatch(input: input, scope: scope, dataRoot: root,
+                catalog: { try await self.inner.listAvailableToolSchemas() }) { name, arguments in
+                let scoped = ChatToolSessionInjection.apply(toolName: name, input: arguments, sessionId: scope)
+                return try await self.dispatch(tool: name, input: scoped, surface: surface)
+              }
+              }
+            }
+        }
         // Translate the conversational facade before every admission owner.
         // Both the facade policy and the actual executor policy remain visible.
         // Dotted facade aliases are deliberately unsupported: this context has
         // two policy identities, not three.
-        let input = namingSavedContact(tool, input)
+        let input = try namingSavedContact(tool, input)
+        if Self.canonical(tool) == "bot_run_once", let root = peerDataRoot,
+           let scope = ChatToolSessionContext.verifiedSessionId ?? conversationScope, !scope.isEmpty {
+            return try await BotRunConversation.dispatch(input: input, surface: surface, scope: scope, dataRoot: root) { _, input in
+                try await self.dispatchExact(tool: tool, input: input, surface: surface)
+            }
+        }
+        if !AgentConversationContext.isInternalRead,
+           ["agent_message", "agent_read"].contains(tool), let root = peerDataRoot,
+           let scope = ChatToolSessionContext.verifiedSessionId ?? conversationScope, !scope.isEmpty {
+            return try await AgentConversationSession.dispatch(tool: tool, input: input, surface: surface,
+                scope: scope, dataRoot: root) { tool, input in
+                    try await self.dispatchExact(tool: tool, input: input, surface: surface)
+                }
+        }
+        return try await dispatchExact(tool: tool, input: input, surface: surface)
+    }
+
+    private func dispatchExact(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
         if let route = try AgentConversationRouting.route(tool: tool, input: input) {
             let alias = GatedToolNameAlias(raw: tool, canonical: route.tool)
             return try await GatedToolNameContext.$alias.withValue(alias) {
@@ -872,11 +937,6 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
     /// gave it in Trust → Connected agents. DISPLAY ONLY — nothing here grants
     /// authority, and a nil root simply falls back to the id.
     private let peerDirectoryDataRoot: URL?
-    /// The root this chain was BUILT with, for the advisory tool-call check's
-    /// key and log. Nil ⇒ the lane simply does not run; it is never inferred
-    /// from the process default, which would read one root's key while the
-    /// dispatcher underneath used another.
-    private let jevDataRoot: URL?
 
     /// The peer's contact name, or nil when the directory has none.
     private func peerDisplayName(peerID: String?) -> String? {
@@ -913,13 +973,11 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
         approvedReplayVerifier: (any ApprovedReplayVerifying)? = nil,
         externalToolIsEffect: (@Sendable (String) -> Bool)? = nil,
         firstConversationDataRoot: URL? = nil,
-        peerDirectoryDataRoot: URL? = nil,
-        jevDataRoot: URL? = nil
+        peerDirectoryDataRoot: URL? = nil
     ) {
         self.externalToolIsEffect = externalToolIsEffect
         self.firstConversationDataRoot = firstConversationDataRoot
         self.peerDirectoryDataRoot = peerDirectoryDataRoot
-        self.jevDataRoot = jevDataRoot
         self.approvedReplayVerifier = approvedReplayVerifier
         self.inner = inner
         self.gate = gate
@@ -1251,7 +1309,14 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
                 $0.isTainted ? $0.sourceDescription : nil
             }
            ),
-           PeerTurnEffectPolicy.isEffect(tool, externalToolIsEffect: externalToolIsEffect) {
+           PeerTurnEffectPolicy.requiresPeerApproval(tool, capabilities: envelope.capabilities,
+                                                    externalToolIsEffect: externalToolIsEffect,
+                                                    input: input,
+                                                    workspaceRoot: NativeAgentWorkspaceRoot.resolve(
+                                                        dataRoot: peerDirectoryDataRoot ?? defaultDataRoot()),
+                                                    // Full Mac file ops resolve relative paths here.
+                                                    relativeBases: SwiftToolDispatcher.builderSourceRepoRoot(
+                                                        dataRoot: peerDirectoryDataRoot ?? defaultDataRoot()).map { [$0] } ?? []) {
             decision = .requireApproval(
                 reason: PeerTurnEffectPolicy.approvalReason(tool: tool, requester: requester)
             )
@@ -1547,36 +1612,7 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
 
         let finalInput = effectiveInput
         let finalCapability = capability
-        // Jev lane 2 (advisory). Started here — AFTER every gate has decided
-        // to allow this call — and read after the tool has run, so it adds no
-        // latency and can never sit in front of a gate. It grants nothing,
-        // denies nothing and files no approval; at most it adds one note to
-        // the result the agent reads next.
-        //
-        // The task is cancelled on EVERY exit, including a throw from the
-        // dispatch, so nothing here outlives the call it belongs to.
-        let jevRoot = jevDataRoot
-        // Use the tool's actual schema, not its broad family (time_now was
-        // previously described as scheduling/self-evolution). The enumeration
-        // runs INSIDE the check task, beside the tool — never on the dispatch
-        // path, where a slow lookup would delay a call the gates have already
-        // allowed. The 300 ms post-dispatch grace stays the only wait. No
-        // schema means unknown semantics, never an invented purpose.
-        let schemaSource = inner
-        let jevCheck = jevRoot.flatMap {
-            JevToolCallCheck.begin(
-                tool: tool,
-                input: finalInput,
-                purpose: {
-                    try? await schemaSource.listAvailableToolSchemas()
-                        .first(where: { $0.name == tool })?.description
-                },
-                surface: surface,
-                dataRoot: $0
-            )
-        }
-        defer { jevCheck?.cancel() }
-        let outcome = try await ChatToolSessionContext.$verifiedSessionId.withValue(verifiedSessionId) {
+        return try await ChatToolSessionContext.$verifiedSessionId.withValue(verifiedSessionId) {
             // Bound even when nil: a non-injection tool must never inherit a
             // capability left in scope by an enclosing task.
             try await MacInjectionCapabilityContext.$current.withValue(finalCapability) {
@@ -1585,54 +1621,6 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
                 }
             }
         }
-        guard let jevCheck, let jevRoot else { return outcome }
-        // The tool has finished. Give the check a SHORT grace to land rather
-        // than reading it the same instant — a bounded wait was the ruling,
-        // and reading it with no wait at all abstained on every fast tool,
-        // which is every local one. Past the grace it is cancelled by the
-        // defer above and the abstention is the log's business, not the
-        // turn's. Either way the outcome is returned; nothing is held.
-        let delivered = await jevCheck.waitUntilReady(graceMillis: JevToolCallCheck.graceMillis)
-        guard delivered else {
-            JevLog.shared.note(
-                lane: .toolCall,
-                summary: "\(tool) check abstained",
-                context: JevLogContext(
-                    sessionID: verifiedSessionId,
-                    turnID: TurnTraceContext.turnId,
-                    acted: "abstained: no answer within the \(JevToolCallCheck.graceMillis) ms grace"
-                ),
-                dataRoot: jevRoot
-            )
-            return outcome
-        }
-        let warning = jevCheck.readIfReady()
-        // `attach` declines a result it cannot add a field to, and one that
-        // already carries a note. Comparing the two is how this row knows
-        // whether the note was really attached to the result the model reads
-        // next — which is as far as this lane can see it go.
-        let annotated = JevToolCallCheck.attach(warning, to: outcome)
-        let attached = warning != nil && annotated != outcome
-        JevLog.shared.note(
-            lane: .toolCall,
-            summary: "\(tool) check delivered",
-            context: JevLogContext(
-                sessionID: verifiedSessionId,
-                turnID: TurnTraceContext.turnId,
-                acted: warning == nil
-                    ? "delivered within the grace; nothing flagged"
-                    : (attached
-                        ? "delivered within the grace; note attached"
-                        : "delivered within the grace; note could not be attached to this result")
-            ),
-            dataRoot: jevRoot,
-            extra: warning.map {
-                JevLog.delivery(
-                    told: $0, sourceTurn: TurnTraceContext.turnId, reachedAgent: attached
-                )
-            } ?? [:]
-        )
-        return annotated
     }
 
     func listAvailableTools() async throws -> [String] {

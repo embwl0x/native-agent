@@ -22,7 +22,9 @@ extension ContextFlowCoordinatorTests {
             kind: .correction,
             body: "User's explicit correction remains protected.",
             authority: .explicitCorrection,
-            policy: .adaptive
+            policy: .adaptive,
+            // 2026-09-23: only a topic-matched correction is mandatory.
+            topics: ["unrelated task"]
         )
         let fixture = try await makeFixture(
             mode: .active,
@@ -59,7 +61,8 @@ extension ContextFlowCoordinatorTests {
                 kind: .correction,
                 body: String(repeating: "explicit correction \(index) remains authoritative. ", count: 55),
                 authority: .explicitCorrection,
-                policy: .adaptive
+                policy: .adaptive,
+                topics: ["cobalt garden"]
             )
         }
         let memory = compiledSource(
@@ -122,7 +125,8 @@ extension ContextFlowCoordinatorTests {
                 kind: .correction,
                 body: String(repeating: "authoritative correction \(index). ", count: 90),
                 authority: .explicitCorrection,
-                policy: .adaptive
+                policy: .adaptive,
+                topics: ["hello"]
             )
         }
         let fixture = try await makeFixture(

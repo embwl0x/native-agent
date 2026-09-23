@@ -287,6 +287,7 @@ final class VoiceInputController {
 
         let request = SFSpeechAudioBufferRecognitionRequest()
         request.shouldReportPartialResults = true
+        request.contextualStrings = [AgentVoice.live.name]
         if #available(macOS 13.0, *) {
             request.addsPunctuation = true
         }

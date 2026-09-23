@@ -137,16 +137,7 @@ public enum REMGrowthEvictionHistory {
             if try existingKeys(url: url).contains(dedupeKey(record)) { return }
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.sortedKeys]
-            var line = try encoder.encode(record)
-            line.append(contentsOf: Data("\n".utf8))
-            if FileManager.default.fileExists(atPath: url.path) {
-                let handle = try FileHandle(forWritingTo: url)
-                defer { try? handle.close() }
-                try handle.seekToEnd()
-                try handle.write(contentsOf: line)
-            } else {
-                try line.write(to: url, options: .atomic)
-            }
+            try await persistence.appendJSONL(JSONValue.parse(encoder.encode(record)), to: url)
         }
     }
 

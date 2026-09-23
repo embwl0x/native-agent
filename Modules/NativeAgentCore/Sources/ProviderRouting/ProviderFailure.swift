@@ -20,7 +20,7 @@ public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable
         case .overloaded: return "The model is busy; try again in a moment."
         case .contextTooLong: return "The conversation is too long; start a new chat or shorten your message."
         case .network: return "The connection was interrupted; check your internet connection and try again."
-        case .refused: return "The model could not accept this request; revise your message or choose another model."
+        case .refused: return "The model turned this request down. Try again, or pick another model in Settings."
         case .malformedResponse: return "The model returned an unreadable response; try again."
         case .routingUnavailable: return "Your model settings could not be loaded; check your model connection in Settings."
         case .modelUnavailable: return "The selected model is unavailable; choose another model."
@@ -31,7 +31,7 @@ public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable
     public static func http(status: Int, detail: String = "", retryAfter: Int? = nil) -> Self {
         switch status {
         case 401: return .authExpired
-        case 429: return .rateLimited(retryAfter: retryAfter)
+        case 429: return .rateLimited(retryAfter: quotaExceeded(detail) && !rateLimitWording(detail) ? quotaRetryAfter : retryAfter)
         case 413: return .contextTooLong
         case 408: return .network
         case 409, 425, 500...599: return .overloaded
@@ -39,7 +39,8 @@ public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable
         default:
             if contextOverflow(detail) { return .contextTooLong }
             // 2026-09-19 WHY: some quota responses use 403 rather than 429.
-            if quotaExceeded(detail) { return .rateLimited(retryAfter: retryAfter) }
+            if rateLimitWording(detail) { return .rateLimited(retryAfter: retryAfter) }
+            if quotaExceeded(detail) { return .rateLimited(retryAfter: quotaRetryAfter) }
             if modelUnavailable(detail) { return .modelUnavailable }
             if status == 403 { return .authExpired }
             return .refused
@@ -49,7 +50,7 @@ public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable
     // Wire protocols and the CLI sometimes expose only text. Keep that
     // compatibility translation here, outside every retry/tell decision.
     static func wireDetail(_ object: [String: Any]) -> String {
-        ["type", "code", "message", "error"].compactMap { object[$0] as? String }.joined(separator: " ")
+        ["type", "code", "error_code", "message", "error"].compactMap { object[$0] as? String }.joined(separator: " ")
     }
 
     static func wireDetail(_ data: Data) -> String {
@@ -68,9 +69,8 @@ public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable
         if ["invalid_api_key", "invalid authentication", "authentication_error", "unauthorized", "token expired", "expired token", "invalid token"].contains(where: text.contains) {
             return .authExpired
         }
-        if quotaExceeded(text) {
-            return .rateLimited(retryAfter: nil)
-        }
+        if rateLimitWording(text) { return .rateLimited(retryAfter: nil) }
+        if quotaExceeded(text) { return .rateLimited(retryAfter: quotaRetryAfter) }
         if modelUnavailable(text) { return .modelUnavailable }
         if ["overloaded", "unavailable", "server_error", "try again later"].contains(where: text.contains) {
             return .overloaded
@@ -81,14 +81,24 @@ public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable
         return fallback
     }
 
+    // 2026-09-22 WHY: spent quota does not come back inside a turn; an hour's
+    // wait trips the ladder's "needs more time than this turn has left" stop
+    // on the first failure instead of nine retries into the same refusal.
+    private static let quotaRetryAfter = 3600
+
     private static func quotaExceeded(_ detail: String) -> Bool {
         let text = detail.lowercased()
-        return ["rate limit", "rate_limit", "too many requests", "usage exhausted", "usage is exhausted", "out of extra usage", "quota exceeded", "insufficient_quota", "usage limit", "credit balance", "billing limit", "quota_exceeded"].contains(where: text.contains)
+        return ["usage exhausted", "usage is exhausted", "out of extra usage", "quota exceeded", "insufficient_quota", "usage limit", "credit balance", "billing limit", "quota_exceeded", "spending limit"].contains(where: text.contains)
+    }
+
+    private static func rateLimitWording(_ detail: String) -> Bool {
+        let text = detail.lowercased()
+        return ["rate limit", "rate_limit", "too many requests"].contains(where: text.contains)
     }
 
     private static func modelUnavailable(_ detail: String) -> Bool {
         let text = detail.lowercased()
-        return ["model_not_found", "model_not_available", "model not found", "model not available", "model unavailable", "model is unavailable", "does not exist or you do not have access"].contains(where: text.contains)
+        return ["model_not_found", "model_not_available", "model not found", "model not available", "model unavailable", "model is unavailable", "does not exist or you do not have access", "claude_code_version_too_old", "does not support this model", "or newer is required"].contains(where: text.contains)
     }
 
     private static func contextOverflow(_ detail: String) -> Bool {
@@ -228,6 +238,11 @@ extension ProviderFailure {
         public var providerWorkState: WorkState? { work }
         public var errorDescription: String? {
             (cause.errorDescription ?? "The reply could not be completed.") + " Work: " + work.rawValue + "."
+        }
+        /// 2026-09-22 WHY: people get the cause alone; the work tag is for agent peers.
+        public var personDescription: String {
+            (cause.errorDescription ?? "The reply could not be completed.")
+                + (work == .ranPartly ? " Some steps had already run before it stopped." : "")
         }
     }
 

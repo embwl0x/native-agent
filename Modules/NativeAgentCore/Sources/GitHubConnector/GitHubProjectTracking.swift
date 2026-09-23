@@ -897,11 +897,27 @@ private enum GitHubProjectTracker {
         }
         var sortedEntities = built.entities
         sortedEntities.sort { $0.updatedAt > $1.updatedAt }
-        let existingCommandIDs = Set((try await commandStore.liveState()).items.map(\.itemId))
+        let commandItems = (try await commandStore.liveState()).items
+        let existingCommandIDs = Set(commandItems.map(\.itemId))
         let previouslyOpen = Set((previous?.entities ?? []).filter { $0.state == "open" }.map {
             GitHubCommandObservation.itemId(repository: $0.repo, number: $0.number)
         })
-        let observations = sortedEntities.compactMap { entity -> GitHubCommandObservation? in
+        // 2026-09-22: dropping a repo from tracking left its items open in the
+        // command feed forever (121 hermes-agent items after the switch to
+        // User's repos). An open item from an untracked repo resolves here.
+        var untrackedClosures: [GitHubCommandObservation] = []
+        if config.mode == .repository {
+            let tracked = Set(config.repositories.map { $0.fullName.lowercased() })
+            untrackedClosures = commandItems.compactMap { item in
+                guard !item.state.isTerminal, !tracked.contains(item.repository.lowercased()) else { return nil }
+                return GitHubCommandObservation(
+                    repository: item.repository, number: item.number, kind: item.kind, title: item.title,
+                    isOpen: false, observedVersion: "untracked",
+                    finalReceipt: "\(item.repository) is no longer tracked."
+                )
+            }
+        }
+        let observations = untrackedClosures + sortedEntities.compactMap { entity -> GitHubCommandObservation? in
             guard let observation = entity.commandObservation else { return nil }
             // Contribution snapshots retain bounded closed PR history. Historical
             // closures are not newly tracked work; only open items, existing

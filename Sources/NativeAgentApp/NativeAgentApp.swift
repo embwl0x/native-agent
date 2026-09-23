@@ -195,6 +195,9 @@ struct NativeAgentApp: App {
     @AppStorage("showDeveloperSurfaces") private var showDeveloperSurfaces = false
 
     init() {
+        // User, 2026-09-23: no way back to the classic sidebar; anyone left on
+        // it lands in the current shell.
+        UserDefaults.standard.removeObject(forKey: NativeAgentShellPreference.classicShellKey)
         // User, 2026-09-03: native text on this app looked heavy next to the
         // Claude desktop app's. That app is Chromium, which draws without
         // macOS font smoothing (stem darkening). Turn it off for this process
@@ -220,15 +223,9 @@ struct NativeAgentApp: App {
         // is connected and still offers that model lives where the catalogs are.
         // StandingBots owns scheduling, not provider catalogs, so the app hands
         // it the live check here (2026-09-13 review).
-        Task {
-            await BotRunGate.installLiveCheck { bot, dataRoot in
-                await SwiftNativeProviderRouting(dataRoot: dataRoot).botChoiceRejection(
-                    provider: bot.provider,
-                    model: bot.model,
-                    reasoningEffort: bot.reasoningEffort
-                )
-            }
-        }
+        // Early for bot_ask from chat; launch installs it again right before
+        // the loops start so a due bot is never skipped on a lost race.
+        Task { await installBotProviderCheck() }
 
         if let mismatch = ProviderSurfaceGroups.membershipMismatch() {
             FileHandle.standardError.write(Data(
@@ -497,8 +494,11 @@ struct NativeAgentApp: App {
             }
         }
 
+        // One Settings page: Command-comma opens the same SetupView the
+        // sidebar's Settings opens. SlimSettingsView survives only as the
+        // classic sidebar's Settings (ContentView).
         Settings {
-            SlimSettingsView()
+            SetupView()
                 .environment(appModel)
                 // User, 2026-09-02: never a nil scheme. AppearanceController
                 // answers dark or light for both layers; "off" follows the
@@ -630,4 +630,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     static let residentIOSChatClient = makeNativeAgentAppChatOrchestrationClient(
         profile: .ios
     )
+}
+
+/// The bot provider check (see App.init). Idempotent.
+func installBotProviderCheck() async {
+    await BotRunGate.installLiveCheck { bot, dataRoot in
+        await SwiftNativeProviderRouting(dataRoot: dataRoot).botChoiceRejection(
+            provider: bot.provider,
+            model: bot.model,
+            reasoningEffort: bot.reasoningEffort
+        )
+    }
 }

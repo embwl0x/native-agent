@@ -542,6 +542,8 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
             atom.validToGeneration == nil
                 && atom.draft.kind == .correction
                 && atom.draft.authority == .explicitCorrection
+                // 2026-09-23: topic-less corrections rode every turn uncapped.
+                && ContextCorrectionScope.hasTopics(atom.draft)
                 && allowedSourceIDs.contains(atom.draft.sourceID)
                 && request.allowedPrivacy.contains(atom.draft.privacy)
                 && atom.draft.permittedSurfaces.contains(request.surface)
@@ -1710,8 +1712,14 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
                         updatedAt: updatedAt
                     )
                     successfulSources[sourceID] = compiled
+                    // 2026-09-22: an embedding-provider change leaves bytes
+                    // (and so sourceHash) unchanged; without this the
+                    // re-embedded atoms were dropped and old vectors stuck.
+                    let embeddingChanged = Set(compiled.atoms.map { $0.embedding?.modelFingerprint })
+                        != Set((previousBySource[sourceID]?.atoms ?? []).map { $0.embedding?.modelFingerprint })
                     if compiled.sourceHash != previousBySource[sourceID]?.sourceHash
-                        || compiled.descriptor != previousBySource[sourceID]?.descriptor {
+                        || compiled.descriptor != previousBySource[sourceID]?.descriptor
+                        || embeddingChanged {
                         changedSources.append(compiled)
                     }
                 } catch let error as CancellationError {

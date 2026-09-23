@@ -9,6 +9,7 @@ import Testing
 import TrustCenter
 @testable import ChatOrchestration
 @testable import Context
+import NativeAgentTestSupport
 
 private final class FluidPersonaStub: PersonaEngineProtocol, @unchecked Sendable {
     enum Failure: Error { case shouldNotRead }

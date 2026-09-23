@@ -3,8 +3,6 @@
 // HTTP fallbacks are removed; iOS talks to the Mac through signed iCloud
 // messages and snapshots. Public surface preserved for view compatibility:
 //   - chat: sendMessage / cancelChat / observeICloudReplies → iCloudBridge
-//   - reads (get) / writes (postDict) → throw a clean transportRemoved error;
-//     views that wrap calls in `try?` degrade to empty/nil states.
 //   - refreshChatHistory → reads from iCloudSyncEngine snapshots.
 
 import Foundation
@@ -504,30 +502,6 @@ final class MacBridgeClient: ObservableObject {
 
     private static func minutesAgo(since date: Date, now: Date) -> Int {
         max(1, Int(now.timeIntervalSince(date) / 60))
-    }
-
-    // MARK: - Generic read/write (HTTP transport removed)
-    //
-    // Direct Mac HTTP routes are no longer reachable from iOS.
-    // `get` / `postDict` throw `transportRemoved`; views that wrap calls in `try?`
-    // degrade to nil/empty rather than hanging on a dead network call.
-
-    static let transportRemoved = NSError(
-        domain: "NativeAgentMobile",
-        code: -42,
-        userInfo: [NSLocalizedDescriptionKey:
-            "Direct HTTP transport removed. iCloud is the only iOS transport."]
-    )
-
-    func get<T: Decodable>(_ path: String) async throws -> T {
-        _ = path
-        throw Self.transportRemoved
-    }
-
-    func postDict(_ path: String, body: [String: Any]) async throws -> [String: Any] {
-        _ = path
-        _ = body
-        throw Self.transportRemoved
     }
 
     // MARK: - Chat history refresh (iCloud snapshot read)

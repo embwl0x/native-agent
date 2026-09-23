@@ -1,4 +1,5 @@
 import Foundation
+import os
 import NativeAgentCore
 import PersistenceCore
 
@@ -118,11 +119,24 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
     // Anthropic gates newer models (Fable 5.1: "version 2.1.251 or newer is
     // required", error_code claude_code_version_too_old) on this version. Keep it
     // at the Claude Code release actually installed on this Mac.
-    private static let claudeCLIVersion = "2.1.257"
-    /// The first row of this route's own catalog — computed, not a model id
-    /// chosen in code (2026-09-13, matching the OpenAI OAuth adapter).
-    private static var defaultClaudeModel: String {
-        FirstPartyModelCatalog.models(forProviderID: "anthropic_oauth_direct").first?.id ?? ""
+    // Newer models are served only to recent clients (Opus 5.5 needed
+    // 2.1.280, 09-22). Follow the newest Claude Code on this Mac, CLI or
+    // desktop app, so updating Claude updates this; the literal is the floor.
+    // 2026-09-22 WHY: an OLDER install used to win over the floor (2.1.278
+    // got Opus 5.5 refused), so the floor is a candidate in the max.
+    private static var claudeCLIVersion: String { installedClaudeCodeVersion(floor: "2.1.280") ?? "2.1.280" }
+
+    static func installedClaudeCodeVersion(home: URL = FileManager.default.homeDirectoryForCurrentUser,
+                                           floor: String? = nil) -> String? {
+        let stores = [".local/share/claude/versions", "Library/Application Support/Claude/claude-code"]
+        let found = stores.flatMap { (try? FileManager.default.contentsOfDirectory(atPath: home.appendingPathComponent($0).path)) ?? [] }
+            + [floor].compactMap { $0 }
+        func parts(_ v: String) -> [Int]? {
+            let p = v.split(separator: ".").map { Int($0) }
+            return p.count == 3 && p.allSatisfy { $0 != nil } ? p.map { $0! } : nil
+        }
+        return found.compactMap { v in parts(v).map { (v, $0) } }
+            .max { $0.1.lexicographicallyPrecedes($1.1) }?.0
     }
     /// Refresh proactively when the token has less than this many seconds
     /// of life left. Mirrors OpenAI adapter's 120s buffer.
@@ -188,6 +202,9 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
         }
         if !(200..<300).contains(status) {
             let body = try await ProviderErrorBodyDrain.read(bytes, maxBytes: 4096, timeout: 2.0)
+            // The person sees one generic line; the provider's own reason stays findable.
+            let reason = String(data: body.prefix(600), encoding: .utf8) ?? ""
+            Logger(subsystem: "NativeAgent", category: "Anthropic").error("oauth HTTP \(status, privacy: .public): \(reason, privacy: .public)")
             try throwIfChatCompletionsError(status: status, data: body, response: response)
         }
     }
@@ -267,7 +284,7 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
     /// adapter default, and an `anthropic/claude-*` namespaced id has its
     /// namespace stripped. Anything else (`llama-3`, `deepseek-chat`, `o3`,
     /// a bare `gpt-*` misrouted onto this adapter) used to fall through to
-    /// `defaultClaudeModel`, so User's pick was silently replaced by
+    /// the adapter default, so User's pick was silently replaced by
     /// claude-opus-4-8 and the call was billed against a model he never
     /// chose. It now throws `modelUnavailable` naming the offending id.
     static func coerceToClaudeModel(_ requested: String?) throws -> String {
@@ -295,6 +312,14 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
         return r == coerced ? nil : r
     }
 
+    /// The subscription connection must never carry a native `tools` array
+    /// (NativeToolCapability); tools reach Claude here only as prompt text.
+    private static func refuseNativeTools(_ tools: [LLMToolSchema]?) throws {
+        guard let tools, !tools.isEmpty else { return }
+        throw LLMError.providerError(message:
+            "anthropic_oauth_direct never receives a native tools[] array (text tool lane only)")
+    }
+
     // MARK: - LLMAdapter conformance
 
     public func complete(prompt: String, system: String?, model: String) async throws -> String {
@@ -312,6 +337,7 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
         model: String,
         tools: [LLMToolSchema]?
     ) async throws -> String {
+        try Self.refuseNativeTools(tools)
         let coercedModel = try Self.coerceToClaudeModel(model)
         let substitutedFrom = Self.substitutionTrace(requested: model, coerced: coercedModel)
         // User, 2026-09-06: the token the last attempt actually sent, handed to
@@ -346,7 +372,6 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
                 system: system,
                 coercedModel: coercedModel,
                 maxTokens: requestMaxTokens(model: coercedModel),
-                tools: tools,
                 stream: false
             )
             do {
@@ -398,6 +423,7 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
         model: String,
         tools: [LLMToolSchema]?
     ) async throws -> String {
+        try Self.refuseNativeTools(tools)
         let coercedModel = try Self.coerceToClaudeModel(model)
         let substitutedFrom = Self.substitutionTrace(requested: model, coerced: coercedModel)
         // Two-attempt loop mirrors the OpenAI adapter: refresh inline on a
@@ -430,23 +456,14 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
                 req.setValue(v, forHTTPHeaderField: k)
             }
 
-            // toolCapable mirrors makeToolList's non-empty rule so the
-            // dynamic-end breakpoint appears exactly when a tools block does.
-            let systemBlocks = Self.makeSystemBlocks(
-                system, toolCapable: !(tools?.isEmpty ?? true)
-            )
+            let systemBlocks = Self.makeSystemBlocks(system)
             var body: [String: Any] = [
                 "model": coercedModel,
                 "max_tokens": requestMaxTokens(model: coercedModel),
                 "messages": [["role": "user", "content": prompt]],
                 "system": systemBlocks,
             ]
-            // Anthropic Messages-API tools field. Only add when non-empty so a
-            // nil/empty tools arg produces a byte-identical request body to
-            // the no-tools path.
-            if let toolList = Self.makeToolList(tools) {
-                body["tools"] = toolList
-            }
+            Self.applyTextLaneStops(to: &body, system: system)
             FirstPartyExecutionControls.applyAnthropicControls(to: &body, model: coercedModel)
             do {
                 req.httpBody = try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
@@ -490,28 +507,18 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
         throw LLMError.notConfigured(provider: "anthropic_oauth_direct")
     }
 
-    /// Preserve response order and tool markers before recording successful usage.
+    /// Preserve response text order before recording successful usage.
     private func completionPieces(data: Data, status: Int) throws -> ([String: Any], [String]) {
         guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               let content = obj["content"] as? [[String: Any]] else {
             throw LLMError.invalidResponse(status: status)
         }
-        // Walk content blocks: text → append; tool_use → emit
-        // `<tool_use id="..." name="...">{json}</tool_use>` markers the
-        // ToolCallParser understands. ID is now included so the tool
-        // loop can pair the result back to the call.
+        // Text blocks only: tool calls arrive as markers inside the text
+        // (text tool lane), never as native tool_use blocks.
         var pieces: [String] = []
         for block in content {
-            guard let btype = block["type"] as? String else { continue }
-            if btype == "text", let t = block["text"] as? String {
+            if block["type"] as? String == "text", let t = block["text"] as? String {
                 pieces.append(t)
-            } else if btype == "tool_use" {
-                let id = (block["id"] as? String) ?? ""
-                let name = (block["name"] as? String) ?? ""
-                let input = block["input"] ?? [String: Any]()
-                let bodyData = (try? JSONSerialization.data(withJSONObject: input)) ?? Data("{}".utf8)
-                let bodyStr = String(data: bodyData, encoding: .utf8) ?? "{}"
-                pieces.append("<tool_use id=\"\(id)\" name=\"\(name)\">\(bodyStr)</tool_use>")
             }
         }
         if pieces.isEmpty {
@@ -592,6 +599,7 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
                 "messages": [["role": "user", "content": prompt]],
                 "system": systemBlocks,
             ]
+            Self.applyTextLaneStops(to: &body, system: system)
             FirstPartyExecutionControls.applyAnthropicControls(to: &body, model: model)
             req.httpBody = try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
             Self.dumpBodyIfEnabled(body, call: "runStream")
@@ -617,6 +625,7 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
             var ttftMs: Int?
             var yieldedAnyText = false
             var lastStopReason: String?
+            var streamedText = ""
             // R15: SSEEventStream owns framing; protocol semantics stay here.
             for try await sse in SSEEventStream(bytes) {
                 try Task.checkCancellation()
@@ -652,7 +661,8 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
                         ttftMs: ttftMs,
                         durationMs: durationMs,
                         substitutedFrom: substitutedFrom,
-                        cacheMarkers: Self.cacheMarkers(in: body)
+                        cacheMarkers: Self.cacheMarkers(in: body),
+                        stopReason: lastStopReason
                     )
                     if !yieldedAnyText {
                         throw FirstPartyExecutionControls.anthropicEmptyStreamError(
@@ -661,6 +671,13 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
                             expectedOutput: "answer text"
                         )
                     }
+                    // 2026-09-22: a max_tokens cut-off is a truncated reply, not
+                    // a finished one — tool markers in it must never dispatch.
+                    if lastStopReason == "max_tokens" {
+                        Self.logCutoffShape(streamedText)
+                        throw LLMError.outputLengthLimit(partial: streamedText)
+                    }
+                    Self.logStopWithoutToolCall(lastStopReason, streamedText)
                     continuation.finish()
                     return
                 case "content_block_delta":
@@ -673,6 +690,7 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
                         ttftMs = Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
                     }
                     yieldedAnyText = true
+                    streamedText += text
                     continuation.yield(text)
                 default:
                     continue
@@ -691,10 +709,8 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
     // text-compat chat path that would kill live deltas in the Mac UI. This
     // override streams the SAME wire body completeMessages sends (shared
     // builder above, + "stream": true) through the SAME SSE event protocol
-    // runStream parses, extended with the structured tool_use block events
-    // (content_block_start → input_json_delta accumulation →
-    // content_block_stop → one .toolCall) so the structured streaming tool
-    // loop gets live tool-call events too. Error mapping mirrors stream():
+    // runStream parses. Native tool_use blocks never arrive: this route sends
+    // no tools array (NativeToolCapability). Error mapping mirrors stream():
     // .notConfigured propagates BEFORE any yield so SwiftNativeLLMClient's
     // api-key fallback chain still engages.
     public func streamMessages(
@@ -706,13 +722,13 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
         return AsyncThrowingStream { continuation in
             let task = Task {
                 do {
+                    try Self.refuseNativeTools(tools)
                     // Coerce INSIDE the stream task — see stream() above.
                     let coercedModel = try Self.coerceToClaudeModel(model)
                     try await self.runStreamMessages(
                         messages: messages,
                         system: system,
                         model: coercedModel,
-                        tools: tools,
                         substitutedFrom: Self.substitutionTrace(
                             requested: model,
                             coerced: coercedModel
@@ -735,7 +751,6 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
         messages: [LLMMessage],
         system: String?,
         model: String,
-        tools: [LLMToolSchema]?,
         substitutedFrom: String?,
         continuation: AsyncThrowingStream<LLMMessageStreamEvent, Error>.Continuation
     ) async throws {
@@ -764,7 +779,6 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
                 system: system,
                 coercedModel: model,
                 maxTokens: requestMaxTokens(model: model),
-                tools: tools,
                 stream: true
             )
             req.httpBody = try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
@@ -785,25 +799,12 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
 
             // Telemetry mirrors runStream: usage split across message_start
             // (input + cache counters) and message_delta (output_tokens);
-            // row recorded on message_stop. TTFT stamps at the FIRST
-            // MODEL-OUTPUT FRAME — first text delta, tool_use
-            // content_block_start, or first input_json_delta, whichever
-            // arrives first — matching the OpenAI OAuth structured parser's
-            // convention exactly (it stamps at output_item.added /
-            // function_call_arguments.delta, NOT at output_item.done).
-            // Stamping only at content_block_stop (after the whole argument
-            // stream) read materially too high for tool-call-first
-            // responses (gpt-5.5 review NEEDS_FIX, 2026-06-11).
+            // row recorded on message_stop. TTFT stamps at the first text delta.
             var usage = LLMUsage()
             var ttftMs: Int?
             var yieldedSemanticOutput = false
             var lastStopReason: String?
-            // In-flight tool_use block being assembled from
-            // input_json_delta frames (fine-grained-tool-streaming beta is
-            // already in the request headers).
-            var openToolId: String?
-            var openToolName: String?
-            var openToolJSON = ""
+            var streamedText = ""
             // Mid-stream transport errors (resource timeout, connection
             // lost, ...) thrown by the byte stream must route through the SAME
             // transientNetworkError mapping the initial session.bytes(for:)
@@ -854,7 +855,8 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
                             ttftMs: ttftMs,
                             durationMs: durationMs,
                             substitutedFrom: substitutedFrom,
-                            cacheMarkers: Self.cacheMarkers(in: body)
+                            cacheMarkers: Self.cacheMarkers(in: body),
+                            stopReason: lastStopReason
                         )
                         if !yieldedSemanticOutput {
                             throw FirstPartyExecutionControls.anthropicEmptyStreamError(
@@ -863,6 +865,14 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
                                 expectedOutput: "answer text or tool call"
                             )
                         }
+                        // 2026-09-22: turn 37802ab2 hit max_tokens and ran 51
+                        // tool calls parsed from the cut-off text. Truncated is
+                        // not finished: the text lane stops on this error.
+                        if lastStopReason == "max_tokens" {
+                            Self.logCutoffShape(streamedText)
+                            throw LLMError.outputLengthLimit(partial: streamedText)
+                        }
+                        Self.logStopWithoutToolCall(lastStopReason, streamedText)
                         continuation.finish()
                         return
                     case "content_block_start":
@@ -870,25 +880,10 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
                         // Turn Inspector W2 — thinking lane: a redacted thinking
                         // block is rendered HONESTLY as "[redacted]" onto the
                         // bus (never decoded, never mutated). Bus-only — it does
-                        // NOT enter the text stream and does NOT change tool/text
-                        // handling below.
+                        // NOT enter the text stream.
                         if (blockObj?["type"] as? String) == "redacted_thinking" {
                             Self.fireThinkingDeltaEvent("[redacted]", redacted: true)
-                            continue
                         }
-                        guard let blockObj,
-                              (blockObj["type"] as? String) == "tool_use"
-                        else { continue }
-                        // First model-output frame for a tool-call-first
-                        // response — stamp TTFT here, not at content_block_stop
-                        // (parity with the OpenAI parser's output_item.added
-                        // stamp; gpt-5.5 review NEEDS_FIX, 2026-06-11).
-                        if ttftMs == nil {
-                            ttftMs = Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
-                        }
-                        openToolId = (blockObj["id"] as? String) ?? ""
-                        openToolName = (blockObj["name"] as? String) ?? ""
-                        openToolJSON = ""
                     case "content_block_delta":
                         guard let delta = obj["delta"] as? [String: Any] else { continue }
                         switch delta["type"] as? String {
@@ -898,6 +893,7 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
                                 ttftMs = Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
                             }
                             yieldedSemanticOutput = true
+                            streamedText += text
                             continuation.yield(.textDelta(text))
                         case "thinking_delta":
                             // Turn Inspector W2 — summarized-thinking lane.
@@ -924,43 +920,9 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
                             // assistant reply or any consumer's token handling.
                             continuation.yield(.keepAlive)
                             continue
-                        case "input_json_delta":
-                            // Argument deltas are model output even if the
-                            // tool_use block_start frame wasn't recognized —
-                            // stamp unconditionally (parity with the OpenAI
-                            // parser's function_call_arguments.delta stamp).
-                            if ttftMs == nil {
-                                ttftMs = Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
-                            }
-                            openToolJSON += (delta["partial_json"] as? String) ?? ""
-                            // Liveness (audit #4): tool-argument deltas are model
-                            // output but aren't yielded as content, so reset the
-                            // guard's idle clock during a long tool-arg
-                            // accumulation (same rationale as thinking_delta) via
-                            // the no-content `.keepAlive` signal.
-                            continuation.yield(.keepAlive)
                         default:
                             continue
                         }
-                    case "content_block_stop":
-                        guard let name = openToolName else { continue }
-                        let trimmedJSON = openToolJSON.trimmingCharacters(in: .whitespacesAndNewlines)
-                        let inputJSON = trimmedJSON.isEmpty ? Data("{}".utf8) : Data(trimmedJSON.utf8)
-                        // Idempotent last-resort stamp (mirrors the OpenAI
-                        // parser's yieldToolCall stamp) — the block-start /
-                        // first-argument-delta stamps above win in practice.
-                        if ttftMs == nil {
-                            ttftMs = Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
-                        }
-                        continuation.yield(.toolCall(LLMStreamToolCall(
-                            id: openToolId ?? "",
-                            name: name,
-                            inputJSON: inputJSON
-                        )))
-                        yieldedSemanticOutput = true
-                        openToolId = nil
-                        openToolName = nil
-                        openToolJSON = ""
                     default:
                         continue
                     }
@@ -1276,5 +1238,30 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
         try? FileManager.default.setAttributes(
             [.posixPermissions: NSNumber(value: Int16(0o600))], ofItemAtPath: path.path
         )
+    }
+}
+
+extension AnthropicOAuthDirectAdapter {
+    /// 2026-09-22: a text-lane runaway leaves no trace of what the model wrote.
+    /// Log only the markup tag names it used (never chat text) so the next
+    /// stop sequence can be aimed.
+    /// 2026-09-22: a text-lane stop sequence fired but no complete tool call
+    /// precedes it — the turn will likely end on a half-written call.
+    static func logStopWithoutToolCall(_ stopReason: String?, _ text: String) {
+        guard stopReason == "stop_sequence",
+              !text.contains("</invoke>"), !text.contains("</tool_use>") else { return }
+        logCutoffShape(text, event: "stop_sequence without tool call")
+    }
+
+    static func logCutoffShape(_ text: String, event: String = "max_tokens cutoff") {
+        var counts: [String: Int] = [:]
+        let pattern = try? NSRegularExpression(pattern: #"</?[a-z_][a-z0-9_:-]{0,30}(?=[\s>])"#)
+        let range = NSRange(text.startIndex..., in: text)
+        pattern?.enumerateMatches(in: text, range: range) { match, _, _ in
+            if let match, let r = Range(match.range, in: text) { counts[String(text[r]), default: 0] += 1 }
+        }
+        let headerCount = text.components(separatedBy: "NativeAgent tool result").count - 1
+        let shape = counts.sorted { $0.value > $1.value }.prefix(12).map { "\($0.key)x\($0.value)" }.joined(separator: " ")
+        Logger(subsystem: "NativeAgent", category: "Anthropic").error("\(event, privacy: .public) chars=\(text.count, privacy: .public) resultHeaders=\(headerCount, privacy: .public) tags=\(shape, privacy: .public)")
     }
 }

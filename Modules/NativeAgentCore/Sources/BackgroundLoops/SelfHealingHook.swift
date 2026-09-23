@@ -403,6 +403,8 @@ public struct SelfHealingHook: LoopRunner {
             // timestamps, and one stale row must not hide newer rows behind
             // it. The scan is already bounded by errorLogTailBytes.
             if ts < cutoff { continue }
+            // 2026-09-22: a wifi drop is not a fault; don't pay an LLM to diagnose it.
+            if SwiftNativeLoopScheduler.isOfflineError(String(line)) { continue }
             kept.append(line.prefix(280).description)
         }
         return kept

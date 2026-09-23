@@ -27,10 +27,8 @@ public struct ChatSessionDirectiveRecord: Codable, Equatable, Sendable {
     public var createdAt: String
     public var directive: String
     public var deliveredAt: String?
-    /// Set when an advisory lane wrote this line, so the turn that actually
-    /// delivers it can say so on that lane's own log row — a line that was
-    /// queued and one that was read are not the same thing, and the log could
-    /// not tell them apart.
+    /// Legacy advisory provenance retained to recognize retired helper records
+    /// on disk. These records must never be delivered as session directives.
     public var helperLane: String?
     /// The turn whose content produced the line.
     public var helperSourceTurn: String?
@@ -96,7 +94,8 @@ public enum ChatSessionDirective {
         now: Date = Date()
     ) -> String? {
         guard let record = load(dataRoot: dataRoot, sessionID: sessionID),
-              record.deliveredAt == nil else { return nil }
+              record.deliveredAt == nil,
+              record.helperLane == nil else { return nil }
         let directive = record.directive.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !directive.isEmpty else { return nil }
         let formatter = ISO8601DateFormatter()

@@ -358,23 +358,11 @@ extension NativeClient {
         let userIds = cfg?.allowedUserIds.sorted().map { String($0) } ?? []
         let voiceBackend = cfg?.voiceTranscriptionBackend ?? TelegramBot.TelegramConfig.defaultVoiceTranscriptionBackend
         let voiceModel = cfg?.voiceTranscriptionModel ?? TelegramBot.TelegramConfig.defaultVoiceTranscriptionModel
-        let voiceSupported = TelegramVoiceTranscriptionBackends.isSupported(voiceBackend)
-        let voiceRequiresAPIKey = TelegramVoiceTranscriptionBackends.requiresAPIKey(voiceBackend)
-        let voiceKeyConfigured = voiceSupported && (
-            !voiceRequiresAPIKey || LLMCredentialResolver.resolveAPIKey(
-                envVar: "OPENAI_API_KEY",
-                providerConfigFile: "openai.json",
-                dataRoot: dataRoot
-            ) != nil
-        )
         let voiceStatus = TelegramVoiceTranscriptionStatus(
             enabled: cfg?.voiceTranscriptionEnabled ?? TelegramBot.TelegramConfig.defaultVoiceTranscriptionEnabled,
             backend: voiceBackend,
             model: voiceModel,
-            maxBytes: cfg?.voiceMaxBytes ?? TelegramBot.TelegramConfig.defaultVoiceMaxBytes,
-            backendSupported: voiceSupported,
-            keyConfigured: voiceKeyConfigured,
-            requiresAPIKey: voiceRequiresAPIKey
+            maxBytes: cfg?.voiceMaxBytes ?? TelegramBot.TelegramConfig.defaultVoiceMaxBytes
         )
         // F4 fix-6: pollerEnabled reports ACTUAL loop-running state from the
         // BackgroundLoopsManager — registered AND its runtime is running —

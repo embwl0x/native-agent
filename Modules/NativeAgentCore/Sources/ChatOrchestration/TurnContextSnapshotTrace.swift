@@ -430,7 +430,7 @@ extension SwiftNativeTurnEngine {
         "\n\nNativeAgent Swift tool protocol",
         "\n\n# Since last session",
         // v2 volatile-block neighbours.
-        "\n\n# Historical evidence boundary",
+        "\n\nEarlier messages are history",
         "\n\nSESSION_CONTINUITY_STATE:",
         "\n\nRelevant earlier session snippets:",
         "\n\nConversation history:",

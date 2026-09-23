@@ -86,14 +86,15 @@ private struct CognitiveReflectionLoop: LoopRunner {
     }
 
     func tickOutcome() async -> LoopTickOutcome {
-        // C2 lease PRIORITY: the window is marked INSIDE runReflectionIfDue,
-        // only when reflection actually runs its expensive work (gpt-5.5 LOW —
-        // marking here pre-emptively would let a not-due tick consume the
-        // window and block the workshop for nothing).
+        // C2 lease PRIORITY: the window is claimed INSIDE runReflectionIfDue,
+        // after the cognition gate and before planning; a refused plan or a
+        // pre-provider skip returns it, so a not-due tick never spends the
+        // window and blocks the workshop for nothing.
         return await runtime.runReflectionIfDue(
             llm: llm,
             reason: "scheduled cognitive reflection",
-            demand: .spontaneous
+            demand: .spontaneous,
+            sameSourceCooldown: 6 * 3600
         ).loopTickOutcome
     }
 }

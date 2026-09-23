@@ -19,16 +19,6 @@ private let stableSeg = "PERSONA-STABLE persona packet\n\n# Pinned facts\n- pin"
 private let suffixSeg = "# Session tool contract\n- tool_load is available"
 private let dynamicSeg = "Recent memory:\n- hit"
 
-private func tools() -> [LLMToolSchema] {
-    let schema = try! JSONSerialization.data(withJSONObject: [
-        "type": "object", "properties": ["q": ["type": "string"]],
-    ])
-    return [
-        LLMToolSchema(name: "tool_a", description: "first", parametersJSON: schema),
-        LLMToolSchema(name: "tool_b", description: "last", parametersJSON: schema),
-    ]
-}
-
 private func systemBlocks(_ body: [String: Any]) -> [[String: Any]] {
     body["system"] as? [[String: Any]] ?? []
 }
@@ -43,7 +33,6 @@ private func cacheControl(_ block: [String: Any]) -> [String: Any]? {
 
 private func breakpointTotal(_ body: [String: Any]) -> Int {
     systemBlocks(body).filter { $0["cache_control"] != nil }.count
-        + (body["tools"] as? [[String: Any]] ?? []).filter { $0["cache_control"] != nil }.count
         + wireMessages(body)
             .flatMap { ($0["content"] as? [[String: Any]]) ?? [] }
             .filter { $0["cache_control"] != nil }.count
@@ -53,7 +42,6 @@ private func v2Body(
     messages: [LLMMessage],
     segments: SystemPromptSegments?,
     system: String?,
-    withTools: Bool = false,
     model: String = "claude-opus-5"
 ) -> [String: Any] {
     ConversationPrefixShape.$override.withValue(.v2Prefix) {
@@ -63,7 +51,6 @@ private func v2Body(
                 system: system,
                 coercedModel: model,
                 maxTokens: 1024,
-                tools: withTools ? tools() : nil,
                 stream: false
             )
         }
@@ -126,7 +113,7 @@ private func v2Body(
                 AnthropicOAuthDirectAdapter.makeMessagesRequestBody(
                     messages: [.user("hi")], system: seg.combined,
                     coercedModel: "claude-opus-5", maxTokens: 1024,
-                    tools: nil, stream: false
+                    stream: false
                 )
             }
         }
@@ -277,12 +264,8 @@ private func v2Body(
                 #expect(marker == nil, "index \(i)")
             }
         }
-        // stable-end + previous + current = 3; with tools, 4 — never 5.
+        // stable-end + previous + current = 3.
         #expect(breakpointTotal(body) == 3)
-        let withTools = v2Body(
-            messages: messages, segments: seg, system: seg.combined, withTools: true
-        )
-        #expect(breakpointTotal(withTools) == 4)
     }
 
     /// A within-turn round appends PAST the trailing system message: the
@@ -301,7 +284,7 @@ private func v2Body(
             #expect(AnthropicOAuthDirectAdapter.currentBoundaryIndex(messages) == 7)
             #expect(AnthropicOAuthDirectAdapter.previousTurnBoundaryIndex(messages) == 3)
             return v2Body(
-                messages: messages, segments: seg, system: seg.combined, withTools: true
+                messages: messages, segments: seg, system: seg.combined
             )
         }
         let wire = wireMessages(body)
@@ -315,23 +298,18 @@ private func v2Body(
             default: #expect(marker == nil, "index \(i)")
             }
         }
-        // stable-end + previous + current + last tool = 4, still at budget.
-        #expect(breakpointTotal(body) == 4)
+        // stable-end + previous + current = 3, inside budget.
+        #expect(breakpointTotal(body) == 3)
     }
 
     /// The system message can NEVER carry cache_control, on any shape.
     @Test func systemMessagesNeverCarryCacheControl() {
         let seg = SystemPromptSegments(stable: stableSeg, dynamic: dynamicSeg)
         for messages in [multiTurn(), multiTurnRoundTwo(), [LLMMessage.user("a"), .system("v")]] {
-            for withTools in [false, true] {
-                let body = v2Body(
-                    messages: messages, segments: seg, system: seg.combined,
-                    withTools: withTools
-                )
-                for msg in wireMessages(body) where msg["role"] as? String == "system" {
-                    let blocks = msg["content"] as? [[String: Any]] ?? []
-                    #expect(blocks.allSatisfy { $0["cache_control"] == nil })
-                }
+            let body = v2Body(messages: messages, segments: seg, system: seg.combined)
+            for msg in wireMessages(body) where msg["role"] as? String == "system" {
+                let blocks = msg["content"] as? [[String: Any]] ?? []
+                #expect(blocks.allSatisfy { $0["cache_control"] == nil })
             }
         }
     }
@@ -595,7 +573,7 @@ private actor FlattenCapturingClient: LLMClient {
                 AnthropicOAuthDirectAdapter.makeMessagesRequestBody(
                     messages: [.user("a"), .assistantText("b"), .user("c")],
                     system: seg.combined, coercedModel: "claude-opus-5",
-                    maxTokens: 1024, tools: nil, stream: false
+                    maxTokens: 1024, stream: false
                 )
             }
         }
@@ -857,26 +835,19 @@ private func clearAtHeaderStubSession() -> URLSession {
         }
     }
 
-    /// ORDERING RULE: Anthropic renders tools → system → messages and requires
-    /// longer-TTL entries to appear BEFORE shorter ones. The tools breakpoint
-    /// is always first, so it can never be the 5m one while a 1h marker sits
-    /// behind it — which is what a per-section TTL decision would have done.
+    /// ORDERING RULE: Anthropic renders system → messages and requires
+    /// longer-TTL entries to appear BEFORE shorter ones — a per-section TTL
+    /// decision could put a 5m marker ahead of a 1h one.
     @Test func longTTLRequest_neverPutsA5mMarkerAheadOfA1hMarker() {
         let messages: [LLMMessage] = [
             .user("a"), .assistantText("b"), .user("c"), .assistantText("d"),
             .user("e"), .system("volatile", clearAtNextUserMessage: true),
         ]
-        for withTools in [false, true] {
-            let body = v2Body(
-                messages: messages, segments: seg, system: seg.combined,
-                withTools: withTools
-            )
+        do {
+            let body = v2Body(messages: messages, segments: seg, system: seg.combined)
             let markers = AnthropicOAuthDirectAdapter.cacheMarkers(in: body)
             // 2+ prior turns → the request is on the long TTL.
             #expect(markers.first?.ttl == "1h")
-            if withTools {
-                #expect(markers.first?.position == "tools[1]")
-            }
             // Once a 5m marker appears, no 1h marker may follow it.
             var seenShort = false
             for marker in markers {
@@ -897,7 +868,7 @@ private func clearAtHeaderStubSession() -> URLSession {
             [LLMMessage.user("a"), .assistantText("b"), .user("c"), .system("v")],
         ] {
             let body = v2Body(
-                messages: messages, segments: seg, system: seg.combined, withTools: true
+                messages: messages, segments: seg, system: seg.combined
             )
             let markers = AnthropicOAuthDirectAdapter.cacheMarkers(in: body)
             #expect(!markers.isEmpty)

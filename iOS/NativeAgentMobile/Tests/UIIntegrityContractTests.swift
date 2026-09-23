@@ -47,7 +47,6 @@ final class UIIntegrityContractTests: XCTestCase {
         let app = try Self.source("NativeAgentMobileApp.swift")
         XCTAssertFalse(advanced.contains("base64EncodedString"))
         XCTAssertFalse(settings.contains("base64EncodedString"))
-        XCTAssertTrue(settings.contains("Replace the current pairing?"))
         XCTAssertTrue(
             app.contains(
                 """
@@ -75,8 +74,6 @@ final class UIIntegrityContractTests: XCTestCase {
         XCTAssertFalse(pairing.contains("[Your Name]"))
         XCTAssertFalse(bridge.contains("[Your Name]"))
         XCTAssertFalse(pairing.contains("does not scan a QR code yet"))
-        XCTAssertTrue(pairing.contains("DisclosureGroup(\"Pairing key help\")"))
-        XCTAssertTrue(pairing.contains("copy the pairing key"))
         XCTAssertTrue(pairing.contains("Settings -> Apple Account"))
         XCTAssertTrue(bridge.contains("Settings → Apple Account"))
     }
@@ -429,7 +426,6 @@ final class UIIntegrityContractTests: XCTestCase {
 
     func testSnapshotGroupsDriveVisibleStoresWithoutCloudPolling() throws {
         let setup = try Self.source("iCloudSyncEngine+Setup.swift")
-        let content = try Self.source("ContentView.swift")
         let desk = try Self.source("DeskView.swift")
         let memory = try Self.source("MemoryView.swift")
         let advanced = try Self.source("AdvancedView.swift")
@@ -438,7 +434,6 @@ final class UIIntegrityContractTests: XCTestCase {
         XCTAssertTrue(setup.contains("func refreshSnapshotGroup("))
         XCTAssertTrue(setup.contains("await refreshActivitySnapshot()"))
         XCTAssertTrue(setup.contains("await refreshCatalogSnapshot()"))
-        XCTAssertTrue(content.contains("while !Task.isCancelled, !pairingStore.usesICloudTransport"))
         XCTAssertTrue(desk.contains("await sync.refreshDeskSnapshot()"))
         XCTAssertTrue(desk.contains("iCloudSyncEngine.shared.setDeskItemStatus"))
         XCTAssertTrue(memory.contains(".onChange(of: sync.memories)"))
@@ -570,39 +565,6 @@ final class UIIntegrityContractTests: XCTestCase {
         XCTAssertTrue(persist.contains("seenMessageIDsOrdered.suffix(maxProcessedMacReplyIDs)"))
         XCTAssertFalse(persist.contains("seenMessageIDs.suffix"),
                        "persisting Array(set.suffix(cap)) keeps an arbitrary subset")
-    }
-
-    /// ios.macBridgeClient.retiredHTTPSurface — a dead route BY DESIGN. The
-    /// verdict is pinned here so it stays dated: if a view ever calls `get`
-    /// or `postDict` again it silently receives a throw that `try?` swallows
-    /// into an empty screen.
-    func testTheRetiredHTTPSurfaceHasNoCallersAndFailsLoudlyIfUsed() throws {
-        let client = try Self.source("MacBridgeClient.swift")
-        XCTAssertTrue(client.contains("throw Self.transportRemoved"))
-        XCTAssertTrue(client.contains("Direct HTTP transport removed"))
-        // No live URLSession on the iOS transport path (the header comment
-        // still names it as the thing that was removed, so match a CALL).
-        XCTAssertFalse(client.contains("URLSession.shared"))
-        XCTAssertFalse(client.contains("URLSession("))
-        XCTAssertFalse(client.contains("URLRequest("))
-
-        var callers: [String] = []
-        let sources = try Self.sourcesRoot()
-        let walker = FileManager.default.enumerator(at: sources, includingPropertiesForKeys: nil)
-        for case let url as URL in walker! where url.pathExtension == "swift" {
-            guard let text = try? String(contentsOf: url, encoding: .utf8) else { continue }
-            for line in text.split(separator: "\n") {
-                let trimmed = line.trimmingCharacters(in: .whitespaces)
-                guard trimmed.contains(".postDict(") || trimmed.contains("bridge.get(") else { continue }
-                if trimmed.hasPrefix("//") || trimmed.hasPrefix("///") { continue }
-                if url.lastPathComponent == "MacBridgeClient.swift" { continue }
-                callers.append("\(url.lastPathComponent): \(trimmed)")
-            }
-        }
-        XCTAssertTrue(
-            callers.isEmpty,
-            "the retired HTTP surface has callers again; they degrade to empty screens: \(callers)"
-        )
     }
 
     /// Extract a brace-balanced function body by header prefix.

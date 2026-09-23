@@ -145,35 +145,8 @@ extension CognitiveSubstrate {
         return thoughtSeeds[seed.id]
     }
 
-    public func decayThoughtSeeds() async {
-        await waitForMaintenanceTransition()
-        // Review round 2 (MED): this public entry persists the thought-seed
-        // family, so it must also respect the MICROCYCLE's commit window
-        // (R-F2's maintenanceCommitInFlight), not just the maintenance gate —
-        // otherwise it can reproduce the exact seed-family disk race R-F2
-        // closes. No production caller hits this today; skip-and-let-the-next-
-        // pass-decay matches how maintenance itself yields to the window.
-        guard !maintenanceCommitInFlight else { return }
-        guard configuration.enabled, configuration.thoughtSeedsEnabled else { return }
-        let now = dependencies.now()
-        let previous = thoughtSeeds
-        let changed = decayThoughtSeedsInMemory(at: now)
-        guard changed else { return }
-        thoughtSeedRevision &+= 1
-        let revision = thoughtSeedRevision
-        do {
-            try await persistThoughtSeedFamily()
-        } catch {
-            if thoughtSeedRevision == revision {
-                thoughtSeeds = previous
-                thoughtSeedRevision &+= 1
-            }
-        }
-    }
-
-    /// Await-free maintenance primitive. The public lifecycle helper retains
-    /// its checked family write; the full maintenance pass folds this exact
-    /// mutation into its larger SQLite transaction instead.
+    /// Await-free maintenance primitive. The full maintenance pass folds this
+    /// mutation into its larger SQLite transaction.
     @discardableResult
     func decayThoughtSeedsInMemory(at now: Date) -> Bool {
         guard configuration.enabled, configuration.thoughtSeedsEnabled else { return false }

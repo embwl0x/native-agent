@@ -10,28 +10,21 @@ struct KimiCodeTextCompatRoutingTests {
     @Test func kimiCodeModelsRouteToTextCompat() {
         for model in ["kimi-for-coding", "k3", "kimi-for-coding-highspeed"] {
             #expect(SwiftNativeChatOrchestrationClient.shouldUseAnthropicTextStreamingCompatibility(
-                model: model, surface: "chat"))
+                model: model))
         }
     }
 
     @Test func moonshotKimiIdsDoNotRouteToTextCompat() {
         for model in ["kimi-k2-instruct", "kimi-latest", "moonshot-v1-128k"] {
             #expect(!SwiftNativeChatOrchestrationClient.shouldUseAnthropicTextStreamingCompatibility(
-                model: model, surface: "chat"))
+                model: model))
         }
-    }
-
-    @Test func kimiCodeRoutingRespectsSurfaceGate() {
-        // Non-compat surfaces (e.g. the dream surface) stay off text-compat
-        // regardless of model — same rule as claude-* ids.
-        #expect(!SwiftNativeChatOrchestrationClient.shouldUseAnthropicTextStreamingCompatibility(
-            model: "kimi-for-coding", surface: "dream"))
     }
 
     @Test func slackUsesTheSameAnthropicTextToolContractAsChat() {
         for model in ["claude-sonnet-5", "kimi-for-coding"] {
             #expect(SwiftNativeChatOrchestrationClient.shouldUseAnthropicTextStreamingCompatibility(
-                model: model, surface: "slack"))
+                model: model))
         }
     }
 }

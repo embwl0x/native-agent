@@ -17,7 +17,8 @@ import WorkshopExecution
 
 extension SwiftToolDispatcher {
     func impl_get_persona_doc(input: [String: JSONValue]) async throws -> JSONValue {
-        let doc = try requireString(input, "doc")
+        // 2026-09-22: persona_read/write/append take `kind`; accept it here too.
+        let doc = try requireString(input, input["doc"] == nil && input["kind"] != nil ? "kind" : "doc")
         // Reject path-traversal characters.
         if doc.contains("/") || doc.contains("..") || doc.hasPrefix(".") {
             throw AutonomyGateError.toolDenied(
@@ -137,11 +138,6 @@ extension SwiftToolDispatcher {
 
     func impl_agent_introspect(input: [String: JSONValue], invokedAs: String) async throws -> JSONValue {
         let sessionId = Self.extractSessionId(from: input)
-        if jsonString(input["detail"])?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "jev" {
-            return await JevLog.shared.evidence(
-                dataRoot: dataRoot, sessionID: sessionId, turnID: jsonString(input["turn_id"])
-            )
-        }
         let fullDetail = (jsonString(input["detail"]) ?? "compact")
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased() == "full"

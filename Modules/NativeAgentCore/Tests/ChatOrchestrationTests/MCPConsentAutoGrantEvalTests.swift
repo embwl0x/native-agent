@@ -202,3 +202,60 @@ func mcpDispatch_fullMacYoloRunsApprovalRiskWithoutPersistingStandingConsent(col
         #expect(String(describing: error).contains("consent was revoked"))
     }
 }
+
+/// A legacy granted row is not a fresh authorization request: Full Mac can
+/// resolve and renew it. Restricted and unauthenticated surfaces cannot,
+/// except for a low-risk tool, which auto-grants as if it had no row.
+@Test(arguments: ["chat", "telegram", "a2a"], [false, true])
+func mcpDispatch_legacyConsentRenewalRequiresAdmittedFullMac(surface: String, fullMac: Bool) async throws {
+    let root = try MCPConsentEvalRoot.make()
+    defer { root.cleanup() }
+    if fullMac { try root.enableFullMacYolo() }
+    let mcp = SwiftNativeMCPDispatcher(root: root.dataRoot)
+    for (server, tool, risk) in [("readserver", "peek", "app_data_read"), ("writeserver", "poke", "app_write")] {
+        _ = try await mcp.grantConsent(MCPConsentGrant(serverId: server, toolName: tool, risk: risk))
+    }
+    let ledger = root.dataRoot.appendingPathComponent("mcp/consent/ledger.json")
+    var rows = try JSONSerialization.jsonObject(with: Data(contentsOf: ledger)) as! [[String: Any]]
+    for index in rows.indices {
+        rows[index].removeValue(forKey: "unpinned")
+        rows[index].removeValue(forKey: "serverIdentity")
+    }
+    try JSONSerialization.data(withJSONObject: rows).write(to: ledger)
+    let dispatcher = SwiftToolDispatcher(dataRoot: root.dataRoot)
+    for (server, tool, risk) in [("readserver", "peek", "app_data_read"), ("writeserver", "poke", "app_write")] {
+        let original = try Data(contentsOf: ledger)
+        if risk == "app_data_read" || (fullMac && surface == "chat") {
+            let result = try await dispatcher.impl_mcp_tool(serverId: server, toolName: tool, input: [:], surface: surface)
+            guard case .object(let fields) = result else { Issue.record("Expected transport result"); continue }
+            #expect(fields["reason"] == .string("server_not_running"), "Must reach transport rather than stale-consent denial")
+            let row = try #require(try await mcp.listConsents().first { $0.serverId == server && $0.toolName == tool })
+            #expect(MCPToolBridge.consent(row, matchesCurrentEffectiveRisk: risk))
+        } else {
+            await #expect(throws: (any Error).self) {
+                _ = try await dispatcher.impl_mcp_tool(serverId: server, toolName: tool, input: [:], surface: surface)
+            }
+            #expect(try Data(contentsOf: ledger) == original)
+        }
+    }
+}
+
+@Test func mcpDispatch_fullMacCannotRenewUnresolvableImplementation() async throws {
+    let root = try MCPConsentEvalRoot.make()
+    defer { root.cleanup() }
+    try root.enableFullMacYolo()
+    let registry = root.dataRoot.appendingPathComponent("mcp/servers.json")
+    try Data(#"[{"id":"readserver","name":"read","transport":"stdio","command":"/usr/bin/env -i /usr/bin/true","status":"ready","riskClass":"app_data_read"}]"#.utf8).write(to: registry)
+    let mcp = SwiftNativeMCPDispatcher(root: root.dataRoot)
+    _ = try await mcp.grantConsent(MCPConsentGrant(serverId: "readserver", toolName: "peek", risk: "app_data_read"))
+    let ledger = root.dataRoot.appendingPathComponent("mcp/consent/ledger.json")
+    let original = try Data(contentsOf: ledger)
+    do {
+        _ = try await SwiftToolDispatcher(dataRoot: root.dataRoot).impl_mcp_tool(
+            serverId: "readserver", toolName: "peek", input: [:], surface: "chat")
+        Issue.record("Unresolvable execution must not run")
+    } catch {
+        #expect(String(describing: error).contains("could not be pinned"))
+    }
+    #expect(try Data(contentsOf: ledger) == original)
+}

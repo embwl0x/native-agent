@@ -263,7 +263,7 @@ private func makeSN(_ surfacesBody: String = "{}") throws -> SwiftNativeProvider
     // rewritten to the provider default, never left stale (the runtime would
     // fail that turn loudly) and never silently swapped at dispatch time.
     let pinned = try await routing.pinnedModelStringForSurfaceChecked("telegram")
-    #expect(pinned == "claude-opus-4-8")
+    #expect(pinned == "claude-opus-5-5")
 }
 
 // A compatible pin survives a provider switch untouched.

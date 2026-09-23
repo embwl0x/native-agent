@@ -371,7 +371,8 @@ extension ContextFlowCoordinatorTests {
         body: String,
         authority: ContextAuthority,
         policy: ContextInjectionPolicy,
-        permittedSurfaces: Set<ContextSurface> = [.chat, .bridge]
+        permittedSurfaces: Set<ContextSurface> = [.chat, .bridge],
+        topics: [String] = []
     ) -> ContextCompiledSource {
         let sourceID = ContextStableID.source(owner: owner, locator: locator)
         let sourceHash = ContextStableID.digest(parts: [body])
@@ -404,7 +405,10 @@ extension ContextFlowCoordinatorTests {
             privacy: .localPrivate,
             permittedSurfaces: permittedSurfaces,
             injectionPolicy: policy,
-            contentRole: kind == .correction ? .memory : .fact
+            contentRole: kind == .correction ? .memory : .fact,
+            entities: topics.map {
+                ContextEntity(kind: ContextCorrectionScope.entityKind, id: $0.lowercased(), label: $0)
+            }
         )
         return ContextCompiledSource(
             descriptor: descriptor,

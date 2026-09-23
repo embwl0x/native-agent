@@ -212,7 +212,7 @@ enum ChatFirstRenderTelemetry {
     ) -> Eligibility {
         guard role == "assistant" else { return .notAssistant }
         guard isLastAssistant else { return .notLastAssistant }
-        guard !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        guard ChatTranscriptPresentation.hasVisibleText(content) else {
             return .emptyContent
         }
         // A present-but-blank message session is malformed; do not fall back
@@ -1376,22 +1376,19 @@ struct MessageBubble: View {
                     // The classic shell keeps the floating bar exactly where it
                     // was. The new shell does NOT — see the strip below.
                     .overlay(alignment: seatsRight ? .topTrailing : .topLeading) {
-                        if !shellChrome {
+                        // Mounted only while hovered (2026-09-22): an
+                        // opacity-zero bar still built in every row.
+                        if !shellChrome, isHovered {
                             hoverBar
                                 .padding(.horizontal, 8)
                                 .offset(y: -14)
-                                .opacity(isHovered ? 1 : 0)
-                                .scaleEffect(
-                                    isHovered ? 1 : 0.96,
-                                    anchor: seatsRight ? .topTrailing : .topLeading
-                                )
-                                .allowsHitTesting(isHovered)
                                 // This is a pointer-only duplicate of the
                                 // message's accessibility actions below.
-                                // Keeping an opacity-zero button row in the AX
-                                // tree creates phantom focus stops.
                                 .accessibilityHidden(true)
-                                .animation(NativeAgentMotion.quick, value: isHovered)
+                                .transition(.opacity.combined(with: .scale(
+                                    scale: 0.96,
+                                    anchor: seatsRight ? .topTrailing : .topLeading
+                                )))
                         }
                     }
 
@@ -1406,12 +1403,14 @@ struct MessageBubble: View {
                 // that appears on hover changes the bubble's height, and every
                 // scroll strategy shows that as a hop.
                 if shellChrome {
-                    hoverBar
-                        .frame(height: NativeAgentShellLayout.hoverBarStrip, alignment: .center)
-                        .opacity(isHovered ? 1 : 0)
-                        .allowsHitTesting(isHovered)
-                        .accessibilityHidden(true)
-                        .animation(NativeAgentMotion.quick, value: isHovered)
+                    ZStack {
+                        if isHovered {
+                            hoverBar
+                                .accessibilityHidden(true)
+                                .transition(.opacity)
+                        }
+                    }
+                    .frame(height: NativeAgentShellLayout.hoverBarStrip, alignment: .center)
                 }
 
                 if !isUser, isLastAssistant, messageNeedsRetry {
@@ -1493,7 +1492,7 @@ struct MessageBubble: View {
             }
         ))
         .onAppear { emitFirstRenderIfNeeded() }
-        .onChange(of: message.content) { emitFirstRenderIfNeeded() }
+        .onChange(of: hasVisibleContent) { emitFirstRenderIfNeeded() }
         // Read-aloud failures (trust denied / not configured / auth rejected)
         // land in voiceOutput.errorMessage, which nothing else reads — surface
         // them in the bubble toast. Cleared after showing so a repeat failure
@@ -1576,7 +1575,9 @@ struct MessageBubble: View {
         // message's own session, not the active session, so an in-flight
         // bubble in a non-active session still renders correctly when the
         // user switches back to view it.
-        if appModel.isSessionStreaming(message.sessionId ?? appModel.activeChatSessionId) && isLastAssistant && message.role == "assistant" {
+        // Cheap row-local checks first (2026-09-22): only the tail bubble may
+        // observe `streamingSessions`, or every row re-renders per turn.
+        if isLastAssistant && message.role == "assistant" && appModel.isSessionStreaming(message.sessionId ?? appModel.activeChatSessionId) {
             // Streaming stays raw: the in-flight bubble changes on every
             // coalesce tick, so neither the block split nor the markdown parse
             // may run here. Rich content resolves once the turn settles.

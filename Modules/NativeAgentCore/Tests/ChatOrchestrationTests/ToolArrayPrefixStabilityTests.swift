@@ -37,6 +37,7 @@ private struct PrefixTurnHarness {
     let store: ActiveToolsStore
     let session: String
     let catalog: [LLMToolSchema]
+    let root: URL
 
     @discardableResult
     func turn(
@@ -44,6 +45,16 @@ private struct PrefixTurnHarness {
         predicting: Set<String> = [],
         stableToolArray: Bool = true
     ) async -> (advertised: [String], toolsSHA256: String, commit: ActiveToolsStore.TurnContractCommit) {
+        // 2026-09-22: predictions land only on a cold cache, so a predicting
+        // turn here arrives after a long idle gap.
+        if !promoting.isEmpty || !predicting.isEmpty {
+            let path = root.appendingPathComponent("chat/active_tools/\(session).json")
+            if let data = try? Data(contentsOf: path),
+               var object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                object["lastTurnAt"] = "2000-01-01T00:00:00Z"
+                try? JSONSerialization.data(withJSONObject: object).write(to: path)
+            }
+        }
         await store.beginTurn(sessionId: session)
         let commit = await store.commitTurnStartContract(
             sessionId: session,
@@ -89,7 +100,8 @@ private func makeHarness(
         PrefixTurnHarness(
             store: ActiveToolsStore(dataRoot: root),
             session: "11111111-2222-3333-4444-555555555555",
-            catalog: names.map(prefixSchema)
+            catalog: names.map(prefixSchema),
+            root: root
         ),
         root
     )
@@ -178,7 +190,7 @@ func changingPredictions_appendPersistedSlotsAcrossThreeTurns() async throws {
     var previous: [String] = []
     for name in ["calendar_list", "music_search", "files_read"] {
         let reopened = PrefixTurnHarness(
-            store: ActiveToolsStore(dataRoot: root), session: h.session, catalog: h.catalog
+            store: ActiveToolsStore(dataRoot: root), session: h.session, catalog: h.catalog, root: root
         )
         let next = await reopened.turn(predicting: [name])
         #expect(next.advertised.starts(with: previous))
@@ -312,7 +324,8 @@ func floorEntryMissingFromTheCatalog_isDroppedNotRestoredFromAStaleSchema() asyn
     let shrunk = PrefixTurnHarness(
         store: h.store,
         session: h.session,
-        catalog: h.catalog.filter { $0.name != "mail_send" }
+        catalog: h.catalog.filter { $0.name != "mail_send" },
+        root: h.root
     )
     let next = await shrunk.turn()
     #expect(next.commit.state.offerFloor?.contains("mail_send") == false)

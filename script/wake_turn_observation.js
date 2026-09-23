@@ -149,7 +149,10 @@ async function readCanonicalTurnResult(client, threadId, turnId, config, eventTu
         // items, which reads as an unknown outcome. The rollout's
         // task_complete row carries the actual error — let its failed
         // verdict override the ambiguous no-reply classification.
-        if (fromThread.status === "completed_without_reply") {
+        // A different app-server can hydrate a completed resumed turn as
+        // interrupted. Its exact durable terminal event wins over that view;
+        // retained answer text by itself never establishes completion.
+        if (fromThread.status === "completed_without_reply" || fromThread.status === "aborted") {
           let livePath = rolloutPath && fs.existsSync(rolloutPath) ? rolloutPath : null;
           let fromRollout = livePath ? extractTurnResultFromRollout(livePath, turnId) : null;
           if (!fromRollout) {
@@ -165,7 +168,7 @@ async function readCanonicalTurnResult(client, threadId, turnId, config, eventTu
               fromRollout = extractTurnResultFromRollout(livePath, turnId);
             }
           }
-          if (fromRollout && fromRollout.status === "failed") {
+          if (fromRollout && (fromRollout.status === "failed" || fromThread.status === "aborted")) {
             return fromRollout;
           }
         }
@@ -674,7 +677,7 @@ function runClaude({ prompt, sessionArgs, sessionId, cwd, timeoutSeconds, stallS
     const binOverride = process.env.NATIVE_AGENT_CLAUDE_WAKE_CLAUDE_BIN;
     const command = binOverride || "/usr/bin/env";
     // the user, 2026-09-04: a wake session is a worker, and workers run Opus 5.
-    const model = process.env.NATIVE_AGENT_CLAUDE_WAKE_MODEL || "claude-opus-5";
+    const model = process.env.NATIVE_AGENT_CLAUDE_WAKE_MODEL || "claude-opus-5-5";
     const args = binOverride
       ? [...sessionArgs, "-p", prompt, "--model", model]
       : ["claude", ...sessionArgs, "-p", prompt, "--model", model];

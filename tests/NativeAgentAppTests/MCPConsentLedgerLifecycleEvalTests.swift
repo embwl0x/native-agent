@@ -34,6 +34,29 @@ func seedConsentTestServer(root: URL, id: String, risk: String = "external") thr
 /// here against the real dispatcher over a throwaway root.
 @Suite("app.settings · MCP consent ledger lifecycle")
 struct MCPConsentLedgerLifecycleEvalTests {
+    @Test func fullMacUIRenewsResolvableLegacyConsentAndExecutes() async throws {
+        let root = try tempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let registry = root.appendingPathComponent("mcp/servers.json")
+        try Data(#"[{"id":"nativeagent-internal","name":"native","transport":"native","riskClass":"app_data_read","status":"ready"}]"#.utf8).write(to: registry)
+        let trust = root.appendingPathComponent("trust")
+        try FileManager.default.createDirectory(at: trust, withIntermediateDirectories: true)
+        try Data(#"{"permissionLevel":"full_mac_os","fullMacNeverExpires":true,"fullMacExpiresAt":"never"}"#.utf8).write(to: trust.appendingPathComponent("policy.json"))
+        let dispatcher = SwiftNativeMCPDispatcher(root: root)
+        _ = try await dispatcher.grantConsent(MCPConsentGrant(
+            serverId: "nativeagent-internal", toolName: "production.summary", risk: "app_data_read"))
+        let ledger = root.appendingPathComponent("mcp/consent/ledger.json")
+        var rows = try ledgerRows(root: root)
+        rows[0].removeValue(forKey: "unpinned")
+        rows[0].removeValue(forKey: "serverIdentity")
+        try JSONSerialization.data(withJSONObject: rows).write(to: ledger)
+        let client = NativeClient(baseURL: "", dataRootOverride: root)
+        let result = try await client.callMCPTool(serverId: "nativeagent-internal", toolName: "production.summary", input: [:])
+        #expect(result.status == "ok")
+        let renewed = try #require(try await dispatcher.listConsents().first)
+        #expect(MCPToolBridge.consent(renewed, matchesCurrentEffectiveRisk: "app_data_read"))
+    }
+
     @Test(arguments: ["existing", "legacy", "auto-granted"])
     func uiRefusesUnpinnedConsentBeforeDispatch(_ scenario: String) async throws {
         let root = try tempRoot()

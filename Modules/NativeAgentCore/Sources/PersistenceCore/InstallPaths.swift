@@ -59,10 +59,19 @@ public struct InstallPaths: Sendable {
     }
     public func ownsChromeManifest(_ manifest: [String: Any], relay: URL) -> Bool {
         if let owner = manifest["nativeagent_bundle_id"] as? String { return owner == bundleIdentifier }
-        // A pre-ownership manifest can only be adopted by the relay it names.
-        return (manifest["path"] as? String).map {
-            URL(fileURLWithPath: $0).resolvingSymlinksInPath() == relay.resolvingSymlinksInPath()
-        } ?? false
+        // Adopt a pre-ownership relay from an earlier location of this app.
+        guard let path = manifest["path"] as? String, path.hasPrefix("/") else { return false }
+        let oldRelay = URL(fileURLWithPath: path).standardizedFileURL
+        if oldRelay.resolvingSymlinksInPath() == relay.resolvingSymlinksInPath() { return true }
+        guard oldRelay.lastPathComponent == "NativeAgentChromeRelay",
+              oldRelay.deletingLastPathComponent().lastPathComponent == "MacOS",
+              oldRelay.deletingLastPathComponent().deletingLastPathComponent().lastPathComponent == "Contents" else { return false }
+        let app = oldRelay.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        // Only when that app is gone or is this same bundle: another installed
+        // variant's manifest is not ours to replace or delete.
+        let other = Bundle(url: app)?.bundleIdentifier
+        return app.pathExtension == "app" && app.deletingPathExtension().lastPathComponent.hasPrefix("NativeAgent")
+            && (other == nil || other == bundleIdentifier)
     }
 
     public func bridgeEnvironment(configRoot: URL) -> [String: String] {

@@ -221,53 +221,6 @@ struct OrganismResidualSleepTests {
         #expect(noPrediction != noField)
     }
 
-    @Test func generatedFrozenRecalibrationImprovesArtifactButHasNoProductionInfluence() throws {
-        let now = Date(timeIntervalSince1970: 500_000)
-        let reading = controlledRecalibrationReading(now: now, evidenceAt: now.addingTimeInterval(-3_600))
-        let samples = (0..<20).map { index in
-            OrganismSleepCalibrationSample(
-                evidenceID: "frozen-\(index)",
-                evidenceClass: index.isMultiple(of: 2) ? .generated : .frozenControlled,
-                predictedProbability: 0.30,
-                observedSuccess: index < 14
-            )
-        }
-        let result = try OrganismGeneratedSleepRecalibrator.recalibrate(
-            reading: reading,
-            samples: samples,
-            authorization: .generatedAndFrozen,
-            at: now
-        )
-        let artifact = result.artifact
-        #expect(artifact.generatedOrFrozenOnly)
-        #expect(artifact.personalModelUpdated == false)
-        #expect(artifact.productionInfluence == false)
-        #expect(artifact.brierAfter < artifact.brierBefore)
-        #expect(result.controlState.lastGeneratedEvidenceGeneration == reading.evidenceGeneration)
-        #expect(result.controlState.lastGeneratedRecalibrationAt == now)
-    }
-
-    @Test func generatedRecalibrationRejectsPersonalRuntimeEvidence() throws {
-        let now = Date(timeIntervalSince1970: 600_000)
-        let reading = controlledRecalibrationReading(now: now, evidenceAt: now.addingTimeInterval(-3_600))
-        let samples = (0..<8).map { index in
-            OrganismSleepCalibrationSample(
-                evidenceID: "runtime-\(index)",
-                evidenceClass: .exactRuntime,
-                predictedProbability: 0.5,
-                observedSuccess: true
-            )
-        }
-        #expect(throws: OrganismGeneratedSleepRecalibrationError.personalEvidenceDenied) {
-            _ = try OrganismGeneratedSleepRecalibrator.recalibrate(
-                reading: reading,
-                samples: samples,
-                authorization: .generatedAndFrozen,
-                at: now
-            )
-        }
-    }
-
     @Test func localRepairReducesFieldResidualAndAcknowledgesExactGeneration() throws {
         let now = Date(timeIntervalSince1970: 700_000)
         let reading = highPressureReading(now: now, evidenceAt: now.addingTimeInterval(-3_600))
@@ -335,45 +288,6 @@ private func highPressureReading(
         lastSignalAt: evidenceAt,
         now: now,
         resourcePressure: resourcePressure
-    )
-}
-
-private func controlledRecalibrationReading(
-    now: Date,
-    evidenceAt: Date
-) -> OrganismResidualRepairOpportunity {
-    let evidence = [
-        OrganismSleepEvidenceReference(
-            id: "frozen-surprise",
-            kind: .transitionSurprise,
-            evidenceClass: .frozenControlled,
-            observedAt: evidenceAt
-        ),
-        OrganismSleepEvidenceReference(
-            id: "generated-contradiction",
-            kind: .contradiction,
-            evidenceClass: .generated,
-            observedAt: evidenceAt
-        ),
-        OrganismSleepEvidenceReference(
-            id: "frozen-calibration",
-            kind: .calibration,
-            evidenceClass: .frozenControlled,
-            observedAt: evidenceAt
-        ),
-    ]
-    return OrganismResidualRepair.opportunity(
-        ledger: .empty,
-        field: .empty,
-        repairState: .empty,
-        lastSignalAt: evidenceAt,
-        at: now,
-        supplemental: OrganismSupplementalSleepResiduals(
-            transitionSurprise: 1,
-            contradiction: 1,
-            calibration: 1,
-            evidence: evidence
-        )
     )
 }
 

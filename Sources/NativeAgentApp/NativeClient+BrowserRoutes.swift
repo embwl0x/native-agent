@@ -435,22 +435,22 @@ extension NativeClient {
         links: [BrowserLink]?
     ) async throws -> [String: JSONValue] {
         let browser = SwiftNativeBrowserClient.defaultClient()
-        let fm = FileManager.default
-        try fm.createDirectory(at: browser.sourcesDir, withIntermediateDirectories: true)
-        let textPath = browser.sourcesDir.appendingPathComponent("\(id).txt")
-        try text.write(to: textPath, atomically: true, encoding: .utf8)
-        try? fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: textPath.path)
+        var artifacts: [BrowserCaptureCache.Kind: Data] = [.text: Data(text.utf8)]
+        if let links { artifacts[.links] = try JSONEncoder().encode(links) }
+        let paths = try await BrowserCaptureCache.shared.store(
+            id: id, artifacts: artifacts, browserRoot: browser.sourcesDir.deletingLastPathComponent())
+        guard let textPath = paths[.text] else { throw CocoaError(.fileWriteUnknown) }
         var receipt: [String: JSONValue] = [
             "url": .string(url.absoluteString),
             "textPath": .string(textPath.path),
             "textChars": .int(Int64(text.count)),
             "textPreview": .string(NativeAppSecretRedactor.redactText(String(text.prefix(3_000)))),
+            "captureRetention": BrowserCaptureCache.shared.policy.receipt,
         ]
-        if let links {
-            let linksReceipt = try await persistBrowserLinksCapture(id: id, url: url, links: links)
-            for (key, value) in linksReceipt where key != "url" {
-                receipt[key] = value
-            }
+        if let links, let linksPath = paths[.links] {
+            receipt["linksPath"] = .string(linksPath.path)
+            receipt["linkCount"] = .int(Int64(links.count))
+            receipt["linksPreview"] = try JSONValue.fromEncodable(Array(links.prefix(25)))
         }
         return receipt
     }
@@ -461,17 +461,16 @@ extension NativeClient {
         links: [BrowserLink]
     ) async throws -> [String: JSONValue] {
         let browser = SwiftNativeBrowserClient.defaultClient()
-        let fm = FileManager.default
-        try fm.createDirectory(at: browser.sourcesDir, withIntermediateDirectories: true)
-        let path = browser.sourcesDir.appendingPathComponent("\(id)-links.json")
         let data = try JSONEncoder().encode(links)
-        try data.write(to: path, options: .atomic)
-        try? fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path.path)
+        let paths = try await BrowserCaptureCache.shared.store(
+            id: id, artifacts: [.links: data], browserRoot: browser.sourcesDir.deletingLastPathComponent())
+        guard let path = paths[.links] else { throw CocoaError(.fileWriteUnknown) }
         return [
             "url": .string(url.absoluteString),
             "linksPath": .string(path.path),
             "linkCount": .int(Int64(links.count)),
             "linksPreview": try JSONValue.fromEncodable(Array(links.prefix(25))),
+            "captureRetention": BrowserCaptureCache.shared.policy.receipt,
         ]
     }
 
@@ -481,11 +480,9 @@ extension NativeClient {
         png: Data
     ) async throws -> [String: JSONValue] {
         let browser = SwiftNativeBrowserClient.defaultClient()
-        let fm = FileManager.default
-        try fm.createDirectory(at: browser.screenshotsDir, withIntermediateDirectories: true)
-        let path = browser.screenshotsDir.appendingPathComponent("\(id).png")
-        try png.write(to: path, options: .atomic)
-        try? fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path.path)
+        let paths = try await BrowserCaptureCache.shared.store(
+            id: id, artifacts: [.screenshot: png], browserRoot: browser.screenshotsDir.deletingLastPathComponent())
+        guard let path = paths[.screenshot] else { throw CocoaError(.fileWriteUnknown) }
         // A screenshot exists to be LOOKED at. 2026-09-13: it came back as a
         // path, so seeing it cost a second turn with read_file — the same
         // complaint Agent raised about image_generate. The thumbnail rides
@@ -498,6 +495,7 @@ extension NativeClient {
             "bytes": .int(Int64(png.count)),
             "shownToModel": .bool(shown.shown),
             "visionNote": .string(shown.note),
+            "captureRetention": BrowserCaptureCache.shared.policy.receipt,
         ]
     }
 

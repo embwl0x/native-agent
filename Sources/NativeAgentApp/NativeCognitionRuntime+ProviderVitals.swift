@@ -200,8 +200,11 @@ extension NativeCognitionRuntime {
             "related_paths": .array([]),
             "related_groups": .array([]),
             "actions": .array([]),
-            "status": .string("unread"),
-            "read_at": .null,
+            // 2026-09-22: a recovery retires the degraded card rather than
+            // posting a new one; the row lands archived so the latest-state
+            // gate still reads "recovered".
+            "status": .string(kind == "recovered" ? "archived" : "unread"),
+            "read_at": kind == "recovered" ? .string(stamp) : .null,
             "providerVitalsProvider": .string(providerId),
             "providerVitalsKind": .string(kind),
         ])

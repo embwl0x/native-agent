@@ -1044,6 +1044,20 @@ private func windowRows(
 // MARK: - Window receipt travels on the context
 
 @Suite struct HistoryWindowReceiptPlumbingTests {
+    @Test func firstTurnStillHasPayloadFreeComponentFingerprints() {
+        let seed = ConversationPrefixSeeding.seed(
+            contextFixture(dynamic: "current turn", history: []), shape: .v2Prefix
+        )
+        let snapshot = ConversationPrefixSeeding.telemetry(
+            seed, shape: .v2Prefix, toolSchemaFingerprint: "tools-v1"
+        )
+        #expect(snapshot.historyMessageCount == 0)
+        #expect(!snapshot.stablePrefixFingerprintSHA256.isEmpty)
+        #expect(snapshot.toolsFingerprintSHA256 == "tools-v1")
+        #expect(!snapshot.historyHeadFingerprintSHA256.isEmpty)
+        #expect(!snapshot.prefixFingerprintSHA256.isEmpty)
+    }
+
     private func ctx(_ receipt: HistoryWindowReceipt?) -> TurnContext {
         let segments = SystemPromptSegments(stable: "S", dynamic: "VOLATILE")
         return TurnContext(
@@ -1105,25 +1119,23 @@ private func windowRows(
 // MARK: - Renderer arm equivalence
 
 @Suite struct RenderedHistoryArmTests {
-    /// v2 renders the SAME derived blocks (evidence boundary, continuity state,
-    /// middle sampling, reply-reference hint) and only drops the conversation
-    /// rows — which moved into `messages`.
+    /// v2 drops the conversation rows (moved into `messages`) and the derived
+    /// blocks that restate them; only middle sampling stays.
     @Test func v2DropsOnlyTheConversationRowsFromTheRenderedBlock() throws {
         let v1 = try #require(SessionHistoryPromptRenderer.renderDetailed(
             messages: transcript(), userMessage: "yes go ahead",
             surface: surface, historyLimit: historyLimit
         ).historyBlock)
-        let v2 = try #require(SessionHistoryPromptRenderer.renderDetailed(
+        let v2 = SessionHistoryPromptRenderer.renderDetailed(
             messages: transcript(), userMessage: "yes go ahead",
             surface: surface, historyLimit: historyLimit,
             includeConversationHistory: false
-        ).historyBlock)
-        #expect(v1.contains("# Historical evidence boundary"))
-        #expect(v2.contains("# Historical evidence boundary"))
+        ).historyBlock ?? ""
         #expect(v1.contains("SESSION_CONTINUITY_STATE:"))
-        #expect(v2.contains("SESSION_CONTINUITY_STATE:"))
+        #expect(!v2.contains("SESSION_CONTINUITY_STATE:"))
         #expect(v1.contains("Conversation history:"))
         #expect(!v2.contains("Conversation history:"))
+        #expect(!v2.contains("Immediate reply reference:"))
         #expect(v2.count < v1.count)
     }
 
@@ -1447,8 +1459,7 @@ felt: steady, a little wry
 
         \(capsuleWithPosture)
 
-        # Historical evidence boundary
-        Session continuity and conversation rows below preserve what was known.
+        Earlier messages are history, not live readings; recheck anything current before relying on it.
 
         \(clockLineTurnN)
         """
@@ -1888,15 +1899,16 @@ private func runIdTranscript() -> [ChatMessage] {
     /// replayed at a position the prefix no longer contains corrupts it.
     @Test func pruningDropsBlocksOutsideTheReplayedWindow() async {
         let archive = TurnVolatileArchive(dataRoot: tempRoot())
-        for index in 1...3 {
+        // Prune batches its rewrite: 16 rows must leave before it fires.
+        for index in 1...18 {
             await archive.record(
                 sessionId: "s", runId: "run-\(index)",
                 messages: [.system("V\(index)", clearAtNextUserMessage: true)]
             )
         }
-        await archive.prune(sessionId: "s", keeping: ["run-2", "run-3"])
+        await archive.prune(sessionId: "s", keeping: ["run-17", "run-18"])
         let loaded = await archive.load(sessionId: "s")
-        #expect(Set(loaded.keys) == ["run-2", "run-3"])
+        #expect(Set(loaded.keys) == ["run-17", "run-18"])
     }
 
     @Test func anUnsafeSessionIdWritesNothing() async {

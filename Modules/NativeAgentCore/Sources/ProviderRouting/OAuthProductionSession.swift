@@ -5,7 +5,7 @@ enum OAuthProductionSession {
         let cfg = URLSessionConfiguration.default
         cfg.timeoutIntervalForRequest = timeoutValue(requestTimeout, fallback: 240)
         cfg.timeoutIntervalForResource = timeoutValue(resourceTimeout, fallback: 600)
-        cfg.waitsForConnectivity = true
+        cfg.waitsForConnectivity = false
         cfg.requestCachePolicy = .reloadIgnoringLocalCacheData
         cfg.urlCache = nil
         return URLSession(configuration: cfg)

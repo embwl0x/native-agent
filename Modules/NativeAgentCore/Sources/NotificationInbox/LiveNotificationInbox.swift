@@ -674,27 +674,13 @@ public actor LiveNotificationInbox {
     /// under the inbox flock the caller already holds, so concurrent producers
     /// cannot interleave a partial batch.
     private static func appendToArchive(_ lines: [Line], forInbox path: URL) throws {
-        let archive = archivePath(forInbox: path)
-        try FileManager.default.createDirectory(
-            at: archive.deletingLastPathComponent(), withIntermediateDirectories: true
-        )
         var payload = Data()
         payload.reserveCapacity(lines.reduce(0) { $0 + $1.raw.count + 1 })
         for line in lines {
             payload.append(line.raw)
             payload.append(0x0A)
         }
-        guard FileManager.default.fileExists(atPath: archive.path) else {
-            try payload.write(to: archive, options: .atomic)
-            try? FileManager.default.setAttributes(
-                [.posixPermissions: 0o600], ofItemAtPath: archive.path
-            )
-            return
-        }
-        let handle = try FileHandle(forWritingTo: archive)
-        defer { try? handle.close() }
-        try handle.seekToEnd()
-        try handle.write(contentsOf: payload)
+        try SwiftNativePersistenceCore.appendLines(payload, to: archivePath(forInbox: path))
     }
 
     private static func id(of row: JSONValue?) -> String? {

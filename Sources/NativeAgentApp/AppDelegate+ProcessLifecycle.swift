@@ -110,6 +110,14 @@ extension AppDelegate {
 
     // MARK: - Login item
 
+    static func registerLoginItemInBackground() {
+        if ProcessInfo.processInfo.environment["NATIVE_AGENT_SKIP_LOGIN_ITEM_REGISTER"] != "1" {
+            Task.detached(priority: .background) {
+                await AppDelegate.registerLoginItemIfNeeded()
+            }
+        }
+    }
+
     /// Register the app to launch at login. Uses SMAppService (modern,
     /// sandboxable, replaces the old SMLoginItemSetEnabled API).
     @MainActor

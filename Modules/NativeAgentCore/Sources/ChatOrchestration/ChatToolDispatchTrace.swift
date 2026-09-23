@@ -51,7 +51,7 @@ public enum ChatToolOutcome {
         let code = [text("error_code"), text("errorCode"), oldReason].compactMap { $0 }.first {
             isCode($0) && !["failed", "error"].contains($0)
         } ?? "tool_failed"
-        let candidates = ["message", "text", "detail", "error", "content", "result"].flatMap { explanations(object[$0]) }
+        let candidates = ["message", "text", "detail", "error", "content", "result", "fix"].flatMap { explanations(object[$0]) }
         let message = candidates.first { !isCode($0) }
             ?? oldReason.flatMap { isCode($0) ? nil : $0 }
             ?? candidates.first
@@ -65,7 +65,7 @@ public enum ChatToolOutcome {
         return .object(object)
     }
 
-    public static func failure(error: any Error) -> JSONValue {
+    public static func failure(error: any Error, tool: String? = nil) -> JSONValue {
         var object: [String: JSONValue] = [
             "status": .string("failed"),
             "failure_code": .string("dispatch_error"),
@@ -79,8 +79,13 @@ public enum ChatToolOutcome {
         if let gate = error as? AutonomyGateError {
             if case .toolDenied(let reason) = gate {
                 object["gate_reason"] = .string(ChatSecretRedactor.redactText(reason))
+                if let tool, reason.hasPrefix("autonomy=") || reason.hasPrefix("fileAccess=") {
+                    let sentence = ToolNotRunStatus.blockedSentence(reason: reason, tool: tool)
+                    object["reason"] = .string(sentence)
+                    object["error"] = .string(sentence)
+                }
             }
-            return normalizedFailure(gate.notRunStatus.reporting(.object(object)))
+            return normalizedFailure(gate.notRunStatus.reporting(.object(object), tool: tool))
         }
         return normalizedFailure(.object(object))
     }
@@ -383,6 +388,7 @@ public enum ChatToolOutcome {
         take("message")
         take("error")
         take("detail")
+        take("fix", label: "fix")
         guard !parts.isEmpty else { return nil }
         return boundedDetail(parts.joined(separator: " | "))
     }
@@ -530,7 +536,7 @@ final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Sendable {
             Self.fireBusEvent(
                 tool: tool, input: input, surface: surface,
                 phase: "end", status: "failed", durationMs: durationMs,
-                result: ChatToolOutcome.failure(error: error)
+                result: ChatToolOutcome.failure(error: error, tool: tool)
             )
             await appendTraceRow(
                 tool: tool, input: input, surface: surface,

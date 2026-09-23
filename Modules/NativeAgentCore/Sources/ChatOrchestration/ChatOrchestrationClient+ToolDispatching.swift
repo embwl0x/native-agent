@@ -28,16 +28,19 @@ extension SwiftNativeChatOrchestrationClient {
         fileAccess: String,
         verifiedSessionId: String?
     ) -> any ToolDispatchClient {
-        makeGatedToolDispatchClient(
+        // 2026-09-22: a background turn on the text tool lane keeps its caller's
+        // trust source and identity, as it would on the structured loop.
+        let ephemeral = EphemeralTextLane.current.flatMap { $0.sessionId == verifiedSessionId ? $0 : nil }
+        return makeGatedToolDispatchClient(
             tools: tools,
             fileAccess: fileAccess,
             approvalFiler: approvalFiler,
             approvalTimeoutSeconds: approvalTimeoutSeconds,
             dataRoot: dataRoot,
-            trust: trust,
-            verifiedSessionId: verifiedSessionId,
+            trust: ephemeral?.autonomyResolver ?? trust,
+            verifiedSessionId: ephemeral.map { $0.verifiedSessionId ?? $0.sessionId } ?? verifiedSessionId,
             tracePeerTurn: true,
-            allowsFirstConversationExemption: true
+            allowsFirstConversationExemption: ephemeral?.autonomyResolver == nil
         )
     }
 }

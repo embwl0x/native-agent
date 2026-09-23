@@ -9,7 +9,7 @@ extension SwiftNativeResearchClient {
     }
     // MARK: search
 
-    public func search(query: String) async throws -> ResearchSearchResponse {
+    public func search(query: String, categories: String? = nil, timeRange: String? = nil) async throws -> ResearchSearchResponse {
         // Pull base from config; empty/missing → ResearchClientError.notConfigured
         // (matches Python's `raise ValueError("SearXNG base URL is not configured")`).
         let raw = await persistence.readJSON(configPath, defaultValue: .object([:]))
@@ -20,7 +20,12 @@ extension SwiftNativeResearchClient {
         let base = trimTrailingSlash(rawBase)
         if base.isEmpty { throw ResearchClientError.notConfigured }
 
-        guard let url = makeURL(base: base, path: "/search", query: [("q", query), ("format", "json")]) else {
+        var parameters = [("q", query), ("format", "json")]
+        if let categories, !categories.isEmpty { parameters.append(("categories", categories)) }
+        if let timeRange, ["day", "week", "month", "year"].contains(timeRange) {
+            parameters.append(("time_range", timeRange))
+        }
+        guard let url = makeURL(base: base, path: "/search", query: parameters) else {
             throw ResearchClientError.malformedResponse("could not build SearXNG /search URL")
         }
         let (status, body): (Int, Data)
@@ -69,7 +74,19 @@ extension SwiftNativeResearchClient {
         try await persistence.writeJSON(receiptObj, to: receiptPath)
         pruneReceiptsIfNeeded()
 
-        return ResearchSearchResponse(results: results)
+        // SearXNG sends [[engine, reason], ...].
+        var unresponsive: [String] = []
+        if case .array(let engines) = payload["unresponsive_engines"] ?? .null {
+            for engine in engines {
+                guard case .array(let pair) = engine, case .string(let name)? = pair.first else { continue }
+                if pair.count > 1, case .string(let reason) = pair[1] {
+                    unresponsive.append("\(name): \(reason)")
+                } else {
+                    unresponsive.append(name)
+                }
+            }
+        }
+        return ResearchSearchResponse(results: results, unresponsiveEngines: unresponsive)
     }
 
     // MARK: fetch (wave 30 W17)
@@ -171,7 +188,9 @@ extension SwiftNativeResearchClient {
         let chars = Array(html)
         var i = 0
         let n = chars.count
-        let skipTags: Set<String> = ["script", "style", "noscript"]
+        // 2026-09-23: nav/footer/svg are page chrome; they buried the body.
+        // Not header: <article><header> holds the title, and this skipper has no ancestry.
+        let skipTags: Set<String> = ["script", "style", "noscript", "nav", "footer", "svg"]
 
         func appendData(_ raw: String) {
             // Python's `convert_charrefs=True` means entities are decoded

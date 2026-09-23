@@ -122,7 +122,7 @@ final class AnthropicOAuthStubURLProtocol: URLProtocol, @unchecked Sendable {
         ])
         #expect(session.configuration.timeoutIntervalForRequest == 12)
         #expect(session.configuration.timeoutIntervalForResource == 34)
-        #expect(session.configuration.waitsForConnectivity == true)
+        #expect(session.configuration.waitsForConnectivity == false)
         #expect(session.configuration.urlCache == nil)
     }
 
@@ -387,7 +387,7 @@ final class AnthropicOAuthStubURLProtocol: URLProtocol, @unchecked Sendable {
             _ = try await adapter.complete(prompt: "p", system: nil, model: "claude-opus-4-8")
             Issue.record("expected throw")
         } catch let err as LLMError {
-            #expect(ProviderFailure.classify(err) == .rateLimited(retryAfter: nil))
+            #expect(ProviderFailure.classify(err) == .rateLimited(retryAfter: 3600))
         }
     }
 

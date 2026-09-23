@@ -6,6 +6,7 @@ import PersistenceCore
 import ProviderRouting
 import Testing
 @testable import ChatOrchestration
+import NativeAgentTestSupport
 
 // Coverage-ledger fence `core.chat.persistence`:
 //   * chat.persistence.shouldPersistFailureMessage (dead control)
@@ -91,7 +92,7 @@ struct EvalFailureRowPersistenceTests {
         let persisting = [
             "app", "chat", "mac", "default", "",
             "ios", "mobile", "iphone", "icloud",
-            "claude-bridge", "codex-bridge", "workshop", "missions", "slack", "desk",
+            "claude-bridge", "codex-bridge", "workshop", "missions", "slack", "desk", "telegram",
             // The one that matters most: a name nobody has invented yet.
             "surface-invented-next-quarter",
         ]
@@ -102,9 +103,9 @@ struct EvalFailureRowPersistenceTests {
             )
         }
 
-        // Telegram is the deliberate exception — in every casing/whitespace
+        // Bot is the deliberate exception — in every casing/whitespace
         // shape a live payload actually arrives in, not just the lowercase one.
-        for surface in ["telegram", "Telegram", "TELEGRAM", "  telegram  ", "\ttelegram\n"] {
+        for surface in ["bot", "Bot", "BOT", "  bot  ", "\tbot\n"] {
             #expect(
                 !SwiftNativeChatOrchestrationClient.shouldPersistFailureMessage(surface: surface),
                 "surface \"\(surface)\" is the suppressed lane"
@@ -139,7 +140,7 @@ struct EvalFailureRowPersistenceTests {
         #expect(!content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
         #expect(!content.hasPrefix("Chat error:"))
         #expect(!content.contains("provider stream closed"))
-        #expect(content == ProviderFailure.Report(cause: .network, work: .outcomeUnknown).errorDescription)
+        #expect(content == ProviderFailure.Report(cause: .network, work: .outcomeUnknown).personDescription)
         let metadata = try #require(row["metadata"] as? [String: Any])
         #expect(metadata[CognitiveMechanicalRowKind.metadataKey] as? String
             == CognitiveMechanicalRowKind.systemRow.rawValue)

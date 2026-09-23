@@ -418,7 +418,7 @@ private struct SecurityAuditAppendFailingPersistence: PersistenceCoreProtocol {
     }
     let hotLines = try String(contentsOf: auditPath, encoding: .utf8)
         .split(separator: "\n", omittingEmptySubsequences: true)
-    #expect(hotLines.count == JSONLLineCaps.securityAudit, "trim applied the row cap")
+    #expect(hotLines.count == JSONLLineCaps.securityAuditTrimTargetLines, "trim applied the row cap")
     #expect(hotLines.last?.contains("tool_catalog") == true, "newest receipt survives")
 
     // A later crossing (the trimmed file is still above the trigger here)
@@ -475,7 +475,7 @@ private struct SecurityAuditAppendFailingPersistence: PersistenceCoreProtocol {
     }
     let hotLines = try String(contentsOf: auditPath, encoding: .utf8)
         .split(separator: "\n", omittingEmptySubsequences: true)
-    #expect(hotLines.count == JSONLLineCaps.securityAudit, "row cap applied after archiving")
+    #expect(hotLines.count == JSONLLineCaps.securityAuditTrimTargetLines, "row cap applied after archiving")
     #expect(hotLines.last?.contains("tool_catalog") == true, "newest receipt survives")
 }
 

@@ -102,6 +102,21 @@ enum CodexSelectableModelCatalog {
         }
     }
 
+    /// 2026-09-22: `load` always carries every fallback row, so only the signed
+    /// cache itself says this account can run a model. No cache = cannot.
+    static func signedCacheLists(_ modelID: String, providerID: String, cacheURL: URL?) -> Bool {
+        guard let cacheURL,
+              let data = try? Data(contentsOf: cacheURL),
+              let cache = try? JSONDecoder().decode(Cache.self, from: data) else { return false }
+        let directOAuth = providerID.trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() == "openai_oauth_direct"
+        return cache.models.contains {
+            $0.slug.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == modelID.lowercased()
+                && ($0.visibility == nil || $0.visibility == "list")
+                && (!directOAuth || $0.supportedInAPI != false)
+        }
+    }
+
     static func modelCatalogItems(
         providerID: String = "codex",
         cacheURL: URL? = nil

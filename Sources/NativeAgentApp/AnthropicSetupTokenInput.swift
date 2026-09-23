@@ -82,9 +82,13 @@ struct AnthropicSetupTokenInput: View {
     private func submit() async {
         let t = trimmedToken
         guard !t.isEmpty else { return }
-        status = .submitting
         lastError = nil
         lastSuccess = nil
+        guard t.hasPrefix("sk-ant-oat") else {
+            lastError = "That isn't a setup token. Setup tokens start with sk-ant-oat."
+            return
+        }
+        status = .submitting
 
         // DAEMON KILLED 2026-06-02. Write the setup_token directly to
         // <dataRoot>/providers/anthropic_oauth_direct.json with the shape
@@ -104,7 +108,7 @@ struct AnthropicSetupTokenInput: View {
             try writeJSONObject(payload, to: path)
             status = .idle
             token = ""
-            lastSuccess = "Anthropic setup-token saved to \(path.path)"
+            lastSuccess = "Setup token saved."
             onSuccess?()
         } catch {
             status = .idle

@@ -15,16 +15,8 @@ import Testing
 
 @Suite struct TelegramVoiceDiagnosisTests {
 
-    @Test func missingKeyNoticeIsModelNeutral() {
-        #expect(TelegramPollLoop.voiceTranscriptionNotice(
-            for: TelegramVoiceTranscriptionError.notConfigured
-        ) == "Voice transcription needs an OpenAI API key.")
-    }
-
     /// One representative error per branch, taken from the actual throw sites.
     private static let branchCases: [(label: String, error: Error)] = [
-        // TelegramVoiceTranscription.swift:588
-        ("openai key", TelegramVoiceTranscriptionError.notConfigured),
         // shouldRetryWithoutOnDevice's real macOS string (:523)
         ("siri/dictation", TelegramVoiceTranscriptionError.speechRecognitionFailed(
             "Siri and Dictation are disabled"
@@ -51,7 +43,7 @@ import Testing
         #expect(notices.count == Self.branchCases.count)
 
         let generic = TelegramPollLoop.voiceTranscriptionNotice(
-            for: TelegramVoiceTranscriptionError.transport("connection reset by peer")
+            for: TelegramVoiceTranscriptionError.speechRecognitionFailed("connection reset by peer")
         )
 
         for (label, notice) in notices {
@@ -66,7 +58,7 @@ import Testing
 
     @Test func voiceTranscriptionNotice_uses_the_fallback_only_when_unclassified() {
         let generic = TelegramPollLoop.voiceTranscriptionNotice(
-            for: TelegramVoiceTranscriptionError.transport("connection reset by peer")
+            for: TelegramVoiceTranscriptionError.speechRecognitionFailed("connection reset by peer")
         )
         #expect(generic.contains("voice note"))
         // A second genuinely unclassified error must land on the SAME string —

@@ -90,7 +90,7 @@ struct DiscoveryFirstCallTests {
     }
 
     @Test(arguments: ["mac.notify", "mobile.notify", "mac_notify", "mobile_notify"])
-    func notificationApprovalLoadsOnlyTheAppSchema(tool: String) async throws {
+    func notificationApprovalLoadsOnlyTheCoreSchema(tool: String) async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
         let canonical = tool.replacingOccurrences(of: "_", with: ".")
@@ -123,11 +123,13 @@ struct DiscoveryFirstCallTests {
                 return
             }
         }
+        // The model is offered the core schema only; the app still owns the route.
+        let loadName = canonical.replacingOccurrences(of: ".", with: "_")
         let state = await store.load(sessionId: "notify")
-        #expect(state.activeTools == prior.union([canonical]))
-        #expect(state.loadOrder.last == canonical)
-        #expect(state.pinnedSchemas[canonical] != nil)
-        #expect(state.pinnedSchemas[canonical.replacingOccurrences(of: ".", with: "_")] == nil)
+        #expect(state.activeTools == prior.union([loadName]))
+        #expect(state.loadOrder.last == loadName)
+        #expect(state.pinnedSchemas[loadName] != nil)
+        #expect(state.pinnedSchemas[canonical] == nil)
     }
 
     @Test(arguments: ["doctor_status", "mac.notify", "mobile_notify"])

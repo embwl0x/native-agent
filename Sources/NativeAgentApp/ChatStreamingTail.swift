@@ -53,14 +53,17 @@ struct StreamingTailBubble: View {
 struct ChatStreamingTailObserver: View {
     @Environment(AppModel.self) private var appModel
     var messageID: String?
+    var enabled: Bool
     var onChanged: () -> Void
 
     var body: some View {
-        let box = appModel.streamingTailBox(forMessage: messageID ?? "")
-        return Color.clear
+        if enabled {
+            let box = appModel.streamingTailBox(forMessage: messageID ?? "")
+            Color.clear
             .frame(width: 0, height: 0)
             .accessibilityHidden(true)
             .onChange(of: box.content) { _, _ in onChanged() }
+        }
     }
 }
 
@@ -68,8 +71,8 @@ extension View {
     /// Owns the live-tail dependency without adding a generic layer to a
     /// viewport body that is already at the type-checker's limit.
     func followsStreamingTail(
-        messageID: String?, onChanged: @escaping () -> Void
+        messageID: String?, enabled: Bool = true, onChanged: @escaping () -> Void
     ) -> some View {
-        background(ChatStreamingTailObserver(messageID: messageID, onChanged: onChanged))
+        background(ChatStreamingTailObserver(messageID: messageID, enabled: enabled, onChanged: onChanged))
     }
 }

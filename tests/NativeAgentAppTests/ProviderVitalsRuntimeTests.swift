@@ -89,7 +89,7 @@ private func vitalsRows(root: URL) throws -> [VitalsRow] {
     // association derived from disk, not memory. A second recovery no-ops.
     await second.postProviderVitalsRecoveryNotice(providerId: "kimi-code")
     #expect(try vitalsRows(root: root).map(\.kind) == ["degraded", "recovered"])
-    #expect(try vitalsRows(root: root).map(\.status) == ["archived", "unread"])
+    #expect(try vitalsRows(root: root).map(\.status) == ["archived", "archived"])
     await second.postProviderVitalsRecoveryNotice(providerId: "kimi-code")
     #expect(try vitalsRows(root: root).map(\.kind) == ["degraded", "recovered"])
 
@@ -129,7 +129,7 @@ private func vitalsRows(root: URL) throws -> [VitalsRow] {
     // behind for the latest-row gate to miss.
     await runtimes[0].postProviderVitalsRecoveryNotice(providerId: "kimi-code")
     #expect(try vitalsRows(root: root).map(\.kind) == ["degraded", "recovered"])
-    #expect(try vitalsRows(root: root).map(\.status) == ["archived", "unread"])
+    #expect(try vitalsRows(root: root).map(\.status) == ["archived", "archived"])
 }
 
 @Test func launchReconciliationArchivesSupersededLegacyStates() async throws {

@@ -104,6 +104,54 @@ globalThis.MouseEvent = class {
 
 await import("../src/page-agent.js");
 
+test("semantic main content stays readable when a visible navigation exhausts the ordinary budget", async () => {
+  const original = [...body.children];
+  const nav = new FixtureElement("nav", { parent: body });
+  for (let i = 0; i < 100; i++) new FixtureElement("a", { text: `Navigation ${i}`, parent: nav });
+  const main = new FixtureElement("main", { parent: body });
+  new FixtureElement("h1", { text: "Windows design guidance", parent: main });
+  new FixtureElement("p", { text: "A window presents the content people work with.", parent: main });
+  const nestedNav = new FixtureElement("aside", { parent: main });
+  new FixtureElement("a", { text: "Sidebar navigation", parent: nestedNav });
+  const below = new FixtureElement("p", { text: "Below the current viewport", parent: main });
+  below.getBoundingClientRect = () => ({ x: 10, y: 900, width: 120, height: 40 });
+  body.children = [nav, ...original, main];
+  try {
+    const request = { type: "nativeagent.page.snapshot", leaseId: "article", tabId: 42, userSequence: 0, maxNodes: 80 };
+    const ordinary = (await send(request)).result;
+    assert.equal(ordinary.reading.mainContentAvailable, true);
+    assert.ok(ordinary.summary.truncationReasons.includes("node_limit"));
+    assert.ok(!ordinary.summary.text.includes("window presents"));
+    const focused = (await send({ ...request, scope: "main_content" })).result;
+    assert.equal(focused.reading.scope, "main_content");
+    assert.ok(focused.summary.text.includes("A window presents"));
+    assert.ok(!focused.summary.text.includes("Navigation"));
+    assert.ok(!focused.summary.text.includes("Sidebar navigation"));
+    assert.ok(!focused.summary.text.includes("Below the current viewport"));
+    assert.ok(focused.nodes.length <= 80);
+  } finally { body.children = original; }
+});
+
+test("main-content scope reports missing semantics and does not hide a blocking modal", async () => {
+  const original = [...body.children];
+  try {
+    const request = { type: "nativeagent.page.snapshot", leaseId: "article", tabId: 42, userSequence: 0, scope: "main_content" };
+    const missing = (await send(request)).result;
+    assert.equal(missing.reading.mainContentAvailable, false);
+    assert.equal(missing.nodes.length, 0);
+    const main = new FixtureElement("main", { parent: body });
+    new FixtureElement("button", { text: "Article action", parent: main });
+    const dialog = new FixtureElement("dialog", { text: "Sign in", parent: body });
+    dialog.matches = (selector) => selector === ":modal";
+    new FixtureElement("button", { text: "Close sign in", parent: dialog });
+    const focused = (await send(request)).result;
+    assert.ok(focused.nodes.some((node) => node.name === "Close sign in"));
+    const blocked = focused.nodes.find((node) => node.name === "Article action");
+    assert.equal(blocked.states.blockedByModal, true);
+    assert.deepEqual(blocked.actions, []);
+  } finally { body.children = original; }
+});
+
 test("native modal is a named container and blocks underlying feed actions and page scrolling", async () => {
   const dialog = new FixtureElement("dialog", { text: "Thread", parent: body });
   dialog.matches = (selector) => selector === ":modal";
@@ -138,7 +186,8 @@ test("feed snapshots omit deep layout duplication but keep articles and correctl
     const articleNode = snapshot.nodes.find((node) => node.kind === "article");
     assert.ok(articleNode, "layout cannot consume the 500-node budget before the feed content");
     assert.equal(snapshot.nodes.find((node) => node.name === "Reply").parentNodeId, articleNode.nodeId);
-    assert.ok(snapshot.nodes.some((node) => node.text === "Important prose and a control"));
+    assert.ok(snapshot.nodes.some((node) => node.text === "Important prose"));
+    assert.ok(snapshot.nodes.some((node) => node.name === "More"));
     assert.equal(snapshot.nodes.some((node) => node.text === "Repeated layout text"), false);
     assert.ok(snapshot.nodes.length < 30);
   } finally { body.children.splice(body.children.indexOf(outer), 1); }
@@ -169,6 +218,17 @@ function send(message) {
     assert.ok(returned === false || returned === true);
   });
 }
+
+test("snapshot reports actual rendering state without claiming hidden content is complete", async () => {
+  const previous = { visibility: document.visibilityState, ready: document.readyState };
+  try {
+    document.visibilityState = "hidden"; document.readyState = "complete";
+    const response = await send({ type: "nativeagent.page.snapshot", leaseId: "render-proof", tabId: 42, userSequence: 0 });
+    assert.deepEqual(response.result.rendering, { visibility: "hidden", readyState: "complete", scope: "rendered_dom_only" });
+  } finally {
+    document.visibilityState = previous.visibility; document.readyState = previous.ready;
+  }
+});
 
 test("fill confirms immediate input and editable content without claiming reset values succeeded", async () => {
   const editable = new FixtureElement("div", { attrs: { "aria-label": "Editable proof" }, parent: body });
@@ -274,7 +334,9 @@ test("fixture snapshot returns readable actionable nodes and redacts passwords",
     maxTextChars: 50_000,
   });
   assert.equal(response.ok, true);
-  assert.equal(response.result.summary.text, "Fixture page Buy now Hidden secret");
+  assert.ok(response.result.summary.text.includes("Fixture page"));
+  assert.ok(response.result.summary.text.includes("Buy now"));
+  assert.ok(!response.result.summary.text.includes("Hidden secret"));
   const actionable = response.result.nodes.find((node) => node.name === "Buy now");
   assert.deepEqual(actionable.actions, ["click", "double_click", "keypress", "wait", "drop"]);
   const passwordNode = response.result.nodes.find((node) => node.value === null && node.kind === "input");
@@ -765,6 +827,81 @@ test("zero-delay typing yields for trusted user takeover without continuing the 
   assert.equal(typed.result.stopReason, "user_takeover");
   assert.equal(typed.result.characterCount, 32);
   assert.equal(textInput.value.length, 32);
+});
+
+test("viewport reads reach replies beyond retained feed articles and follow scroll", async () => {
+  const originals = [...body.children];
+  let offset = 0;
+  body.children = [];
+  try {
+    for (let i = 0; i < 550; i++) {
+      const article = new FixtureElement("article", { text: `Old post ${i}`, parent: body });
+      article.getBoundingClientRect = () => ({ x: 0, y: -1000 - i * 50, width: 600, height: 40 });
+      for (let j = 0; j < 12; j++) new FixtureElement("span", { text: "Old detail", parent: article });
+    }
+    const reply = new FixtureElement("article", { text: "A newly visible reply", parent: body });
+    reply.getBoundingClientRect = () => ({ x: 0, y: 900 - offset, width: 600, height: 40 });
+    const read = async () => (await send({ type: "nativeagent.page.snapshot", leaseId: "feed", tabId: 42, userSequence: 0 })).result;
+    assert.ok(!(await read()).summary.text.includes("newly visible"));
+    offset = 500;
+    const after = await read();
+    assert.ok(after.nodes.some((node) => node.text === "A newly visible reply"));
+    assert.equal(after.summary.text, "A newly visible reply");
+    assert.ok(!after.summary.truncationReasons.includes("walk_limit"));
+  } finally { body.children = originals; }
+});
+
+test("spanning feed containers cannot repeat offscreen posts in viewport summaries", async () => {
+  const main = new FixtureElement("main", { text: "Old post plus visible reply", parent: body });
+  main.childNodes = [{ nodeType: 1 }];
+  const old = new FixtureElement("article", { text: "Old post", parent: main });
+  old.getBoundingClientRect = () => ({ x: 0, y: -900, width: 600, height: 100 });
+  new FixtureElement("article", { text: "Visible reply", parent: main });
+  const mixed = new FixtureElement("article", { text: "Direct prose and button", parent: main });
+  mixed.childNodes = [{ nodeType: 3, textContent: "Direct prose" }, { nodeType: 1 }];
+  new FixtureElement("button", { text: "Read thread", parent: mixed });
+  try {
+    const snapshot = (await send({ type: "nativeagent.page.snapshot", leaseId: "containers", tabId: 42, userSequence: 0 })).result;
+    assert.ok(!snapshot.summary.text.includes("Old post"));
+    assert.ok(snapshot.summary.text.includes("Visible reply"));
+    assert.ok(snapshot.summary.text.includes("Direct prose"));
+    assert.ok(!snapshot.nodes.some((node) => node.text.includes("Old post")));
+  } finally { body.children = body.children.filter((node) => node !== main); }
+});
+
+test("unchanged tablist choice survives feed churn but changed selection refuses", async () => {
+  const tabs = new FixtureElement("div", { attrs: { role: "tablist" }, parent: body });
+  const choice = new FixtureElement("button", { text: "AI", attrs: { role: "tab", "aria-selected": "false" }, parent: tabs });
+  try {
+    const snapshot = (await send({ type: "nativeagent.page.snapshot", leaseId: "tabs", tabId: 42, userSequence: 0 })).result;
+    const message = { type: "nativeagent.page.click", snapshotId: snapshot.snapshotId,
+      nodeId: snapshot.nodes.find((node) => node.name === "AI").nodeId };
+    mutationCallback([{ type: "characterData", target: heading }]);
+    assert.equal((await send(message)).ok, true);
+    choice.attributes["aria-selected"] = "true";
+    assert.equal((await send(message)).error.code, "snapshot_stale");
+  } finally { body.children = body.children.filter((node) => node !== tabs); }
+});
+
+test("scroll lets deferred feed rendering settle before the next read", async () => {
+  const original = window.scrollBy;
+  let reply;
+  window.scrollBy = function(options) {
+    this.scrollY += options.top;
+    setTimeout(() => {
+      reply = new FixtureElement("article", { text: "Deferred reply", parent: body });
+      mutationCallback([{ type: "childList", target: body, addedNodes: [reply] }]);
+    }, 10);
+  };
+  try {
+    const result = await send({ type: "nativeagent.page.scroll", deltaX: 0, deltaY: 500 });
+    assert.equal(result.result.contentChangedAfterScroll, true);
+    const snapshot = (await send({ type: "nativeagent.page.snapshot", leaseId: "deferred", tabId: 42, userSequence: 0 })).result;
+    assert.ok(snapshot.summary.text.includes("Deferred reply"));
+  } finally {
+    window.scrollBy = original;
+    body.children = body.children.filter((node) => node !== reply);
+  }
 });
 
 test("unrelated feed updates retain only unchanged navigation clicks", async () => {

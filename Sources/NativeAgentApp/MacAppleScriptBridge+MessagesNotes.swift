@@ -5,52 +5,102 @@ import PersistenceCore
 extension MacAppleScriptBridge {
     // MARK: MESSAGES
 
-    /// List recent iMessage threads (last N conversations). Input: "limit" (default 10, max 30).
-    /// Returns: {status, count, threads: [{handle, lastMessage, lastMessageDate}]}
+    /// AppleScript owns chat identity/participants. An exact selected chat can
+    /// additionally expose bounded local history when macOS permits that read.
     public static func messagesRecentThreads(input: [String: JSONValue]) async throws -> JSONValue {
         let limit = clampedInt(input["limit"], defaultValue: 10, min: 1, max: 30)
+        let threadID = inputString(input["thread_id"])
+        let before: Int64?
+        if let value = input["before_message_id"] {
+            guard threadID != nil, case .int(let id) = value, id > 0 else {
+                return failedEnvelope(integration: "messages", reason: "invalid_history_cursor")
+            }
+            before = id
+        } else { before = nil }
+        let selection = threadID.map { "set chatList to every chat whose id is \"\(escapeForAppleScript($0))\"" }
+            ?? "set chatList to chats"
         let source = """
+        property readDeadline : missing value
+        on checkReadDeadline()
+            if (current date) > readDeadline then error "Conversation read exceeded its bounded time budget" number -1712
+        end checkReadDeadline
+        on replaced(sourceText, needle, replacementText)
+            set oldDelimiters to AppleScript's text item delimiters
+            set AppleScript's text item delimiters to needle
+            set pieces to text items of sourceText
+            set AppleScript's text item delimiters to replacementText
+            set resultText to pieces as text
+            set AppleScript's text item delimiters to oldDelimiters
+            return resultText
+        end replaced
+        on encoded(value)
+            my checkReadDeadline()
+            set resultText to my replaced(value as text, "%", "%25")
+            set resultText to my replaced(resultText, "|", "%7C")
+            set resultText to my replaced(resultText, ":", "%3A")
+            set resultText to my replaced(resultText, ",", "%2C")
+            set resultText to my replaced(resultText, linefeed, "%0A")
+            return my replaced(resultText, return, "%0D")
+        end encoded
+        set readDeadline to (current date) + 9
+        with timeout of 4 seconds
         tell application "Messages"
-            set chatList to chats
+            \(selection)
             set output to ""
             set countChat to 0
-            repeat with i from 1 to (count of chatList)
+            repeat with c in chatList
                 if countChat ≥ \(limit) then exit repeat
-                set c to item i of chatList
-                set handleStr to ""
+                my checkReadDeadline()
+                set chatID to (id of c) as text
+                set chatName to ""
                 try
-                    set handleStr to (id of c) as string
+                    set observedName to name of c
+                    if observedName is not missing value then set chatName to observedName as text
                 end try
-                set lastMsg to ""
-                set lastDate to ""
-                try
-                    set msgs to messages of c
-                    if (count of msgs) > 0 then
-                        set lastM to item -1 of msgs
-                        try
-                            set lastMsg to text 1 thru 200 of (text of lastM)
-                        on error
-                            set lastMsg to (text of lastM) as string
-                        end try
-                        try
-                            set lastDate to ((date sent of lastM) as string)
-                        end try
-                    end if
-                end try
-                set output to output & handleStr & "|||" & lastMsg & "|||" & lastDate & "###"
+                set people to ""
+                repeat with p in participants of c
+                    my checkReadDeadline()
+                    set personHandle to (handle of p) as text
+                    set personName to ""
+                    try
+                        set observedName to name of p
+                        if observedName is not missing value then set personName to observedName as text
+                    end try
+                    set people to people & (my encoded(personHandle)) & ":" & (my encoded(personName)) & ","
+                end repeat
+                set output to output & (my encoded(chatID)) & "|" & (my encoded(chatName)) & "|" & people & linefeed
                 set countChat to countChat + 1
             end repeat
             return output
         end tell
+        end timeout
         """
         do {
             let raw = try await runAppleScript(source)
-            let threads = parseThreadRecords(raw)
-            return .object([
-                "status": .string("completed"),
-                "count": .int(Int64(threads.count)),
-                "threads": .array(threads),
-            ])
+            let threads = parseMessagesMetadata(raw)
+            if threadID != nil && threads.isEmpty {
+                return failedEnvelope(integration: "messages", reason: "thread_not_found")
+            }
+            var result: [String: JSONValue] = [
+                "status": .string("completed"), "count": .int(Int64(threads.count)),
+                "threads": .array(threads), "ordering": .string("Messages app order; recency is not provided by this interface."),
+                "history_status": .string("select_conversation"),
+                "history_note": .string("Open a conversation to read a bounded page of its local history. List previews are metadata, not an empty transcript."),
+            ]
+            if let threadID {
+                result["thread_id"] = .string(threadID)
+                let historyTask = Task.detached(priority: .utility) {
+                    MacMessagesHistory.read(threadID: threadID, limit: limit, before: before)
+                }
+                let history = await withTaskCancellationHandler {
+                    await historyTask.value
+                } onCancel: {
+                    historyTask.cancel()
+                }
+                try Task.checkCancellation()
+                result.merge(history) { _, new in new }
+            }
+            return .object(result)
         } catch let AppleScriptError.permissionDenied(app) {
             return deniedEnvelope(integration: "messages", app: app)
         } catch {
@@ -58,35 +108,84 @@ extension MacAppleScriptBridge {
         }
     }
 
-    /// Send iMessage. Required: "to" (phone number or email), "body".
-    /// Returns: {status, action: "sent", to}.
+    static func parseMessagesMetadata(_ raw: String) -> [JSONValue] {
+        func decoded(_ value: Substring) -> String? {
+            decodeConversationTransport(String(value))
+        }
+        return raw.split(separator: "\n").compactMap { line in
+            let fields = line.split(separator: "|", omittingEmptySubsequences: false)
+            guard fields.count == 3, let id = decoded(fields[0]), !id.isEmpty,
+                  let name = decoded(fields[1]) else { return nil }
+            var participants: [JSONValue] = []
+            for record in fields[2].split(separator: ",") {
+                let pair = record.split(separator: ":", omittingEmptySubsequences: false)
+                guard pair.count == 2, let handle = decoded(pair[0]), !handle.isEmpty,
+                      let personName = decoded(pair[1]) else { return nil }
+                participants.append(.object(["handle": .string(handle), "name": .string(personName)]))
+            }
+            return .object(["thread_id": .string(id), "handle": .string(id), "name": .string(name),
+                "participants": .array(participants)])
+        }
+    }
+
+    /// Send to an explicit recipient, or an exact observed chat after checking
+    /// its current participants. Never reinterpret a chat identifier as a handle.
     public static func messagesSend(input: [String: JSONValue]) async throws -> JSONValue {
-        guard let to = inputString(input["to"]), !to.isEmpty else {
-            return failedEnvelope(integration: "messages", reason: "missing_to")
+        let to = inputString(input["to"])
+        let threadID = inputString(input["thread_id"])
+        guard (to?.isEmpty == false) != (threadID?.isEmpty == false) else {
+            return failedEnvelope(integration: "messages", reason: "choose_recipient_or_thread")
         }
         guard let body = inputString(input["body"]), !body.isEmpty else {
             return failedEnvelope(integration: "messages", reason: "missing_body")
         }
-        let toAS = escapeForAppleScript(to)
         let bodyAS = escapeForAppleScript(body)
-        // Service 1 == iMessage (typical default). If the buddy isn't on
-        // iMessage Messages will surface its own error which propagates as
-        // a failed envelope.
-        let source = """
-        tell application "Messages"
-            set targetService to 1st service whose service type = iMessage
-            set targetBuddy to buddy "\(toAS)" of targetService
-            send "\(bodyAS)" to targetBuddy
-            return "sent"
-        end tell
-        """
+        let source: String
+        if let threadID, !threadID.isEmpty {
+            guard case .array(let values)? = input["expected_participants"], !values.isEmpty,
+                  values.count <= 100 else {
+                return failedEnvelope(integration: "messages", reason: "read_thread_before_reply")
+            }
+            let handles = values.compactMap { inputString($0) }
+            guard handles.count == values.count, handles.allSatisfy({ !$0.isEmpty }),
+                  Set(handles).count == handles.count else {
+                return failedEnvelope(integration: "messages", reason: "invalid_expected_participants")
+            }
+            let expected = handles.map { "\"\(escapeForAppleScript($0))\"" }.joined(separator: ", ")
+            source = """
+            tell application "Messages"
+                set matches to every chat whose id is "\(escapeForAppleScript(threadID))"
+                if (count of matches) is not 1 then return "thread_not_found"
+                set targetChat to item 1 of matches
+                set expectedHandles to {\(expected)}
+                set actualPeople to participants of targetChat
+                if (count of actualPeople) is not (count of expectedHandles) then return "participants_changed"
+                repeat with person in actualPeople
+                    if expectedHandles does not contain ((handle of person) as text) then return "participants_changed"
+                end repeat
+                send "\(bodyAS)" to targetChat
+                return "sent"
+            end tell
+            """
+        } else {
+            source = """
+            tell application "Messages"
+                set targetService to 1st service whose service type = iMessage
+                set targetBuddy to buddy "\(escapeForAppleScript(to!))" of targetService
+                send "\(bodyAS)" to targetBuddy
+                return "sent"
+            end tell
+            """
+        }
         do {
-            _ = try await runAppleScript(source)
-            return .object([
-                "status": .string("completed"),
-                "action": .string("sent"),
-                "to": .string(to),
-            ])
+            let outcome = try await runAppleScript(source)
+            guard outcome == "sent" else {
+                return failedEnvelope(integration: "messages", reason: outcome == "participants_changed" ? "participants_changed_read_thread_again" : "thread_not_found")
+            }
+            var result: [String: JSONValue] = ["status": .string("completed"), "action": .string("sent")]
+            if let threadID, !threadID.isEmpty { result["thread_id"] = .string(threadID) }
+            else { result["to"] = .string(to!) }
+            return .object(result)
         } catch let AppleScriptError.permissionDenied(app) {
             return deniedEnvelope(integration: "messages", app: app)
         } catch {

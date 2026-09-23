@@ -1,6 +1,9 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+#if canImport(AppKit)
+import AppKit
+#endif
 
 extension MacFourVerbs {
     // MARK: 3 — LEGS
@@ -94,6 +97,17 @@ extension MacFourVerbs {
             await clock.sleep(seconds: 0.5)
             landing = await sight(part: nil)
         }
+        // 2026-09-22: an app raised with every window closed stays windowless
+        // until reopened. Opening its bundle while it runs makes Launch
+        // Services send kAEReopenApplication, the Dock-click event. Once.
+        if case .blind(let reply) = landing, reply.detail["error"] == .string("no_frontmost_window"),
+           result.ok, result.action == "focus_app",
+           case .object(let out) = result.output, case .string(let bundle)? = out["bundle_identifier"],
+           let appURL = Self.applicationURL(bundleIdentifier: bundle) {
+            _ = try? await host.dispatch(action: "open_target", body: ["url": .string(appURL.absoluteString)])
+            await clock.sleep(seconds: 0.5)
+            landing = await sight(part: nil)
+        }
         switch landing {
         case .blind(let reply):
             var detail = Self.operationDetail(result).merging(reply.detail) { current, _ in current }
@@ -149,6 +163,14 @@ extension MacFourVerbs {
     // Three shapes, tested in order, with no app-name branch anywhere: a URL
     // with a web scheme, a filesystem path, then a NAME (running first, then
     // installed). A string that is none of those is not guessed at.
+
+    static func applicationURL(bundleIdentifier: String) -> URL? {
+        #if canImport(AppKit)
+        return NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleIdentifier)
+        #else
+        return nil
+        #endif
+    }
 
     static func webURL(_ text: String) -> URL? {
         guard let url = URL(string: text), let scheme = url.scheme?.lowercased() else { return nil }

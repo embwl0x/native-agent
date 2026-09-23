@@ -103,6 +103,7 @@ extension SwiftNativeChatOrchestrationClient {
             }
         }
         let runId = runIdOverride ?? UUID().uuidString
+        ChatTurnExecution.current?.bindHistoryRunID(runId)
         func persistCompatibilityPartial(_ text: String, cancelled: Bool) async {
             await persistPartialIfNeeded(
                 sessionId: resolvedSession,
@@ -811,7 +812,7 @@ extension SwiftNativeChatOrchestrationClient {
                             ?? LLMError.providerError(message: m)
                         if case .outputLengthLimit = classified as? LLMError {
                             reachedLengthLimit = true
-                            accumulated = ToolCallParser.visiblePrefix(in: accumulated + iterAccumulated)
+                            accumulated = ToolCallParser.visiblePrefix(in: accumulated + iterAccumulated, invoke: true)
                             loopRecoveryReply = LLMError.outputLengthLimitNotice
                             exhaustedToolLoop = true
                             break toolLoop
@@ -850,7 +851,7 @@ extension SwiftNativeChatOrchestrationClient {
                         // force-flush would otherwise leak it — gpt-5.5 review
                         // 2026-06-14).
                         if emitTextDeltas {
-                            if let r = ToolCallParser.earliestPotentialProtocolMarker(in: pendingDelta) {
+                            if let r = ToolCallParser.earliestPotentialProtocolMarker(in: pendingDelta, invoke: true) {
                                 let safe = String(pendingDelta[..<r.lowerBound])
                                 if !safe.isEmpty { continuation.yield(.delta(safe)) }
                             } else {
@@ -875,16 +876,16 @@ extension SwiftNativeChatOrchestrationClient {
                         }
                         let report = ProviderFailure.report(ProviderErrorAfterToolEffects.wrapping(
                             classified, dispatchCount: effectful), work: (accumulated + iterAccumulated).isEmpty ? nil : .ranPartly)
-                        var partialVisible = ToolCallParser.visiblePrefix(in: accumulated + iterAccumulated)
+                        var partialVisible = ToolCallParser.visiblePrefix(in: accumulated + iterAccumulated, invoke: true)
                         // Transcript honesty, ENGINE-YIELDED error path (live
                         // 2026-07-20 16:19Z: a native-lane 400 died here with
                         // no stub, no trace — the turn just vanished; only the
                         // bridge event ring held the reason). Same stub the
                         // thrown-catch path persists.
                         if partialVisible.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                            partialVisible = report?.errorDescription ?? "The reply could not be completed. Work: outcome unknown."
+                            partialVisible = report?.personDescription ?? "The reply could not be completed."
                         } else {
-                            partialVisible += "\n\n" + (report?.errorDescription ?? "The reply could not be completed. Work: ran partly.")
+                            partialVisible += "\n\n" + (report?.personDescription ?? "The reply could not be completed.")
                         }
                         TurnTraceBus.fireFromContext(
                             kind: "turn.failed",
@@ -915,7 +916,7 @@ extension SwiftNativeChatOrchestrationClient {
                 // (User, 2026-09-06).
                 if case .outputLengthLimit = error as? LLMError {
                     reachedLengthLimit = true
-                    accumulated = ToolCallParser.visiblePrefix(in: accumulated + iterAccumulated)
+                    accumulated = ToolCallParser.visiblePrefix(in: accumulated + iterAccumulated, invoke: true)
                     loopRecoveryReply = LLMError.outputLengthLimitNotice
                     exhaustedToolLoop = true
                     break toolLoop
@@ -944,7 +945,7 @@ extension SwiftNativeChatOrchestrationClient {
                 // completes call-free; the text the user just watched render
                 // is still in iterAccumulated. Persist both, or a mid-stream
                 // provider error silently loses the whole partial reply.
-                var partialVisible = ToolCallParser.visiblePrefix(in: accumulated + iterAccumulated)
+                var partialVisible = ToolCallParser.visiblePrefix(in: accumulated + iterAccumulated, invoke: true)
                 // Transcript honesty (2026-07-19 Kimi 403 incident): a turn
                 // that dies BEFORE any text leaves a hole in the session —
                 // the next turn's history shows User's message with no reply
@@ -952,7 +953,7 @@ extension SwiftNativeChatOrchestrationClient {
                 // short honest stub so the conversation itself carries the
                 // failure, on every surface.
                 let report = ProviderFailure.report(surfaced, work: partialVisible.isEmpty ? nil : .ranPartly)
-                let detail = report?.errorDescription ?? "The reply could not be completed. Work: outcome unknown."
+                let detail = report?.personDescription ?? "The reply could not be completed."
                 partialVisible += (partialVisible.isEmpty ? "" : "\n\n") + detail
                 await persistCompatibilityPartial(partialVisible, cancelled: false)
                 continuation.finish(throwing: report ?? surfaced)
@@ -989,10 +990,19 @@ extension SwiftNativeChatOrchestrationClient {
                     }
                     let surfaced = ProviderErrorAfterToolEffects.wrapping(replayError,
                         dispatchCount: ProviderErrorAfterToolEffects.effectfulCount(dispatches))
-                    let partial = ToolCallParser.visiblePrefix(in: accumulated + iterAccumulated)
+                    let partial = ToolCallParser.visiblePrefix(in: accumulated + iterAccumulated, invoke: true)
                     let report = ProviderFailure.report(surfaced, work: partial.isEmpty ? nil : .ranPartly)
+                    TurnTraceBus.fireFromContext(
+                        kind: "turn.failed",
+                        surface: surface,
+                        payload: .object([
+                            "reason": .string(String(String(describing: surfaced).prefix(200))),
+                            "iteration": .int(Int64(iteration)),
+                            "dispatchCount": .int(Int64(dispatches.count)),
+                        ])
+                    )
                     await persistCompatibilityPartial(partial + (partial.isEmpty ? "" : "\n\n")
-                        + (report?.errorDescription ?? "The reply could not be completed. Work: outcome unknown."), cancelled: false)
+                        + (report?.personDescription ?? "The reply could not be completed."), cancelled: false)
                     continuation.finish(throwing: report ?? surfaced)
                     return
                 }
@@ -1042,7 +1052,7 @@ extension SwiftNativeChatOrchestrationClient {
                 providerCallAttempt = 1
             }
             if didCancel {
-                let partialVisible = ToolCallParser.visiblePrefix(in: accumulated + iterAccumulated)
+                let partialVisible = ToolCallParser.visiblePrefix(in: accumulated + iterAccumulated, invoke: true)
                 await persistCompatibilityPartial(partialVisible, cancelled: true)
                 continuation.finish()
                 return
@@ -1081,7 +1091,8 @@ extension SwiftNativeChatOrchestrationClient {
                 // here — running the violation detector would bounce valid
                 // answers (e.g. the model explaining tool syntax to the user).
                 lastProtocolViolation = nil
-            } else if let violation = ToolCallParser.formattedToolCallViolation(in: iterAccumulated) {
+            } else if let violation = ToolCallParser.formattedToolCallViolation(
+                in: iterAccumulated, toolNames: preloadAvailableNames.union(turnActiveTools)) {
                 lastProtocolViolation = violation
                 violationNudgeCount += 1
                 if violationNudgeCount > 2 {
@@ -1118,7 +1129,8 @@ extension SwiftNativeChatOrchestrationClient {
             let calls = Self.textCompatibilityCalls(
                 nativeCalls: nativeCalls,
                 ridesNativeTools: ridesNativeTools,
-                iterAccumulated: iterAccumulated
+                iterAccumulated: iterAccumulated,
+                schemas: preloadToolSchemaCatalogSeed?.schemas ?? []
             )
             if calls.isEmpty {
                 // Completion-contract guard (2026-07-19; round 2 after the
@@ -1207,6 +1219,14 @@ extension SwiftNativeChatOrchestrationClient {
                 break toolLoop
             }
             pendingDelta.removeAll(keepingCapacity: true)
+            if !ridesNativeTools {
+                // Bare `<tool_use>`/`<invoke>` calls have no outer block for the
+                // API to stop on (a `</tool_use>` stop would drop parallel
+                // calls), so text after the last marker was written before any
+                // result existed — 2026-09-23 claude-drive: an invented report
+                // of all five results. It is neither shown nor replayed.
+                iterAccumulated = ToolCallParser.throughLastToolMarker(iterAccumulated)
+            }
             // User, 2026-09-06: this round NARRATED before it called its tools,
             // and the user watched that prose render. Absorb it now, before the
             // dispatch, so `accumulated` is the whole visible reply and not just
@@ -1353,9 +1373,8 @@ extension SwiftNativeChatOrchestrationClient {
                 )
                 let toolResultBlock = """
 
-                NativeAgent tool result for \(call.internalName):
+                NativeAgent tool result #\(index + 1) for \(call.internalName)\(ok ? "" : " (failed)"):
                 \(providerResultJSON)
-                Use this verified result. If more action is needed, emit another exact <tool_use name="...">{...}</tool_use> marker; otherwise answer the user directly.
                 """
                 if ridesNativeTools {
                     if index < nativeCalls.count {
@@ -1386,6 +1405,13 @@ extension SwiftNativeChatOrchestrationClient {
                 } else {
                     currentUserMessage += toolResultBlock
                 }
+            }
+            // 2026-09-22: once per round, not per result (51 copies in one
+            // turn); names only the marker form the lane's protocol teaches.
+            if !ridesNativeTools, !slots.isEmpty {
+                let instruction = "\n\nUse these verified results. If more action is needed, make another tool call (an exact <tool_use name=\"...\">{...}</tool_use> marker); otherwise answer the user directly.\n"
+                if appendOnlyEligible { iterationToolResults += instruction }
+                else { currentUserMessage += instruction }
             }
             // Receipts must be durable (or their loss reported) before the
             // next provider call — the write is off the dispatch critical

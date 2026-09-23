@@ -694,6 +694,25 @@ enum FileSystemActions {
             if case .bool(let b)? = input["append"] { return b }
             return false
         }()
+        let expectedHash: String?
+        // 2026-09-22: an empty string means "not provided" — a model sending ""
+        // looped four times (7.5 min) on the old combined refusal.
+        let blankHash: Bool = {
+            if case .string(let s)? = input["expected_content_sha256"] {
+                return s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            }
+            return false
+        }()
+        if let value = input["expected_content_sha256"], value != .null, !blankHash {
+            guard case .string(let hash) = value, hash.count == 64,
+                  hash.unicodeScalars.allSatisfy({ (48...57).contains($0.value) || (97...102).contains($0.value) }) else {
+                return errResult("expected_content_sha256 must be a 64-character lowercase hex SHA-256, or omitted.", code: "bad_input")
+            }
+            guard !append else {
+                return errResult("expected_content_sha256 guards a replacement; it cannot be used with append=true.", code: "bad_input")
+            }
+            expectedHash = hash
+        } else { expectedHash = nil }
 
         let resolved = resolvePath(rawPath, repoRoot: ctx.repoRoot)
         let allowed = allowedRoots(ctx)
@@ -738,7 +757,7 @@ enum FileSystemActions {
             // verified descriptor). The path-based `createDirectory` that used
             // to run first re-resolved the whole pathname through symlinks and
             // could therefore create directories outside the writable root.
-            let verified = try VerifiedPath.openParent(of: resolved, createIntermediates: true)
+            let verified = try VerifiedPath.openParent(of: resolved, createIntermediates: expectedHash == nil)
             defer { verified.release() }
             let data = Data(content.utf8)
             if append {
@@ -814,6 +833,29 @@ enum FileSystemActions {
                     throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
                 }
                 try tmpHandle.close()
+                if let expectedHash {
+                    // Check the existing bytes through the same verified parent
+                    // immediately before replacement. This is a conflict check,
+                    // not an atomic compare-and-swap against other processes.
+                    do {
+                        let currentFD = try VerifiedPath.openFinal(verified, flags: O_RDONLY | O_NONBLOCK)
+                        let current = FileHandle(fileDescriptor: currentFD, closeOnDealloc: true)
+                        defer { try? current.close() }
+                        let window = try readFileWindow(handle: current, path: resolved, maxBytes: 65_536,
+                            useCompactDefault: false, offset: 0, expectedVersion: "")
+                        var opened = stat(), named = stat()
+                        guard window.totalBytes == window.data.count,
+                              String(data: window.data, encoding: .utf8) != nil,
+                              SHA256.hash(data: window.data).map({ String(format: "%02x", $0) }).joined() == expectedHash,
+                              fstat(currentFD, &opened) == 0,
+                              fstatat(verified.fd, verified.name, &named, AT_SYMLINK_NOFOLLOW) == 0,
+                              opened.st_dev == named.st_dev, opened.st_ino == named.st_ino else {
+                            return errResult("The file changed since the revision was prepared. Read it again before revising; nothing was written.", code: "file_changed")
+                        }
+                    } catch {
+                        return errResult("The original file could not be verified. Read it again before revising; nothing was written.", code: "file_changed")
+                    }
+                }
                 if renameat(verified.fd, tmpName, verified.fd, verified.name) != 0 {
                     let err = String(cString: strerror(errno))
                     return errResult("atomic write failed: \(err)")

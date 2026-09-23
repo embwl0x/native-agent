@@ -195,14 +195,11 @@ extension NativeClient {
             ])
         }
         let consents = try await dispatcher.listConsents()
-        if consents.contains(where: {
+        let unpinnedGrant = consents.first {
             $0.serverId == serverId && $0.toolName == toolName && $0.unpinned
-                && $0.status.lowercased() == "granted"
-        }) {
-            throw AutonomyGateError.toolDenied(
-                reason: "MCP tool '\(serverId)/\(toolName)' has unpinned consent; resolve/pin its implementation and explicitly grant consent again"
-            )
+                && $0.status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "granted"
         }
+        let hasUnpinnedGrant = unpinnedGrant != nil
         let effectiveRisk = MCPToolBridge.effectiveRiskClass(
             serverId: serverId,
             toolName: toolName,
@@ -220,8 +217,16 @@ extension NativeClient {
                 surface: "mcp_ui",
                 dataRoot: dataRoot
             )
+            // Full Mac already supplies authority for this call. Legacy metadata
+            // may be repaired only by resolving the real current implementation.
+            if hasUnpinnedGrant && !yoloAdmitted {
+                throw AutonomyGateError.toolDenied(
+                    reason: "MCP tool '\(serverId)/\(toolName)' has unpinned consent; resolve/pin its implementation and explicitly grant consent again"
+                )
+            }
             let explicitlyRevoked = consents.contains {
-                $0.serverId == serverId && $0.toolName == toolName && $0.status == "revoked"
+                $0.serverId == serverId && $0.toolName == toolName
+                    && $0.status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "revoked"
             }
             if explicitlyRevoked || (MCPToolBridge.riskRequiresApproval(effectiveRisk) && !yoloAdmitted) {
                 return MCPCallResult(
@@ -235,12 +240,21 @@ extension NativeClient {
                     evidenceStatus: "not_required"
                 )
             }
-            if !MCPToolBridge.riskRequiresApproval(effectiveRisk) {
+            if yoloAdmitted {
+                guard try server.pinnedExecutionIdentity() != nil else {
+                    throw AutonomyGateError.toolDenied(reason: "MCP server '\(serverId)' could not be pinned; resolve its implementation and explicitly grant consent again")
+                }
+            }
+            if !MCPToolBridge.riskRequiresApproval(effectiveRisk) || (yoloAdmitted && hasUnpinnedGrant) {
                 let grant = try await dispatcher.grantConsent(MCPConsentGrant(
                     serverId: serverId,
                     toolName: toolName,
+                    scope: unpinnedGrant?.scope ?? "server_tool",
                     risk: effectiveRisk,
-                    argumentSummary: "Auto-granted low-risk local Swift MCP call."
+                    permissions: unpinnedGrant?.permissions ?? [],
+                    argumentSummary: hasUnpinnedGrant
+                        ? "Renewed legacy MCP consent under admitted Full Mac authority using the current resolved implementation."
+                        : "Auto-granted low-risk local Swift MCP call."
                 ))
                 guard !grant.unpinned else {
                     throw AutonomyGateError.toolDenied(reason: "MCP server '\(serverId)' could not be pinned; resolve its implementation and explicitly grant consent again")

@@ -60,7 +60,7 @@ public struct AgentHostRow: Sendable, Equatable {
     public var requiresWorkspace: Bool = false
     public var settingsSupported: Bool = true
     public var declaredRoute: Route? = nil
-    public var outboundRoute: String { route == .grokBot ? "grok-webhook" : acpLaunch == nil ? (commandLine == nil ? "none" : "command") : "acp" }
+    public var outboundRoute: String { route == .desktopChat ? "desktop-chat" : route == .grokBot ? "grok-webhook" : acpLaunch == nil ? (commandLine == nil ? "none" : "command") : "acp" }
     /// Compatibility projection of the transport's single launch declaration.
     public var acpLaunch: (executable: String, arguments: [String], version: String)? {
         acp.map { ($0.executable, $0.arguments, $0.referenceVersion) }
@@ -77,7 +77,7 @@ public struct AgentHostRow: Sendable, Equatable {
     /// the same one rather than a second copy.
     public var commandLine: AgentHostCommandLine? { AgentHostCommandLines.byHostID[id] }
     public var acp: AgentHostACP? { AgentHostACP.byHostID[id] }
-    public enum Route: String, Sendable { case acp, a2a, grokBot = "grok-bot", commandLine = "command-line", mcpSettingsOnly = "mcp-settings-only" }
+    public enum Route: String, Sendable { case acp, a2a, grokBot = "grok-bot", desktopChat = "desktop-chat", commandLine = "command-line", mcpSettingsOnly = "mcp-settings-only" }
     public var route: Route { declaredRoute ?? (acp != nil ? .acp : commandLine != nil ? .commandLine : .mcpSettingsOnly) }
 
     public func matches(_ name: String) -> Bool {
@@ -127,8 +127,16 @@ public enum AgentHostDirectory {
         InstallPaths.current.bridgeDiscoveryDirectory(dataRoot: dataRoot)
     }
 
+    /// 2026-09-22: peers read a URL-only descriptor OUTSIDE `claude-bridge/`,
+    /// and the link authenticates with the peer's own secret, so a connected
+    /// agent never holds the main bridge bearer.
+    public static func peerDescriptorDirectory(dataRoot: URL) -> URL {
+        bridgeDiscoveryDirectory(dataRoot: dataRoot).deletingLastPathComponent()
+            .appendingPathComponent("nativeagent-link", isDirectory: true)
+    }
+
     public static func bridgeDescriptorPath(dataRoot: URL) -> String {
-        bridgeDiscoveryDirectory(dataRoot: dataRoot).appendingPathComponent("bridge.json").path
+        peerDescriptorDirectory(dataRoot: dataRoot).appendingPathComponent("bridge.json").path
     }
 
     /// What the entry actually exposes, said plainly on the card. These are the
@@ -170,6 +178,12 @@ public enum AgentHostDirectory {
             restartRequired: false, restartNote: "Grok Bot asks before running the local reply command under its current policy.",
             documentation: "https://cursor.com/help/grok-bot/routines", settingsSupported: false,
             declaredRoute: .grokBot, bundleIDs: ["com.anysphere.sand"]),
+        AgentHostRow(id: "muse", displayName: "Muse",
+            description: "Meta's assistant, reached through its Mac app in a chat of its own.", aliases: ["meta muse", "meta ai"],
+            installMarkers: [], configPath: "", format: .sessionMCP,
+            restartRequired: false, restartNote: "Nothing to restart.",
+            documentation: "https://muse.meta.com", settingsSupported: false,
+            declaredRoute: .desktopChat, bundleIDs: ["com.meta.endo"]),
         AgentHostRow(
             id: "claude-code",
             displayName: "Claude Code",
@@ -199,6 +213,11 @@ public enum AgentHostDirectory {
             documentation: "https://learn.chatgpt.com/docs/extend/mcp?surface=cli",
             bundleIDs: ["com.openai.codex"]
         ),
+        AgentHostRow(
+            id: "antigravity-cli", displayName: "Antigravity CLI", description: "Google's current terminal agent for Gemini with continuing conversations.", aliases: ["antigravity", "agy", "gemini"],
+            installMarkers: [], configPath: "~/.gemini/config/mcp_config.json", format: .jsonMCPServers,
+            restartRequired: false, restartNote: "Each message starts the CLI with the current connection settings and resumes the requested conversation.",
+            documentation: "https://www.antigravity.google/docs/mcp"),
         AgentHostRow(
             id: "claude-desktop", displayName: "Claude Desktop", description: "A chat app for talking with Claude.", aliases: ["claude app"],
             installMarkers: ["/Applications/Claude.app", "~/Applications/Claude.app", "~/Library/Application Support/Claude"],
@@ -231,7 +250,7 @@ public enum AgentHostDirectory {
             documentation: "https://github.com/agentclientprotocol/registry/blob/main/cursor/agent.json",
             settingsSupported: false),
         AgentHostRow(
-            id: "gemini-cli", displayName: "Gemini CLI", description: "A terminal assistant powered by Gemini.", aliases: ["gemini"],
+            id: "gemini-cli", displayName: "Gemini CLI (Legacy)", description: "The older Gemini CLI connection. Use Antigravity CLI for Gemini.", aliases: ["Gemini CLI"],
             installMarkers: ["~/.gemini", "/opt/homebrew/bin/gemini", "~/.local/bin/gemini"],
             configPath: "", format: .sessionMCP,
             restartRequired: false, restartNote: "No restart needed; connection starts an ACP session with reply tools.",
@@ -249,6 +268,17 @@ public enum AgentHostDirectory {
             restartRequired: false, restartNote: "No restart needed; connection starts an ACP session with reply tools.",
             documentation: "https://github.com/agentclientprotocol/registry/blob/main/goose/agent.json",
             settingsSupported: false),
+        // Nous Research Hermes. Nothing of its own is written: the connection
+        // starts `hermes acp`, which runs the person's own Hermes with its
+        // memory, provider and model as they are.
+        AgentHostRow(
+            id: "hermes", displayName: "Hermes", description: "A local agent with its own memory, tools and models.",
+            aliases: ["hermes agent", "nous hermes"],
+            installMarkers: ["/Applications/Hermes.app", "~/.hermes", "~/.local/bin/hermes"],
+            configPath: "", format: .sessionMCP,
+            restartRequired: false, restartNote: "No restart needed; connection starts an ACP session with reply tools.",
+            documentation: "https://hermes-agent.nousresearch.com/docs/user-guide/features/acp",
+            settingsSupported: false, bundleIDs: ["com.nousresearch.hermes"]),
     ]
 
     /// THE PROBE THAT PROVES THE ROUND TRIP. Sent once at connect time to a

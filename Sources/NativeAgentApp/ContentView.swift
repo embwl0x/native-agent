@@ -306,9 +306,7 @@ struct ContentView: View {
                     .environment(\.chatPageIsVisible, isShowingChat)
                     // Keep Liquid Glass in the shared shell's composition.
                     // A separate native host changes its backdrop boundary.
-                    .animation(NativeAgentMotion.crossfade) { content in
-                        content.opacity(isShowingChat ? 1 : 0)
-                    }
+                    .opacity(isShowingChat ? 1 : 0)
                     .allowsHitTesting(isShowingChat)
                     // Pointer hiding alone does not guard assistive actions.
                     // An AXPress carries no point, so VoiceOver/automation was
@@ -330,9 +328,7 @@ struct ContentView: View {
                 // down. Hidden work is cancelled inside the shelf.
                 if hasMountedBots || isShowingBots {
                     BotsShelfPreviewPage(onContinue: applyNavigationDestination, isVisible: isShowingBots)
-                        .animation(NativeAgentMotion.crossfade) { content in
-                            content.opacity(isShowingBots ? 1 : 0)
-                        }
+                        .opacity(isShowingBots ? 1 : 0)
                         .allowsHitTesting(isShowingBots)
                         .disabled(!isShowingBots)
                         .accessibilityHidden(!isShowingBots)
@@ -437,12 +433,13 @@ struct ContentView: View {
                 // new page rather than reusing the old one's state; state
                 // within a page is untouched while its selection is stable.
                 .id(selection.wrappedValue.normalized)
-                .transition(NativeAgentMotion.fade)
+                .transition(.identity)
                 }
                 }
-                // Fade the page layers; keep retained transcripts out of the
-                // navigation transaction so their internal layout stays still.
-                .animation(NativeAgentMotion.crossfade, value: selection.wrappedValue.normalized)
+                // Replace pages atomically. Crossfading two translucent pages
+                // superimposes their text; retained chat/bots keep their state.
+                // Local control animations remain owned by their own views.
+                .animation(nil, value: selection.wrappedValue.normalized)
                 }
                 // The per-panel refresh belongs to the SELECTION, not to the
                 // switch above — Chat now sits outside it and must still get

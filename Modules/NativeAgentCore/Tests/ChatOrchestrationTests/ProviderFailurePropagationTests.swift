@@ -7,8 +7,8 @@ import PersistenceCore
 @Suite struct ProviderFailurePropagationTests {
     @Test func causeAndWorkSurviveWrappersAndWireEncoding() throws {
         let cases: [(Error, ProviderFailure)] = [
-            (LLMError.authRejected(provider: "fixture", detail: "insufficient_quota"), .rateLimited(retryAfter: nil)),
-            (ProviderFailure.http(status: 403, detail: "quota exceeded"), .rateLimited(retryAfter: nil)),
+            (LLMError.authRejected(provider: "fixture", detail: "insufficient_quota"), .rateLimited(retryAfter: 3600)),
+            (ProviderFailure.http(status: 403, detail: "quota exceeded"), .rateLimited(retryAfter: 3600)),
             (ProviderFailure.http(status: 429), .rateLimited(retryAfter: nil)),
             (ProviderFailure.http(status: 401), .authExpired),
             (ProviderFailure.http(status: 404, detail: "model_not_found"), .modelUnavailable),

@@ -106,24 +106,6 @@ struct MemoryEmbeddingEpochAndDisclosureTests {
         #expect(try await store.memory(id: "memory-a")?.embedding == [1, 0, 0])
     }
 
-    @Test("activation retains an exact immediate rollback")
-    func rollback() async throws {
-        let store = try MemoryStorage(inMemoryName: "epoch-rollback")
-        _ = try await store.insertMemory(StoredMemory(
-            id: "memory-a", content: "Rollback content", embedding: [1, 0, 0]
-        ))
-        let snapshot = try await store.embeddingCorpusSnapshot()
-        _ = try await store.activateEmbeddingEpoch(
-            epoch(),
-            staged: snapshot.map { MemoryEmbeddingStagedRow(row: $0, vector: [0, 1, 0]) }
-        )
-        let rolledBack = try await store.rollbackEmbeddingEpochActivation()
-        #expect(rolledBack.activeEpoch == nil)
-        #expect(rolledBack.rollbackAvailable == false)
-        #expect(try await store.memory(id: "memory-a")?.embedding == [1, 0, 0])
-        #expect(try await store.memory(id: "memory-a")?.embeddingEpoch == nil)
-    }
-
     @Test("one disclosure decision handles privacy persona lifecycle and surface aliases")
     func sharedDisclosurePolicy() {
         let privateRecord = MemoryRecord(

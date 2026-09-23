@@ -105,7 +105,7 @@ struct StandingBotsDisk: Sendable {
         case .interval(let seconds):
             let floor = validateCron ? BotRunLimits.minimumInterval : 60
             guard seconds.isFinite, seconds >= floor else {
-                throw StandingBotsError.invalidValue("The agent's bot cadence must be at least \(floor / 60) minutes. The person can change Minimum cadence on the Bots page; the agent cannot change this setting.")
+                throw StandingBotsError.invalidValue("The agent's bot cadence must be at least \(floor / 60) minutes.")
             }
         case .cron(let expression, let zone):
             guard !expression.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,

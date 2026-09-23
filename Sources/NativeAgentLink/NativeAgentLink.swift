@@ -19,26 +19,18 @@ private enum LinkFailure: Error {
 private struct BridgeDescriptor {
     let endpoint: URL
     let token: String
-    /// THIS CONNECTION'S OWN IDENTITY, when the app set this entry up itself.
+    /// THIS CONNECTION'S OWN SECRET, when the app set this entry up itself.
     ///
-    /// The bridge bearer above authenticates the PORT, not the caller. These
-    /// two come from the environment of the entry the app wrote into the other
-    /// agent's settings, and the bridge resolves them to the contact that owns
-    /// them, so the turn is attributed to that contact instead of to a generic
-    /// local agent. Absent — every hand-made entry, and every existing one —
-    /// behaves exactly as it did before.
+    /// It comes from the environment of the entry the app wrote into the other
+    /// agent's settings (with NATIVE_AGENT_PEER_ID), is sent as the bearer, and
+    /// the bridge resolves it to the contact that owns it. Absent — every
+    /// hand-made entry — the descriptor's main token is used as before.
     ///
     /// Environment, never an argument: arguments are readable by every process
     /// on the Mac.
-    let peerID: String?
     let peerSecret: String?
 
-    var identityHeaders: [String: String] {
-        guard let peerID, let peerSecret else { return [:] }
-        return ["X-NativeAgent-Peer-Id": peerID, "X-NativeAgent-Peer-Secret": peerSecret]
-    }
-
-    static func load(pathOverride: String? = nil) throws -> Self {
+    static func load(pathOverride: String? = nil, bearer: String? = nil) throws -> Self {
         let path = pathOverride ?? ProcessInfo.processInfo.environment["NATIVE_AGENT_BRIDGE_DESCRIPTOR"]
             ?? InstallPaths.current.bridgeConfigRoot.appendingPathComponent("claude-bridge/bridge.json").path
         let fd = Darwin.open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK)
@@ -63,9 +55,7 @@ private struct BridgeDescriptor {
               ["127.0.0.1", "::1", "[::1]"].contains(url.host ?? ""),
               url.user == nil, url.password == nil, url.query == nil, url.fragment == nil,
               url.path.isEmpty || url.path == "/",
-              let port = url.port, (1...65535).contains(port),
-              let token = object["token"] as? String, !token.isEmpty, token.utf8.count <= 8192,
-              !token.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) })
+              let port = url.port, (1...65535).contains(port)
         else { throw LinkFailure.descriptor }
         url.path = "/agent/mcp"
         guard let endpoint = url.url else { throw LinkFailure.descriptor }
@@ -81,11 +71,18 @@ private struct BridgeDescriptor {
         }
         let peerID = identity("NATIVE_AGENT_PEER_ID")
         let peerSecret = identity("NATIVE_AGENT_PEER_SECRET")
-        // Half an identity is no identity: an id with no secret proves nothing
-        // and would only invite the bridge to guess.
-        return Self(endpoint: endpoint, token: token,
-                    peerID: peerSecret == nil ? nil : peerID,
-                    peerSecret: peerID == nil ? nil : peerSecret)
+        // 2026-09-22: a connection with its own identity sends its SECRET as
+        // the bearer and no identity headers; the bridge maps it on contact
+        // paths, so the main token is never read or sent. Half an identity is
+        // still no identity.
+        if let bearer { return Self(endpoint: endpoint, token: bearer, peerSecret: nil) }
+        if peerID != nil, let peerSecret {
+            return Self(endpoint: endpoint, token: peerSecret, peerSecret: peerSecret)
+        }
+        guard let token = object["token"] as? String, !token.isEmpty, token.utf8.count <= 8192,
+              !token.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) })
+        else { throw LinkFailure.descriptor }
+        return Self(endpoint: endpoint, token: token, peerSecret: nil)
     }
 }
 
@@ -126,9 +123,6 @@ private enum BridgeHTTP {
         request.httpMethod = "POST"
         request.httpBody = try JSONSerialization.data(withJSONObject: payload)
         request.setValue("Bearer \(descriptor.token)", forHTTPHeaderField: "Authorization")
-        for (name, value) in descriptor.identityHeaders {
-            request.setValue(value, forHTTPHeaderField: name)
-        }
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("application/json, text/event-stream", forHTTPHeaderField: "Accept")
         request.setValue("2025-11-25", forHTTPHeaderField: "MCP-Protocol-Version")
@@ -290,11 +284,11 @@ private struct NativeAgentLink {
             }
             let reply = try GrokReplyInput.parse(data)
             let credential = try GrokLinkCredential.read(peer: peer)
-            let local = try BridgeDescriptor.load(pathOverride: credential.descriptorPath)
+            let local = try BridgeDescriptor.load(pathOverride: credential.descriptorPath, bearer: credential.replyToken)
             let endpoint = local.endpoint.deletingLastPathComponent().appendingPathComponent("grok-reply")
             // Only the contact's bearer crosses loopback. The main token and
             // credentials never go to Grok, stdout or process arguments.
-            let descriptor = BridgeDescriptor(endpoint: endpoint, token: credential.replyToken, peerID: nil, peerSecret: nil)
+            let descriptor = BridgeDescriptor(endpoint: endpoint, token: credential.replyToken, peerSecret: nil)
             _ = try await BridgeHTTP.post(["message_id": reply.message_id, "text": reply.text], descriptor: descriptor)
             output(["status": "reply_received", "automatically_resent": false])
         } catch {

@@ -26,8 +26,8 @@ import PersistenceCore
 extension BackgroundLoopsAssembly {
 
     /// Reacts to bridge-store changes. Routine successful outcomes share one
-    /// bounded informational rollup per source; adverse terminal outcomes keep
-    /// one exact inbox card per job. Cursor lives at
+    /// bounded informational rollup per source; failed/unconfirmed outcomes
+    /// share one actionable summary per source. Cursor lives at
     /// `<dataRoot>/logs/delegation_outcome_cursor.json`.
     ///
     /// `configRoot` mirrors `SwiftToolDispatcher.agentBridgeConfigRoot`. When it
@@ -62,6 +62,16 @@ extension BackgroundLoopsAssembly {
                 // different root's jobs on the Today surface.
                 let read = DelegationStatusProjector(configRoot: root)
                     .allJobsWithAvailability(now: Date())
+                // Feed the already-owned event read to Workspace bookmarks.
+                // Their file event exposes arrivals without Agent opening each
+                // conversation first. No additional polling or provider work.
+                if read.allStoresReadable {
+                    do { try AgentConversationStore(dataRoot: dataRoot).reconcileDelegationReplies(read.jobs) }
+                    catch {
+                        FileHandle.standardError.write(Data(
+                            "DelegationOutcomeLoop: conversation reply projection failed: \(error.localizedDescription)\n".utf8))
+                    }
+                }
                 return DelegationJobsRead(
                     jobs: read.jobs.map(delegationJobSnapshot(from:)),
                     allStoresReadable: read.allStoresReadable
@@ -92,6 +102,9 @@ extension BackgroundLoopsAssembly {
                 root.appendingPathComponent("codex-nativeagent-bridge/reply-jobs/undelivered", isDirectory: true),
                 root.appendingPathComponent("codex-nativeagent-bridge/reply-deliveries.jsonl"),
                 root.appendingPathComponent("omp-bridge/wake-jobs", isDirectory: true),
+                AgentConversationStore(dataRoot: dataRoot).fileURL,
+                dataRoot.appendingPathComponent("bots/run-queue.json"),
+                dataRoot.appendingPathComponent("bots/shelf-index.json"),
             ]
         )
     }
@@ -117,7 +130,8 @@ extension BackgroundLoopsAssembly {
             deskHandle: row.deskHandle,
             stalled: row.stalled,
             stallBasis: row.stallBasis.rawValue,
-            lastLiveness: row.lastLiveness
+            lastLiveness: row.lastLiveness,
+            agentReplyTextHead: row.agentReplyTextHead
         )
     }
 
@@ -212,6 +226,15 @@ extension BackgroundLoopsAssembly {
             }
         }
 
+        // 2026-09-22: every failed/unconfirmed job posted its own actionable
+        // card and push (135 "needs you" cards, mostly Codex). A terminal job
+        // outcome now folds into one summary per agent; stall and backlog
+        // cards (whose ids are not `delegation-outcome:<jobKey>`) keep theirs.
+        if card.outcome == .failed || card.outcome == .unknown, !card.resolved,
+           card.severityOverride == nil, card.cardId == "delegation-outcome:\(card.jobKey)" {
+            return await fileAdverseDelegationRollup(inboxPath: inboxPath, dataRoot: dataRoot, card: card)
+        }
+
         let persistence = SwiftNativePersistenceCore()
         do {
             let inserted = try await persistence.withFileLock(inboxPath) { () async throws -> Bool? in
@@ -294,6 +317,139 @@ extension BackgroundLoopsAssembly {
         }
     }
 
+    /// One actionable summary card per bridge source for failed and unconfirmed
+    /// jobs ("Codex: 26 failed, 11 unconfirmed"), carrying the latest job's
+    /// detail. The card remembers `outcome|jobKey` entries, so a retried upsert
+    /// counts once and a job whose outcome worsens moves between the counts.
+    /// It pushes only when it becomes unread; further outcomes while it is
+    /// still unread just move the counts.
+    private static func fileAdverseDelegationRollup(
+        inboxPath: URL,
+        dataRoot: URL,
+        card: DelegationOutcomeCard
+    ) async -> Bool {
+        let rollupID = "delegation-outcome:\(card.source):adverse-rollup"
+        let entry = "\(card.outcome.rawValue)|\(card.jobKey)"
+        let name = DelegationOutcomeCard.displayName(source: card.source, agent: card.agent)
+        let persistence = SwiftNativePersistenceCore()
+        do {
+            // nil = refused rewrite; .some(nil) = landed, no push.
+            let landed = try await persistence.withFileLock(inboxPath) {
+                () async throws -> (title: String, summary: String)?? in
+                let lines = try InboxRewriteGuard.readLines(inboxPath)
+                guard InboxRewriteGuard.rewriteIsSafe(lines: lines, path: inboxPath) else {
+                    InboxRewriteGuard.refuse("DelegationOutcomeLoop", path: inboxPath)
+                    return nil
+                }
+                func isActive(_ obj: [String: JSONValue]) -> Bool {
+                    guard case .string(let status)? = obj["status"] else { return true }
+                    return status != "archived" && status != "dismissed"
+                }
+                var existing: [String: JSONValue]?
+                for line in lines {
+                    if case .object(let obj)? = line.row, case .string(rollupID)? = obj["id"], isActive(obj) {
+                        existing = obj
+                    }
+                }
+                var jobs: [String] = []
+                if case .array(let values)? = existing?["adverse_jobs"] {
+                    jobs = values.compactMap { if case .string(let s) = $0 { return s } else { return nil } }
+                }
+                if jobs.contains(entry) { return .some(nil) }
+                jobs.removeAll { $0.hasSuffix("|\(card.jobKey)") }
+                jobs.append(entry)
+                if jobs.count > 500 { jobs.removeFirst(jobs.count - 500) }
+                let unconfirmed = jobs.filter { $0.hasPrefix("\(DelegationOutcome.unknown.rawValue)|") }.count
+                let failed = jobs.count - unconfirmed
+                let counts = [failed > 0 ? "\(failed) failed" : nil,
+                              unconfirmed > 0 ? "\(unconfirmed) unconfirmed" : nil]
+                    .compactMap { $0 }.joined(separator: ", ")
+                let title = "\(name): \(counts)"
+                // The push router dedupes on id + summary, and the id never
+                // changes: counts and the job's identity lead the summary so a
+                // newly counted job always reads as a new fact.
+                let summary = "\(counts). Latest (\(card.jobKey), \(card.createdAt)): \(card.summary)"
+
+                guard case .object(var obj) = card.toJSON() else { return nil }
+                obj["id"] = .string(rollupID)
+                obj["title"] = .string(title)
+                obj["summary"] = .string(String(summary.prefix(500)))
+                obj["detail"] = .string(String(("Latest: \(card.title)\n\(card.detail)").prefix(2_000)))
+                obj["error_signature"] = .string("delegation_outcome.adverse.\(card.source)")
+                obj["adverse_jobs"] = .array(jobs.map { .string($0) })
+                obj["first_created_at"] = existing?["first_created_at"] ?? existing?["created_at"] ?? obj["created_at"]
+                let wasUnread = existing.map { ($0["status"] ?? .string("unread")) == .string("unread") } ?? false
+                let row = JSONValue.object(obj)
+
+                var mutated: [Data] = []
+                mutated.reserveCapacity(lines.count + 1)
+                for line in lines {
+                    guard case .object(var other)? = line.row, case .string(let id)? = other["id"] else {
+                        mutated.append(line.raw)
+                        continue
+                    }
+                    // The old summary moves to the newest position; the job's own
+                    // per-job row (a stall warning or a legacy card) is superseded.
+                    if id == rollupID, isActive(other) { continue }
+                    if id == card.cardId, isActive(other) {
+                        other["status"] = .string("archived")
+                        other["read_at"] = .string(card.createdAt)
+                        mutated.append(Data(try JSONValue.object(other).serialize(pretty: false).utf8))
+                        continue
+                    }
+                    mutated.append(line.raw)
+                }
+                mutated.append(Data(try row.serialize(pretty: false).utf8))
+                try InboxRewriteGuard.writeLines(mutated, to: inboxPath)
+                return wasUnread ? .some(nil) : .some((title, summary))
+            }
+            guard let landed else { return false }
+            if let push = landed {
+                await InboxPushNotifier.notifyIfAttentionWorthy(
+                    dataRoot: dataRoot,
+                    itemId: rollupID,
+                    title: push.title,
+                    summary: String(push.summary.prefix(500)),
+                    source: "delegation_outcome",
+                    severity: card.severity
+                )
+            }
+            return true
+        } catch {
+            FileHandle.standardError.write(Data(
+                "DelegationOutcomeLoop: adverse rollup failed for \(card.cardId): \(error)\n".utf8))
+            return false
+        }
+    }
+
+    /// Archives per-job failed/unconfirmed cards older than seven days, written
+    /// before those outcomes moved into the per-agent summary. Stall, backlog,
+    /// and summary cards do not match.
+    static func reconcileStaleAdverseDelegationNotices(
+        dataRoot: URL,
+        now: Date = Date()
+    ) async throws -> Int {
+        let inbox = LiveNotificationInbox(path: LiveNotificationInbox.livePath(dataRoot: dataRoot))
+        let prefix = "delegation-outcome:"
+        let ids = try await inbox.rows().compactMap { row -> String? in
+            guard case .object(let object) = row,
+                  case .string("delegation_outcome")? = object["source"],
+                  case .string("actionable")? = object["severity"],
+                  case .string(let id)? = object["id"], id.hasPrefix(prefix),
+                  case .string(let signature)? = object["error_signature"]
+            else { return nil }
+            let jobKey = String(id.dropFirst(prefix.count))
+            let adverse = [jobKey, "\(jobKey):\(DelegationOutcome.failed.rawValue)",
+                           "\(jobKey):\(DelegationOutcome.unknown.rawValue)"]
+            return adverse.contains(signature) ? id : nil
+        }
+        return try await inbox.archiveActive(
+            ids: ids,
+            readAt: DelegationOutcomeCursor.formatISO(now),
+            createdNoLaterThan: now.addingTimeInterval(-7 * 86_400)
+        )
+    }
+
     /// Retires the unread per-job success cards written before successful
     /// delegations moved to one bounded rollup per bridge source. Exact adverse
     /// outcomes, backlog cards, current rollups, and already-handled history do
@@ -348,15 +504,18 @@ private struct DelegationOutcomeEventRunner: EventDeadlineLoopRunner {
 
     var loopId: String { underlying.loopId }
     var interval: TimeInterval { underlying.interval }
-    var tickTimeoutOverride: TimeInterval? { underlying.tickTimeoutOverride }
+    // One delayed peer continuation may include a full resident chat turn.
+    // The manager still owns single-flight execution and cancellation.
+    var tickTimeoutOverride: TimeInterval? { 600 }
 
     func tickOutcome() async -> LoopTickOutcome {
         do {
             let archived = try await BackgroundLoopsAssembly
                 .reconcileLegacySuccessfulDelegationNotices(dataRoot: dataRoot)
+                + BackgroundLoopsAssembly.reconcileStaleAdverseDelegationNotices(dataRoot: dataRoot)
             if archived > 0 {
                 FileHandle.standardError.write(Data(
-                    "DelegationOutcomeLoop: archived \(archived) legacy success cards\n".utf8
+                    "DelegationOutcomeLoop: archived \(archived) legacy delegation cards\n".utf8
                 ))
             }
         } catch {
@@ -367,7 +526,15 @@ private struct DelegationOutcomeEventRunner: EventDeadlineLoopRunner {
                 "DelegationOutcomeLoop: legacy success reconciliation failed: \(error)\n".utf8
             ))
         }
-        return await underlying.tickOutcome()
+        let outcome = await underlying.tickOutcome()
+        do {
+            try await AgentConversationContinuation(dataRoot: dataRoot).tick()
+        } catch is CancellationError {
+            return .skipped(reason: "Delegation reply handling cancelled", healthNeutral: true)
+        } catch {
+            return .failed(error: "Saved agent conversations could not be reconciled: \(error.localizedDescription)")
+        }
+        return outcome
     }
 
     func physiologyEvents() -> AsyncStream<Void> {
@@ -381,9 +548,11 @@ private struct DelegationOutcomeEventRunner: EventDeadlineLoopRunner {
         // work behind, and nothing in the store changes when they do — so the
         // remainder used to wait for the next bridge write or the six-hour
         // integrity sweep. A deferring tick books its own continuation.
-        guard await deferral.hasDeferredWork else { return stall }
+        let conversation = AgentConversationContinuation(dataRoot: dataRoot).nextDeadline(after: now)
+        let deadline = [stall, conversation].compactMap { $0 }.min()
+        guard await deferral.hasDeferredWork else { return deadline }
         let rerun = now.addingTimeInterval(Self.deferredRerunGap)
-        guard let stall else { return rerun }
-        return min(stall, rerun)
+        guard let deadline else { return rerun }
+        return min(deadline, rerun)
     }
 }

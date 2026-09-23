@@ -140,6 +140,11 @@ func normalizedToolArguments(_ tool: String, _ input: [String: JSONValue]) -> [S
         #expect(read.tool == "shelf_entry")
         #expect(read.input["id"] == .string(entry))
         #expect(read.input["bot_id"] == .string(bot))
+        let opened = try #require(try AgentConversationRouting.route(tool: "agent_read", input: ["agent": .string("bot:" + bot)]))
+        #expect(opened.tool == "shelf_entry")
+        #expect(opened.input == ["bot_id": .string(bot)])
+        let index = try #require(try AgentConversationRouting.route(tool: "agent_read", input: ["agent": .string("bot:" + bot), "limit": .int(5)]))
+        #expect(index.tool == "shelf_read")
         #expect(throws: AgentConversationRouting.InvalidRequest.self) {
             try AgentConversationRouting.route(tool: "agent_message", input: [
                 "agent": .string("bot:" + bot), "text": .string("Hello"), "conversation_id": .string("bot:" + UUID().uuidString)
@@ -178,11 +183,13 @@ func normalizedToolArguments(_ tool: String, _ input: [String: JSONValue]) -> [S
         let bot = "bot:" + UUID().uuidString
         let route = AgentConversationRouting.Route(tool: "bot_ask", input: [:], agent: bot)
         guard case .object(let wrapped) = AgentConversationRouting.wrap(result: .object([
-            "status": .string("waiting_on_you"), "session_id": .string("actual-chat"), "entry_id": .string("entry")
+            "status": .string("waiting_on_you"), "session_id": .string("actual-chat"), "entry_id": .string("entry"),
+            "answer": .string("Which file should I work on?")
         ]), route: route) else { Issue.record("Not an object"); return }
         #expect(wrapped["session_id"] == .string("actual-chat"))
         #expect(wrapped["conversation_id"] == .string(bot))
         #expect(wrapped["message_id"] == .string("entry"))
+        #expect(wrapped["reply"] == .string("Which file should I work on?"))
         let coding = AgentConversationRouting.Route(tool: "codex_message", input: ["message_id": .string("unaccepted")], agent: "codex")
         guard case .object(let failure) = AgentConversationRouting.wrap(result: .object(["status": .string("error")]), route: coding) else { Issue.record("Not an object"); return }
         #expect(failure["message_id"] == nil)

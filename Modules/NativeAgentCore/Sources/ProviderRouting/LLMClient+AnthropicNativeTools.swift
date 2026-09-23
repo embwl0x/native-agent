@@ -206,8 +206,7 @@ extension AnthropicAdapter {
     /// `cacheBreakpoint` stamps ONE ephemeral `cache_control` marker on the
     /// LAST tool definition — Anthropic prompt caching is a prefix match over
     /// tools → system → messages, so a breakpoint at the end of the tools
-    /// block caches the whole declaration mass. Exactly the placement the
-    /// OAuth-direct adapter already uses (`makeToolList`). Budget: this lane
+    /// block caches the whole declaration mass. Budget: this lane
     /// spends at most 1 here + at most 1 in `makeSystemBlocks`, well inside
     /// Anthropic's limit of 4 breakpoints per request.
     static func nativeToolsArray(
@@ -865,7 +864,8 @@ extension AnthropicAdapter {
                         streaming: true,
                         usage: usage.isEmpty ? nil : usage,
                         ttftMs: ttftMs,
-                        durationMs: durationMs
+                        durationMs: durationMs,
+                        stopReason: lastStopReason
                     )
                     if !yieldedSemanticOutput {
                         throw FirstPartyExecutionControls.anthropicEmptyStreamError(

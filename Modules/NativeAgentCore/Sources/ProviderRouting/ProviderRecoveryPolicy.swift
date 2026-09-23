@@ -222,7 +222,7 @@ public enum ProviderRecoveryPolicy {
     }
 
     public static func personMessage(_ error: Error) -> String? {
-        if let report = error as? ProviderFailure.Report { return report.errorDescription }
+        if let report = error as? ProviderFailure.Report { return report.personDescription }
         if let wrapped = error as? any ProviderFailureWrapping { return personMessage(wrapped.providerFailureCause) }
         if let error = error as? LLMError { return error.errorDescription }
         return ProviderFailure.classify(error)?.errorDescription

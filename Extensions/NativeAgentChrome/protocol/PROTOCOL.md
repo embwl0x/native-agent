@@ -42,12 +42,12 @@ snapshot or user takeover.
 | Action | Required payload | Result or behavior |
 |---|---|---|
 | `attach` | none | Negotiates protocol, extension version, host id, and capabilities. |
-| `lease.acquire` | `mode` (`create` or `claim`), optional `leaseDurationMs` | Creates an inactive tab or claims an exact existing tab. Claim requires `tabId` plus exact expected URL/title. The default lease is 60 seconds and the bounded range is 30–300 seconds, matching Chrome's production alarm floor. |
+| `lease.acquire` | `mode` (`create` or `claim`), optional `leaseDurationMs` | Creates an inactive tab or claims an exact existing tab. X/Twitter post creation automatically uses its own unfocused window with one active tab; optional create-only `renderingMode` selects `visible_work_window` or `grouped_background`. Never changes the user's selected tab. One X thread's real replies verified live; rendering remains observable, not universally guaranteed. Claim requires `tabId` plus exact expected URL/title. Default lease 60 seconds; bounded range 30–300 seconds. |
 | `lease.renew` | `leaseId`, `expectedUserSequence`, optional `leaseDurationMs` | Extends an active lease from the current instant and emits `lease.renewed`. |
 | `lease.resume` | `leaseId`, `expectedUserSequence` | Reserved compatibility action. It returns `lease_resume_not_supported`: user yield is terminal, so the host must explicitly reacquire the exact tab. |
 | `lease.release` | `leaseId` | Releases a claimed tab; closes an agent-created tab unless `closeCreatedTab` is false. |
 | `navigate` | `leaseId`, `expectedUserSequence`, HTTP(S) `url` | Navigates only the leased tab. |
-| `page.snapshot.read` | `leaseId` | Returns the structured page snapshot below while the lease remains active. |
+| `page.snapshot.read` | `leaseId` | Returns viewport-scoped nodes and summary while the lease remains active. `rendering` reports actual visibility/readiness; loaded DOM only, never proof absent replies do not exist. Scroll and read again for later feed items or replies. |
 | `page.element.click` | `leaseId`, `expectedUserSequence`, `snapshotId`, `nodeId` | Clicks a node from the exact observed snapshot. No arbitrary selector crosses the protocol. |
 | `page.element.fill` | `leaseId`, `expectedUserSequence`, `snapshotId`, `nodeId`, `value` | Replaces a current non-password editable node value and returns one outcome receipt. |
 | `page.element.type` | `leaseId`, `expectedUserSequence`, `snapshotId`, `nodeId`, `text` | Appends text sequentially to a current non-password editable node and returns one outcome receipt. |

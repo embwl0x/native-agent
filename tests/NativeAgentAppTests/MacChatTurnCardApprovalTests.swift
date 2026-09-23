@@ -289,7 +289,23 @@ struct MacChatTurnCardApprovalTests {
         ])
         #expect(NativeClient.chatApprovalOriginSessionId(payload) == "session-7")
 
-        // Only chat tool approvals carry a chat origin.
+        // Live ACP questions use the same card projection, but their distinct
+        // kind must never qualify them for post-approval tool replay.
+        let acpOrigin = NativeClient.chatApprovalOriginSessionId(.object([
+            "kind": .string("agent_acp_live_approval"),
+            "origin": .object(["sessionId": .string("session-7")]),
+        ]))
+        #expect(acpOrigin == "session-7")
+        var acp = row(id: "acp", session: "ignored", createdAt: 1, status: "pending")
+        acp.chatOriginSessionId = acpOrigin
+        acp.action = "agent.acp.permission"
+        #expect(MacChatTurnApprovalProjection.approval(
+            sessionId: "session-7", turnStartedAt: time(0), approvals: [acp]
+        )?.isActionable == true)
+        #expect(MacChatTurnApprovalProjection.approval(
+            sessionId: "different-chat", turnStartedAt: time(0), approvals: [acp]
+        ) == nil)
+        // Unrelated approvals do not gain a chat origin.
         #expect(NativeClient.chatApprovalOriginSessionId(.object([
             "kind": .string("workshop_step"),
             "origin": .object(["sessionId": .string("session-7")]),

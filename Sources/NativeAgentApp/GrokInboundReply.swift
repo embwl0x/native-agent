@@ -15,10 +15,29 @@ enum GrokInboundReply {
         let pending = try store.claimReply(reply, peer: principal.id)
         let peer = AgentBridgePrincipal(id: principal.id, peerID: principal.id, elevated: false, displayName: contact.name)
         let run: String
-        if let deliver { run = try await deliver(pending, reply.text, peer) }
-        else { run = try await enqueue(pending, text: reply.text, peer: peer, dataRoot: dataRoot) }
+        do {
+            if let deliver { run = try await deliver(pending, reply.text, peer) }
+            else { run = try await enqueue(pending, text: reply.text, peer: peer, dataRoot: dataRoot) }
+        } catch {
+            // Queuing failed: put the claim back so the reply can still land.
+            _ = try? store.update(reply.message_id, peer: peer.id) { $0.state = "accepted" }
+            throw error
+        }
         try store.update(reply.message_id, peer: peer.id) { $0.state = "answered"; $0.runID = run }
+        // 2026-09-22 WHY: no background read covers Grok, so its conversation
+        // row stayed "waiting" forever. Settle the exact row that sent this id.
+        let conversations = AgentConversationStore(dataRoot: dataRoot)
+        if let row = try? conversations.records().first(where: {
+            $0.agent == "peer:" + peer.id && $0.readInput?["message_id"] == .string(reply.message_id) }) {
+            _ = try? conversations.update(id: row.id, operationID: row.operationID) {
+                $0.receipt = AgentConversationStore.cacheReceipt(.object(["status": .string("answered"), "completed": .bool(true),
+                    "message_id": .string(reply.message_id), "reply": .string(reply.text), "untrusted_remote_data": .bool(true)]))
+                $0.phase = "ready"
+            }
+        }
+        // A correlated reply also proves the original outbound message reached this run.
         AgentPeerStore(dataRoot: dataRoot).recordProof(peerID: peer.id, inbound: true)
+        AgentPeerStore(dataRoot: dataRoot).recordRoundTrip(peerID: peer.id, workspace: "Grok Bot conversation")
     }
 
     private static func enqueue(_ pending: GrokPendingRequest, text: String, peer: AgentBridgePrincipal, dataRoot: URL) async throws -> String {

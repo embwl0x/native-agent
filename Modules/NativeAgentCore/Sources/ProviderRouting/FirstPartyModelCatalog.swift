@@ -130,23 +130,27 @@ public enum FirstPartyModelCatalog {
         .init(id: "gpt-5.6-terra", name: "GPT-5.6 Terra", contextLength: 372_000, supportsJSONMode: true, defaultReasoningEffort: "medium", supportedReasoningEfforts: accountGPT56SolTerraEfforts, supportsFast: true),
         .init(id: "gpt-5.6-luna", name: "GPT-5.6 Luna", contextLength: 372_000, supportsJSONMode: true, defaultReasoningEffort: "medium", supportedReasoningEfforts: accountGPT56LunaEfforts, supportsFast: true),
         .init(id: gpt6AstraModelID, name: "GPT-6-Astra", contextLength: 272_000, supportsJSONMode: true, defaultReasoningEffort: "medium", supportedReasoningEfforts: accountGPT6AstraEfforts, supportsFast: true),
+        .init(id: "gpt-6-sol", name: "GPT-6-Sol", contextLength: 272_000, supportsJSONMode: true, defaultReasoningEffort: "medium", supportedReasoningEfforts: accountGPT6AstraEfforts, supportsFast: true),
+        .init(id: "gpt-6-luna", name: "GPT-6-Luna", contextLength: 272_000, supportsJSONMode: true, defaultReasoningEffort: "medium", supportedReasoningEfforts: accountGPT56LunaEfforts, supportsFast: true),
     ]
 
     /// Current Claude API catalog for the account, including still-available
     /// pinned models. `none` means the model has no adjustable API effort
     /// parameter; it is not sent on the wire.
     public static let anthropicModels: [FirstPartyModelDescriptor] = [
+        // Opus 5.5 (User 09-22, launch day): 1M window, 128K output. Thinking
+        // cannot be disabled and forced tool_choice any/tool is a 400; neither
+        // is sent on any Anthropic lane. Its own effort default is medium.
+        // 2026-09-22: first row = a new account's default (saved on connect).
+        .init(id: "claude-opus-5-5", name: "Claude Opus 5.5", contextLength: 1_000_000, defaultReasoningEffort: "medium", supportedReasoningEfforts: fullClaudeEfforts, supportsMidConversationSystem: true, supportsMidConversationToolChanges: true),
         .init(id: "claude-opus-4-8", name: "Claude Opus 4.8", contextLength: 1_000_000, defaultReasoningEffort: "high", supportedReasoningEfforts: fullClaudeEfforts, supportsMidConversationSystem: true, supportsMidConversationToolChanges: true),
         // Fable 5.1 (added 2026-09-01, verified against the live catalog): 1M
         // window, 128K output, thinking always on (adaptive; explicit
         // disabled/budget_tokens 400), forced tool_choice any/tool 400, no
-        // prefill. Placed AFTER opus-4-8 so index 0 (the implicit provider
-        // default) does not change.
+        // prefill.
         .init(id: "claude-fable-5-1", name: "Claude Fable 5.1", contextLength: 1_000_000, defaultReasoningEffort: "high", supportedReasoningEfforts: fullClaudeEfforts, supportsMidConversationSystem: true, supportsMidConversationSystemClearAt: true, supportsMidConversationToolChanges: true),
         // Capability/window fields INHERITED verbatim from claude-opus-4-8 and
-        // not independently verified for opus-5. Deliberately placed AFTER
-        // opus-4-8: index 0 is the implicit provider default via
-        // defaultModelForProvider, which must not change here.
+        // not independently verified for opus-5.
         .init(id: "claude-opus-5", name: "Claude Opus 5", contextLength: 1_000_000, defaultReasoningEffort: "high", supportedReasoningEfforts: fullClaudeEfforts, supportsMidConversationSystem: true, supportsMidConversationToolChanges: true),
         .init(id: "claude-fable-5", name: "Claude Fable 5", contextLength: 1_000_000, defaultReasoningEffort: "high", supportedReasoningEfforts: fullClaudeEfforts, supportsMidConversationSystem: true, supportsMidConversationToolChanges: true),
         .init(id: "claude-sonnet-5", name: "Claude Sonnet 5", contextLength: 1_000_000, defaultReasoningEffort: "high", supportedReasoningEfforts: fullClaudeEfforts),
@@ -155,7 +159,7 @@ public enum FirstPartyModelCatalog {
         .init(id: "claude-opus-4-6", name: "Claude Opus 4.6", contextLength: 1_000_000, defaultReasoningEffort: "high", supportedReasoningEfforts: claude46Efforts),
         .init(id: "claude-opus-4-5-20251101", name: "Claude Opus 4.5", contextLength: 200_000, defaultReasoningEffort: "high", supportedReasoningEfforts: ["low", "medium", "high"]),
         .init(id: "claude-haiku-4-5", name: "Claude Haiku 4.5", contextLength: 200_000, defaultReasoningEffort: "none", supportedReasoningEfforts: ["none"]),
-        .init(id: "claude-sonnet-4-5-20250929", name: "Claude Sonnet 4.5", contextLength: 1_000_000, defaultReasoningEffort: "none", supportedReasoningEfforts: ["none"]),
+        .init(id: "claude-sonnet-4-5-20250929", name: "Claude Sonnet 4.5", contextLength: 200_000, defaultReasoningEffort: "none", supportedReasoningEfforts: ["none"]),
     ]
 
     /// xAI text models retained by NativeAgent plus the current Grok 4.5

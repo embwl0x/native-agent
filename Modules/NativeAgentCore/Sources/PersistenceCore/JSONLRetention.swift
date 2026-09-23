@@ -10,20 +10,27 @@ public enum JSONLLineCaps {
     /// got in 12126ef2. Activity was the ownerless leftover with NO rotation
     /// anywhere post-daemon.
     public static let activityEvents = 5000
+    public static let activityTrimTargetLines = 4000
     /// Within the fixed activity line budget, retain the newest small sample
     /// of every event kind. The shared feed is dominated by chat/history rows;
     /// plain FIFO would erase one-off approval, provider, skill, and security
     /// evidence at the next trim even though those are the rows most useful for
     /// diagnosing a disconnected subsystem.
     public static let activityMinimumRowsPerKind = 8
-    /// Amortizes activity rotation: below this size append remains O(1). Once
-    /// crossed, the newest line-cap is restored under the existing feed lock.
+    /// Marks activity as an amortized feed. The shared writer evaluates its
+    /// row budget on the first/every128th append, then retains4k rows. This is
+    /// a soft scheduling hint, not a hard byte ceiling.
     public static let activityTrimTriggerBytes = 4 * 1024 * 1024
     /// `<dataRoot>/traces/events.jsonl` — shared cross-subsystem trace feed.
     public static let traceEvents = 5000
-    /// Amortizes trace rotation the same way activity does: under the trigger
-    /// append stays O(1), above it the newest retained window is restored.
+    public static let traceTrimTargetLines = 4000
+    /// Trace line checks use the same bounded stride as activity. Byte limits
+    /// below are separate and are evaluated on every append.
     public static let traceTrimTriggerBytes = 4 * 1024 * 1024
+    /// Diagnostic feeds have both a row budget and a hard byte ceiling. The
+    /// lower byte target leaves space for ordinary appends after a rotation.
+    public static let traceMaximumBytes = 8 * 1024 * 1024
+    public static let traceTrimTargetBytes = 4 * 1024 * 1024
 
     // M6 (honesty sweep, 2026-07-09): six audit/receipt ledgers appended
     // forever with no rotation anywhere. Their sibling `workflows/runs.json`
@@ -47,6 +54,10 @@ public enum JSONLLineCaps {
     /// once (`security/audit-archive-<date>.jsonl`) before the first trim so
     /// the accumulated history is not lost.
     public static let securityAuditTrimTriggerBytes = 16 * 1024 * 1024
+    /// 2026-09-22: trimming to exactly the 20k cap left a mature ledger one
+    /// stride from the next 16 MiB rewrite (~10x/day). Trimming to 16k leaves
+    /// 4k rows of headroom, so it rewrites every few days.
+    public static let securityAuditTrimTargetLines = 16_000
     /// `<dataRoot>/mac_control_audit.jsonl` — blocked Mac-control receipts.
     public static let macControlAudit = 20_000
     /// `<dataRoot>/native_power/browser/receipts.jsonl` and
@@ -66,10 +77,6 @@ public enum JSONLLineCaps {
     public static let memoryRetentionReceipts = 5000
     /// `<dataRoot>/training/journal/audit_ledger.jsonl`.
     public static let trainingAudit = 5000
-    /// `~/.config/claude-bridge/message-replies.jsonl` — best-effort bridge
-    /// diagnostics; the canonical transcript and completion lifecycle live
-    /// elsewhere and must not be duplicated without a bound.
-    public static let bridgeMessageReplies = 5000
     /// `~/.config/claude-bridge/claude-inbox.jsonl` — Agent → Claude
     /// durable inbox rows (audit 2026-07-21: raw uncapped append; same
     /// budget as the other bridge feeds).
@@ -149,8 +156,10 @@ public enum JSONLLineCaps {
     // returned to the caller instead — so a cap on it would bound nothing. The
     // existing rows stay on disk as history and nothing appends to them.
 
-    /// How often `appendJSONLCapped` evaluates the LINE cap in full, in
-    /// appends-per-path, regardless of `trimWhenBytesExceed`.
+    /// How often amortized `appendJSONLCapped` feeds evaluate the LINE cap in
+    /// full, in appends-per-path. An inherited over-cap file is checked first;
+    /// afterwards the row trigger can overshoot by at most127 appends. The
+    /// explicit byte ceiling, when configured, still applies after every append.
     ///
     /// F8 (2026-08-28): the byte trigger alone DEFEATS the line cap. Live
     /// `activity/events.jsonl` sat at 4,822 of its 5,000-line budget at 3.0 MB
@@ -227,8 +236,8 @@ final class JSONLCapCheckCounter: @unchecked Sendable {
 /// feed's flock on the chat turn path (a 20k-line trace file meant ~18MB read per
 /// appended row). Two cheap `stat`-based early-outs now short-circuit it:
 ///   - `trimWhenBytesExceed`: an optional soft trigger. Below it the cap is not
-///     evaluated at all, so appends are amortized O(1) and the file stays bounded
-///     by that byte budget instead of being re-counted every row. Callers that
+///     evaluated at all. It is NOT a byte cap: retained rows can remain above
+///     the trigger. Shared appends amortize calls separately. Callers that
 ///     need the exact newest-`maxLines` invariant after EVERY append omit it.
 ///   - an exact lower bound: a file of `n` bytes holds at most `n` lines (every
 ///     line but the last carries a newline), so `size < maxLines` cannot be over
@@ -237,7 +246,8 @@ final class JSONLCapCheckCounter: @unchecked Sendable {
 public func enforceJSONLLineCap(
     at path: URL,
     maxLines: Int,
-    trimWhenBytesExceed: Int? = nil
+    trimWhenBytesExceed: Int? = nil,
+    trimToLines: Int? = nil
 ) throws -> Int {
     guard maxLines > 0, FileManager.default.fileExists(atPath: path.path) else { return 0 }
     // An unstattable-but-present file falls through to the full read rather than
@@ -259,8 +269,9 @@ public func enforceJSONLLineCap(
     var lines = s.split(separator: "\n", omittingEmptySubsequences: false)
     if lines.last?.isEmpty == true { lines.removeLast() }
     guard lines.count > maxLines else { return 0 }
-    let dropped = lines.count - maxLines
-    let trimmed = lines.suffix(maxLines).joined(separator: "\n") + "\n"
+    let retainedLines = min(maxLines, max(1, trimToLines ?? maxLines))
+    let dropped = lines.count - retainedLines
+    let trimmed = lines.suffix(retainedLines).joined(separator: "\n") + "\n"
     // Durable rewrite: the append that preceded this trim was fsync'd, so the
     // trim must not be the weak link — a bare .atomic write + replaceItemAt
     // can commit the rename before the data blocks on power loss, leaving the
@@ -279,7 +290,8 @@ func enforceActivityEventsLineCap(
     at path: URL,
     maxLines: Int,
     minimumRowsPerKind: Int = JSONLLineCaps.activityMinimumRowsPerKind,
-    trimWhenBytesExceed: Int? = nil
+    trimWhenBytesExceed: Int? = nil,
+    trimToLines: Int? = nil
 ) throws -> Int {
     guard maxLines > 0,
           minimumRowsPerKind > 0,
@@ -300,6 +312,7 @@ func enforceActivityEventsLineCap(
     var lines = text.split(separator: "\n", omittingEmptySubsequences: false)
     if lines.last?.isEmpty == true { lines.removeLast() }
     guard lines.count > maxLines else { return 0 }
+    let retainedLines = min(maxLines, max(1, trimToLines ?? maxLines))
 
     var reserved = Set<Int>()
     var retainedPerKind: [String: Int] = [:]
@@ -315,9 +328,9 @@ func enforceActivityEventsLineCap(
         retainedPerKind[kind, default: 0] += 1
     }
 
-    var kept = Set(lines.indices.suffix(maxLines))
+    var kept = Set(lines.indices.suffix(retainedLines))
     kept.formUnion(reserved)
-    while kept.count > maxLines {
+    while kept.count > retainedLines {
         if let oldestUnreserved = kept.sorted().first(where: { !reserved.contains($0) }) {
             kept.remove(oldestUnreserved)
         } else if let oldest = kept.min() {
@@ -342,11 +355,15 @@ func enforceActivityEventsLineCap(
 /// once it crosses `maxBytes`. The caller must hold the file's flock. The
 /// lower target provides hysteresis so a busy feed does not reread/rewrite the
 /// entire file on every append after reaching its ceiling.
+/// A newest whole row larger than the low-water target may survive by itself;
+/// diagnostic mode still requires it to fit the hard maximum. Default mode
+/// preserves even an oversized newest evidence row for its owning caller.
 @discardableResult
 public func enforceJSONLByteCap(
     at path: URL,
     maxBytes: Int,
-    trimToBytes: Int
+    trimToBytes: Int,
+    preserveOversizedNewestRow: Bool = true
 ) throws -> Int {
     guard maxBytes > 0,
           trimToBytes > 0,
@@ -359,6 +376,9 @@ public func enforceJSONLByteCap(
     let data = try Data(contentsOf: path)
     guard data.count > maxBytes else { return 0 }
     guard let text = String(data: data, encoding: .utf8) else {
+        if !preserveOversizedNewestRow {
+            throw JSONLPathOwnedAppendError.unreadableDiagnosticFeed(path.standardizedFileURL.path)
+        }
         NSLog("enforceJSONLByteCap: %@ is not valid UTF-8 (%d bytes) — cap skipped",
               path.path, data.count)
         return 0
@@ -369,6 +389,11 @@ public func enforceJSONLByteCap(
     var keptBytes = 0
     for line in lines.reversed() {
         let lineBytes = line.utf8.count + 1
+        // Only opted-in disposable diagnostics may discard a legacy row that
+        // alone exceeds the hard ceiling. Evidence-owning callers keep the
+        // historical default. New oversized diagnostic rows are refused before
+        // append by appendJSONLCapped, so this is recovery for inherited data.
+        if !preserveOversizedNewestRow, lineBytes > maxBytes { continue }
         if !keptReversed.isEmpty, keptBytes + lineBytes > trimToBytes {
             break
         }
@@ -382,7 +407,7 @@ public func enforceJSONLByteCap(
     let kept = keptReversed.reversed()
     let dropped = max(0, lines.count - kept.count)
     guard dropped > 0 else { return 0 }
-    let trimmed = kept.joined(separator: "\n") + "\n"
+    let trimmed = kept.isEmpty ? "" : kept.joined(separator: "\n") + "\n"
     // Same durable rewrite as enforceJSONLLineCap — see the note there.
     try SwiftNativePersistenceCore.atomicWrite(Data(trimmed.utf8), to: path)
     return dropped
@@ -428,7 +453,40 @@ public func appendJSONLCapped(
     }
     let effectiveMaxLines = policy?.maxLines ?? maxLines
     let effectiveTrimTrigger = policy?.trimWhenBytesExceed ?? trimWhenBytesExceed
+    let effectiveMaxBytes = policy?.maxBytes ?? maxBytes
+    let effectiveTrimToBytes = policy?.trimToBytes ?? trimToBytes ?? effectiveMaxBytes
+    let diagnosticByteBound = policy?.maxBytes != nil
+    let diagnosticAppendBytes: Int?
+    // Reject rather than truncate a new diagnostic record that cannot fit in
+    // its file's hard budget. Audit/authoritative callers do not inherit this.
+    if diagnosticByteBound, let effectiveMaxBytes {
+        let count = try event.serialize(pretty: false).utf8.count + 1
+        guard count <= effectiveMaxBytes else {
+            throw JSONLPathOwnedAppendError.recordExceedsByteLimit(
+                path.standardizedFileURL.path, count, effectiveMaxBytes
+            )
+        }
+        diagnosticAppendBytes = count
+    } else {
+        diagnosticAppendBytes = nil
+    }
     let work: @Sendable () async throws -> Void = {
+        // Do not keep growing an inherited malformed diagnostic feed merely
+        // because retention cannot decode it. Preserve the evidence and refuse
+        // this append before it crosses the ceiling; no quarantine copy can
+        // itself become an unbounded second ledger.
+        if let diagnosticAppendBytes, let effectiveMaxBytes,
+           FileManager.default.fileExists(atPath: path.path) {
+            let currentBytes = ((try? FileManager.default.attributesOfItem(
+                atPath: path.path
+            ))?[.size] as? NSNumber)?.intValue
+            if currentBytes == nil || currentBytes! > effectiveMaxBytes - diagnosticAppendBytes {
+                let data = try Data(contentsOf: path)
+                guard String(data: data, encoding: .utf8) != nil else {
+                    throw JSONLPathOwnedAppendError.unreadableDiagnosticFeed(path.standardizedFileURL.path)
+                }
+            }
+        }
         // Decide once, before the append, whether this call can enter the
         // full-read line-cap path. Owners that must preserve pre-trim evidence
         // use the hook to archive at exactly the same amortized checkpoints;
@@ -437,20 +495,25 @@ public func appendJSONLCapped(
         let fullCheckWillBeDue = JSONLCapCheckCounter.shared.isFullCheckDueOnNextAppend(
             path: path, stride: capCheckStride
         )
+        // A soft trigger is not a ceiling: once a retained file remained above
+        // it, the old code rewrote that file for EVERY new row. Trigger-backed
+        // feeds now count only at bounded stride checkpoints, even when mature.
+        // Explicit hard byte ceilings are checked on every append separately.
+        let shouldCheckLines = fullCheckWillBeDue || effectiveTrimTrigger == nil
         if let beforePotentialLineCap {
-            let reachesByteTrigger: Bool
-            if let effectiveTrimTrigger {
+            let reachesByteCeiling: Bool
+            if let effectiveMaxBytes {
                 let currentBytes = ((try? FileManager.default.attributesOfItem(
                     atPath: path.path
                 ))?[.size] as? NSNumber)?.intValue
                 let appendedBytes = (try? event.serialize(pretty: false).utf8.count + 1)
-                reachesByteTrigger = currentBytes == nil
+                reachesByteCeiling = currentBytes == nil
                     || appendedBytes == nil
-                    || currentBytes! + appendedBytes! >= effectiveTrimTrigger
+                    || currentBytes! + appendedBytes! > effectiveMaxBytes
             } else {
-                reachesByteTrigger = true
+                reachesByteCeiling = false
             }
-            if fullCheckWillBeDue || reachesByteTrigger {
+            if shouldCheckLines || reachesByteCeiling {
                 try await beforePotentialLineCap()
             }
         }
@@ -461,39 +524,41 @@ public func appendJSONLCapped(
                 try await persistence.appendJSONL(event, to: path)
             }
         }
-        // F2 note above applies to WHICH cap; this decides WHEN it is counted.
-        // On a stride append the byte trigger is dropped so the line budget is
-        // actually evaluated — otherwise a feed whose rows are smaller than
-        // `trigger / maxLines` never reaches the trigger at its line cap and
-        // grows past it (F8: activity/events.jsonl, 4,822/5,000 lines at 3.0 MB
-        // against a 4 MB trigger).
-        let fullCheckDue = JSONLCapCheckCounter.shared.isFullCheckDue(
+        // Spend the checkpoint only after a successful append. The caller's
+        // file lock keeps the earlier evidence-hook preview and this decision
+        // together. Full checkpoints always evaluate rows, regardless of size.
+        _ = JSONLCapCheckCounter.shared.isFullCheckDue(
             path: path, stride: capCheckStride
         )
         let dropped: Int
-        if path.lastPathComponent == "events.jsonl",
+        if !shouldCheckLines {
+            dropped = 0
+        } else if path.lastPathComponent == "events.jsonl",
            path.deletingLastPathComponent().lastPathComponent == "activity" {
             dropped = try enforceActivityEventsLineCap(
                 at: path,
                 maxLines: effectiveMaxLines,
-                trimWhenBytesExceed: fullCheckDue ? nil : effectiveTrimTrigger
+                trimWhenBytesExceed: nil,
+                trimToLines: policy?.trimToLines
             )
         } else {
             dropped = try enforceJSONLLineCap(
                 at: path,
                 maxLines: effectiveMaxLines,
-                trimWhenBytesExceed: fullCheckDue ? nil : effectiveTrimTrigger
+                trimWhenBytesExceed: nil,
+                trimToLines: policy?.trimToLines
             )
         }
         if dropped > 0 {
             NSLog("%@: %@ cap dropped %d oldest line(s)",
                   logLabel, path.lastPathComponent, dropped)
         }
-        if let maxBytes {
+        if let effectiveMaxBytes, let effectiveTrimToBytes {
             let byteDropped = try enforceJSONLByteCap(
                 at: path,
-                maxBytes: maxBytes,
-                trimToBytes: trimToBytes ?? maxBytes
+                maxBytes: effectiveMaxBytes,
+                trimToBytes: effectiveTrimToBytes,
+                preserveOversizedNewestRow: !diagnosticByteBound
             )
             if byteDropped > 0 {
                 NSLog("%@: %@ byte cap dropped %d oldest line(s)",
@@ -524,18 +589,29 @@ public func appendJSONLCapped(
 public struct JSONLPathOwnedCapPolicy: Sendable, Equatable {
     public var maxLines: Int
     public var trimWhenBytesExceed: Int?
+    public var trimToLines: Int?
+    public var maxBytes: Int?
+    public var trimToBytes: Int?
 
     public init(
         maxLines: Int,
-        trimWhenBytesExceed: Int? = nil
+        trimWhenBytesExceed: Int? = nil,
+        trimToLines: Int? = nil,
+        maxBytes: Int? = nil,
+        trimToBytes: Int? = nil
     ) {
         self.maxLines = maxLines
         self.trimWhenBytesExceed = trimWhenBytesExceed
+        self.trimToLines = trimToLines
+        self.maxBytes = maxBytes
+        self.trimToBytes = trimToBytes
     }
 }
 
 public enum JSONLPathOwnedAppendError: Error, Equatable {
     case unregisteredPath(String)
+    case recordExceedsByteLimit(String, Int, Int)
+    case unreadableDiagnosticFeed(String)
     /// A raw (uncapped) append reached a file whose retention is path-owned.
     /// F2 (2026-08-28): the registry used to be opt-in at the CALL SITE, so the
     /// invariant "this feed is capped" held only as long as every writer
@@ -565,13 +641,24 @@ public func jsonlPathOwnedCapPolicy(for path: URL) -> JSONLPathOwnedCapPolicy? {
     if file == "events.jsonl", parent == "traces" {
         return JSONLPathOwnedCapPolicy(
             maxLines: JSONLLineCaps.traceEvents,
-            trimWhenBytesExceed: JSONLLineCaps.traceTrimTriggerBytes
+            trimWhenBytesExceed: JSONLLineCaps.traceTrimTriggerBytes,
+            trimToLines: JSONLLineCaps.traceTrimTargetLines,
+            maxBytes: JSONLLineCaps.traceMaximumBytes,
+            trimToBytes: JSONLLineCaps.traceTrimTargetBytes
         )
     }
     if file == "events.jsonl", parent == "activity" {
         return JSONLPathOwnedCapPolicy(
             maxLines: JSONLLineCaps.activityEvents,
-            trimWhenBytesExceed: JSONLLineCaps.activityTrimTriggerBytes
+            trimWhenBytesExceed: JSONLLineCaps.activityTrimTriggerBytes,
+            trimToLines: JSONLLineCaps.activityTrimTargetLines
+        )
+    }
+    if file == "audit.jsonl", parent == "security" {
+        return JSONLPathOwnedCapPolicy(
+            maxLines: JSONLLineCaps.securityAudit,
+            trimWhenBytesExceed: JSONLLineCaps.securityAuditTrimTriggerBytes,
+            trimToLines: JSONLLineCaps.securityAuditTrimTargetLines
         )
     }
     if file == "runs.jsonl",

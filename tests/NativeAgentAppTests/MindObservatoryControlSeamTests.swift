@@ -341,11 +341,11 @@ struct MindObservatoryChangeStreamTests {
         let observatory = await runtime.changes()
         let livingStatus = await runtime.changes()
         let first = Task { () -> NativeCognitionRuntimeChange? in
-            for await change in observatory { return change }
+            for await change in observatory where change.reason == "event:userMessageReceived" { return change }
             return nil
         }
         let second = Task { () -> NativeCognitionRuntimeChange? in
-            for await change in livingStatus { return change }
+            for await change in livingStatus where change.reason == "event:userMessageReceived" { return change }
             return nil
         }
 

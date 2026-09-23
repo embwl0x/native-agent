@@ -14,10 +14,11 @@ struct MacAppleScriptReadinessTests {
                 if source.contains("set msgList to messages of inbox") {
                     throw NSError(domain: "NativeAgentAppleScript", code: -1741)
                 }
-                #expect(source.contains("set messageCount to count of messages of inbox"))
+                #expect(source.contains("set totalMessages to count of messages of inbox"))
                 #expect(source.contains("set msg to message i of inbox"))
                 #expect(source.contains("repeat with i from 1 to messageCount"))
-                return "Subject|||Sender|||Date|||Snippet###"
+                let fields = ["rfc@example.invalid", "Subject", "Sender", "Date", "Snippet"]
+                return "42|" + fields.joined(separator: "|") + "|false|0|7|7\n"
             }) {
                 try await MacAppleScriptBridge.mailListRecent(input: input)
             }

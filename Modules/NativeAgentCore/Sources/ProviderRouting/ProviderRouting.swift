@@ -338,6 +338,29 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
         return provider
     }
 
+    /// Local choices for helper creation; no network probe or setting change.
+    /// The normal creation gate still validates the explicitly chosen tuple.
+    public func botModelChoices() -> JSONValue {
+        let rows = nativeListProviders().filter { providerReadiness(id: $0.id).ready }.map { provider in
+            let shipped = FirstPartyModelCatalog.models(forProviderID: provider.id)
+            let models: [[String: JSONValue]]
+            if !shipped.isEmpty { models = shipped.map { $0.providerJSON() } }
+            else if case .array(let saved)? = provider.modelCatalog {
+                models = saved.compactMap { if case .object(let row) = $0 { return row }; return nil }
+            } else { models = [] }
+            let keys: Set<String> = ["id", "name", "supported_reasoning_efforts", "default_reasoning_effort", "supports_fast", "supports_tools"]
+            return JSONValue.object([
+                "provider": .string(provider.id), "name": .string(provider.displayName ?? provider.id),
+                "readiness": .string("credentials_available"),
+                "catalog_source": .string(shipped.isEmpty ? "local_catalog_suggestions" : "shipped_catalog"),
+                "models": .array(models.prefix(40).map { .object($0.filter { keys.contains($0.key) }) }),
+                "models_truncated": .bool(models.count > 40)
+            ])
+        }
+        return .object(["providers": .array(rows),
+            "detail": .string("Choose provider, model and reasoning_effort explicitly. These are local catalog choices on configured accounts, not a live service test. Non-shipped catalogs may be incomplete; creation validates the chosen route. No account or model setting changed.")])
+    }
+
     public func configureProvider(id: String, config: JSONValue) async throws -> Provider {
         guard case .object(let body) = config else {
             throw ProviderRoutingError.invalidRequest
@@ -1826,10 +1849,12 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
         switch lowerModel {
         case let model where model.hasPrefix("kimi-") || model.hasPrefix("moonshot-"):
             supported = Set(MoonshotModelCatalog.supportedReasoningEfforts(for: model))
-        case FirstPartyModelCatalog.gpt6AstraModelID:
+        case FirstPartyModelCatalog.gpt6AstraModelID, "gpt-6-sol":
             supported = providerID?.lowercased() == "openai"
                 ? Set(FirstPartyModelCatalog.publicGPT6AstraEfforts)
                 : Set(FirstPartyModelCatalog.accountGPT6AstraEfforts)
+        case "gpt-6-luna":
+            supported = Set(FirstPartyModelCatalog.accountGPT56LunaEfforts)
         case "gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra":
             supported = providerID?.lowercased() == "openai"
                 ? Set(FirstPartyModelCatalog.publicGPT56Efforts)

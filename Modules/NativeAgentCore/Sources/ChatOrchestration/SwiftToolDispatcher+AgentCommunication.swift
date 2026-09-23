@@ -13,6 +13,8 @@ public protocol BuiltInAgentLaneProviding: Sendable {
 }
 
 extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
+    public static func closeACPConnections() async { await AgentACPConnections.shared.closeAll() }
+
     public func builtInAgentLaneUsable(_ name: String) -> Bool {
         let helper: URL?
         let cli: String
@@ -102,7 +104,7 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
                 guard args["endpoint"] == nil, args["bearer_token"] == nil, args["app_bundle_id"] == nil else {
                     throw AgentCommunicationError.invalid("disconnect takes a name only")
                 }
-                return try hostDisconnect(name: name, workspace: workspace, store: store)
+                return try await hostDisconnect(name: name, store: store)
             }
             if args["endpoint"] == nil, args["app_bundle_id"] == nil, transportName == "auto" {
                 return try await hostConnect(name: name, workspace: workspace, executablePath: try Self.peerString(args, "executable_path", max: 4096, required: false), store: store, surface: surface,
@@ -209,9 +211,9 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
             guard !session.isEmpty else { throw AgentCommunicationError.invalid("A conversation is required") }
             if !sending {
                 let id = try Self.peerString(args, "message_id", max: 36)!
-                let pending = try GrokRequestStore(dataRoot: dataRoot).read(id, peer: peer.id)
-                guard pending.conversationID == session else { throw AgentCommunicationError.invalid("This request belongs to another conversation") }
-                return GrokBotRoute.projection(pending)
+                // 2026-09-22: her workspace window reads a Grok thread from any of
+                // her chats (User's product rule); only replies stay scoped to the asker.
+                return GrokBotRoute.projection(try GrokRequestStore(dataRoot: dataRoot).read(id, peer: peer.id))
             }
             if let requested = try Self.peerString(args, "conversation_id", max: 128, required: false), requested != session {
                 throw AgentCommunicationError.invalid("Grok replies return to the conversation asking")
@@ -227,15 +229,31 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
                 throw AgentCommunicationError.invalid("A2A listing filters require agent_read without task_id")
             }
         }
+        if peer.transport == .desktopChat {
+            guard sending else {
+                return .object(["status": .string("nothing_to_read"), "completed": .bool(false),
+                    "detail": .string("The answer returns with the message; there is no saved answer to recover here.")])
+            }
+            guard args["message_id"] == nil, args["task_id"] == nil,
+                  let bundle = AgentPeerStore.desktopBundleID(peer.endpoint) else {
+                throw AgentCommunicationError.invalid("This contact takes text and conversation_id only.")
+            }
+            var plan: [String: JSONValue] = ["status": .string("desktop_chat_send"), "peer_id": .string(peer.id),
+                "app_bundle_id": .string(bundle), "text": .string(try Self.peerString(args, "text", max: 64000)!)]
+            // The thread's title in that app; absent starts a new thread there.
+            if let thread = try Self.peerString(args, "conversation_id", max: 480, required: false) { plan["conversation_id"] = .string(thread) }
+            return .object(plan)
+        }
         if peer.transport == .acp {
             guard sending else {
                 return .object(["status": .string("nothing_to_read"), "completed": .bool(false),
-                    "detail": .string("The answer returns with the message. This contact starts a new conversation for each message; there is no saved answer to recover.")])
+                    "detail": .string("The answer returns with the message; there is no saved answer to recover here.")])
             }
-            guard args["conversation_id"] == nil, args["message_id"] == nil, args["task_id"] == nil else {
-                throw AgentCommunicationError.invalid("This contact starts a new conversation for each message. Send text only.")
+            guard args["message_id"] == nil, args["task_id"] == nil else {
+                throw AgentCommunicationError.invalid("This contact takes text and conversation_id only.")
             }
             return try await hostACPRun(contact: peer, message: Self.peerString(args, "text", max: 64000)!,
+                                        conversationID: Self.peerString(args, "conversation_id", max: 1024, required: false),
                                         store: store, surface: surface)
         }
         if peer.transport == .mcpHost {
@@ -269,7 +287,10 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
             if requested != nil, row.commandLine?.continuesConversations != true {
                 throw AgentCommunicationError.invalid("\(row.displayName)'s command line documents no way to continue a conversation, so every message to it is standalone; omit conversation_id")
             }
-            let session = requested ?? (row.commandLine?.continuesConversations == true
+            if let requested, UUID(uuidString: requested) == nil {
+                throw AgentCommunicationError.invalid("conversation_id must be the session UUID returned by this contact")
+            }
+            let session = requested ?? (row.commandLine?.continuesConversations == true && row.commandLine?.capturesThreadID != true
                 ? UUID().uuidString.lowercased() : nil)
             return await hostCommandRun(row: row, contact: peer, message: text, session: session,
                                         resuming: requested != nil, store: store, surface: surface,
@@ -557,6 +578,18 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
     /// confirm-tier tool body only executes on the approved replay — so this is
     /// where the entry is actually written and not one step earlier.
     private func hostConnect(name: String, workspace: String?, executablePath: String?, store: AgentPeerStore, surface: String, workingDirectory: String? = nil) async throws -> JSONValue {
+        // A chat app driven through its own window: nothing is written to its
+        // settings and no key is minted, so saving it needs no card.
+        if let row = AgentHostDirectory.row(named: name), row.route == .desktopChat {
+            guard row.isInstalled, let bundle = row.bundleIDs.first, let endpoint = URL(string: "app://" + bundle) else {
+                return .object(["status": .string("not_supported"), "requested": .string(name), "changed": .bool(false),
+                                "detail": .string("\(row.displayName) is not installed on this Mac.")])
+            }
+            let saved = try store.insertDiscovered(AgentPeerContact(name: row.displayName, endpoint: endpoint, transport: .desktopChat))
+            return .object(["status": .string("configured"), "contact": Self.peerProjection(saved, peers: (try? store.list()) ?? []),
+                "changed": .bool(true), "completed": .bool(false),
+                "detail": .string("Saved. Your first message opens a chat of your own in \(row.displayName) and brings its answer back in the same call.")])
+        }
         guard AgentHostDirectory.row(named: name)?.acp != nil || AgentHostConnection.personApproved else {
             throw AgentCommunicationError.invalid("Connecting a named agent requires the person's approval card.")
         }
@@ -578,10 +611,15 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
             return .object(["status": .string("grok_setup"), "peer_id": .string(result.contact.id)])
         }
         if let existing = proposal.existing, proposal.row.acp == nil {
+            let permissionsChanged = try AgentHostConnection.ensureMessagingPermissions(contact: existing, store: store)
             var value: [String: JSONValue] = ["status": .string("already_configured"), "contact": Self.peerProjection(existing, peers: (try? store.list()) ?? []),
-                            "changed": .bool(false),
+                            "changed": .bool(permissionsChanged),
                             "detail": .string("\(proposal.row.displayName) already has this app's entry and its own key. Nothing was changed.")]
-            if existing.state != .connected, proposal.row.commandLine != nil {
+            if existing.state != .connected, proposal.row.commandLine?.automaticMCPProbe == false {
+                value["detail"] = .string(Self.directCommandSetupDetail)
+            }
+            if permissionsChanged { value["detail"] = .string("Enabled only this connection's two messaging tools in Antigravity. Send a message to verify the return path; existing Ask/Deny rules and all other permissions are unchanged.") }
+            if existing.state != .connected, proposal.row.commandLine?.automaticMCPProbe == true {
                 let probe = await hostCommandRun(row: proposal.row, contact: existing,
                     message: AgentHostDirectory.probeText(appName: Self.appDisplayName),
                     session: nil, store: store, surface: surface, probe: true)
@@ -599,9 +637,15 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
         if proposal.row.acp != nil {
             let version = try await proposal.executable?.reportedVersion()
             proposal.executable?.version = version
-            guard try await AgentACPApproval.connect(proposal, appName: Self.appDisplayName,
-                inbox: SwiftNativeApprovalInbox(root: dataRoot)) else {
-                return .object(["status": .string("denied"), "changed": .bool(false), "completed": .bool(false)])
+            // The person already answered this named connect in chat (or Full Mac
+            // allows it): a second card here is filed where the chat never shows
+            // it, and the first live drive waited on it unseen for fifteen
+            // minutes. Ask here only when no one has been asked yet.
+            if !AgentHostConnection.personApproved {
+                guard try await AgentACPApproval.connect(proposal, appName: Self.appDisplayName,
+                    inbox: SwiftNativeApprovalInbox(root: dataRoot)) else {
+                    return .object(["status": .string("denied"), "changed": .bool(false), "completed": .bool(false)])
+                }
             }
         } else if proposal.executablePath != executablePath {
             throw AgentCommunicationError.invalid("The agent executable changed since the approval card. Ask to connect again; nothing ran or changed.")
@@ -619,7 +663,7 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
         // when the inbound request carrying this connection's key actually
         // arrives — not because the probe returned, and never on a handshake.
         var probe: JSONValue?
-        if row.commandLine != nil {
+        if row.commandLine?.automaticMCPProbe == true {
             probe = await hostCommandRun(
                 row: row, contact: result.contact,
                 message: AgentHostDirectory.probeText(appName: Self.appDisplayName),
@@ -650,24 +694,25 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
                      : "Set up is not connected: this one turns connected when its first message arrives through the entry.")),
         ]
         if let probe { Self.includeConnectionProbe(probe, in: &value) }
+        if row.commandLine?.automaticMCPProbe == false, state != .connected {
+            value["detail"] = .string(Self.directCommandSetupDetail)
+        }
         if let backup = result.outcome.backupPath { value["backup_path"] = .string(backup) }
         return .object(value)
     }
 
-    private func hostDisconnect(name: String, workspace: String?, store: AgentPeerStore) throws -> JSONValue {
+    private static let directCommandSetupDetail = "Connection saved with permission for only its two MCP messaging tools. Send an ordinary message with agent_message; the command returns its answer directly, and its conversation_id continues that conversation. No automatic callback was attempted. The separate MCP return path remains unverified until a message arrives through it."
+
+    private func hostDisconnect(name: String, store: AgentPeerStore) async throws -> JSONValue {
         guard usesCanonicalBody else {
             throw AgentCommunicationError.invalid("changing another agent's settings is unavailable outside the canonical app")
         }
-        let row = AgentHostDirectory.row(named: name)
-        let folder = try row.map { try AgentHostConnection.workspaceFolder(row: $0, workspace: workspace) } ?? nil
-        let wanted = row?.id
-        guard let contact = try store.list().first(where: { peer in
-            "peer:" + peer.id == name || (wanted != nil && (peer.transport == .mcpHost || peer.transport == .acp || peer.transport == .grokBot)
-                && AgentPeerStore.hostRowID(peer.endpoint) == wanted && peer.hostWorkspace == folder)
-        }) else {
+        // 2026-09-22 WHY: a disconnect of "Grok" matched Grok Bot by name and
+        // revoked its keys. Only the exact peer id from agent_contacts removes.
+        guard let contact = try store.list().first(where: { "peer:" + $0.id == name }) else {
             return .object(["status": .string("not_configured"), "requested": .string(name),
                             "changed": .bool(false),
-                            "detail": .string("No connection of this app's making was found for that name. Nothing was changed.")])
+                            "detail": .string("Disconnect needs the exact peer:<id> from agent_contacts. Nothing was changed.")])
         }
         let outcome: AgentHostConfigWriter.Outcome?
         if contact.transport == .grokBot {
@@ -686,6 +731,7 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
         } else {
             try AgentPeerCredentials.delete(peerID: contact.id)
             _ = try store.remove(contact.id)
+            await AgentACPConnections.shared.revoke(peer: contact.id)
             outcome = nil
         }
         var value: [String: JSONValue] = ["status": .string("disconnected"), "changed": .bool(true),
@@ -701,7 +747,7 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
 
     // MARK: - One verb, one adapter: run the other agent's command line
 
-    private func hostACPRun(contact: AgentPeerContact, message: String, store: AgentPeerStore,
+    private func hostACPRun(contact: AgentPeerContact, message: String, conversationID: String?, store: AgentPeerStore,
                             surface: String) async throws -> JSONValue {
         guard usesCanonicalBody, await fullMacToolAccess(surface: surface).fileOpsAllowed else {
             return builderFullMacRequired(tool: "agent_message")
@@ -714,10 +760,17 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
                 "detail": .string("This connection cannot start. Check the other agent's installation and reconnect it.")])
         }
         guard let approved = contact.approvedACPExecutable, approved.isCurrent else {
-            _ = try await AgentACPApproval.renewExecutable(contact, store: store,
-                inbox: SwiftNativeApprovalInbox(root: dataRoot))
+            await AgentACPConnections.shared.revoke(peer: contact.id)
+            // 2026-09-22 WHY: awaiting a renewal card here held the turn (756s
+            // once) and never changed the reply; reconnecting raises the card.
             return .object(["status": .string("reconnect_required"), "sent": .bool(false), "completed": .bool(false),
-                "detail": .string("The approved program is missing, changed, or was never bound to this contact. Review the fresh connection approval or reconnect. Nothing ran; the message was not resent.")])
+                "detail": .string("The approved program is missing, changed, or was never bound to this contact. Reconnect this agent to approve it. Nothing ran; the message was not resent.")])
+        }
+        if let blocker = line.startupBlocker(installedVersion: approved.version) {
+            await AgentACPConnections.shared.revoke(peer: contact.id)
+            store.recordUnavailable(peerID: contact.id)
+            return .object(["status": .string("unavailable"), "sent": .bool(false), "completed": .bool(false),
+                "reason": .string("incompatible_sandboxed_acp"), "detail": .string(blocker)])
         }
         let executable = approved.path
         guard let folder = contact.acpWorkingDirectory else {
@@ -739,25 +792,44 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
         let inbox = SwiftNativeApprovalInbox(root: dataRoot)
         let sandbox = await Self.builderShellSandboxMode(dataRoot: dataRoot)
         guard sandbox != .lockedDown else {
+            await AgentACPConnections.shared.revoke(peer: contact.id)
             return .object(["status": .string("unavailable"), "sent": .bool(false), "completed": .bool(false),
                 "detail": .string("Running another agent is turned off in the current permission settings.")])
         }
         let program = sandbox == .off ? executable : "/usr/bin/sandbox-exec"
+        // 2026-09-22: the peer never reads the main bridge bearer; its link
+        // uses the url-only descriptor outside this directory.
+        let bridgeDir = Self.sbplEscapeLiteral(AgentHostDirectory.bridgeDiscoveryDirectory(dataRoot: dataRoot)
+            .standardizedFileURL.resolvingSymlinksInPath().path)
         let arguments = sandbox == .off ? line.arguments : ["-p",
-            sandbox == .developerFullMac ? Self.builderDeveloperSandboxProfile(dataRoot: dataRoot)
-                : Self.builderSandboxProfile(dataRoot: dataRoot), executable] + line.arguments
+            (sandbox == .developerFullMac ? Self.builderDeveloperSandboxProfile(dataRoot: dataRoot)
+                : Self.builderSandboxProfile(dataRoot: dataRoot))
+                + "\n(deny file-read* (subpath \"\(bridgeDir)\"))", executable] + line.arguments
+        let approvalContext = AgentACPApproval.Context.current
+        let childEnvironment = AgentHostCommandLines.scrubbedEnvironment().merging(line.environment) { _, fixed in fixed }
+        let configuration = try JSONValue.object([
+            "program": .string(program), "arguments": .array(arguments.map(JSONValue.string)),
+            "folder": .string(folder), "server": server,
+            "environment": .object(childEnvironment.mapValues(JSONValue.string))
+        ]).serialize(pretty: false)
+        var lease: AgentACPConnections.Lease?
         do {
-            let reply = try await AgentACPClient().turn(
+            let acquired = try await AgentACPConnections.shared.acquire(peer: contact.id, conversation: conversationID, configuration: configuration)
+            lease = acquired
+            let reply = try await acquired.client.turn(
                 executable: program, arguments: arguments,
-                directory: directory, environment: AgentHostCommandLines.scrubbedEnvironment().merging(line.environment) { _, fixed in fixed },
+                directory: directory, environment: childEnvironment,
                 message: message, mcpServers: [server], permissionMode: line.permissionMode,
-                approvedExecutable: approved, permission: { request in
+                conversationID: conversationID,
+                approvedExecutable: approved, keepAlive: true, requireVerifiedRestore: id == "hermes", permission: { request in
                     // Revocation wins even if an already-open card was approved.
                     guard try store.list().contains(where: { $0.id == contact.id }) else { return false }
-                    let allowed = try await AgentACPApproval.request(request, peer: contact, inbox: inbox)
+                    let allowed = try await AgentACPApproval.request(request, peer: contact, context: approvalContext, inbox: inbox)
                     let stillConnected = try store.list().contains(where: { $0.id == contact.id })
                     return allowed && stillConnected
                 })
+            guard await AgentACPConnections.shared.finish(acquired, peer: contact.id, conversation: reply.stopReason == "cancelled" ? nil : reply.sessionID) else { throw AgentACPClient.Failure.interrupted }
+            lease = nil
             store.recordProof(peerID: contact.id, inbound: reply.completed && !reply.text.isEmpty, outbound: true)
             if reply.completed && !reply.text.isEmpty {
                 store.recordRoundTrip(peerID: contact.id, executable: approved.path,
@@ -765,26 +837,43 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
             } else {
                 store.recordUnavailable(peerID: contact.id)
             }
-            return Self.peerRedact(.object(["status": .string(reply.completed ? "replied" : reply.stopReason),
+            var result: [String: JSONValue] = ["status": .string(reply.completed ? "replied" : reply.stopReason),
                 "agent": .string("peer:" + contact.id), "transport": .string("acp"),
+                "conversation_id": .string(reply.sessionID), "continued": .bool(reply.continued),
                 "sent": .bool(true), "completed": .bool(reply.completed), "reply": .string(reply.text),
-                "untrusted_remote_data": .bool(!reply.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)]), token: secret)
+                "untrusted_remote_data": .bool(!reply.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)]
+            if let detail = reply.detail { result["detail"] = .string(detail) }
+            return Self.peerRedact(.object(result), token: secret)
         } catch AgentACPClient.Failure.executableChanged {
+            if let lease { await AgentACPConnections.shared.finish(lease, peer: contact.id, conversation: nil) }
             store.recordUnavailable(peerID: contact.id)
-            _ = try await AgentACPApproval.renewExecutable(contact, store: store, inbox: inbox)
             return .object(["status": .string("reconnect_required"), "sent": .bool(false), "completed": .bool(false),
-                "detail": .string("The program changed before launch. A fresh approval was requested. Nothing ran; the message was not resent.")])
+                "detail": .string("The program changed before launch. Reconnect this agent to approve it. Nothing ran; the message was not resent.")])
         } catch {
+            // The session it already has, so an uncertain turn can be resumed, not orphaned.
+            let opened = await lease?.client.currentSessionID
+            let session = conversationID ?? opened
+            if let lease { await AgentACPConnections.shared.finish(lease, peer: contact.id, conversation: nil) }
+            if let failure = error as? AgentACPClient.Failure, failure == .sessionUnavailable || failure == .busy {
+                return .object(["status": .string(failure == .busy ? "busy" : "session_unavailable"), "sent": .bool(false), "completed": .bool(false), "detail": .string(failure.localizedDescription)])
+            }
             store.recordUnavailable(peerID: contact.id)
+            if var result = AgentACPClient.startupTimeoutReceipt(error) {
+                result["agent"] = .string("peer:" + contact.id)
+                result["transport"] = .string("acp")
+                return .object(result)
+            }
             if let failure = ProviderFailure.report(error, work: .outcomeUnknown) {
                 var result: [String: JSONValue] = ["agent": .string("peer:" + contact.id), "transport": .string("acp")]
                 Self.peerFailure(failure, into: &result)
                 return Self.peerRedact(.object(result), token: secret)
             }
-            return .object(["status": .string(Task.isCancelled ? "cancelled" : "outcome_unknown"),
+            var result: [String: JSONValue] = ["status": .string(Task.isCancelled ? "cancelled" : "outcome_unknown"),
                 "agent": .string("peer:" + contact.id), "transport": .string("acp"), "completed": .bool(false),
                 "detail": .string(Task.isCancelled ? "The conversation was stopped." :
-                    (error as? AgentACPClient.Failure)?.localizedDescription ?? "The conversation did not finish. Do not resend automatically.")])
+                    (error as? AgentACPClient.Failure)?.localizedDescription ?? "The conversation did not finish. Do not resend automatically.")]
+            if let session { result["conversation_id"] = .string(session) }
+            return .object(result)
         }
     }
 
@@ -888,7 +977,11 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
         guard case .object(let envelope) = outcome else { return outcome }
         var reply = ""
         var truncated = false
-        if let replyFile, let handle = FileHandle(forReadingAtPath: replyFile) {
+        if line.jsonResultReply, case .string(let text)? = envelope["stdout"] {
+            let response = line.resultReply(stdout: text) ?? ""
+            truncated = response.utf8.count > 64 * 1024
+            reply = String(decoding: response.utf8.prefix(64 * 1024), as: UTF8.self)
+        } else if let replyFile, let handle = FileHandle(forReadingAtPath: replyFile) {
             defer { try? handle.close() }
             // Bounded at the READ, not after it: a reply file is written by
             // another program and its size is that program's choice. One byte
@@ -896,7 +989,7 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
             let data = (try? handle.read(upToCount: 64 * 1024 + 1)) ?? Data()
             truncated = data.count > 64 * 1024
             reply = String(decoding: data.prefix(64 * 1024), as: UTF8.self)
-        } else if case .string(let text)? = envelope["stdout"] {
+        } else if !line.capturesThreadID, case .string(let text)? = envelope["stdout"] {
             reply = text
             truncated = envelope["_truncated"] == .bool(true)
         }
@@ -924,7 +1017,17 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
             "untrusted_remote_data": .bool(!reply.isEmpty),
             "exit_code": envelope["exit_code"] ?? .null, "timed_out": envelope["timed_out"] ?? .bool(false),
         ]
-        if let session { result["conversation_id"] = .string(session) }
+        if line.capturesThreadID {
+            let stdout: String
+            if case .string(let text)? = envelope["stdout"] { stdout = text } else { stdout = "" }
+            if let confirmed = line.capturedThreadID(stdout: stdout, expected: resuming ? session : nil) {
+                result["conversation_id"] = .string(confirmed)
+                result["continuation_available"] = .bool(true)
+            } else {
+                result["continuation_available"] = .bool(false)
+                result["continuation_detail"] = .string("The command did not confirm the expected conversation identity. Its reply is retained, but continuity is unverified. Do not resend automatically or silently start a replacement conversation.")
+            }
+        } else if let session { result["conversation_id"] = .string(session) }
         if probe {
             // A handshake proves the path; its words are not for her. Without them the
             // turn is not carrying another agent's text, so the person's own next
@@ -1047,12 +1150,23 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
 
     private static func peerHistoryProjection(_ peer: AgentPeerContact) -> JSONValue {
         if peer.transport == .grokBot {
-            return .object(["agent": .string("peer:" + peer.id), "name": .string(peer.name),
-                "transport": .string("grokBot"), "state": .string(peer.grokSetup ?? "set up"),
+            var value: [String: JSONValue] = ["agent": .string("peer:" + peer.id), "name": .string(peer.name),
+                "kind": .string("agent_host"), "transport": .string("grokBot"),
+                "state": .string(peer.grokSetup == "set up" && peer.provenInboundAt != nil ? "connected" : peer.grokSetup ?? "set up"),
+                "last_reply_in": peer.provenInboundAt.map(JSONValue.string) ?? .null,
+                "last_message_out": peer.provenOutboundAt.map(JSONValue.string) ?? .null,
+                "readiness": .string("not_checked"),
                 "can_start_turn": .bool(peer.grokSetup == "set up"), "can_answer_back": .bool(true),
                 "capabilities": .array([.string("message"), .string("read")]),
                 "read_inputs": .array([.string("message_id")]),
-                "state_detail": .string("Webhook acceptance starts a run. Only a correlated local reply is an answer. Grok Bot may ask for local execution approval each time.")])
+                "state_detail": .string("Webhook acceptance starts a run. Only a correlated local reply is an answer. Grok Bot may ask for local execution approval each time.")]
+            if let proof = peer.roundTripProof {
+                value["round_trip_proof"] = .object([
+                    "route": .string("grokBot"), "at": .string(proof.at),
+                    "endpoint": .string(proof.endpoint.absoluteString),
+                    "executable": .null, "version": .null, "workspace": .string(proof.workspace)])
+            }
+            return .object(value)
         }
         // The state, in the same four words everywhere, on every contact.
         var value: [String: JSONValue] = ["agent": .string("peer:" + peer.id), "name": .string(peer.name),
@@ -1077,14 +1191,18 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
         if peer.transport == .acp {
             value["kind"] = .string("agent_host")
             if peer.state == .setUp {
-                value["state_detail"] = .string("The connection is saved, but it has not answered a message yet.")
+                value["state_detail"] = .string(!peer.canStartTurn
+                    ? "The saved executable cannot currently be verified. Reconnect to review the changed or missing program; earlier replies remain recorded."
+                    : peer.unavailableAt != nil
+                        ? "The last connection attempt was unavailable. Earlier replies remain recorded; opening a new turn rechecks the route."
+                        : "The connection is saved, but it has not answered a message yet.")
             }
             value["transport"] = .string("acp")
             value["route"] = .string("acp")
             value["outbound_route"] = .string("acp")
             value["capabilities"] = .array([.string("message")])
             value["readiness"] = .string("not_checked")
-            value["setup"] = .string("Can start a conversation and receive its answer in the same call. Each message starts a new conversation. It runs on this Mac as you; this app asks you only when the agent asks it for permission.")
+            value["setup"] = .string("Can start a conversation and receive its answer in the same call. The app remembers the conversation within your current chat and continues it when supported; use conversation to select a named discussion. It runs on this Mac as you; this app asks you only when the agent asks it for permission.")
             value["executable"] = peer.approvedExecutablePath.map(JSONValue.string) ?? .null
             value["working_directory"] = peer.acpWorkingDirectory.map(JSONValue.string) ?? .null
             if let id = AgentPeerStore.hostRowID(peer.endpoint), let line = AgentHostDirectory.row(named: id)?.acp {
@@ -1111,9 +1229,18 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
                 ? hostInboundOnlyDetail
                 : "A message to this contact runs its command line once and brings its reply back in the same call."
                     + (line?.continuesConversations == true
-                       ? " Carry conversation_id forward to stay in one conversation."
+                       ? " The app remembers the conversation within your current chat; use conversation to select a named discussion."
                        : " This connection starts a separate conversation for each message.")
                     + " It also reaches this app any time through its own entry.")
+            return .object(value)
+        }
+        if peer.transport == .desktopChat {
+            value["kind"] = .string("desktop_chat_agent")
+            value["transport"] = .string("desktopChat")
+            value["app_bundle_id"] = .string(AgentPeerStore.desktopBundleID(peer.endpoint) ?? "")
+            value["capabilities"] = .array([.string("message")])
+            value["read_inputs"] = .array([.string("conversation_id")])
+            value["setup"] = .string("A message is typed into your own chat in its app and its answer comes back in the same call. The app remembers that chat within your conversation; start a new conversation for a fresh chat there.")
             return .object(value)
         }
         if peer.transport == .desktop {

@@ -368,7 +368,7 @@ struct OAuthProvider {
 
     static let anthropic = OAuthProvider(
         id: "anthropic_oauth_direct",
-        displayShort: "Anthropic",
+        displayShort: "Claude",
         iconSystemName: "brain.head.profile"
     )
 

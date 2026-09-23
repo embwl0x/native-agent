@@ -5,32 +5,23 @@ import ProviderRouting
 
 extension TelegramPollLoop {
     func startTypingHeartbeat(destination: TelegramDestination) async -> Task<Void, Never>? {
-        do {
-            try await sendChatAction(token, destination, "typing")
-        } catch {
-            FileHandle.standardError.write(
-                Data("TelegramPollLoop: sendChatAction failed for chat \(destination.chatId): \(Self._tgRedactToken(String(describing: error)))\n".utf8)
-            )
-        }
-        guard typingRefreshNanoseconds > 0 else { return nil }
         let token = self.token
         let sendChatAction = self.sendChatAction
         let delay = typingRefreshNanoseconds
+        // Presence must never delay starting the actual conversation.
         return Task {
             while !Task.isCancelled {
                 do {
-                    try await Task.sleep(nanoseconds: delay)
-                } catch {
-                    break
-                }
-                guard !Task.isCancelled else { break }
-                do {
                     try await sendChatAction(token, destination, "typing")
                 } catch {
+                    guard !Task.isCancelled else { break }
                     FileHandle.standardError.write(
-                        Data("TelegramPollLoop: sendChatAction refresh failed for chat \(destination.chatId): \(Self._tgRedactToken(String(describing: error)))\n".utf8)
+                        Data("TelegramPollLoop: sendChatAction failed: \(Self._tgRedactToken(String(describing: error)))\n".utf8)
                     )
                 }
+                guard delay > 0 else { break }
+                do { try await Task.sleep(nanoseconds: delay) }
+                catch { break }
             }
         }
     }
@@ -62,6 +53,7 @@ extension TelegramPollLoop {
                     replyMarkup
                 )
             },
+            deleteCard: deleteMessage,
             recordFailure: { redactedError in
                 await recordError(
                     context: errorContext,
@@ -131,7 +123,8 @@ extension TelegramPollLoop {
     func repairInterruptedTurnCardsIfNeeded() async {
         let result = await turnCardRestartRepairer.repairOnce(
             token: token,
-            editCard: editMessageTextWithReplyMarkup
+            editCard: editMessageTextWithReplyMarkup,
+            deleteCard: deleteMessage
         )
         for failure in result.failures {
             await recordError(context: "turn_card_restart_repair", error: failure)
@@ -251,6 +244,37 @@ extension TelegramPollLoop {
         suppressUserAppend: Bool = false,
         sessionId: String? = nil
     ) async throws -> String {
+        let typingTask = await startTypingHeartbeat(destination: destination)
+        return try await withTaskCancellationHandler {
+            do {
+                let reply = try await runChatHandlerAttempts(
+                    destination: destination, text: text, attachments: attachments,
+                    progress: progress, replyTo: replyTo, fromUserId: fromUserId,
+                    suppressUserAppend: suppressUserAppend, sessionId: sessionId
+                )
+                typingTask?.cancel()
+                await typingTask?.value
+                return reply
+            } catch {
+                typingTask?.cancel()
+                await typingTask?.value
+                throw error
+            }
+        } onCancel: {
+            typingTask?.cancel()
+        }
+    }
+
+    private func runChatHandlerAttempts(
+        destination: TelegramDestination,
+        text: String,
+        attachments: [TelegramMediaAttachment],
+        progress: @escaping TelegramChatProgressSink,
+        replyTo: TelegramReplyContext?,
+        fromUserId: Int?,
+        suppressUserAppend: Bool,
+        sessionId: String?
+    ) async throws -> String {
         // The retired model/effort/fast/persona commands, said in words.
         // This is the single choke point every non-slash Telegram text turn
         // passes through, so the words reach the preference writers without
@@ -310,7 +334,7 @@ extension TelegramPollLoop {
                 FileHandle.standardError.write(
                     Data("TelegramPollLoop: retrying chat handler after transient failure: \(Self._tgRedactToken(String(describing: error)))\n".utf8)
                 )
-                await progress(.status(text: "Draft stalled; retrying"))
+                await progress(.status(text: "Still can't reach the model — trying again."))
                 await writeStatePatch([
                     "lastChatRetryAt": .string(_tgNowString()),
                     "lastChatRetryFailedAttempt": .int(Int64(attempt + 1)),

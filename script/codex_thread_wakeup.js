@@ -1556,6 +1556,10 @@ async function deliverReplyJobUnlocked(jobPath, config) {
       connectorDiagnostics: turnResult.connectorDiagnostics || null,
       brain: turnResult.brain || null,
       messagePreview: unicodePrefix(turnResult.message || "", 1000),
+      // The original answer stays distinct from NativeAgent's delivery
+      // assessment. This bounded read field never authorizes a replay.
+      agentReplyText: unicodePrefix(turnResult.message || "", 6000),
+      agentReplyTruncated: unicodePrefix(turnResult.message || "", 6000).length < (turnResult.message || "").length,
     },
     bridge,
   };

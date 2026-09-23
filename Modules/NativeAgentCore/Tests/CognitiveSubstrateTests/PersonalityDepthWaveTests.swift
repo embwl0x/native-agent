@@ -387,19 +387,6 @@ struct PersonalityDepthRuminationTests {
         #expect(itching.taskPressure <= CognitiveSubstrate.ruminationPressureFloorCeiling + 1e-9)
     }
 
-    /// THE `- Thread:` CANDIDATE — the line that has been unreachable since it
-    /// was written. This asserts the seam the capsule builder consumes.
-    @Test func theThreadCandidateIsExposed() async throws {
-        let clock = DepthClock(Date(timeIntervalSince1970: 1_700_000_000))
-        let substrate = try await depthSubstrate(clock)
-        _ = await seedAnomaly(substrate, clock)
-        clock.advance(24 * 3_600)
-        let seeds = await substrate.ruminationThreadSeeds(at: clock.now())
-        #expect(seeds.count == 1)
-        #expect(seeds[0].kind != .reflectionTakeaway,
-                "a non-takeaway kind is what makes innerThoughtSeedLine render `- Thread:`")
-    }
-
     /// IT HEALS. When the user's own words answer the thing, the weight clears
     /// and one relief is staged through the measured-felt door.
     @Test func answeringTheThingClearsTheWeightAndMintsRelief() async throws {
@@ -1059,12 +1046,6 @@ struct PersonalityDepthDeskRuminationTests {
         #expect(carried.count == 1)
         #expect(carried.first?.externalId == "h-audit")
         #expect((carried.first?.weight ?? 0) > 0.2, "a day untouched has weight: \(carried)")
-
-        let thread = await substrate.ruminationThreadSeeds(at: clock.now())
-        #expect(thread.count == 1, "and it reaches the `- Thread:` candidate seam")
-        #expect(thread.first?.kind != .reflectionTakeaway,
-                "a non-takeaway kind is what renders `- Thread:`")
-        #expect(thread.first?.text == "Finish the Codex tool audit")
     }
 
     /// Something she touched this morning is the work, not a nag.

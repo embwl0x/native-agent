@@ -1,4 +1,5 @@
 import Foundation
+import MacControl
 import PersistenceCore
 import UserNotifications
 
@@ -46,16 +47,31 @@ enum NativeAgentNotificationRoute {
     }
 }
 
-extension Notification.Name {
+/// MacControl's `notify` action posts through the app's one banner exit
+/// instead of its own copy of the UserNotifications calls.
+struct NativeAgentMacControlNotificationAdapter: NotificationCenterAdapter {
+    func postNotification(title: String, message: String, soundName: String?) async throws {
+        _ = try await postNotificationReceipt(title: title, message: message, soundName: soundName)
+    }
+
+    func postNotificationReceipt(
+        title: String,
+        message: String,
+        soundName: String?
+    ) async throws -> NotificationPostReceipt {
+        let result = await NativeAgentNotifications.postAndReport(
+            title: title, body: message, soundName: soundName)
+        guard result.posted else {
+            throw MacControlError.notificationFailed(result.error ?? result.delivery)
+        }
+        return NotificationPostReceipt(
+            authorization: result.authorizationStatus == "provisional" ? .provisional : .authorized,
+            requestIdentifier: result.identifier
+        )
+    }
 }
 
 enum NativeAgentNotifications {
-    static func requestAuthorization() {
-        Task {
-            _ = await requestAuthorizationResult()
-        }
-    }
-
     static func post(title: String, body: String) {
         Task {
             _ = await postAndReport(title: title, body: body)
@@ -68,7 +84,8 @@ enum NativeAgentNotifications {
     static func postAndReport(
         title: String,
         body: String,
-        userInfo: [String: String] = [:]
+        userInfo: [String: String] = [:],
+        soundName: String? = nil
     ) async -> NativeAgentNotificationPostResult {
         let notificationTitle = NativeAgentNotificationDefaults.title(title)
         let center = UNUserNotificationCenter.current()
@@ -100,7 +117,9 @@ enum NativeAgentNotifications {
         let content = UNMutableNotificationContent()
         content.title = notificationTitle
         content.body = body
-        content.sound = .default
+        content.sound = soundName.flatMap {
+            $0.isEmpty ? nil : UNNotificationSound(named: UNNotificationSoundName(rawValue: $0))
+        } ?? .default
         if !userInfo.isEmpty { content.userInfo = userInfo }
         let request = UNNotificationRequest(identifier: identifier, content: content, trigger: nil)
         let addError = await add(request, center: center)

@@ -199,16 +199,30 @@ actor TelegramTurnCardRestartRepairer {
     The prior process stopped before reply delivery could be confirmed.
     """
 
+    typealias DeleteCard = @Sendable (_ token: String, _ chatId: Int, _ messageId: Int) async throws -> Void
+
     private let ledger: TelegramTurnCardLedger
     private var attempted = false
+    /// Cards this repair marked interrupted, by chat, so a recovered reply
+    /// resent into that chat can take its card away.
+    private var interruptedCards: [Int: [Int]] = [:]
 
     init(ledger: TelegramTurnCardLedger) {
         self.ledger = ledger
     }
 
+    /// Only when the chat has exactly one: with several, which card belongs
+    /// to the resent reply is unknown, so all of them stay.
+    func takeInterruptedCard(chatId: Int) -> Int? {
+        guard let ids = interruptedCards[chatId], ids.count == 1 else { return nil }
+        interruptedCards[chatId] = nil
+        return ids[0]
+    }
+
     func repairOnce(
         token: String,
-        editCard: @escaping EditCard
+        editCard: @escaping EditCard,
+        deleteCard: DeleteCard? = nil
     ) async -> TelegramTurnCardRepairResult {
         guard !attempted else {
             return TelegramTurnCardRepairResult(repaired: 0, cleanedTerminal: 0, failures: [])
@@ -225,20 +239,38 @@ actor TelegramTurnCardRestartRepairer {
             )
         }
 
+        // 2026-09-22: a card deleted just before a crash is gone for good, so
+        // "message to edit not found" counts as done, not a retry forever.
+        func edit(_ record: TelegramPersistedTurnCard, _ text: String) async throws {
+            do {
+                try await editCard(
+                    token,
+                    record.chatId,
+                    record.messageId,
+                    text,
+                    TelegramTurnControlCallback.clearedReplyMarkup
+                )
+            } catch let failure as TelegramAPIFailure
+                where failure.telegramDescription?
+                    .localizedCaseInsensitiveContains("message to edit not found") == true {}
+        }
+
         var repaired = 0
         var cleanedTerminal = 0
         var failures: [String] = []
         for record in records {
             if record.isTerminal {
                 do {
-                    if let terminalText = record.terminalText, !terminalText.isEmpty {
-                        try await editCard(
-                            token,
-                            record.chatId,
-                            record.messageId,
-                            terminalText,
-                            TelegramTurnControlCallback.clearedReplyMarkup
-                        )
+                    // 2026-09-22: a completed card has nothing left to say
+                    // once its reply landed; delete it rather than leave "Done.".
+                    if record.phase == .completed, let deleteCard {
+                        do {
+                            try await deleteCard(token, record.chatId, record.messageId)
+                        } catch let failure as TelegramAPIFailure
+                            where failure.telegramDescription?
+                                .localizedCaseInsensitiveContains("message to delete not found") == true {}
+                    } else if let terminalText = record.terminalText, !terminalText.isEmpty {
+                        try await edit(record, terminalText)
                     }
                     try await ledger.remove(turnId: record.turnId)
                     cleanedTerminal += 1
@@ -248,14 +280,9 @@ actor TelegramTurnCardRestartRepairer {
                 continue
             }
             do {
-                try await editCard(
-                    token,
-                    record.chatId,
-                    record.messageId,
-                    Self.interruptedText,
-                    TelegramTurnControlCallback.clearedReplyMarkup
-                )
+                try await edit(record, Self.interruptedText)
                 try await ledger.remove(turnId: record.turnId)
+                interruptedCards[record.chatId, default: []].append(record.messageId)
                 repaired += 1
             } catch {
                 // Preserve the active identity for a future process start. An

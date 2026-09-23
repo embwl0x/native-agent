@@ -8,6 +8,15 @@ import CognitiveSubstrate
 final class ChatTurnExecution: @unchecked Sendable {
     @TaskLocal static var current: ChatTurnExecution?
     private let lock = NSLock()
+    private var persistedHistoryRunID: String?
+    var historyRunID: String? {
+        lock.lock(); defer { lock.unlock() }
+        return persistedHistoryRunID
+    }
+    func bindHistoryRunID(_ id: String) {
+        lock.lock(); defer { lock.unlock() }
+        persistedHistoryRunID = id
+    }
 
     /// PROVENANCE CARRIED BY THE CALLER, for the whole of this invocation.
     ///

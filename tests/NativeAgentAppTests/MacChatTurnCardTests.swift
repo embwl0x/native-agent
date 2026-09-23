@@ -142,8 +142,8 @@ struct MacChatTurnCardTests {
         #expect(card.tone != MacChatTurnCardProjection.tone(for: .completed))
         #expect(card.tone != MacChatTurnCardProjection.tone(for: .failed))
         #expect(card.symbolName == "questionmark.circle")
-        #expect(card.title == "Outcome unknown")
-        #expect(try #require(card.detail).contains("without proof"))
+        #expect(card.title == "Not sure that finished.")
+        #expect(try #require(card.detail).contains("say it again"))
         #expect(card.showsLiveIndicator == false)
         #expect(card.isTerminal)
     }
@@ -708,7 +708,7 @@ struct MacChatTurnCardTests {
         #expect(chatView.contains(
             ": store.idleClearance(floor: NativeAgentShellLayout.composerClearanceMargin)"
         ))
-        #expect(chatView.contains("turnCardClearanceStore.measuredHeight = height"))
+        #expect(chatView.contains("store.measuredHeight = height"))
         #expect(!chatView.contains("@State var measuredTurnCardHeight"))
         // A clearance change must never drive a scroll: that read is what put
         // the measured height back into ChatView.body. Messages drive scrolling.

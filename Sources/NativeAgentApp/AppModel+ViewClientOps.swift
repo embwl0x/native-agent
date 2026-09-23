@@ -214,7 +214,7 @@ extension AppModel {
     }
 
     func macControlRun(path: String, bodyData: Data, timeout: TimeInterval = 90) async throws -> MacControlRunResult {
-        try await client.macControlRun(path: path, bodyData: bodyData, timeout: timeout)
+        try await client.macControlRun(path: path, bodyData: bodyData, timeout: timeout, localWorkbench: true)
     }
 
     // MARK: Providers

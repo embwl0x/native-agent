@@ -55,7 +55,7 @@ public struct TelegramConfig: Sendable, Equatable {
             .trimmingCharacters(in: .whitespacesAndNewlines)
         self.voiceTranscriptionBackend = canonicalVoiceBackend
         self.voiceTranscriptionModel = trimmedVoiceModel.isEmpty
-            ? TelegramVoiceTranscriptionBackends.defaultModel(for: canonicalVoiceBackend)
+            ? TelegramVoiceTranscriptionBackends.appleSpeechModel
             : trimmedVoiceModel
         self.voiceMaxBytes = max(1, voiceMaxBytes)
     }
@@ -191,7 +191,8 @@ public struct TelegramConfig: Sendable, Equatable {
         return (
             enabled: enabled,
             backend: backend.isEmpty ? defaultVoiceTranscriptionBackend : backend,
-            model: model.isEmpty ? TelegramVoiceTranscriptionBackends.defaultModel(for: backend) : model,
+            // Apple Speech is the only backend now; a saved OpenAI model name is stale.
+            model: TelegramVoiceTranscriptionBackends.appleSpeechModel,
             maxBytes: maxBytes
         )
     }

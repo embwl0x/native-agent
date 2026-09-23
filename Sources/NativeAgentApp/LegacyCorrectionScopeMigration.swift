@@ -162,9 +162,11 @@ enum LegacyCorrectionScopeMigration {
         // `context_topics_origin=legacy_scope_review_v1`) are exactly the rows
         // that would have deadlocked it.
         var satisfied: [JSONValue] = []
+        var anyMatched = false
 
         for entry in entries {
             let matches = corrections.filter { $0.content.contains(entry.phrase) }
+            anyMatched = anyMatched || !matches.isEmpty
             guard matches.count == 1, let row = matches.first else {
                 // Not the row the review read. Say which and move on — a guess
                 // here would scope the wrong correction.
@@ -233,7 +235,10 @@ enum LegacyCorrectionScopeMigration {
             skipped: skipped,
             satisfied: satisfied,
             correctionsSeen: corrections.count,
-            complete: skipped.isEmpty
+            // 2026-09-22: an install that never had any of the reviewed rows
+            // (every new user) has nothing to retry; without this it wrote a
+            // receipt on every launch forever.
+            complete: skipped.isEmpty || !anyMatched
         )
         NSLog("[correctionScope] legacy scope review: scoped=\(applied.count) already_scoped=\(satisfied.count) skipped=\(skipped.count) kept_global=\(keptGlobal.count)")
     }

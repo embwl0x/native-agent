@@ -43,15 +43,9 @@ struct TelegramVoiceTranscriberBridgeEvalTests {
         #expect(apple is SwiftAppleSpeechTranscriber,
                 "Apple aliases must resolve to the non-prompting Apple Speech transcriber")
 
-        let openAI = BackgroundLoopsAssembly.makeTelegramVoiceTranscriber(
-            cfg: config(backend: "whisper_api", model: "whisper-1"), dataRoot: root
-        )
-        #expect(openAI is SwiftOpenAIWhisperTranscriber,
-                "OpenAI aliases must resolve to the configured OpenAI transcriber")
-
         #expect(BackgroundLoopsAssembly.makeTelegramVoiceTranscriber(
             cfg: config(backend: "unsupported-backend"), dataRoot: root
-        ) == nil,
-                "An unknown backend must fail closed instead of silently borrowing a different transcription route")
+        ) is SwiftAppleSpeechTranscriber,
+                "Apple Speech is the only backend; an unknown value falls back to it")
     }
 }

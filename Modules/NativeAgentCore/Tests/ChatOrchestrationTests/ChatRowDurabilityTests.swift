@@ -7,6 +7,7 @@ import TrustCenter
 import DreamREMCycle
 import NativeAgentCore
 @testable import ChatOrchestration
+import NativeAgentTestSupport
 
 // Sweep R4 items 4 + 5. Chat rows were appended under the transcript flock but
 // NOT durably: `write(2)` returns once the kernel has the page, so a power cut

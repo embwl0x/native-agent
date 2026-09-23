@@ -19,7 +19,8 @@ import Testing
 /// has to come with evidence, not arrive as a drive-by edit.
 @Suite("Fluid Context shipped defaults")
 struct ContextShippedDefaultsTests {
-    /// Selection shape. `maximumPointers = 8` is load-bearing today — live
+    /// Selection shape. `maximumPointers = 0` since 2026-09-23 (skill-heading
+    /// pointers cost ~800 chars/turn, expanded 3 times in 7 days). Was 8 — live
     /// selection receipts sit exactly at the cap, i.e. every turn offers the
     /// full pointer budget — so a quiet reduction directly removes reach.
     /// `maximumDynamicAtoms = 12` is the packet's dynamic half.
@@ -28,7 +29,7 @@ struct ContextShippedDefaultsTests {
         let configuration = ContextSelectionConfiguration()
         #expect(configuration.maximumCandidates == 256)
         #expect(configuration.maximumDynamicAtoms == 12)
-        #expect(configuration.maximumPointers == 8)
+        #expect(configuration.maximumPointers == 0)
         #expect(configuration.maximumAtomsPerSource == 2)
         #expect(configuration.maximumAtomsPerKind == 4)
         #expect(configuration.maximumAtomsPerKindOverrides == [.memory: 8, .relationship: 4])

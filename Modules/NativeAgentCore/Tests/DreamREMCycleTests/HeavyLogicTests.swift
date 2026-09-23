@@ -303,27 +303,6 @@ private func mkProposal(_ doc: String, _ text: String) -> REMProposal {
     #expect(!evicted.contains("2026-03-01"))
 }
 
-@Test func GrowthDocManager_appendEntry_appends_with_date_prefix() async throws {
-    let root = tempDir()
-    let m = GrowthDocManager(personaRoot: root)
-    try await m.appendEntry("first thing", date: "2026-05-01")
-    try await m.appendEntry("second thing", date: "2026-05-02")
-    let body = try String(contentsOf: root.appendingPathComponent("GROWTH.md"), encoding: .utf8)
-    #expect(body.contains("2026-05-01 first thing"))
-    #expect(body.contains("2026-05-02 second thing"))
-}
-
-@Test func GrowthDocManager_deleteSlice_removes_exact_match() async throws {
-    let root = tempDir()
-    let path = root.appendingPathComponent("GROWTH.md")
-    let body = "2026-01-01 alpha\n2026-02-01 beta\n2026-03-01 gamma\n"
-    try body.data(using: .utf8)!.write(to: path)
-    let m = GrowthDocManager(personaRoot: root)
-    try await m.deleteSlice("2026-02-01 beta\n")
-    let after = try String(contentsOf: path, encoding: .utf8)
-    #expect(after == "2026-01-01 alpha\n2026-03-01 gamma\n")
-}
-
 @Test func GrowthDocManager_evictionCandidates_returns_empty_when_under_cap() async throws {
     let root = tempDir()
     let path = root.appendingPathComponent("GROWTH.md")

@@ -222,33 +222,6 @@ private actor REMReplayCommitRecorder {
         #expect(!FileManager.default.fileExists(atPath: target.path))
     }
 
-    @Test func tick_growth_near_cap_triggers_eviction_logic() async throws {
-        let root = try mkTmp()
-        try setupPersona(root)
-        try setupDiary(root, dates: ["2026-05-28"])
-        let growthPath = root.appendingPathComponent("persona/GROWTH.md")
-        var big = ""
-        let fmt = ISO8601DateFormatter()
-        fmt.formatOptions = [.withFullDate]
-        fmt.timeZone = TimeZone(identifier: "UTC")
-        let base = fmt.date(from: "2024-01-01")!
-        for i in 0..<60 {
-            let d = base.addingTimeInterval(TimeInterval(i * 86_400))
-            big += "\(fmt.string(from: d)) " + String(repeating: "x", count: 1500) + "\n"
-        }
-        try big.data(using: .utf8)!.write(to: growthPath)
-        let sizeBefore = ((try? FileManager.default.attributesOfItem(atPath: growthPath.path)[.size]) as? NSNumber)?.intValue ?? 0
-        #expect(sizeBefore > REMCycleLoop.growthEvictThreshold)
-
-        let llm = MockLLMClient(scriptedResponses: [
-            proposalsJSON(targetDoc: "GROWTH", evidence: ["2026-05-28"], texts: ["g"]),
-        ])
-        let loop = makeLoop(dataRoot: root, llm: llm)
-        await loop.tick()
-        let sizeAfter = ((try? FileManager.default.attributesOfItem(atPath: growthPath.path)[.size]) as? NSNumber)?.intValue ?? 0
-        #expect(sizeAfter < sizeBefore)
-    }
-
     @Test func tick_non_throwing_on_consolidator_error() async throws {
         let root = try mkTmp()
         try setupPersona(root)

@@ -10,9 +10,6 @@ import CryptoKit
 #if canImport(AppKit)
 import AppKit
 #endif
-#if canImport(UserNotifications)
-import UserNotifications
-#endif
 
 // MARK: - Adapter protocols (test-injectable)
 
@@ -183,79 +180,6 @@ public protocol FileStateVerificationAdapter: Sendable {
 }
 
 // MARK: - System adapters (production impls)
-
-public final class SystemNotificationCenterAdapter: NotificationCenterAdapter {
-    public init() {}
-    public func postNotification(title: String, message: String, soundName: String?) async throws {
-        _ = try await postNotificationReceipt(title: title, message: message, soundName: soundName)
-    }
-
-    public func postNotificationReceipt(
-        title: String,
-        message: String,
-        soundName: String?
-    ) async throws -> NotificationPostReceipt {
-        #if canImport(UserNotifications)
-        let center = UNUserNotificationCenter.current()
-        // Authorization is the user's responsibility — we don't force a runtime
-        // prompt (the prompt belongs in the permissions onboarding flow). But
-        // center.add completes with err==nil when unauthorized and silently
-        // drops the request, so check settings explicitly: unauthorized must
-        // map to ok:false with an actionable reason, not a fabricated success.
-        let settings = await center.notificationSettings()
-        let authorization: NotificationAuthorizationDisposition
-        switch settings.authorizationStatus {
-        case .authorized:
-            authorization = .authorized
-        case .provisional:
-            authorization = .provisional
-        default:
-            throw MacControlError.notificationFailed(
-                "notifications not authorized (status: \(Self.describe(settings.authorizationStatus))) — enable NativeAgent in System Settings → Notifications"
-            )
-        }
-        let content = UNMutableNotificationContent()
-        content.title = title
-        content.body = message
-        if let s = soundName, !s.isEmpty {
-            content.sound = UNNotificationSound(named: UNNotificationSoundName(rawValue: s))
-        } else {
-            content.sound = .default
-        }
-        let requestIdentifier = UUID().uuidString
-        let req = UNNotificationRequest(
-            identifier: requestIdentifier,
-            content: content,
-            trigger: nil
-        )
-        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-            center.add(req) { err in
-                if let err { cont.resume(throwing: err) }
-                else { cont.resume(returning: ()) }
-            }
-        }
-        return NotificationPostReceipt(
-            authorization: authorization,
-            requestIdentifier: requestIdentifier
-        )
-        #else
-        throw MacControlError.notificationFailed("UserNotifications unavailable on this platform")
-        #endif
-    }
-
-    #if canImport(UserNotifications)
-    private static func describe(_ status: UNAuthorizationStatus) -> String {
-        switch status {
-        case .notDetermined: return "notDetermined"
-        case .denied: return "denied"
-        case .authorized: return "authorized"
-        case .provisional: return "provisional"
-        case .ephemeral: return "ephemeral"
-        @unknown default: return "unknown(\(status.rawValue))"
-        }
-    }
-    #endif
-}
 
 public final class SystemAppleScriptAdapter: AppleScriptAdapter {
     public init() {}

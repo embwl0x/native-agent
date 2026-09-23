@@ -1,7 +1,8 @@
 # path	needle	expected_count	classification	canonical_owner
 # FileSystemProcessOwner: pipe readers use poll(100ms) only while draining an active child; the existing two-second EOF grace stops them when descendants retain pipe writers.
+Modules/NativeAgentCore/Sources/ChatOrchestration/AgentWorkspaceActionReadback.swift	*	1	timeout_retry_deadline	One 350ms loading-page readback delay per action; recheck exact tab identity, never replay the effect or poll in the background
 Sources/NativeAgentApp/GrokBotConnection.swift	*	5	timeout_retry_deadline	GrokRoutineAccessibility bounded launch, foreground, focus, paste and visible-in-chat observation; actions at most once; no webhook resend or background polling
-Modules/NativeAgentCore/Sources/ChatOrchestration/AgentACPClient.swift	*	3	timeout_retry_deadline	ACP turn deadline and bounded EOF/terminate/kill shutdown; no polling or retry
+Modules/NativeAgentCore/Sources/ChatOrchestration/AgentACPClient.swift	*	5	timeout_retry_deadline	ACP initialize and turn deadlines, retained connection idle expiry and bounded EOF/terminate/kill shutdown; no polling or retry
 Modules/NativeAgentCore/Sources/ProviderRouting/ProviderRecoveryPolicy.swift	*	1	timeout_retry_deadline	Shared once-only pre-output overload retry
 # 2026-09-09: speech-permission voice replay uses existing Telegram ticks; diagnostics fallback adds no timer sites.
 # 2026-09-09: Providers second-pass disclosures and offscreen fixture stores add no timer or sleep sites.
@@ -116,7 +117,7 @@ Sources/NativeAgentApp/iCloudBridge.swift	*	1	external_protocol_poll	iCloudBridg
 iOS/NativeAgentMobile/Sources/ChatStore+ICloudReplies.swift	*	3	external_protocol_poll	MobileICloudReplyTransport
 iOS/NativeAgentMobile/Sources/ChatStore+Typewriter.swift	*	1	visible_ui	MobileTypewriterUI
 iOS/NativeAgentMobile/Sources/ChatView.swift	*	1	visible_ui	MobileChatUI
-iOS/NativeAgentMobile/Sources/ContentView.swift	*	3	visible_ui	MobileContentUI
+iOS/NativeAgentMobile/Sources/ContentView.swift	*	2	visible_ui	MobileContentUI
 iOS/NativeAgentMobile/Sources/MacBridgeClient.swift	*	2	external_protocol_poll	MobileMacBridgeTransport
 iOS/NativeAgentMobile/Sources/NativeAgentDesign.swift	*	1	visible_ui	MobileDesignAnimation
 iOS/NativeAgentMobile/Sources/MobilePushNotifications.swift	*	1	visible_ui	MobileAppUI
@@ -143,13 +144,11 @@ Modules/NativeAgentCore/Sources/ChatOrchestration/ChatSessionAgingConsolidation.
 Sources/NativeAgentApp/DeskPageView.swift	Task.sleep(for: .seconds(30))	1	visible_ui	DeskPageView
 Modules/NativeAgentCore/Sources/ProviderRouting/LLMClient+Real.swift	try? await Task.sleep(nanoseconds: UInt64(wall * 1_000_000_000))	1	timeout_retry_deadline	SwiftNativeLLMClient.withCompletionWall
 Modules/NativeAgentCore/Sources/ChatOrchestration/IntraTurnContextCompaction.swift	*	1	timeout_retry_deadline	IntraTurnContextCompaction.withDeadline (60s ceiling on the intra-turn working-notes distill, 2026-09-05)
-# 2026-09-16: the two Jev advisory lane bounds. Neither waits on anything a person can see: the dedup budget caps a check that rides a save, and the tool-call grace caps how long a finished dispatch waits for its check before abstaining.
-Modules/NativeAgentCore/Sources/ChatOrchestration/JevMemoryDedup.swift	Task.sleep(for: budget)	1	timeout_retry_deadline	JevMemoryDedup.suggestion budget race; the save goes ahead unannotated when it loses
-Modules/NativeAgentCore/Sources/ChatOrchestration/JevToolCallCheck.swift	Task.sleep(nanoseconds: UInt64(step)	1	timeout_retry_deadline	JevToolCallCheck.Pending.waitUntilReady grace poll; abstains at the bound
 # 2026-09-16: the mood-tint sampling clock, pre-existing and previously unclassified — it blocked every commit touching a timer file. One repeating sample behind the window tint; idempotent, stopped with the window.
 Sources/NativeAgentApp/MoodTint.swift	Timer.scheduledTimer(withTimeInterval: Self.sampleSeconds	1	visible_ui	MoodTintWeather.begin sampling clock behind the window tint
 # 2026-09-17: the second_opinion tool's hard cap. The agent asked for this call, so the bound is its own wait, not one a turn absorbs; the losing side is cancelled and the outcome reads timeout.
-Modules/NativeAgentCore/Sources/ChatOrchestration/JevSecondOpinion.swift	Task.sleep(for: budget)	1	timeout_retry_deadline	JevSecondOpinion.withBudget 4 s race; returns outcome timeout when it wins
 Sources/NativeAgentApp/NativeAgentA2AWire+Push.swift	*	2	timeout_retry_deadline	Push webhook delivery: 3-second destination-resolution deadline and bounded delivery retries; no polling
 Modules/NativeAgentCore/Sources/MacControl/MacControl+SystemActions.swift	*	1	timeout_retry_deadline	handleFocusApp bounded frontmost re-check after a cold launch (16 looks, 8s)
 # tests/NativeAgentAppTests/MacChatTranscriptSearchTests.swift: waitForSearch replaces five fixed sleeps with one bounded completion wait; test-only, outside the production inventory.
+Sources/NativeAgentApp/NativeCognitionRuntime+Organism.swift	*	1	event_deadline	NativeCognitionRuntime organism_state.json save debounce: one 30s coalescing sleep inside the sole persistence drain, only while a save is pending; an awaited save cancels it
+Sources/NativeAgentApp/DesktopChatRoute.swift	*	9	timeout_retry_deadline	DesktopChatRoute bounded launch, window restore, foreground, typing-idle wait (~5s), paste, submit confirmation and one two-minute reply watch per message; actions at most once; no resend or background polling

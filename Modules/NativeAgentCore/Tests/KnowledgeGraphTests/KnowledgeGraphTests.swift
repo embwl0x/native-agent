@@ -846,8 +846,6 @@ private let fixtureRaw: [String: JSONValue] = [
     #expect(s2.edges.count == 1)
 }
 
-// ── WAVE 37 W15 — forget WRITE port (KnowledgeGraph+Write.swift) ─────────────
-
 /// Write a knowledge_graph.json fixture into a fresh temp dir and return its URL.
 private func writeKGFixture(_ doc: JSONValue) throws -> URL {
     let dir = URL(fileURLWithPath: NSTemporaryDirectory())
@@ -918,91 +916,6 @@ private func writeKGFixture(_ doc: JSONValue) throws -> URL {
     } catch KnowledgeGraphReadError.paginationLimitExceeded(let limit) {
         #expect(limit == 1)
     }
-}
-
-@Test func forgetEntityRemovesEntityAndIncidentEdgesAndBumpsSeq() async throws {
-    let doc: JSONValue = .object([
-        "entities": .object([
-            "a": obj(["id": .string("a"), "name": .string("Alpha"), "type": .string("concept")]),
-            "b": obj(["id": .string("b"), "name": .string("Beta"), "type": .string("concept")]),
-            "c": obj(["id": .string("c"), "name": .string("Gamma"), "type": .string("concept")]),
-        ]),
-        "edges": .array([
-            obj(["from": .string("a"), "to": .string("b"), "type": .string("rel")]), // touches a -> drop
-            obj(["from": .string("c"), "to": .string("a"), "type": .string("rel")]), // touches a -> drop
-            obj(["from": .string("b"), "to": .string("c"), "type": .string("rel")]), // survives
-        ]),
-        "version": .int(1),
-        "_commit_seq": .int(7),
-    ])
-    let path = try writeKGFixture(doc)
-    let client = SwiftNativeKnowledgeGraphForgetClient(graphPath: path)
-
-    let result = try await client.forgetEntity(entityId: "a", reason: "test cleanup")
-    // Byte-faithful success body (forget_entity L649).
-    #expect(result == .object([
-        "ok": .bool(true),
-        "forgotten": .string("a"),
-        "reason": .string("test cleanup"),
-    ]))
-
-    // Re-read the file and assert the mutation persisted.
-    let after = try JSONValue.parse(Data(contentsOf: path))
-    guard case .object(let root) = after,
-          case .object(let entities)? = root["entities"],
-          case .array(let edges)? = root["edges"] else {
-        Issue.record("post-forget file malformed"); return
-    }
-    #expect(entities["a"] == nil)           // entity gone
-    #expect(entities["b"] != nil)           // others intact
-    #expect(entities["c"] != nil)
-    #expect(edges.count == 1)               // only b->c survives
-    if case .object(let e) = edges[0] {
-        #expect(e["from"] == .string("b"))
-        #expect(e["to"] == .string("c"))
-    } else { Issue.record("surviving edge malformed") }
-    // _commit_seq bumped 7 -> 8 (matches _flush_locked bump+stamp).
-    #expect(SwiftNativeKnowledgeGraphForgetClient.commitSeq(from: root["_commit_seq"]) == 8)
-}
-
-@Test func forgetUnknownEntityReturnsNotFoundAndDoesNotWrite() async throws {
-    let doc: JSONValue = .object([
-        "entities": .object([
-            "a": obj(["id": .string("a"), "name": .string("Alpha"), "type": .string("concept")]),
-        ]),
-        "edges": .array([]),
-        "version": .int(1),
-        "_commit_seq": .int(3),
-    ])
-    let path = try writeKGFixture(doc)
-    let before = try Data(contentsOf: path)
-    let client = SwiftNativeKnowledgeGraphForgetClient(graphPath: path)
-
-    let result = try await client.forgetEntity(entityId: "ghost", reason: "")
-    #expect(result == .object(["error": .string("not_found")]))
-    // Not-found is a pure read: the file MUST be byte-unchanged (no seq bump,
-    // matching the daemon's early `return {"error": "not_found"}` before _save).
-    let after = try Data(contentsOf: path)
-    #expect(before == after)
-}
-
-@Test func forgetEntityOnMissingFileReturnsNotFound() async throws {
-    // No fixture written — the empty-graph skeleton has no entities, so any id is
-    // not_found (matches the daemon's boot skeleton).
-    let dir = URL(fileURLWithPath: NSTemporaryDirectory())
-        .appendingPathComponent("kgforget-\(UUID().uuidString)", isDirectory: true)
-    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-    let path = dir.appendingPathComponent("knowledge_graph.json")
-    let client = SwiftNativeKnowledgeGraphForgetClient(graphPath: path)
-    let result = try await client.forgetEntity(entityId: "a", reason: "")
-    #expect(result == .object(["error": .string("not_found")]))
-}
-
-@Test func forgetFactoryReturnsSwiftNative() async {
-    let client = makeKnowledgeGraphForgetClient(
-        graphPath: URL(fileURLWithPath: "/tmp/never.json")
-    )
-    #expect(client is SwiftNativeKnowledgeGraphForgetClient)
 }
 
 // MARK: - B5: recency as a tiebreak, never a dominance flip

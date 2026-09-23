@@ -43,6 +43,7 @@ actor PersonaContextFlowProvider:
     private let compiler: PersonaCompiler
     private let mode: ContextFlowMode
     private let personaOverride: @Sendable () -> String?
+    private let dataRoot: URL
     private var cachedBuild: Build?
 
     init(
@@ -64,6 +65,7 @@ actor PersonaContextFlowProvider:
         self.compiler = compiler ?? PersonaCompiler(engine: persona)
         self.mode = mode
         self.personaOverride = personaOverride
+        self.dataRoot = standardizedRoot
     }
 
     func refreshContextSources(in registry: ContextSourceRegistry) async throws {
@@ -153,6 +155,13 @@ actor PersonaContextFlowProvider:
             for registration in catalog.registrations {
                 registrations[registration.descriptor.id] = registration
             }
+        }
+        // 2026-09-22: skills she saves live in data/skills/bodies, which was
+        // never scanned, so they never entered context flow.
+        let runtimeCatalog = try NativeMarkdownContextSourceCatalog.runtime(dataRoot: dataRoot)
+        for catalogRoot in runtimeCatalog.allowedRoots { allowedRoots.insert(catalogRoot) }
+        for registration in runtimeCatalog.registrations {
+            registrations[registration.descriptor.id] = registration
         }
 
         let grouped = Dictionary(grouping: snapshots, by: { $0.packet.personaId })

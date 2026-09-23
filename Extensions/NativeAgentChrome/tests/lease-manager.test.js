@@ -49,6 +49,94 @@ function fixture({ now = Date.parse("2026-08-18T12:00:00.000Z"), storage = {} } 
   };
 }
 
+function renderedFixture() {
+  const value = fixture();
+  const work = { id: 22, focused: false, state: "normal", type: "normal", tabs: [] };
+  value.chromeApi.windows = {
+    async getLastFocused() { return { id: 2, focused: true }; },
+    async create(options) {
+      assert.equal(options.focused, false);
+      const tab = { id: 33, windowId: 22, active: true, title: "X", url: options.url };
+      work.tabs = [tab]; value.tabs.set(tab.id, tab);
+      return structuredClone(work);
+    },
+    async get(id) { assert.equal(id, 22); return structuredClone(work); },
+  };
+  return { ...value, work };
+}
+
+test("rendered work tab uses only its own unfocused window and closes only its tab", async () => {
+  const value = renderedFixture();
+  const lease = await value.manager.acquire({ mode: "create", renderingMode: "visible_work_window", initialUrl: "https://x.com/home" });
+  assert.equal(lease.renderingMode, "visible_work_window");
+  await value.manager.verifyRenderingWindow(lease.leaseId);
+  const released = await value.manager.release({ leaseId: lease.leaseId });
+  assert.equal(released.tabClosed, true);
+  assert.equal(value.tabs.size, 0);
+});
+
+test("X post creation automatically selects the proven rendered route", async () => {
+  for (const host of ["x.com", "www.x.com", "twitter.com", "www.twitter.com"]) {
+    const value = renderedFixture();
+    const lease = await value.manager.acquire({ mode: "create", initialUrl: `https://${host}/MiaAI_lab/status/2101466550133788888` });
+    assert.equal(lease.renderingMode, "visible_work_window");
+    assert.equal(lease.tabId, 33);
+  }
+});
+
+test("explicit grouped background overrides X post routing; unrelated and deceptive URLs stay grouped", async () => {
+  const value = fixture();
+  const lease = await value.manager.acquire({ mode: "create", initialUrl: "https://x.com/A/status/123", renderingMode: "grouped_background" });
+  assert.equal(lease.renderingMode, undefined);
+  assert.equal(lease.originalTab.active, false);
+  for (const url of ["https://x.com/home", "https://x.com/A/status/123/photo/1", "https://x.com.evil.test/A/status/123",
+    "https://evil.test/x.com/A/status/123", "https://user:pass@x.com/A/status/123", "https://x.com:8443/A/status/123", "file://x.com/A/status/123"]) {
+    const other = fixture();
+    const grouped = await other.manager.acquire({ mode: "create", initialUrl: url });
+    assert.equal(grouped.renderingMode, undefined, url);
+    assert.equal(grouped.originalTab.active, false);
+  }
+});
+
+test("claim of an X post never creates or changes its presentation", async () => {
+  const value = fixture();
+  const tab = { id: 7, windowId: 2, active: false, url: "https://x.com/A/status/123", title: "X" };
+  value.tabs.set(tab.id, tab);
+  const lease = await value.manager.acquire({ mode: "claim", tabId: tab.id, expectedTab: { url: tab.url, title: tab.title } });
+  assert.equal(lease.renderingMode, undefined);
+  assert.equal(lease.ownership, "claimed");
+  assert.equal(value.tabs.size, 1);
+});
+
+test("rendered work window focus immediately blocks effects and yields without closing", async () => {
+  const value = renderedFixture();
+  const lease = await value.manager.acquire({ mode: "create", renderingMode: "visible_work_window" });
+  value.work.focused = true;
+  value.manager.windowFocused(22);
+  assert.throws(() => value.manager.requireActiveLease(lease.leaseId));
+  await value.manager.pendingOperation;
+  assert.equal(value.tabs.has(33), true);
+  assert.equal(value.manager.leases.size, 0);
+});
+
+test("rendered work guard yields if user adds another tab, preserving both", async () => {
+  const value = renderedFixture();
+  const lease = await value.manager.acquire({ mode: "create", renderingMode: "visible_work_window" });
+  value.work.tabs.push({ id: 34, windowId: 22, active: false });
+  await assert.rejects(value.manager.verifyRenderingWindow(lease.leaseId), /changed/);
+  assert.equal(value.tabs.has(33), true);
+  assert.equal(value.manager.leases.size, 0);
+});
+
+test("rendered work expiry does not close a focused window even if focus event was missed", async () => {
+  const value = renderedFixture();
+  const lease = await value.manager.acquire({ mode: "create", renderingMode: "visible_work_window" });
+  value.work.focused = true;
+  const released = await value.manager.release({ leaseId: lease.leaseId });
+  assert.equal(released.tabClosed, false);
+  assert.equal(value.tabs.has(33), true);
+});
+
 test("restores an active lease across a service-worker restart", async () => {
   const first = fixture();
   const lease = await first.manager.acquire({ mode: "create", leaseDurationMs: 120_000 });

@@ -197,8 +197,15 @@ public struct DelegationJobProjection: Sendable, Equatable {
     var acceptedMessageIDs: Set<String> = []
     var recordedThreadID: String? = nil
     var recordedTurnID: String? = nil
+    /// Claude's `claude:<topic>` handle, joined from the inbox row.
+    var conversationID: String? = nil
+    /// Her side of the exchange: the inbox message this reply answered.
+    var requestTextHead: String? = nil
     /// Retained executor text, distinct from Agent's delivery assessment.
-    var agentReplyTextHead: String? = nil
+    public var agentReplyTextHead: String? = nil
+    /// Bounded original executor words, separate from delivery diagnostics.
+    var agentReplyText: String? = nil
+    var agentReplyTruncated: Bool = false
     /// Which bridge store this row came from: "claude" | "codex" | "omp".
     public var source: String
     /// The agent that runs the job. Currently 1:1 with `source`, kept separate
@@ -263,7 +270,7 @@ public struct DelegationJobProjection: Sendable, Equatable {
     /// field.
     var stallDeadline: Date?
 
-    public func toJSON() -> JSONValue {
+    public func toJSON(includeReplyText: Bool = false) -> JSONValue {
         var obj: [String: JSONValue] = [
             "id": .string(id),
             "source": .string(source),
@@ -290,12 +297,18 @@ public struct DelegationJobProjection: Sendable, Equatable {
         put("last_liveness", lastLiveness)
         put("completed_at", completedAt)
         put("completion_text_head", completionTextHead)
+        put("request_text_head", requestTextHead)
         put("agent_reply_text_head", agentReplyTextHead)
+        if includeReplyText {
+            put("agent_reply_text", agentReplyText)
+            if agentReplyText != nil { obj["agent_reply_truncated"] = .bool(agentReplyTruncated) }
+        }
         put("execution_error", executionError)
         put("record_kind", recordKind)
         put("recovery_note", recoveryNote)
         put("thread_id", recordedThreadID)
         put("turn_id", recordedTurnID)
+        put("conversation_id", conversationID)
         obj["accepted_message_ids"] = .array(acceptedMessageIDs.sorted().map(JSONValue.string))
         put("delivery_outcome", deliveryOutcome)
         put("delivery_reason", deliveryReason)
@@ -332,6 +345,7 @@ public struct DelegationJobProjection: Sendable, Equatable {
         put("completion_text_head", completionTextHead)
         put("execution_error", executionError)
         put("record_kind", recordKind)
+        put("conversation_id", conversationID)
         put("delivery_outcome", deliveryOutcome)
         put("delivery_reason", deliveryReason)
         if let elapsedSeconds { obj["elapsed_seconds"] = .int(Int64(elapsedSeconds)) }
@@ -548,8 +562,55 @@ public struct DelegationStatusProjector: Sendable {
             }
         }
         rows.sort(by: Self.newestFirst)
-        let page = Array(rows.dropFirst(min(offset, rows.count)).prefix(limit ?? rows.count))
+        var page = Array(rows.dropFirst(min(offset, rows.count)).prefix(limit ?? rows.count))
+        // A thread reads as ask and answer. Only the returned page is joined,
+        // from the tail of the inbox, so this stays a bounded read.
+        let wanted = Set(page.flatMap { $0.acceptedMessageIDs })
+        if !wanted.isEmpty {
+            let asks = Self.requestTexts(inbox: codexDeliveriesFile.deletingLastPathComponent()
+                .appendingPathComponent("codex-inbox.jsonl"), ids: wanted)
+            for index in page.indices where page[index].requestTextHead == nil {
+                page[index].requestTextHead = page[index].acceptedMessageIDs.sorted().lazy.compactMap { asks[$0] }.first.flatMap(Self.head)
+            }
+        }
+        // 2026-09-22: Claude jobs don't record their conversation handle;
+        // its inbox row does, so every Claude row lacked one to reply with.
+        let claudeIDs = Set(page.filter { $0.agent == "claude" }.flatMap { $0.acceptedMessageIDs })
+        if !claudeIDs.isEmpty {
+            let handles = Self.requestTexts(inbox: claudeJobsDirectory.deletingLastPathComponent()
+                .appendingPathComponent("claude-inbox.jsonl"), ids: claudeIDs, field: "conversationId")
+            // 2026-09-22: a live Claude answers in a bridge chat, not the
+            // job; the bridge records a reply that names her message here.
+            let replies = Self.requestTexts(inbox: claudeJobsDirectory.deletingLastPathComponent()
+                .appendingPathComponent("claude-replies.jsonl"), ids: claudeIDs, field: "replyTextHead")
+            for index in page.indices where page[index].agent == "claude" {
+                page[index].conversationID = page[index].acceptedMessageIDs.sorted().lazy.compactMap { handles[$0] }.first
+                if page[index].agentReplyTextHead == nil {
+                    page[index].agentReplyTextHead = page[index].acceptedMessageIDs.sorted().lazy.compactMap { replies[$0] }.first.flatMap(Self.head)
+                }
+            }
+        }
         return DelegationStatusReadSnapshot(jobs: page, sources: sources, matchedCount: matchedCount)
+    }
+
+    /// Inbox `field` for the given message ids, read from the file's last 512 KiB.
+    public static func requestTexts(inbox url: URL, ids: Set<String>, field: String = "text") -> [String: String] {
+        guard let file = try? FileHandle(forReadingFrom: url) else { return [:] }
+        defer { try? file.close() }
+        let size = (try? file.seekToEnd()) ?? 0
+        let start = size > 524_288 ? size - 524_288 : 0
+        guard (try? file.seek(toOffset: start)) != nil, let data = try? file.readToEnd() else { return [:] }
+        var lines = data.split(separator: 0x0A)
+        if start > 0, !lines.isEmpty { lines.removeFirst() }
+        var found: [String: String] = [:]
+        for line in lines {
+            guard let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
+                  let text = object[field] as? String, !text.isEmpty else { continue }
+            for key in ["id", "messageId"] {
+                if let id = object[key] as? String, ids.contains(id) { found[id] = text }
+            }
+        }
+        return found
     }
 
     fileprivate static func newestFirst(_ lhs: DelegationJobProjection, _ rhs: DelegationJobProjection) -> Bool {
@@ -703,10 +764,12 @@ public struct DelegationStatusProjector: Sendable {
             stallDeadline: stallDeadline
         )
         row.recencyKey = firstDate(completedAt, liveness, startedAt, claimedAt, createdAt)
+        Self.retainReply(string(job, "agentReplyText"), truncated: bool(job, "agentReplyTruncated") ?? true, in: &row)
         row.acceptedMessageIDs = Set([Self.recordedLookupID(job["messageId"])].compactMap { $0 })
         if row.deliveryOutcome == "blocked", string(job, "bridgeReason") == "missing_origin_session" {
             row.deliveryReason = "missing_origin_session"
         }
+        if case .object(let payload)? = job["payload"] { row.requestTextHead = head(string(payload, "text")) }
         return row
     }
 
@@ -794,6 +857,7 @@ public struct DelegationStatusProjector: Sendable {
         row.recencyKey = firstDate(completedAt, liveness, claimedAt, createdAt)
         row.executionError = Self.codexExecutionError(turnResult)
         row.recordKind = undelivered ? "retained_reply_job" : "reply_job"
+        Self.retainReply(string(turnResult, "message") ?? string(turnResult, "lastAgentMessage"), truncated: false, in: &row)
         row.acceptedMessageIDs = Set(Self.codexPayloadValues(job, field: "messageId").compactMap { Self.recordedLookupID($0) })
         // A completed execution may belong to a later recovery turn. Keep its
         // recorded pair together instead of mixing it with initial job IDs.
@@ -873,6 +937,8 @@ public struct DelegationStatusProjector: Sendable {
                 row.executionError = Self.codexExecutionError(turnResult)
                 row.recordKind = "delivery_receipt"
                 row.agentReplyTextHead = head(string(turnResult, "messagePreview"))
+                Self.retainReply(string(turnResult, "agentReplyText") ?? string(turnResult, "messagePreview"),
+                    truncated: bool(turnResult, "agentReplyTruncated") ?? true, in: &row)
                 row.acceptedMessageIDs = Set([Self.recordedLookupID(.string(id))].compactMap { $0 })
                 row.recordedThreadID = Self.recordedLookupID(delivery["threadId"])
                 row.recordedTurnID = Self.recordedLookupID(delivery["turnId"])
@@ -945,6 +1011,7 @@ public struct DelegationStatusProjector: Sendable {
             stallDeadline: stallDeadline
         )
         row.recencyKey = firstDate(completedAt, liveness, startedAt, createdAt)
+        Self.retainReply(string(job, "reply"), truncated: false, in: &row)
         row.acceptedMessageIDs = Set([Self.recordedLookupID(job["messageId"])].compactMap { $0 })
         if delivery == "blocked", string(bridge, "reason") == "missing_origin_session" {
             row.deliveryReason = "missing_origin_session"
@@ -1096,7 +1163,14 @@ public struct DelegationStatusProjector: Sendable {
 
     static func head(_ text: String?) -> String? {
         guard let text, !text.isEmpty else { return nil }
-        return String(text.prefix(completionTextHeadLimit))
+        guard text.count > completionTextHeadLimit else { return text }
+        // 2026-09-22: a cut head ends on a word and carries "…", which is how
+        // readers tell a cut reply from a short one.
+        var cut = text.prefix(completionTextHeadLimit - 1)
+        if !text[cut.endIndex].isWhitespace, let space = cut.lastIndex(where: \.isWhitespace) {
+            cut = cut[..<space]
+        }
+        return String(cut).trimmingCharacters(in: .whitespacesAndNewlines) + "…"
     }
 
     static func string(_ obj: [String: JSONValue], _ key: String) -> String? {
@@ -1159,6 +1233,13 @@ public struct DelegationStatusProjector: Sendable {
         case (nil, _?): return b
         case (nil, nil): return a ?? b
         }
+    }
+
+    private static func retainReply(_ text: String?, truncated: Bool, in row: inout DelegationJobProjection) {
+        guard let text, !text.isEmpty else { return }
+        row.agentReplyText = String(text.prefix(6000))
+        row.agentReplyTextHead = head(text)
+        row.agentReplyTruncated = truncated || text.count > 6000
     }
 
     static func firstDate(_ candidates: String?...) -> Date? {

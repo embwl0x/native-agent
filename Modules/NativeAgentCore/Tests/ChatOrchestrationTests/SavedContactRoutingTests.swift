@@ -30,7 +30,7 @@ import NativeAgentCore
         let store = AgentPeerStore(dataRoot: root)
         try store.upsert(AgentPeerContact(name: "Grok Bot", endpoint: URL(string: "https://agent.example")!, transport: .a2a))
         let message = "Ask grok bot this: what is 6 times 7?"
-        #expect(ToolPreloadHeuristics.predict(userMessage: message, dataRoot: root)?.candidateTools == ["agent_message"])
+        #expect(ToolPreloadHeuristics.predict(userMessage: message, dataRoot: root)?.candidateTools == ["agent_message", "agent_read"])
         #expect(try store.namesMentioned(in: "Ask Grok Bots").isEmpty)
         #expect(try store.namesMentioned(in: "Ask NotGrok Bot").isEmpty)
         #expect(try store.namesMentioned(in: "Ask another bot").isEmpty)

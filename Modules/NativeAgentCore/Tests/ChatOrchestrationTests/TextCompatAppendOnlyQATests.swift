@@ -805,7 +805,7 @@ func textCompatQA2_toolRoundTrip_equivalent_appendOnly_byteCarrier() async throw
     #expect(old.llm.promptCalls.count == 2)
     let composed = try #require(textOf(second.messages[0]))
     let toolResultsText = try #require(textOf(second.messages[2]))
-    #expect(toolResultsText.contains("NativeAgent tool result for read_file:"))
+    #expect(toolResultsText.contains("NativeAgent tool result #1 for read_file:"))
     #expect(toolResultsText.contains("BODY-A"))
     #expect(old.llm.promptCalls[1].prompt == composed + toolResultsText,
             "QA2: grown prompt != conversation carrier bytes")
@@ -848,8 +848,8 @@ func textCompatQA3_multiCallIteration_singleResultsMessage_equivalent() async th
     let second = try #require(new.llm.messagesCalls.last)
     #expect(second.messages.count == 3)
     let resultsText = try #require(textOf(second.messages[2]))
-    let readRange = try #require(resultsText.range(of: "NativeAgent tool result for read_file:"))
-    let recallRange = try #require(resultsText.range(of: "NativeAgent tool result for recall_memory:"))
+    let readRange = try #require(resultsText.range(of: "NativeAgent tool result #1 for read_file:"))
+    let recallRange = try #require(resultsText.range(of: "NativeAgent tool result #2 for recall_memory:"))
     #expect(readRange.lowerBound < recallRange.lowerBound)
     // And the same single-message bytes match the old grown suffix.
     let composed = try #require(textOf(second.messages[0]))
@@ -902,7 +902,7 @@ func textCompatQA6_compatLever_forcesGrownPromptShape() async throws {
     #expect(obs.llm.promptCalls.count == 2)
     let p2 = try #require(obs.llm.promptCalls.last)
     #expect(p2.prompt.hasPrefix("hello"))
-    #expect(p2.prompt.contains("NativeAgent tool result for read_file:"))
+    #expect(p2.prompt.contains("NativeAgent tool result #1 for read_file:"))
     #expect(obs.finalReply == "after tool")
 }
 

@@ -2132,3 +2132,9 @@ struct PersonalityRangeBenchLayer2RangeTests {
     }
 
 }
+
+// MARK: - Test-only affect read (no production caller, so it lives here)
+
+extension CognitiveSubstrate {
+    func affectSnapshot() -> CognitiveAffectState { projectedAffect(at: dependencies.now()) }
+}

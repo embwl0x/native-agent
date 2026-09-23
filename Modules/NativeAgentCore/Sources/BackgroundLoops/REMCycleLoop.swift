@@ -24,9 +24,9 @@ import DreamREMCycle
 
 /// Weekly REM consolidation loop. Once per ~7d, runs SwiftNativeREMConsolidator
 /// over the last week of dream-diary entries, filters out tombstoned proposals,
-/// triggers GROWTH.md eviction if the doc is near cap, and appends surviving
-/// proposals to the canonical `<dataRoot>/rem_proposals.jsonl` store via the
-/// shared flock'd appender, staging one approval record per new row.
+/// and appends surviving proposals to the canonical
+/// `<dataRoot>/rem_proposals.jsonl` store via the shared flock'd appender,
+/// staging one approval record per new row.
 ///
 /// tick() is non-throwing by LoopRunner contract — any error (consolidator
 /// throw, IO failure) is caught and surfaced via stderr.
@@ -62,11 +62,6 @@ public struct REMCycleLoop: LoopRunner {
     /// proposal content and fires only after a successful tick durably adds
     /// replay-relevant canonical proposal evidence.
     private let replaySourceCommitted: (@Sendable () async -> Void)?
-
-    /// Hard cap fed to GrowthDocManager.evictionCandidates when eviction trips.
-    static let growthMaxBytes: Int = 50_000
-    /// Size threshold above which the eviction path is taken.
-    static let growthEvictThreshold: Int = 40_000
 
     public init(
         interval: TimeInterval = 604_800,
@@ -182,15 +177,6 @@ public struct REMCycleLoop: LoopRunner {
                 return .skipped(reason: "all REM proposals tombstoned")
             }
             if dryRun { return .skipped(reason: "REM dry run") }
-
-            // GROWTH cap eviction (caller-side; helper returns the slice to drop).
-            let size = await growth.growthSize()
-            if size > Self.growthEvictThreshold {
-                let slice = (try? await growth.evictionCandidates(maxBytes: Self.growthMaxBytes)) ?? ""
-                if !slice.isEmpty {
-                    try? await growth.deleteSlice(slice)
-                }
-            }
 
             // Canonical append: camelCase rows at <dataRoot>/rem_proposals.jsonl
             // via the shared flock'd, id-deduped appender — the same store the

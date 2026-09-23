@@ -342,8 +342,20 @@ struct NativeAgentMobileApp: App {
                     }
                 }
             }
+            // 2026-09-22: automatic pairing never taps Connect, so the Mac
+            // never listed this phone and the first approve failed. Announce
+            // on launch and whenever the key changes; the Mac treats repeats
+            // as a no-op and re-lists a removed phone as pending.
+            .task { announcePhoneToMac() }
+            .onChange(of: pairingStore.iCloudPairingSecret) { _, _ in announcePhoneToMac() }
             .preferredColorScheme(NativeAgentAppearance.resolved(appearanceRawValue).colorScheme)
         }
+    }
+
+    private func announcePhoneToMac() {
+        guard pairingStore.iCloudPairingSecret != nil else { return }
+        iCloudSyncEngine.shared.pairingStore = pairingStore
+        Task { _ = try? await iCloudSyncEngine.shared.sendAction(.make(action: "pairDevice", payload: [:]), intentionalNewRequest: true) }
     }
 
     private func configureNotifications() {
@@ -438,6 +450,7 @@ struct NativeAgentMobileApp: App {
     /// there. This injects the secret directly into the PairingStore so
     /// we can verify the post-pair UI in headless tests.
     private func checkLaunchArgsForPairingSecret() {
+        #if DEBUG
         let args = ProcessInfo.processInfo.arguments
         guard args.contains("-pairingSecretBase64"), !didApplyPairingSecretLaunchArgument else { return }
         didApplyPairingSecretLaunchArgument = true
@@ -450,6 +463,7 @@ struct NativeAgentMobileApp: App {
             pairingStore.isICloudPaired = true
             NSLog("[NativeAgentMobile] -pairingSecretBase64: injected (\(data.count) bytes); isICloudPaired=true")
         }
+        #endif
     }
 
     /// Launch-args test hook for physical-device notification verification.

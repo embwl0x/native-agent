@@ -99,7 +99,6 @@ import PersistenceCore
     #expect(await substrate.thoughtSeedSnapshot().first?.priority == 0.8)
 
     clock.advance(24 * 60 * 60)
-    await substrate.decayThoughtSeeds()
     let decayed = try #require(await substrate.thoughtSeedSnapshot().first)
     #expect(abs(decayed.priority - 0.4) < 0.000_001)
 

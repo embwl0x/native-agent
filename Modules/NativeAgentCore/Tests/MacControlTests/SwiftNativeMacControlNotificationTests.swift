@@ -34,7 +34,7 @@ import Darwin
         return
     }
     #expect(receipt["submission"] == .string("accepted_for_delivery"))
-    #expect(receipt["authorization"] == .string("adapter_managed"))
+    #expect(receipt["access"] == .string("adapter_managed"))
     #expect(receipt["delivery_observed"] == .bool(false),
             "adapter acceptance must not claim a user-visible delivery")
 }
@@ -122,7 +122,7 @@ import Darwin
         return
     }
     #expect(receipt["submission"] == .string("accepted_for_delivery"))
-    #expect(receipt["authorization"] == .string("authorized"))
+    #expect(receipt["access"] == .string("authorized"))
     #expect(receipt["request_id"] == .string("notification-request-42"))
     #expect(receipt["delivery_observed"] == .bool(false))
     let readModel = try await store.motorActionReadModel(actionId: "notify-receipt")

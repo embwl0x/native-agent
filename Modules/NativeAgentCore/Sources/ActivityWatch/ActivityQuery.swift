@@ -94,7 +94,7 @@ public struct ActivityQueryService: Sendable {
     /// Runs the query. Throws `.captureDisabled` when the Trust Center toggle
     /// is off — the tool must never answer from rows recorded before a user
     /// turned capture off, and must never imply it has data it does not have.
-    public func run(_ request: Request) async throws -> JSONValue {
+    public func run(_ request: Request, fullMacAdmitted: Bool = false) async throws -> JSONValue {
         let policy: ActivityPolicy
         do {
             policy = try ActivityPolicyStore(dataRoot: dataRoot).loadChecked()
@@ -102,7 +102,9 @@ public struct ActivityQueryService: Sendable {
             throw QueryError.policyUnavailable(error.localizedDescription)
         }
         guard policy.captureEnabled else { throw QueryError.captureDisabled }
-        guard policy.allowModelAccess else { throw QueryError.modelAccessDisabled }
+        // The caller must obtain this per-call authority from TrustCenter,
+        // including the actual origin. It does not alter capture or retention.
+        guard policy.allowModelAccess || fullMacAdmitted else { throw QueryError.modelAccessDisabled }
         guard request.from.isFinite, request.to.isFinite, request.to > request.from else {
             throw QueryError.badRange("the end of the range must be after its start")
         }

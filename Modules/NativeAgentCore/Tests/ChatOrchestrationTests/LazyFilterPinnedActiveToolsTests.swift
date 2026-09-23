@@ -6,6 +6,7 @@ import PersistenceCore
 import PersonaEngine
 import ProviderRouting
 import DreamREMCycle
+import NativeAgentTestSupport
 
 // turn-context-iteration-cache (2026-08-13): the text-compat marker lane pins
 // the advertised tool catalog to its turn-start set so a mid-turn tool_load

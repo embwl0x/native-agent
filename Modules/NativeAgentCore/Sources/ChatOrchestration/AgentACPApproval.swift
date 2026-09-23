@@ -5,6 +5,24 @@ import PersistenceCore
 /// A permission belongs to this live request only. Resolution uses the existing
 /// inbox and lifecycle edges; cancellation retires the card, never replays a turn.
 enum AgentACPApproval {
+    /// Capture at the initiating turn, before the protocol reader calls back.
+    /// The other agent's sessionId is never the local chat's identity.
+    struct Context: Sendable {
+        let origin: JSONValue
+
+        static var current: Context {
+            let envelope = TurnEnvelope.current(surface: ChatToolSessionContext.replyRoute?.surface ?? "chat")
+            let route = envelope.replyRoute
+            return Context(origin: .object([
+                "sessionId": ChatToolSessionContext.verifiedSessionId.map(JSONValue.string) ?? .null,
+                "surface": .string(route.surface),
+                "chatId": envelope.verifiedChatId.map(JSONValue.string) ?? .null,
+                "destinationId": route.destinationId.map(JSONValue.string) ?? .null,
+                "threadId": route.threadId.map(JSONValue.string) ?? .null,
+            ]))
+        }
+    }
+
     /// Never launch the replacement to inspect its version before consent.
     /// The refused message is not replayed after this fresh setup approval.
     static func renewExecutable(_ contact: AgentPeerContact, store: AgentPeerStore,
@@ -22,6 +40,7 @@ enum AgentACPApproval {
     }
 
     static func request(_ request: JSONValue, peer: AgentPeerContact,
+                        context: Context = .current,
                         inbox: any ApprovalInboxProtocol) async throws -> Bool {
         // Only a redacted, bounded preview leaves this live request. The raw
         // protocol object is never needed to resolve or replay an inbox card.
@@ -31,7 +50,9 @@ enum AgentACPApproval {
             "title": .string("Allow \(peer.name) to do this once?"),
             "action": .string("agent.acp.permission"), "risk": .string("confirm"),
             "reason": .string("The other agent is asking to act on this Mac. Your answer is sent to that agent for this request. This app asks only when the other agent asks; this card does not control everything that program can do."),
-            "payload": .object(["peer_id": .string(peer.id), "requestPreview": .string(preview),
+            "payload": .object(["kind": .string("agent_acp_live_approval"),
+                                "origin": context.origin,
+                                "peer_id": .string(peer.id), "requestPreview": .string(preview),
                                 "untrusted_remote_data": .bool(true)]),
             "payloadPreview": .string("Untrusted request from another program:\n" + preview),
             "remoteResolvable": .bool(false), "localOnly": .bool(true)
@@ -44,7 +65,8 @@ enum AgentACPApproval {
             "title": .string("Connect \(proposal.row.displayName)?"),
             "action": .string("agent.acp.connect"), "risk": .string("confirm"),
             "reason": .string(AgentHostConnection.cardText(proposal, appName: appName)),
-            "payload": .object(["peer_id": .string(proposal.contactID),
+            "payload": .object(["kind": .string("agent_acp_live_approval"),
+                "origin": Context.current.origin, "peer_id": .string(proposal.contactID),
                 "path": .string(proposal.executable?.path ?? ""),
                 "digest": .string(proposal.executable?.digest ?? ""),
                 "folder": .string(proposal.workingDirectory.path)]),
@@ -53,6 +75,7 @@ enum AgentACPApproval {
     }
 
     private static func resolve(_ content: JSONValue, inbox: any ApprovalInboxProtocol) async throws -> Bool {
+        try Task.checkCancellation()
         let events = await ApprovalLifecycleBus.shared.events()
         let record = try await inbox.create(content)
         do {

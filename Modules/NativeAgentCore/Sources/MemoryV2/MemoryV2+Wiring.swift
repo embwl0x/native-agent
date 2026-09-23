@@ -148,12 +148,7 @@ extension SwiftNativeMemoryV2 {
         // re-assertion as corroborating evidence (metadata.recall_count, the
         // same bump mergeProposal applies — a merge is evidence, not access).
         // Checked BEFORE embedding: a duplicate never pays the embed cost.
-        let contentKey = MemoryConsolidator.normalizedContentKey(content)
-        let existingRows = try await storage.listMemory(kind: nil)
-        if let existing = existingRows.first(where: {
-            ($0.status ?? "active") == "active"
-                && MemoryConsolidator.normalizedContentKey($0.text) == contentKey
-        }) {
+        func reassert(_ existing: MemoryRecord) async throws -> MemoryRecord {
             var currentCount: Int64 = 0
             if case .object(let m)? = existing.extras {
                 if case .int(let n)? = m["recall_count"] { currentCount = n }
@@ -196,6 +191,14 @@ extension SwiftNativeMemoryV2 {
             // so the next prepared context sees the committed evidence.
             await flushDerivedMemoryChanges()
             return updated
+        }
+        let contentKey = MemoryConsolidator.normalizedContentKey(content)
+        let existingRows = try await storage.listMemory(kind: nil)
+        if let existing = existingRows.first(where: {
+            ($0.status ?? "active") == "active"
+                && MemoryConsolidator.normalizedContentKey($0.text) == contentKey
+        }) {
+            return try await reassert(existing)
         }
         // Embed ONCE; the same vector serves the semantic tombstone gate and
         // the insert. Wave1 T3: a paraphrase of a deleted claim blocks here at
@@ -272,6 +275,27 @@ extension SwiftNativeMemoryV2 {
                 text: content
             )
         )
+        // 2026-09-22: near-duplicates slipped past the exact guard (three
+        // rephrasings of one fact in a day). A paraphrase of an ACTIVE,
+        // non-correction row in the same disclosure scope written in the last
+        // 24h re-asserts that row instead. Older rows, other scopes and
+        // corrections (either side) still get their own row.
+        if Self.metadataKind(metadata) != "correction",
+           let near = try await storage.nearestNeighbor(
+               embedding: embedded.vector,
+               embeddingEpoch: embedded.epoch,
+               excluding: nil
+           ),
+           near.cosine >= MemoryManagerLane.duplicateSimilarity,
+           (near.record.status ?? "active") == "active",
+           MemoryRecallScoring.kind(of: near.record.extras) != "correction",
+           let scope = MemoryRecordDisclosurePolicy.classify(record),
+           MemoryRecordDisclosurePolicy.classify(near.record) == scope,
+           MemorySemanticDuplicateGuard.sameQuantityAndNegation(near.record.text, content),
+           let created = MemoryRecallScoring.parseTimestamp(near.record.createdAt),
+           Date().timeIntervalSince(created) < 24 * 3600 {
+            return try await reassert(near.record)
+        }
         let inserted = try await storage.insert(
             record: record,
             embedding: embedded.vector,
@@ -303,5 +327,24 @@ extension SwiftNativeMemoryV2 {
         }
         let trimmed = kind.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
+    }
+
+}
+
+enum MemorySemanticDuplicateGuard {
+    /// Similar wording cannot reassert or archive a changed quantity or polarity.
+    static func sameQuantityAndNegation(_ old: String, _ new: String) -> Bool {
+        func matches(_ pattern: String, in text: String) -> [String] {
+            guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { return [] }
+            let ns = text as NSString
+            return regex.matches(in: text, range: NSRange(location: 0, length: ns.length))
+                .map { ns.substring(with: $0.range).lowercased().replacingOccurrences(of: "’", with: "'") }
+        }
+        let digits = #"[0-9]+"#
+        // Third-person memories negate with n't ("doesn't", "isn't"); count, so
+        // "does not" and "doesn't" still read as the same polarity.
+        let negations = #"\b(?:no\s+longer|not|never|cannot)\b|n['’]t\b"#
+        return matches(digits, in: old) == matches(digits, in: new)
+            && matches(negations, in: old).count == matches(negations, in: new).count
     }
 }

@@ -272,7 +272,6 @@ extension SwiftNativeTrustCenter {
         "app_settings_list": .string("auto"),
         "app_setting_set": .string("auto"),
         "interaction_act": .string("auto"),
-        "voice_render": .string("auto"),
         "gh.create_issue": .string("draft_auto"),
         "github.status": .string("auto"),
         "github_status": .string("auto"),
@@ -480,6 +479,9 @@ extension SwiftNativeTrustCenter {
         // plain local read as the search that names it; without an explicit
         // entry it falls through to the approval default (see above).
         "read_chat_message": .string("auto"),
+        "workspace": .string("auto"),
+        "work_context": .string("auto"),
+        "artifact_find": .string("auto"),
         "search_kg": .string("auto"),
         "recent_trace_summary": .string("auto"),
         "scratchpad_read": .string("auto"),
@@ -634,7 +636,6 @@ extension SwiftNativeTrustCenter {
         "app_settings_list": .string("auto"),
         "app_setting_set": .string("auto"),
         "interaction_act": .string("auto"),
-        "voice_render": .string("auto"),
         "tool_catalog": .string("auto"),
         "list_tools": .string("auto"),
         "tool_load": .string("auto"),
@@ -648,6 +649,9 @@ extension SwiftNativeTrustCenter {
         // plain local read as the search that names it; without an explicit
         // entry it falls through to the approval default (see above).
         "read_chat_message": .string("auto"),
+        "workspace": .string("auto"),
+        "work_context": .string("auto"),
+        "artifact_find": .string("auto"),
         "search_kg": .string("auto"),
         "recent_trace_summary": .string("auto"),
         "scratchpad_read": .string("auto"),

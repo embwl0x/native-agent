@@ -2,7 +2,9 @@ import Foundation
 
 /// Credential scrubbing shared by presentation and trace boundaries; callers own bounding.
 public enum TurnSecretRedactor {
-    private static let credentialName = #"(?:[\w-]*(?:password|passwd|token|secret)|(?:[\w-]*[_-])?(?:api[_-]?key|private[_-]?key)|authorization)"#
+    // 2026-09-22: X search's next_token/pagination_token are cursors the
+    // tools take back as input; scrubbing them broke paging.
+    private static let credentialName = #"(?!(?:next|pagination)_token(?![\w-]))(?:[\w-]*(?:password|passwd|token|secret)|(?:[\w-]*[_-])?(?:api[_-]?key|private[_-]?key)|authorization)"#
 
     public static func isCredentialName(_ name: String) -> Bool {
         name.range(of: "^" + credentialName + "$", options: [.regularExpression, .caseInsensitive]) != nil
@@ -19,6 +21,7 @@ public enum TurnSecretRedactor {
                 [.dotMatchesLineSeparators]
             ),
             ("GITHUB_TOKEN", "\\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{30,})\\b", []),
+            ("JWT", "\\beyJ[A-Za-z0-9_-]{8,}\\.eyJ[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}", []),
             ("OPENAI_KEY", "\\bsk-(?:proj-)?[A-Za-z0-9_-]{20,}\\b", []),
             ("ANTHROPIC_KEY", "\\bsk-ant-[A-Za-z0-9_-]{20,}\\b", []),
             ("STRIPE_KEY", "\\b(?:sk|rk)_live_[A-Za-z0-9]{16,}\\b", []),
@@ -65,6 +68,7 @@ public enum TurnSecretRedactor {
                 [.dotMatchesLineSeparators]
             ),
             ("GITHUB_TOKEN", "\\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{30,})\\b", []),
+            ("JWT", "\\beyJ[A-Za-z0-9_-]{8,}\\.eyJ[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}", []),
             ("OPENAI_KEY", "\\bsk-(?:proj-)?[A-Za-z0-9_-]{20,}\\b", []),
             ("ANTHROPIC_KEY", "\\bsk-ant-[A-Za-z0-9_-]{20,}\\b", []),
             ("STRIPE_KEY", "\\b(?:sk|rk)_live_[A-Za-z0-9]{16,}\\b", []),

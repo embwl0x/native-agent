@@ -35,6 +35,7 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
     private let browserActionRunner: @Sendable (String, Bool, [String: JSONValue]) async throws -> JSONValue
     private let doctorStatusProvider: @Sendable () async throws -> JSONValue
     private let telegramStatusProvider: @Sendable () async throws -> JSONValue
+    private let humanConversationReplyHandler: @Sendable ([String: JSONValue]) async throws -> JSONValue
     private let reflexReviewHandler: @Sendable (
         String,
         OrganismReflexReviewDecision,
@@ -89,6 +90,7 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
         browserActionRunner: (@Sendable (String, Bool, [String: JSONValue]) async throws -> JSONValue)? = nil,
         doctorStatusProvider: (@Sendable () async throws -> JSONValue)? = nil,
         telegramStatusProvider: (@Sendable () async throws -> JSONValue)? = nil,
+        humanConversationReplyHandler: (@Sendable ([String: JSONValue]) async throws -> JSONValue)? = nil,
         reflexReviewHandler: @escaping @Sendable (
             String,
             OrganismReflexReviewDecision,
@@ -124,6 +126,9 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
         self.browserActionRunner = browserActionRunner ?? Self.defaultBrowserActionRunner
         self.doctorStatusProvider = doctorStatusProvider ?? Self.defaultDoctorStatusProvider
         self.telegramStatusProvider = telegramStatusProvider ?? Self.defaultTelegramStatusProvider
+        self.humanConversationReplyHandler = humanConversationReplyHandler ?? { input in
+            try await HumanConversationReplyService.shared.reply(input: input)
+        }
         self.reflexReviewHandler = reflexReviewHandler
         self.organismPostureProvider = organismPostureProvider
         self.contextPrewarm = contextPrewarm
@@ -191,14 +196,16 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
         let active = persisted
             .union(LLMCallContext.turnActiveTools ?? [])
             .subtracting(unloadedThisTurn)
-        if active.contains(canonical) {
+        let loadName = Self.advertisedAppToolName(canonical)
+        if active.contains(canonical) || active.contains(loadName) {
             // USAGE STAMP (2026-09-13): every app-owned tool returns from
             // `dispatchWithoutOrganismPosture` BEFORE `inner.dispatch`, so
             // Core's sole `markUsed` never sees these calls and `beginTurn`
             // idle-dropped a browser/health/reflex/notify tool that was being
             // used every turn. This is the app side's stamp.
-            if persisted.contains(canonical) {
-                await activeToolsStore.markUsed(sessionId: sessionId, names: [canonical])
+            let used = persisted.intersection([canonical, loadName])
+            if !used.isEmpty {
+                await activeToolsStore.markUsed(sessionId: sessionId, names: used)
             }
             return nil
         }
@@ -209,8 +216,8 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
             ])
             guard case .object(let object) = receipt,
                   case .array(let loaded)? = object["loaded"],
-                  loaded.contains(.string(canonical)) else { return receipt }
-            await activeToolsStore.markUsed(sessionId: sessionId, names: [canonical])
+                  loaded.contains(.string(loadName)) else { return receipt }
+            await activeToolsStore.markUsed(sessionId: sessionId, names: [loadName])
             return nil
         } catch {
             return .object([
@@ -231,11 +238,12 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
         // before this dispatcher sees it, and the fence matched the dotted
         // spelling only — so on a synthetic root the call fell through to
         // `runMobileNotify` and attempted a real push. Fence the canonical
-        // notification name too.
-        let canonicalNotification = Self.canonicalNotificationToolName(tool)
+        // notification name too. 2026-09-22: every alias, not just notify —
+        // `browser_navigate` / `browser_status` slipped past on synthetic roots.
+        let canonicalApp = Self.canonicalAppToolName(tool)
         if !includeAppOwnedTools,
            Self.appToolNames.contains(tool)
-            || canonicalNotification.map({ Self.appToolNames.contains($0) }) == true {
+            || canonicalApp.map({ Self.appToolNames.contains($0) }) == true {
             return .object([
                 "status": .string("failed"),
                 "reason": .string("canonical_body_unavailable"),
@@ -285,15 +293,19 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
             }
             throw error
         }
-        let enriched = await resultByAddingOrganismPosture(result, tool: tool, surface: surface)
+        // 2026-09-22 WHY: the posture already rides the prompt's
+        // [OrganismBehavior] block; stamping it on every result cost ~1K
+        // tokens a turn and crowded real data out of trimmed results.
+        let organismActive = await organismPostureProvider() != nil
         schedulePrewarmAfterToolResult(
             tool: tool,
             input: canonicalInput,
-            result: enriched,
-            surface: surface
+            result: result,
+            surface: surface,
+            organismActive: organismActive
         )
-        await observeMotorOutcomeIfNeeded(tool: tool, result: enriched)
-        return enriched
+        await observeMotorOutcomeIfNeeded(tool: tool, result: result)
+        return result
     }
 
     private func observeMotorOutcomeIfNeeded(tool: String, result: JSONValue) async {
@@ -320,13 +332,15 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
         tool: String,
         input: [String: JSONValue],
         result: JSONValue,
-        surface: String
+        surface: String,
+        organismActive: Bool
     ) {
         let hints = Self.prewarmHints(
             tool: tool,
             input: input,
             result: result,
-            surface: surface
+            surface: surface,
+            organismActive: organismActive
         )
         guard !hints.isEmpty else { return }
         let prewarm = self.contextPrewarm
@@ -349,7 +363,8 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
         tool: String,
         input: [String: JSONValue],
         result: JSONValue,
-        surface: String
+        surface: String,
+        organismActive: Bool = false
     ) -> [ContextPrewarmHint] {
         let canonical = Self.canonicalAppToolName(tool) ?? tool
         let terms = [canonical, surface]
@@ -368,7 +383,7 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
             id = canonical
         }
         var hints = [ContextPrewarmHint(kind: kind, id: id, terms: terms)]
-        if case .object(let object) = result, object["organism_posture"] != nil {
+        if organismActive {
             hints.append(ContextPrewarmHint(kind: .organism, id: "tool-posture", terms: terms))
         }
         return hints
@@ -414,6 +429,10 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
             return Self.securityGateResponse(envelope)
         }
 
+        if includeAppOwnedTools, tool == "chat_reply" {
+            return try await humanConversationReplyHandler(input)
+        }
+
         // B5 (tightness-sweep 2026-07-17) — SINGLE OWNER of notify on wrapped
         // chat surfaces. Core's SwiftToolDispatcher also has `mac_notify` /
         // `mobile_notify` cases, and BOTH ultimately reach the identical
@@ -439,13 +458,15 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
             // gpt-5.5 review BLOCKING: this path bypasses the Core dispatcher's
             // MacIntegration gate. Check the gate here so the user's "iPhone
             // Notifications" Write toggle actually denies the call.
-            let allowed = await macIntegrationPermissionStore.allows(MacIntegrationID.notifyMobile, mode: .write)
+            let admission = await securityCenter.fullMacYoloAuthority(tool: securityTool, origin: Self.securityOrigin(input: input, surface: surface))
+            let allowed = await macIntegrationPermissionStore.allows(MacIntegrationID.notifyMobile, mode: .write, fullMacAdmitted: admission.admitted)
             guard allowed else {
                 return Self.macIntegrationDeniedEnvelope(integration: MacIntegrationID.notifyMobile, mode: "write")
             }
             return try await runMobileNotify(input: input, surface: surface)
         case "mac.notify":
-            let allowed = await macIntegrationPermissionStore.allows(MacIntegrationID.notifyMac, mode: .write)
+            let admission = await securityCenter.fullMacYoloAuthority(tool: securityTool, origin: Self.securityOrigin(input: input, surface: surface))
+            let allowed = await macIntegrationPermissionStore.allows(MacIntegrationID.notifyMac, mode: .write, fullMacAdmitted: admission.admitted)
             guard allowed else {
                 return Self.macIntegrationDeniedEnvelope(integration: MacIntegrationID.notifyMac, mode: "write")
             }
@@ -470,11 +491,15 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
         case "tool_catalog", "list_tools":
             return try await toolCatalog(input: input, surface: surface)
         case "tool_load":
-            var loadInput = input
+            var loadInput = try await Self.categoryNamedAsTool(input, available: Set(listAvailableTools()))
             // Expand categories additively before splitting ownership. A category
             // and explicit names are one request, never competing selectors.
-            if Self.hasResearchCategory(input) {
+            if Self.hasResearchCategory(loadInput) {
                 loadInput["category"] = .string("browser")
+                // Research also brings web search (SearXNG), not just Chrome.
+                var names: [JSONValue] = []
+                if case .array(let existing)? = loadInput["names"] { names = existing }
+                loadInput["names"] = .array(names + ToolPreloadHeuristics.webSearchTools.sorted().map { .string($0) })
             }
             if Self.isAppToolLoadRequest(loadInput) {
                 var requested = Self.requestedToolLoadNames(loadInput)
@@ -496,12 +521,21 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
                 }
                 return try await dispatchMixedToolLoad(input: loadInput, app: app, other: other, surface: surface)
             }
+            if loadInput != input { return try await inner.dispatch(tool: tool, input: loadInput, surface: surface) }
         case "tool_unload":
             var unloadInput = input
             if case .array(let names)? = input["names"] {
-                unloadInput["names"] = .array(names.map { name in
-                    guard case .string(let raw) = name else { return name }
-                    return .string(Self.canonicalAppToolName(raw) ?? raw)
+                // Unload the advertised name and any older row stored under
+                // the internal app name.
+                unloadInput["names"] = .array(names.flatMap { name -> [JSONValue] in
+                    guard case .string(let raw) = name else { return [name] }
+                    let loadName = Self.advertisedAppToolName(raw)
+                    let canonical = Self.canonicalAppToolName(raw) ?? raw
+                    // The raw name too: a session loaded before 09-22 may hold
+                    // a `browser.navigate` row that now canonicalizes away.
+                    var unload: [String] = []
+                    for n in [loadName, canonical, raw] where !unload.contains(n) { unload.append(n) }
+                    return unload.map { .string($0) }
                 })
             }
             return try await inner.dispatch(tool: tool, input: unloadInput, surface: surface)
@@ -513,6 +547,10 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
            case .object(let plan) = result,
            [JSONValue.string("grok_setup"), .string("grok_disconnect"), .string("grok_send")].contains(plan["status"] ?? .null) {
             return await GrokBotConnection.perform(plan: plan, dataRoot: NativeAgentPaths.dataRoot, inner: inner, surface: surface)
+        }
+        if includeAppOwnedTools, tool == "agent_message", case .object(let plan) = result,
+           plan["status"] == .string("desktop_chat_send") {
+            return await DesktopChatRoute.perform(plan: plan, dataRoot: NativeAgentPaths.dataRoot)
         }
         if includeAppOwnedTools, ["act", "go", "screen"].contains(tool) {
             return await Self.performMacSelfAppRoute(result) { tool, input in
@@ -529,22 +567,11 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
         return result
     }
 
-    private func resultByAddingOrganismPosture(_ result: JSONValue, tool: String, surface: String) async -> JSONValue {
-        guard case .object(var object) = result,
-              object["organism_posture"] == nil,
-              let posture = await organismPostureProvider()
-        else {
-            return result
-        }
-        object["organism_posture"] = posture.toolResultJSON(tool: tool, surface: surface)
-        return .object(object)
-    }
-
     func listAvailableTools() async throws -> [String] {
         var names = try await inner.listAvailableTools()
         guard includeAppOwnedTools else { return names.sorted() }
         let existing = Set(names)
-        names.append(contentsOf: Self.appToolNames.filter { !existing.contains($0) })
+        names.append(contentsOf: Self.advertisedAppToolNames.filter { !existing.contains($0) })
         return names.sorted()
     }
 
@@ -557,9 +584,7 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
     }
 
     private func runMacNotify(input: [String: JSONValue], surface: String) async throws -> JSONValue {
-        let input = input.filter { $0.value != .string("") }
-        let title = NativeAgentNotificationDefaults.title(Self.inputString(input["title"]))
-        let message = try Self.requiredMessage(input, toolName: "mac.notify")
+        let (title, message) = try NativeAgentNotificationDefaults.parseInput(input, toolName: "mac.notify")
         let result = try await macNotificationSender(title, message)
         var obj = result.deliveryFields()
         obj.merge([
@@ -573,8 +598,7 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
 
     private func runMobileNotify(input: [String: JSONValue], surface: String) async throws -> JSONValue {
         let input = input.filter { $0.value != .string("") }
-        let title = NativeAgentNotificationDefaults.title(Self.inputString(input["title"]))
-        let message = try Self.requiredMessage(input, toolName: "mobile.notify")
+        let (title, message) = try NativeAgentNotificationDefaults.parseInput(input, toolName: "mobile.notify")
         let screen = Self.inputString(input["screen"]) ?? "inbox"
         let source = Self.inputString(input["source"]) ?? "chat_tool"
         let urgency = Self.inputString(input["urgency"]) ?? "normal"
@@ -605,7 +629,11 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
 
     private func runBrowserTool(actionId: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
         let dryRun = Self.inputBool(input["dryRun"] ?? input["dry_run"], default: false)
-        let result = try await browserActionRunner(actionId, dryRun, input)
+        let result = try await ChromeControlInvocationContext.$origin.withValue(Self.securityOrigin(input: input, surface: surface)) {
+            try await ChromeControlInvocationContext.$tool.withValue(actionId) {
+                try await browserActionRunner(actionId, dryRun, input)
+            }
+        }
         guard case .object(var obj) = result else {
             return result
         }
@@ -692,6 +720,21 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
     }
 
     private func toolCatalog(input: [String: JSONValue], surface: String) async throws -> JSONValue {
+        if input["load"] == .bool(true) {
+            // Select after app/core merging; the inner catalog must not load
+            // its local winner before the app-owned candidates are ranked.
+            let result = try await toolCatalog(input: ToolCatalogSelection.searchInput(input), surface: surface)
+            let selected = ToolCatalogSelection.selectedName(in: result)
+            let loading: JSONValue?
+            if let selected {
+                var loadInput = input
+                loadInput.removeValue(forKey: "category")
+                loadInput.removeValue(forKey: "name")
+                loadInput["names"] = .array([.string(selected)])
+                loading = try await dispatch(tool: "tool_load", input: loadInput, surface: surface)
+            } else { loading = nil }
+            return ToolCatalogSelection.finish(result, selected: selected, loading: loading)
+        }
         let selection = SwiftToolDispatcher.catalogCategorySelection(input["category"])
         if let error = selection.error { return error }
         if let category = selection.category {
@@ -748,7 +791,7 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
         let turnScoped = LLMCallContext.turnActiveTools ?? []
         let modelVisibleTurnScoped = SwiftToolDispatcher.modelVisibleCatalogToolNames(turnScoped)
         let sessionActive = persistedActive.union(turnScoped)
-        let appNameSet = Set(Self.appToolNames)
+        let appNameSet = Set(Self.advertisedAppToolNames)
         let loadedAppTools = appNameSet.intersection(sessionActive)
         let discoveryAppTools = appNameSet.subtracting(sessionActive)
         var loadedNames = Self.jsonStringArray(obj["currently_loaded"])
@@ -825,8 +868,8 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
         // currently_loaded or discovery_only_tools based on this session's
         // ActiveToolsStore state.
         obj["permission_source"] = obj["permission_source"] ?? .string("trust/policy.json")
-        obj["notification_tools"] = .array(Self.notificationToolNames.map { .string($0) })
-        obj["browser_tools"] = .array(Self.browserToolNames.map { .string($0) })
+        obj["notification_tools"] = .array(Self.advertised(Self.notificationToolNames).map { .string($0) })
+        obj["browser_tools"] = .array(Self.advertised(Self.browserToolNames).map { .string($0) })
         obj["health_tools"] = .array(Self.healthToolNames.map { .string($0) })
         obj["organism_tools"] = .array(Self.organismToolNames.map { .string($0) })
         obj["currently_loaded"] = .array(loadedNames.sorted().map { .string($0) })
@@ -862,7 +905,9 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
         let base: JSONValue
         if Self.hasAppToolCategory(categoryInput) {
             let appNames = Self.appToolLoadNames(categoryInput)
-            declared = Set(appNames)
+            declared = Self.hasResearchCategory(["category": .string(category)])
+                ? Set(appNames).union(ToolPreloadHeuristics.webSearchTools)
+                : Set(appNames)
             canonical = Self.appToolLoadCategory(input: categoryInput, loaded: appNames)
             base = .object(["status": .string("ok"), "catalog_detail": .string("search"), "match_count": .int(0), "matches": .array([])])
         } else if let group = ToolPreloadHeuristics.loadGroup(forCategory: category) {
@@ -901,7 +946,12 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
             }
         }
         if full {
-            for schema in Self.appToolSchemas() where nameSet.contains(schema.name) {
+            let rowNames = Set(rows.compactMap { row -> String? in
+                guard case .object(let r) = row, case .string(let n)? = r["name"] else { return nil }
+                return n
+            })
+            for schema in try await listAvailableToolSchemas()
+            where nameSet.contains(schema.name) && !rowNames.contains(schema.name) {
                 var row: [String: JSONValue] = ["name": .string(schema.name), "description": .string(schema.description),
                     "load_state": .string(loaded.contains(schema.name) ? "loaded" : "discovery_only")]
                 if let parameters = try? JSONValue.parse(schema.parametersJSON) { row["parameters"] = parameters }
@@ -1124,7 +1174,7 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
             // capacity eviction, including ones that were already active.
             let names = Set(loaded).subtracting(turnActive)
             var descriptors: [String: PinnedToolSchema] = [:]
-            for schema in Self.appToolSchemas()
+            for schema in try await listAvailableToolSchemas()
             where names.contains(schema.name) && descriptors[schema.name] == nil {
                 descriptors[schema.name] = PinnedToolSchema(schema)
             }
@@ -1168,7 +1218,7 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
             .union(activeForTurn)
             .intersection(catalogNames)
             .sorted()
-        let schemasAdded = Self.appToolSchemas()
+        let schemasAdded = try await listAvailableToolSchemas()
             .filter { loadedNow.contains($0.name) }
             .map { schema -> JSONValue in
                 var row: [String: JSONValue] = [
@@ -1329,6 +1379,8 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
 
     private static let notificationToolNames = ["mac.notify", "mobile.notify"]
     private static let browserToolNames = [
+        "browser.chrome_setup",
+        "browser.chrome_status",
         "browser.status",
         "browser.open_url",
         "browser.navigate",
@@ -1356,12 +1408,31 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
     /// Quiet self-administration (0.4.14). Lazy like every other app tool.
     static let selfAdminToolNames = [
         "app_page_read", "app_page_screenshot", "app_settings_list",
-        "app_setting_set", "interaction_act", "voice_render",
+        "app_setting_set", "interaction_act", "chat_reply",
     ]
     private static var appToolNames: [String] {
         notificationToolNames + browserToolNames + healthToolNames + organismToolNames
             + selfAdminToolNames
     }
+
+    /// The one name the model is offered for an app tool. Notifications are
+    /// advertised by their core schemas (the app still owns the route), and
+    /// `browser.navigate` is `browser.open_url`. `appToolNames` keeps every
+    /// internal name for the surface fence and aliasing.
+    static func advertisedAppToolName(_ raw: String) -> String {
+        switch canonicalAppToolName(raw) ?? raw {
+        case "mac.notify": return "mac_notify"
+        case "mobile.notify": return "mobile_notify"
+        case let name: return name
+        }
+    }
+
+    private static func advertised(_ names: [String]) -> [String] {
+        var seen: Set<String> = []
+        return names.map(advertisedAppToolName).filter { seen.insert($0).inserted }
+    }
+
+    private static var advertisedAppToolNames: [String] { advertised(appToolNames) }
 
     /// App-owned dispatch cases participate in the same typed catalog
     /// contract as the core dispatcher. Keep this adjacent to the actual
@@ -1440,16 +1511,19 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
         switch raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
         case "browser.status", "browser_status", "browser.get_status", "browser_get_status":
             return "browser.status"
-        case "browser.open_url", "browser_open_url", "browser.open", "browser_open":
+        case "browser.open_url", "browser_open_url", "browser.open", "browser_open",
+             "browser.navigate", "browser_navigate", "navigate_browser":
             return "browser.open_url"
-        case "browser.navigate", "browser_navigate", "navigate_browser":
-            return "browser.navigate"
         case "browser.read_text", "browser_read_text", "browser.text", "browser_text", "browser_get_text", "browser.dom_text", "browser_dom_text":
             return "browser.read_text"
         case "browser.read_links", "browser_read_links", "browser.links", "browser_links":
             return "browser.read_links"
         case "browser.screenshot", "browser_screenshot", "browser.capture_screenshot", "browser_capture_screenshot":
             return "browser.screenshot"
+        case "browser.chrome_setup", "browser_chrome_setup":
+            return "browser.chrome_setup"
+        case "browser.chrome_status", "browser_chrome_status":
+            return "browser.chrome_status"
         case "browser.chrome_acquire", "browser_chrome_acquire", "chrome.acquire", "chrome_acquire":
             return "browser.chrome_acquire"
         case "browser.chrome_renew", "browser_chrome_renew", "chrome.renew", "chrome_renew":
@@ -1506,7 +1580,7 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
     }
 
     private static func canonicalAppToolName(_ raw: String) -> String? {
-        canonicalNotificationToolName(raw)
+        raw == "chat_reply" ? raw : canonicalNotificationToolName(raw)
             ?? canonicalBrowserToolName(raw)
             ?? canonicalHealthToolName(raw)
             ?? canonicalReflexToolName(raw)
@@ -1597,6 +1671,27 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
         return Set(categories).sorted()
     }
 
+    /// `tool_load(names:["web_search"])`: a category spoken as a tool name
+    /// loads that category instead of failing as not_in_catalog.
+    private static func categoryNamedAsTool(_ input: [String: JSONValue], available: Set<String>) -> [String: JSONValue] {
+        guard (inputString(input["category"])?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "").isEmpty else { return input }
+        func isCategory(_ raw: String) -> Bool {
+            let probe: [String: JSONValue] = ["category": .string(raw)]
+            return !available.contains(raw) && (hasAppToolCategory(probe) || hasResearchCategory(probe)
+                || ToolPreloadHeuristics.loadGroup(forCategory: raw) != nil)
+        }
+        var out = input
+        if let single = inputString(input["name"]), isCategory(single) {
+            out["category"] = .string(single)
+            out["name"] = nil
+        } else if case .array(let names)? = input["names"],
+                  let alias = names.compactMap({ inputString($0) }).first(where: isCategory) {
+            out["category"] = .string(alias)
+            out["names"] = .array(names.filter { inputString($0) != alias })
+        }
+        return out
+    }
+
     private static func hasAppToolCategory(_ input: [String: JSONValue]) -> Bool {
         hasNotificationCategory(input)
             || hasBrowserCategory(input)
@@ -1646,16 +1741,15 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
         if requested.isEmpty {
             requested = appToolNames
         }
-        var seen: Set<String> = []
-        return requested.filter { seen.insert($0).inserted }
+        return advertised(requested)
     }
 
     private static func appToolLoadCategory(input: [String: JSONValue], loaded: [String]) -> String {
         if hasNotificationCategory(input), !hasBrowserCategory(input) { return "notifications" }
         if hasBrowserCategory(input), !hasNotificationCategory(input) { return "browser" }
         let loadedSet = Set(loaded)
-        if loadedSet.isSubset(of: Set(notificationToolNames)) { return "notifications" }
-        if loadedSet.isSubset(of: Set(browserToolNames)) { return "browser" }
+        if loadedSet.isSubset(of: Set(advertised(notificationToolNames))) { return "notifications" }
+        if loadedSet.isSubset(of: Set(advertised(browserToolNames))) { return "browser" }
         if loadedSet.isSubset(of: Set(healthToolNames)) { return "health" }
         if loadedSet.isSubset(of: Set(organismToolNames)) { return "organism" }
         return "app"
@@ -1810,6 +1904,19 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
         input: [String: JSONValue]
     ) async throws -> JSONValue {
         let client = NativeClient(baseURL: "")
+        if actionId == "browser.chrome_status" || actionId == "browser.chrome_setup" {
+            var result: [String: JSONValue] = [:]
+            if actionId == "browser.chrome_setup", !dryRun {
+                let setup = await ChromeExtensionFolder.setUp()
+                result["folder"] = setup.folder.map { .string($0.path) } ?? .null
+                result["extensions_page_opened"] = .bool(setup.extensionsPageOpened)
+                result["message"] = .string(setup.message)
+            }
+            let status = await ChromeControlRuntime.shared.setupConnectionStatus()
+            result.merge(chromeSetupStatusJSON(state: status.state, enabled: status.enabled)) { _, new in new }
+            result["dry_run"] = .bool(dryRun)
+            return .object(result)
+        }
         if actionId.hasPrefix("browser.chrome_") {
             guard !dryRun else {
                 return .object(["status": .string("dry_run"), "action": .string(actionId)])
@@ -1828,10 +1935,68 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
         return try JSONValue.fromEncodable(receipt)
     }
 
+    static func chromeSetupStatusJSON(state: ChromeControlConnectionState, enabled: Bool) -> [String: JSONValue] {
+        let connection: String
+        switch state {
+        case .connected: connection = "connected"
+        case .disconnected: connection = "previously_connected"
+        case .extensionNotLoaded: connection = "not_yet_connected"
+        }
+        return [
+            "connection": .string(connection),
+            "connected": .bool(state == .connected),
+            "chrome_control_enabled": .bool(enabled),
+            "permissions_changed": .bool(false),
+            "status_note": .string("Only a live connection confirms availability. A prepared folder or previous connection does not prove the extension is currently loaded. Chrome control permission remains unchanged."),
+        ]
+    }
+
     private static func runChromeControlTool(
         actionId: String,
         input: [String: JSONValue]
     ) async throws -> JSONValue {
+        if actionId == "browser.chrome_select" {
+            guard case .array(let values)? = input["values"],
+                  values.allSatisfy({ if case .string = $0 { return true }; return false }) else {
+                return .object([
+                    "ok": .bool(false), "error": .string("invalid_values"),
+                    "reason": .string("values must be an array of strings; no selection was dispatched."),
+                ])
+            }
+        }
+        // 2026-09-22: a loading tab's title is legitimately "", so only the URL is required.
+        if actionId == "browser.chrome_acquire", inputString(input["mode"]) == "claim",
+           (inputString(input["expected_url"]) ?? "").isEmpty {
+            return .object([
+                "ok": .bool(false), "error": .string("invalid_payload"),
+                "reason": .string("claim needs expected_url"),
+            ])
+        }
+        let (effect, requestPayload) = try chromeControlRequest(actionId: actionId, input: input)
+        var payload = requestPayload
+        // Missing optional proof may use this chat's observed sequence. An
+        // explicit invalid value remains invalid; never repair a supplied proof.
+        if (input["expected_user_sequence"] == nil || input["expected_user_sequence"] == .null),
+           payload["expectedUserSequence"] != nil {
+            payload.removeValue(forKey: "expectedUserSequence")
+        }
+        let response = try await ChromeControlRuntime.shared.performInConversation(
+            effect, payload: payload, verifiedSessionID: ChatToolSessionContext.verifiedSessionId)
+        guard case .object(let object) = response,
+              let result = object["result"] else { throw ChromeControlRuntimeError.invalidResponse }
+        // Admit the extension's actual action receipt as a motor consequence.
+        if let model = chromeReceiptMotorActionReadModel(result) {
+            await NativeCognitionRuntime.shared.observeMotorActionState(model)
+        }
+        return result
+    }
+
+    /// Pure provider-input boundary; optional empty strings mean omitted, not
+    /// a request to override the extension's route selection.
+    static func chromeControlRequest(
+        actionId: String,
+        input: [String: JSONValue]
+    ) throws -> (ChromeControlEffect, [String: JSONValue]) {
         let effect: ChromeControlEffect
         var payload: [String: JSONValue] = [:]
         func string(_ key: String) -> String? { inputString(input[key]) }
@@ -1849,6 +2014,12 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
             let mode = string("mode") ?? "create"
             payload["mode"] = .string(mode)
             if let value = string("initial_url") { payload["initialUrl"] = .string(value) }
+            if let value = string("rendering_mode"),
+               !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                // Preserve nonempty values exactly: the extension owns enum
+                // validation and must still reject invalid explicit choices.
+                payload["renderingMode"] = .string(value)
+            }
             if let value = integer("lease_duration_ms") { payload["leaseDurationMs"] = .int(Int64(value)) }
             if mode == "claim" {
                 if let value = integer("tab_id") { payload["tabId"] = .int(Int64(value)) }
@@ -1874,8 +2045,11 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
         case "browser.chrome_snapshot":
             effect = .snapshot
             payload["leaseId"] = .string(string("lease_id") ?? "")
-            if let value = integer("max_nodes") { payload["maxNodes"] = .int(Int64(value)) }
-            if let value = integer("max_text_chars") { payload["maxTextChars"] = .int(Int64(value)) }
+            // 2026-09-22: sent explicitly so an already-installed extension
+            // (old 500 / 50,000 defaults) also gets the smaller page.
+            payload["maxNodes"] = .int(Int64(min(integer("max_nodes") ?? 80, 80)))
+            payload["maxTextChars"] = .int(Int64(min(integer("max_text_chars") ?? 12_000, 40_000)))
+            if let value = string("scope") { payload["scope"] = .string(value) }
         case "browser.chrome_click":
             effect = .click
             payload = [
@@ -1907,10 +2081,7 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
             effect = .select
             guard case .array(let values)? = input["values"],
                   values.allSatisfy({ if case .string = $0 { return true }; return false }) else {
-                return .object([
-                    "ok": .bool(false), "error": .string("invalid_values"),
-                    "reason": .string("values must be an array of strings; no selection was dispatched."),
-                ])
+                throw ChromeControlRuntimeError.invalidResponse
             }
             payload = [
                 "leaseId": .string(string("lease_id") ?? ""),
@@ -1991,17 +2162,7 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
         default:
             throw ChromeControlRuntimeError.invalidResponse
         }
-        let response = try await ChromeControlRuntime.shared.perform(effect, payload: payload)
-        guard case .object(let object) = response,
-              let result = object["result"] else { throw ChromeControlRuntimeError.invalidResponse }
-        // ITEM 10b. The extension already builds a per-action receipt with
-        // outcome / verification / retry and it was being handed back as raw
-        // JSON and nothing else — never admitted as a motor consequence the
-        // way MacControl and Browser are. Same seam, same call.
-        if let model = chromeReceiptMotorActionReadModel(result) {
-            await NativeCognitionRuntime.shared.observeMotorActionState(model)
-        }
-        return result
+        return (effect, payload)
     }
 
     /// The Chrome per-action receipt, in the shared motor vocabulary.
@@ -2242,8 +2403,6 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
                 "enabled": .bool(voice.enabled),
                 "backend": .string(voice.backend),
                 "model": .string(voice.model),
-                "backend_supported": .bool(voice.backendSupported),
-                "key_configured": .bool(voice.keyConfigured),
             ])
         }
         return .object(object)
@@ -2257,27 +2416,6 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
     private static func jsonObjectToAny(_ input: [String: JSONValue]) throws -> [String: Any] {
         let data = try JSONValue.object(input).serializedData(pretty: false)
         return (try JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
-    }
-
-    /// D2 (2026-09-11 tools review): both `mobile.notify` dispatches in the
-    /// 09-01..09-11 window failed `missingMessage("mobile.notify")` even though
-    /// `message` WAS on the wire. The arg name is right and no alias rewrite
-    /// drops it — `argKeys: ["__session_id", "message", "screen", "source",
-    /// "title", "urgency"]` on both, with `"message": ""`. The body was present
-    /// and empty, and the refusal said "requires message", which reads as "you
-    /// forgot the field" and sends the caller looking for a naming bug that is
-    /// not there. Separate the two so the text matches the fault.
-    private static func requiredMessage(_ input: [String: JSONValue], toolName: String) throws -> String {
-        let supplied = inputString(input["message"])
-            ?? inputString(input["body"])
-            ?? inputString(input["text"])
-        guard let supplied else {
-            throw AppNotificationToolError.missingMessage(toolName)
-        }
-        guard !supplied.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            throw AppNotificationToolError.emptyMessage(toolName)
-        }
-        return supplied
     }
 
     private static func inputString(_ raw: JSONValue?) -> String? {
@@ -2314,20 +2452,6 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
             return d != 0
         default:
             return defaultValue
-        }
-    }
-}
-
-private enum AppNotificationToolError: LocalizedError {
-    case missingMessage(String)
-    case emptyMessage(String)
-
-    var errorDescription: String? {
-        switch self {
-        case .missingMessage(let tool):
-            return "\(tool) requires a 'message' argument (a 'body' or 'text' argument is also accepted)"
-        case .emptyMessage(let tool):
-            return "\(tool) received 'message' but it was empty — send the notification body text"
         }
     }
 }

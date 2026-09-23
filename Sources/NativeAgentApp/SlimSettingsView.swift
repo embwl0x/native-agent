@@ -487,9 +487,9 @@ struct SlimSettingsView: View {
                 }
             }
             .formStyle(.grouped)
-            // The page renders inside the shell's room as well as in the
-            // Settings window; without this the Form paints its own slab over
-            // the glass (`ShellPageFrame`, SetupView.swift).
+            // The page renders inside the classic shell's room; without this
+            // the Form paints its own slab over the glass (`ShellPageFrame`,
+            // SetupView.swift).
             .scrollContentBackground(.hidden)
             .navigationDestination(for: SlimSettingsNavigationDestination.self) { destination in
                 SlimSettingsDestinationView(destination: destination)
@@ -540,7 +540,7 @@ struct SlimSettingsView: View {
 
 }
 
-/// The one mounted destination seam for the macOS Settings scene. Tests mount
+/// The one mounted destination seam for the classic sidebar's Settings. Tests mount
 /// this exact view with each typed route so a Settings entry cannot retain a
 /// valid-looking route while its visible destination drifts elsewhere.
 struct SlimSettingsDestinationView: View {
@@ -1708,9 +1708,9 @@ struct EmbeddingsSettingsSection: View {
 
 // MARK: - The kit
 //
-// Advanced page kit, 2026-09-03. This page is also the macOS Settings window
-// (Command-comma), so it keeps its Form — the shell frame hides the Form's
-// slab (`ShellPageFrame`, SetupView.swift). Everything ON it is the kit:
+// Advanced page kit, 2026-09-03. This page is the classic sidebar's Settings
+// (Command-comma opens SetupView), and it keeps its Form — the shell frame
+// hides the Form's slab (`ShellPageFrame`, SetupView.swift). Everything ON it is the kit:
 // eyebrow section heads, `ShellType` throughout, colour from
 // `NativeAgentShell`, no glyph doing a word's job.
 

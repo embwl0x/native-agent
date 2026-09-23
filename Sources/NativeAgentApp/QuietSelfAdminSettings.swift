@@ -249,48 +249,6 @@ enum QuietSettings {
         )
     }
 
-    /// What each of the second opinion's checks is called on its row.
-    private static func jevLaneLabel(_ lane: JevLane) -> String {
-        switch lane {
-        case .preTurn: return "Second opinion: brief before a turn"
-        case .toolCall: return "Second opinion: check each tool call"
-        case .postTurn: return "Second opinion: check the finished turn"
-        case .memoryDedup: return "Second opinion: duplicate check before saving a memory"
-        case .shadowRank: return "Second opinion: ranking and peer messages, in shadow"
-        case .secondOpinion: return "Second opinion: let the agent ask its own questions"
-        }
-    }
-
-    private static func jevLaneNote(_ lane: JevLane) -> String {
-        let common = " Needs the Jev key on the Providers page; without it this does nothing. "
-            + "Everything it finds is a hint — it grants, denies and blocks nothing."
-        switch lane {
-        case .preTurn:
-            return "Before a turn starts, one call reads the message and may have one family of tools "
-                + "ready and leave up to three short notes. It can only add; it never narrows what "
-                + "would otherwise be discovered." + common
-        case .toolCall:
-            return "Alongside each tool call the gates have already allowed, a check for a call that "
-                + "does not match the request, names a different target, cannot be undone, or goes "
-                + "beyond the ask. At most eight per turn, then silent." + common
-        case .postTurn:
-            return "After a turn, a check for an unanswered ask, a promise with nothing behind it, a "
-                + "reply that sent the person to a screen, or a claimed completion. Findings go to "
-                + "the log; at most one line carries into the next turn." + common
-        case .memoryDedup:
-            return "Before a memory is saved, a check against the closest existing ones. It can only "
-                + "suggest; the save happens either way and nothing is merged or removed." + common
-        case .shadowRank:
-            return "Recalled passages are ranked into the log and nothing is reordered. Messages from "
-                + "other agents are classified, and only a blocker or a question leaves a line." + common
-        case .secondOpinion:
-            return "The `second_opinion` tool: the agent writes its own state and typed questions and "
-                + "reads the answers back. It sends exactly what it wrote and nothing else, never "
-                + "the conversation. Off, the tool refuses; the other five checks are unaffected."
-                + common
-        }
-    }
-
     private static func defaultsChoice(
         id: String, page: String, label: String, key: String,
         choices: [String], fallback: String, note: String = ""
@@ -931,7 +889,7 @@ enum QuietSettings {
         rows.append(defaultsBool(
             id: "chat.read_replies_aloud", page: "chat",
             label: "Read replies aloud", key: "voiceAutoRead",
-            note: "Speaks new replies through the speakers. voice_render is the silent path and does not touch this."
+            note: "Speaks new replies through the speakers."
         ))
         rows.append(defaultsInt(
             id: "chat.compaction_threshold_tokens", page: "chat",
@@ -945,7 +903,7 @@ enum QuietSettings {
             label: "Quiet mode (no audio out)", key: VoicePreference.quietKey,
             note: "On, nothing is ever spoken through the speakers, whatever else is set. "
                 + "It is enforced at the one place both voice routes pass through, so it holds "
-                + "for read-aloud and for anything added later. voice_render still writes files."
+                + "for read-aloud and for anything added later."
         ))
         rows.append(QuietSetting(
             id: "chat.voice_name", page: "chat", label: "Read-aloud voice",
@@ -1122,9 +1080,7 @@ enum QuietSettings {
             read: { appModel in .bool(appModel.trustPolicy?.multimodalPolicy?.tts_openai ?? false) },
             write: { appModel, value in
                 let enabled = try boolValue(value, "Use the cloud voice for reading aloud")
-                // The same two steps the Trust page's own toggle takes
-                // (TrustPermissionsViews.saveVoiceOutputPolicy): the loaded
-                // policy is the only base, so a write can never invent the
+                // The loaded policy is the only base, so a write can never invent the
                 // five multimodal fields it did not read.
                 guard var next = appModel.trustPolicy?.multimodalPolicy else {
                     throw QuietSettingError.unavailable(
@@ -1370,19 +1326,6 @@ enum QuietSettings {
                 .int(Int64((BotRunLimits.minimumInterval / 60).rounded()))
             }
         ))
-
-        // ── The second opinion's checks ─────────────────────────────────────
-        // One switch each, all on by default, all silent when no key is saved
-        // on the Providers page. They are settings rather than controls on
-        // purpose: the agent turns a check off itself when it is not earning
-        // its place, and the page keeps its one row.
-        for lane in JevLane.allCases {
-            rows.append(defaultsBool(
-                id: lane.settingID, page: "providers",
-                label: jevLaneLabel(lane), key: JevSettings.defaultsKey(for: lane),
-                defaultOn: true, note: jevLaneNote(lane)
-            ))
-        }
 
         rows.append(QuietSetting(
             id: "capabilities.image_model", page: "capabilities",

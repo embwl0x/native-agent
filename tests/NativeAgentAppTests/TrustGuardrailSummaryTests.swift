@@ -119,11 +119,11 @@ struct TrustGuardrailSummaryTests {
         let autonomy = row(rows, "autonomy")
         #expect(autonomy.value == "Full Mac autonomy active")
         #expect(autonomy.detail.contains("trusted remote surfaces"))
-        #expect(autonomy.detail.contains("External sends, explicit tool blocks, and protected system actions still wait"))
+        #expect(autonomy.detail.contains("including external messages"))
         // The reach row states reach; the approval row states approval. Neither
         // repeats the other's sentence (Agent copy pass 2026-09-10).
         #expect(!autonomy.detail.contains(row(rows, "files").detail))
-        #expect(row(rows, "external_send").value == "Asks before sending")
+        #expect(row(rows, "external_send").value == "Full Mac sending active")
     }
 
     @Test

@@ -196,11 +196,29 @@ public actor GitHubCredentialStore {
     /// Resolves the Keychain token and performs the one-time plaintext migration.
     /// A vault error is terminal: plaintext is never an availability fallback.
     public func resolveToken(dataRoot: URL) async throws -> String? {
+        try await resolveToken(dataRoot: dataRoot, reconcileMetadata: false)
+    }
+
+    @discardableResult
+    public func reconcileAtLaunch(dataRoot: URL) async throws -> Bool {
+        try await resolveToken(dataRoot: dataRoot, reconcileMetadata: true) != nil
+    }
+
+    private func resolveToken(dataRoot: URL, reconcileMetadata: Bool) async throws -> String? {
         let account = Self.credentialAccount(dataRoot: dataRoot)
         if let stored = try vault.read(service: Self.keychainService, account: account) {
             let token = stored.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !token.isEmpty else { throw GitHubCredentialVaultError.invalidStoredValue }
-            try await rewriteMetadata(dataRoot: dataRoot, metadata: nil, createMissing: false)
+            // 2026-09-23: the no-op rewrite ran under a file lock on every token
+            // read (~4,200/day). Rewrite at launch, or when plaintext is present.
+            var plaintextPresent = false
+            for path in Self.metadataPaths(dataRoot: dataRoot) {
+                let object = try Self.readObject(at: path)
+                plaintextPresent = plaintextPresent || Self.secretKeys.contains { object[$0] != nil }
+            }
+            if reconcileMetadata || plaintextPresent {
+                try await rewriteMetadata(dataRoot: dataRoot, metadata: nil, createMissing: false)
+            }
             return token
         }
 
@@ -210,11 +228,6 @@ public actor GitHubCredentialStore {
         try writeAndVerify(plaintext, account: account)
         try await rewriteMetadata(dataRoot: dataRoot, metadata: nil, createMissing: false)
         return plaintext
-    }
-
-    @discardableResult
-    public func reconcileAtLaunch(dataRoot: URL) async throws -> Bool {
-        try await resolveToken(dataRoot: dataRoot) != nil
     }
 
     public func deleteCredential(dataRoot: URL) async throws {

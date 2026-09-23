@@ -206,7 +206,7 @@ struct ActivityCapturePermissionsView: View {
                 )
             )
             .disabled(!ActivityCapturePresentation.isAgentAccessControlEnabled(policy: controller.policy))
-            Text("Off by default. When on, an activity answer requested in chat is sent to the AI provider selected for that chat so the agent can discuss it. The database and full history remain local; only the bounded answer leaves the Mac. Turn this off to keep every activity answer on-device.")
+            Text("Full Mac grants the agent access to captured activity in trusted chats. Outside Full Mac, this switch controls that access and is off by default. Requested answers go to the AI provider selected for the chat; the database and full history remain local. The capture switch above controls recording.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)

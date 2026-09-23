@@ -82,11 +82,14 @@ public let memoryConsolidationAutoAcceptThreshold: Double = 0.85
 /// Active memories older than this with zero recall hits get archived.
 public let memoryConsolidationStaleAgeSeconds: TimeInterval = 365 * 24 * 60 * 60
 
-/// Active-memory semantic duplicate cleanup is intentionally stricter than
-/// proposal-vs-active duplicate merge: only near-identical same-kind rows with
-/// high lexical overlap are archived automatically.
-public let memoryConsolidationActiveDuplicateThreshold: Double = 0.995
-public let memoryConsolidationActiveDuplicateJaccardFloor: Double = 0.80
+/// Active-memory semantic duplicate cleanup. 2026-09-22: was 0.995 cosine +
+/// 0.80 Jaccard + same kind, which never fired (live paraphrase triples sat at
+/// 0.93-0.98 cosine, 0.49-0.72 Jaccard, across decision/correction). Any kind
+/// now; the word-overlap floor keeps distinct dates/numbers apart. A
+/// correction survives over a non-correction, else the newest row wins.
+/// Still archives, never deletes.
+public let memoryConsolidationActiveDuplicateThreshold: Double = 0.95
+public let memoryConsolidationActiveDuplicateJaccardFloor: Double = 0.45
 
 // MARK: - MemoryConsolidator actor
 
@@ -562,14 +565,15 @@ public actor MemoryConsolidator {
                 guard !archivedIDs.contains(left.id) else { break }
                 let right = remaining[j]
                 guard !archivedIDs.contains(right.id) else { continue }
-                guard Self.sameKind(left, right) else { continue }
                 // Same persona + disclosure scope, and vectors from the same
                 // stamped epoch — otherwise this is not a comparison.
                 guard scopeKeys[i] == scopeKeys[j] else { continue }
+                guard MemoryRecallScoring.kind(of: left.metadata) == MemoryRecallScoring.kind(of: right.metadata) else { continue }
+                guard MemorySemanticDuplicateGuard.sameQuantityAndNegation(left.content, right.content) else { continue }
                 guard Self.comparableEpochs(left.embeddingEpoch, right.embeddingEpoch) else { continue }
                 guard Self.cosine(left.embedding, right.embedding) >= memoryConsolidationActiveDuplicateThreshold else { continue }
                 guard Self.lexicalJaccard(left.content, right.content) >= memoryConsolidationActiveDuplicateJaccardFloor else { continue }
-                let keeper = Self.preferredKeeper(in: [left, right])
+                let keeper = Self.semanticKeeper(left, right)
                 let duplicate = keeper.id == left.id ? right : left
                 if try await archiveActiveMemory(
                     duplicate,
@@ -658,10 +662,14 @@ public actor MemoryConsolidator {
         return left == right
     }
 
-    private static func sameKind(_ left: StoredMemory, _ right: StoredMemory) -> Bool {
-        let leftKind = MemoryRecallScoring.kind(of: left.metadata) ?? ""
-        let rightKind = MemoryRecallScoring.kind(of: right.metadata) ?? ""
-        return leftKind == rightKind
+    private static func semanticKeeper(_ left: StoredMemory, _ right: StoredMemory) -> StoredMemory {
+        let leftCorrection = MemoryRecallScoring.kind(of: left.metadata) == "correction"
+        let rightCorrection = MemoryRecallScoring.kind(of: right.metadata) == "correction"
+        if leftCorrection != rightCorrection { return leftCorrection ? left : right }
+        let leftDate = parseISO8601(left.createdAt) ?? .distantPast
+        let rightDate = parseISO8601(right.createdAt) ?? .distantPast
+        if leftDate != rightDate { return leftDate > rightDate ? left : right }
+        return preferredKeeper(in: [left, right])
     }
 
     private static func preferredKeeper(in memories: [StoredMemory]) -> StoredMemory {
@@ -690,21 +698,14 @@ public actor MemoryConsolidator {
     }
 
     private static func lexicalJaccard(_ left: String, _ right: String) -> Double {
-        let leftTokens = Set(lexicalTokens(left))
-        let rightTokens = Set(lexicalTokens(right))
+        func tokens(_ text: String) -> Set<String> {
+            Set(text.lowercased().split { !($0.isLetter || $0.isNumber) }.map(String.init))
+        }
+        let leftTokens = tokens(left)
+        let rightTokens = tokens(right)
         guard !leftTokens.isEmpty, !rightTokens.isEmpty else { return 0 }
-        let intersection = leftTokens.intersection(rightTokens).count
-        let union = leftTokens.union(rightTokens).count
-        return union == 0 ? 0 : Double(intersection) / Double(union)
-    }
-
-    private static func lexicalTokens(_ text: String) -> [String] {
-        text.lowercased()
-            .split { character in
-                !(character.isLetter || character.isNumber)
-            }
-            .map(String.init)
-            .filter { !$0.isEmpty }
+        return Double(leftTokens.intersection(rightTokens).count)
+            / Double(leftTokens.union(rightTokens).count)
     }
 
     // MARK: - stale eviction

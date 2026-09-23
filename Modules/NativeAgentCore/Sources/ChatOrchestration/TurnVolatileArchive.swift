@@ -123,6 +123,8 @@ public actor TurnVolatileArchive {
     /// pruning cannot grow this file without bound. The cursor's own window is
     /// far smaller in practice; this is the backstop, not the rule.
     static let maxEntries = 128
+    /// Prune rewrites only once this many rows have left the window.
+    static let pruneBatch = 16
 
     /// Orphan-sweep contract, identical to the sibling sidecars.
     private static let ttlSeconds: TimeInterval = 24 * 60 * 60
@@ -222,7 +224,10 @@ public actor TurnVolatileArchive {
         try? await persistence.withFileLock(path) {
             let entries = await self.readLocked(path: path)
             let kept = entries.filter { keeping.contains($0.runId) }
-            guard kept.count != entries.count else { return }
+            // 2026-09-22: batch the rewrite. Stale rows are never replayed (the
+            // projection matches run ids on replayed user rows), so rewriting
+            // the whole file each time one run slides out is pure churn.
+            guard entries.count - kept.count >= Self.pruneBatch else { return }
             try? await self.writeLocked(kept, path: path)
         }
     }

@@ -135,13 +135,12 @@ struct ChatTranscriptBottomAnchor: View {
 /// clearance read is confined to a modifier body.
 struct ChatTurnCardClearancePadding: ViewModifier {
     let store: ChatTurnCardClearance
-    let isShowingCard: Bool
     let idle: CGFloat
 
     func body(content: Content) -> some View {
         content.padding(
             .bottom,
-            (isShowingCard ? store.clearance : store.idleClearance(floor: idle))
+            (store.showsCard ? store.clearance : store.idleClearance(floor: idle))
                 + store.openComposerCardHeight
         )
     }
@@ -364,6 +363,77 @@ struct ChatSidebarSessionRowIdentity: Hashable, Sendable {
     init(sessionID: String, pinned: Bool) {
         self.sessionID = sessionID
         self.section = pinned ? .pinned : .recent
+    }
+}
+
+/// The live-turn card's bottom inset. 2026-09-22: its own view because
+/// `showThinkingRow` reads the turn lifecycle (ticks at 1 Hz) and approvals;
+/// read in ChatView.body that re-ran the whole screen every second of a turn.
+struct ChatTurnCardInset: View {
+    @Environment(AppModel.self) var appModel
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    let classicShell: Bool
+    let store: ChatTurnCardClearance
+
+    var body: some View {
+        ZStack(alignment: .bottom) {
+            if showThinkingRow {
+                // Desk 658.11: the one shared live-turn card. The
+                // detached window composes this exact host.
+                MacChatTurnCardHost(
+                    sessionId: appModel.activeChatSessionId,
+                    onStop: { appModel.stopChatStream() }
+                )
+                // User, 2026-09-03: the working card shares the
+                // composer's frame in the new shell, edge to edge.
+                .padding(
+                    .horizontal,
+                    classicShell ? 32 : NativeAgentShellLayout.roomGutter
+                )
+                .frame(
+                    maxWidth: classicShell
+                        ? NativeAgentLayout.maxReadableChatWidth
+                        : NativeAgentShellLayout.roomColumn,
+                    alignment: classicShell ? .center : .topLeading
+                )
+                .padding(
+                    .leading,
+                    classicShell ? 0 : NativeAgentShellLayout.roomLeadingInset
+                )
+                .padding(
+                    .trailing,
+                    classicShell ? 0 : NativeAgentShellLayout.roomTrailingInset
+                )
+                .frame(
+                    maxWidth: .infinity,
+                    alignment: classicShell
+                        ? .top
+                        : NativeAgentShellLayout.roomAlignment
+                )
+                .padding(.bottom, 6)
+                .transition(NativeAgentMotion.fade)
+            }
+        }
+        // User, 2026-09-15: the floor is the SHOWN card's minimum,
+        // not a standing reservation. At rest no card is drawn and
+        // this inset still held 80pt of the transcript's room.
+        .frame(
+            minHeight: showThinkingRow ? MacChatTurnCardMetrics.floatingClearance : 0,
+            alignment: .bottom
+        )
+        // The reservation is whatever this actually drew. The write
+        // goes to the observable, which ChatView.body does not read,
+        // so measuring the card costs the spacer a relayout and
+        // costs the transcript nothing.
+        .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { height in
+            store.measuredHeight = height
+        }
+        .onChange(of: showThinkingRow, initial: true) { _, shows in
+            store.showsCard = shows
+        }
+        .animation(
+            NativeAgentMotion.respecting(NativeAgentMotion.standard, reduceMotion: reduceMotion),
+            value: showThinkingRow)
     }
 }
 
@@ -1508,10 +1578,15 @@ struct ChatView: View {
                     // measured card height back into this body, and a card that
                     // grows mid-turn already gets a settle from the scroll
                     // geometry change below (its content insets move) and from
-                    // the next token. Scroll-to-bottom is driven by MESSAGES.
-                    .onScrollGeometryChange(for: CGFloat.self) { geometry in
-                        geometry.containerSize.height
-                            - geometry.contentInsets.top - geometry.contentInsets.bottom
+                    // content growth. Tokens that do not add a line need no
+                    // scroll command. Observe extent, never content offset, so
+                    // the follow itself cannot schedule another follow.
+                    .onScrollGeometryChange(for: ChatScrollLayoutExtent.self) { geometry in
+                        ChatScrollLayoutExtent(
+                            contentHeight: geometry.contentSize.height,
+                            viewportHeight: geometry.containerSize.height
+                                - geometry.contentInsets.top - geometry.contentInsets.bottom
+                        )
                     } action: { _, _ in
                         // Card and composer resizing must settle the anchor
                         // without waiting for the next reply token.
@@ -1586,29 +1661,18 @@ struct ChatView: View {
                             )
                         }
                     }
-                    // User, 2026-09-13: no scroll command per streamed chunk.
-                    // The `.defaultScrollAnchor(.bottom, for: .sizeChanges)`
-                    // above keeps the bottom pinned while follow is armed, so
-                    // the delta path only has the open search bar left to feed.
-                    // (PATCH-2026-05-06 hotpath-4 used to call scrollToBottom
-                    // here; coalesced at 0.16s its eases overlapped at the
-                    // 14 Hz coalesce cadence, which is the bump.)
-                    // 2026-09-14: a streamed chunk no longer publishes the
-                    // transcript, so this edge is the tail row's own box, not
-                    // `chatMessages.last?.content` — the trigger moved to the
-                    // leaf's publication with the observation. The behaviour is
-                    // the one 91925c76a added: an explicit follow per
-                    // publication (non-animated, coalesced by the coordinator
-                    // at 160 ms, off while the reader has scrolled away), so
-                    // the reply stays above the composer while it streams.
+                    // Layout growth above owns follow, including late wraps,
+                    // images and card resizing. Only an open search needs to
+                    // observe every text publication independently of layout.
                     .followsStreamingTail(
                         messageID: appModel.chatMessages.last?.id,
-                        onChanged: { followStreamedTail(proxy) }
+                        enabled: showTranscriptSearch,
+                        onChanged: { refreshTranscriptSearchTailIfPresented() }
                     )
                     // The structural seam still carries the end-of-turn write
                     // and any interior rewrite.
                     .onChange(of: appModel.chatMessages.last?.content) { _, _ in
-                        followStreamedTail(proxy)
+                        refreshTranscriptSearchTailIfPresented()
                     }
                     .onChange(of: appModel.chatMessages.last?.id) { _, _ in
                         refreshTranscriptSearchTailIfPresented()
@@ -1687,7 +1751,7 @@ struct ChatView: View {
                         let kind = (note.userInfo?["kind"] as? String) ?? ""
                         switch ChatTurnNoticePresentation.destination(for: kind) {
                         case .chatTop:
-                            turnNoticeToasts.push(info: text, autoDismissAfter: 6)
+                            pushChatTopNotice(text, kind: kind)
                         case .globalWarning:
                             appModel.systemToasts.push(warn: text)
                         case .globalInfo:
@@ -1717,64 +1781,7 @@ struct ChatView: View {
                 // Keep the idle floor, and let approval rows or larger text
                 // grow the reservation independently of the composer below.
                 .safeAreaInset(edge: .bottom, spacing: 0) {
-                    ZStack(alignment: .bottom) {
-                        if showThinkingRow {
-                            // Desk 658.11: the one shared live-turn card. The
-                            // detached window composes this exact host.
-                            MacChatTurnCardHost(
-                                sessionId: appModel.activeChatSessionId,
-                                onStop: { appModel.stopChatStream() }
-                            )
-                            // User, 2026-09-03: the working card shares the
-                            // composer's frame in the new shell, edge to edge.
-                            .padding(
-                                .horizontal,
-                                classicShell ? 32 : NativeAgentShellLayout.roomGutter
-                            )
-                            .frame(
-                                maxWidth: classicShell
-                                    ? NativeAgentLayout.maxReadableChatWidth
-                                    : NativeAgentShellLayout.roomColumn,
-                                alignment: classicShell ? .center : .topLeading
-                            )
-                            .padding(
-                                .leading,
-                                classicShell ? 0 : NativeAgentShellLayout.roomLeadingInset
-                            )
-                            .padding(
-                                .trailing,
-                                classicShell ? 0 : NativeAgentShellLayout.roomTrailingInset
-                            )
-                            .frame(
-                                maxWidth: .infinity,
-                                alignment: classicShell
-                                    ? .top
-                                    : NativeAgentShellLayout.roomAlignment
-                            )
-                            .padding(.bottom, 6)
-                            .transition(NativeAgentMotion.fade)
-                        }
-                    }
-                    // User, 2026-09-15: the floor is the SHOWN card's minimum,
-                    // not a standing reservation. At rest no card is drawn and
-                    // this inset still held 80pt of the transcript's room.
-                    .frame(
-                        minHeight: showThinkingRow ? MacChatTurnCardMetrics.floatingClearance : 0,
-                        alignment: .bottom
-                    )
-                    // The reservation is whatever this actually drew. The write
-                    // goes to the observable, which ChatView.body does not read,
-                    // so measuring the card costs the spacer a relayout and
-                    // costs the transcript nothing.
-                    .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { height in
-                        turnCardClearanceStore.measuredHeight = height
-                    }
-                    .onChange(of: showThinkingRow, initial: true) { _, shows in
-                        turnCardClearanceStore.showsCard = shows
-                    }
-                    .animation(
-                        NativeAgentMotion.respecting(NativeAgentMotion.standard, reduceMotion: reduceMotion),
-                        value: showThinkingRow)
+                    ChatTurnCardInset(classicShell: classicShell, store: turnCardClearanceStore)
                 }
                 // User, 2026-09-03: a safeAreaInset only insets; a safeAreaBar
                 // also registers the region with the scroll view's edge

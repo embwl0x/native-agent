@@ -33,6 +33,7 @@ public enum AgentHostConnection {
         case unknownHost(String)
         case notInstalled(String)
         case linkCommandMissing
+        case notInApplications
         case alreadyConnected(String)
         case workspaceRequired
 
@@ -48,6 +49,8 @@ public enum AgentHostConnection {
                 return "\(name) does not look installed on this Mac, so there is nothing to write into. Nothing was changed."
             case .linkCommandMissing:
                 return "The nativeagent-link command is not installed beside this app, so an entry would point at a command that does not exist. Nothing was changed."
+            case .notInApplications:
+                return "Move NativeAgent to Applications first. Run from a disk image or quarantined copy, its link path would not last. Nothing was changed."
             case .alreadyConnected(let name):
                 return "\(name) is already connected. Disconnect it first if you want a new key."
             }
@@ -80,6 +83,8 @@ public enum AgentHostConnection {
         if let folder { row.configPath = folder + "/" + row.configPath }
         guard row.isInstalled else { throw Refusal.notInstalled(row.displayName) }
         guard let command = AgentHostDirectory.linkCommandPath() else { throw Refusal.linkCommandMissing }
+        // A translocated or mounted copy's path vanishes; the entry would point nowhere.
+        guard !command.contains("/AppTranslocation/"), !command.hasPrefix("/Volumes/") else { throw Refusal.notInApplications }
         let existing = try store.list().first {
             row.route == .grokBot ? $0.transport == .grokBot : row.acp != nil
                 ? $0.transport == .acp && AgentPeerStore.hostRowID($0.endpoint) == row.id
@@ -98,7 +103,7 @@ public enum AgentHostConnection {
             directory = URL(fileURLWithPath: saved)
         } else {
             directory = SwiftToolDispatcher.builderWorkspaceRoot(dataRoot: dataRoot)
-                .appendingPathComponent("agent-bridge-runs/" + contactID)
+                .appendingPathComponent("agent-bridge-runs/" + (row.acp != nil ? row.id : contactID))
         }
         let executable = try row.acp.map { line in
             guard let path = AgentHostCommandLines.resolveExecutable(line.executable) else { throw Refusal.notInstalled(row.displayName) }
@@ -168,7 +173,7 @@ public enum AgentHostConnection {
         return """
         Connect \(row.displayName) to \(appName)?
         I'll add a messaging connection to \(row.displayName)'s settings so we can exchange messages on this Mac. Existing settings will be preserved.
-        Changes: \(AgentHostDirectory.changesLine(row: row, command: proposal.command))
+        Changes: \(AgentHostDirectory.changesLine(row: row, command: proposal.command))\(row.id == "antigravity-cli" ? "\nAntigravity permissions: allow only this connection's agent_message and agent_reply MCP tools. Disconnect removes only allowances added here; existing Ask/Deny rules are never overridden." : "")
         Access: \(AgentHostDirectory.accessSummary)
         Restart: \(row.restartNote)\(Self.probeLine(proposal))
         You can disconnect later. This does not open access from the network.
@@ -195,6 +200,9 @@ public enum AgentHostConnection {
     private static func probeLine(_ proposal: Proposal) -> String {
         let row = proposal.row
         guard let executable = proposal.executablePath else { return "\nCheck: no executable found; nothing will run." }
+        if row.commandLine?.automaticMCPProbe == false {
+            return "\nExecutable: \(executable)\nCheck: send a message after setup to verify the connection; setup itself does not run this agent."
+        }
         return "\nExecutable: \(executable)\nCheck: once, right after the entry is written, this exact path is run with a fixed "
             + "message asking \(row.displayName) to answer back through the entry, so \"connected\" means "
             + "a message really crossed rather than a file having been written. It runs under your "
@@ -293,7 +301,10 @@ public enum AgentHostConnection {
                     backupRecordURL: backupRecordURL(row: row, store: store))
             }
             }
-            do { _ = try store.upsert(contact) }
+            do {
+                _ = try ensureMessagingPermissions(contact: contact, store: store)
+                _ = try store.upsert(contact)
+            }
             catch {
                 // Undo only our entry using its ownership receipt, which also
                 // restores any entry it replaced. A whole-file backup would
@@ -301,6 +312,7 @@ public enum AgentHostConnection {
                 if row.acp != nil || row.format == .sessionMCP {
                     // No settings were changed.
                 } else {
+                    try? removeMessagingPermissions(contact: contact, store: store)
                     try? removeEntry(row: row, store: store, peerID: contact.id)
                 }
                 throw error
@@ -326,12 +338,32 @@ public enum AgentHostConnection {
         if let path = settingsPath(contact: contact) { row.configPath = path }
         // Keep the contact and ownership receipt until revocation succeeds,
         // so a failed removal or key deletion can be retried.
+        try removeMessagingPermissions(contact: contact, store: store)
         let outcome = try removeEntry(row: row, store: store, peerID: contact.id)
         try AgentPeerCredentials.delete(peerID: contact.id)
         _ = try store.remove(contact.id)
         try AgentHostConfigWriter.removeBackups(path: row.expandedConfigPath,
             recordURL: backupRecordURL(row: row, store: store))
         return outcome
+    }
+
+    static func ensureMessagingPermissions(contact: AgentPeerContact, store: AgentPeerStore) throws -> Bool {
+        guard AgentPeerStore.hostRowID(contact.endpoint) == "antigravity-cli" else { return false }
+        let outcome = try AgentHostConfigWriter.grantAntigravityMessaging(
+            path: AgentHostDirectory.expand("~/.gemini/antigravity-cli/settings.json"),
+            server: AgentHostDirectory.entryName, peerID: contact.id, recordURL: permissionRecord(contact, store))
+        return outcome.backupPath != nil
+    }
+
+    private static func removeMessagingPermissions(contact: AgentPeerContact, store: AgentPeerStore) throws {
+        guard AgentPeerStore.hostRowID(contact.endpoint) == "antigravity-cli" else { return }
+        try AgentHostConfigWriter.removeAntigravityMessaging(
+            path: AgentHostDirectory.expand("~/.gemini/antigravity-cli/settings.json"),
+            server: AgentHostDirectory.entryName, peerID: contact.id, recordURL: permissionRecord(contact, store))
+    }
+
+    private static func permissionRecord(_ contact: AgentPeerContact, _ store: AgentPeerStore) -> URL {
+        store.fileURL.deletingLastPathComponent().appendingPathComponent("antigravity-\(contact.id)-permission-backups.json")
     }
 
     private static func backupRecordURL(row: AgentHostRow, store: AgentPeerStore) -> URL {

@@ -810,46 +810,6 @@ public actor AdaptiveMemoryPromoter {
         return (try? await memory.countMomentProposals(status: "pending")) ?? 0
     }
 
-    /// One-shot backfill for pending proposals that satisfy the same narrow
-    /// structured-fact policy as live auto-accept. Preferences/goals and rows
-    /// without typed confidence evidence remain pending for human review.
-    @discardableResult
-    public func runAutoAcceptSweep(maxToScan: Int = 500) async -> Int {
-        guard let memory else { return 0 }
-        guard let allPending = try? await memory.listProposals(status: "pending") else {
-            return 0
-        }
-        // Slice to maxToScan (storage layer doesn't expose a limit yet).
-        // 2026-07-21 audit fix: the pending list arrives NEWEST-first
-        // (staged_at DESC), so prefix(maxToScan) over a >maxToScan backlog
-        // starved the OLDEST pending rows forever — exactly the rows an
-        // aging pass exists to clear. Sort oldest-first before slicing so
-        // every sweep drains the tail of the queue; fresh arrivals are
-        // handled by the live observeTurn auto-accept lane and later sweeps.
-        let pending = Array(allPending.sorted { $0.createdAt < $1.createdAt }.prefix(maxToScan))
-        var accepted = 0
-        for p in pending {
-            // Skip if content is empty (legacy daemon-era staging artifacts)
-            // — these can't usefully recall and would pollute the well.
-            let trimmed = p.content.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
-            if trimmed.isEmpty { continue }
-            guard let candidate = Self.autoAcceptCandidate(from: p),
-                  Self.shouldAutoAccept(candidate, confidenceFloor: autoAcceptThreshold) else {
-                continue
-            }
-            // Tombstone re-check at accept time (mirrors acceptProposal's
-            // own gate — cheaper to skip here than throw inside).
-            if (try? await memory.isRejected(content: trimmed)) == true { continue }
-            do {
-                _ = try await memory.acceptProposal(id: p.id)
-                accepted += 1
-            } catch {
-                continue
-            }
-        }
-        return accepted
-    }
-
     /// True when the turn's user-seat text was machine-tagged as coming from
     /// another agent over a local bridge. The prefix is affixed at the single
     /// bridge entry points (ClaudeBridge / codex bridge), same convention
@@ -894,26 +854,5 @@ public actor AdaptiveMemoryPromoter {
         default:
             return false
         }
-    }
-
-    private static func autoAcceptCandidate(from proposal: ProposalRecord) -> AdaptiveCandidate? {
-        guard case .object(let metadata)? = proposal.metadata,
-              case .string(let kind)? = metadata["kind"] else {
-            return nil
-        }
-        let confidence: Double? = {
-            switch metadata["confidence"] {
-            case .double(let value)?: return value
-            case .int(let value)?: return Double(value)
-            case .string(let value)?: return Double(value)
-            default: return nil
-            }
-        }()
-        guard let confidence, confidence.isFinite else { return nil }
-        return AdaptiveCandidate(
-            content: proposal.content,
-            score: min(1, max(0, confidence)),
-            kind: kind
-        )
     }
 }

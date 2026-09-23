@@ -1511,7 +1511,7 @@ extension AppModel {
                             turnId: activityIdentity.turnId
                         ),
                         kind: .outcomeUnknown(
-                            reason: "The turn reconciled into another active session without attributable terminal proof."
+                            reason: "I'm not sure that finished \u{2014} if my answer isn't here, say it again and I'll pick it up."
                         ),
                         at: Date()
                     )
@@ -1584,7 +1584,7 @@ extension AppModel {
                             _ = applyChatTurnLifecycleInput(MacChatTurnLifecycleInput(
                                 identity: rebound.identity,
                                 kind: .outcomeUnknown(
-                                    reason: "The turn changed session identity without a durable lifecycle receipt."
+                                    reason: "I'm not sure that finished \u{2014} if my answer isn't here, say it again and I'll pick it up."
                                 ),
                                 occurredAt: Date()
                             ))
@@ -1901,14 +1901,13 @@ extension AppModel {
     /// assert on that raw text). Keep the raw error in any os_log/telemetry on
     /// this path; only the bubble text is normalized.
     ///
-    /// Match order: (1) the ProviderStreamGuard's OWN stable in-repo timeout
-    /// strings (they flow through `LLMError.transient` -> "llm: transient: …"
-    /// unchanged); (2) URLError categories / adapter transport strings; (3)
-    /// provider transient (busy/rate-limited) and explicit auth failures; (4)
-    /// default — preserve today's "Chat error: <desc>" so nothing regresses and
-    /// unmatched provider text still reads.
+    /// A typed provider failure speaks its own person sentence (2026-09-22: its
+    /// localizedDescription ended " Work: …" in the bubble). Anything else:
+    /// (1) the ProviderStreamGuard's stable timeout strings; (2) URLError
+    /// categories / transport strings; (3) default "Chat error: <desc>".
     private func normalizeStreamErrorForChat(_ error: Error) -> String {
-        Self.normalizeStreamErrorText(error.localizedDescription)
+        ProviderRecoveryPolicy.personMessage(error)
+            ?? Self.normalizeStreamErrorText(error.localizedDescription)
     }
 
     /// The SAME sentence on Mac and iPhone (2026-09-13, first-failure pass).
@@ -1950,66 +1949,8 @@ extension AppModel {
             || d.contains("code=-1003") || d.contains("code=-1004") {
             return "Couldn't resolve the server address. Check your network, then use \(retryAction) to retry."
         }
-        // (3) Provider transient errors — overload / rate-limit / 5xx — the most
-        // common transient class. LLMError surfaces these as
-        // "llm: provider error: …overloaded…" and "llm: invalid response status 529"
-        // (audit finding #11, 2026-06-14). Deliberately NOT matching a bare
-        // "provider error": that would mask auth/invalid-request failures as
-        // "busy" — let those fall to the raw default so the real cause shows.
-        if d.contains("overloaded") || d.contains("rate limit") || d.contains("rate_limit")
-            || d.contains("status 429") || d.contains("status 529")
-            || d.contains("status 503") || d.contains("status 500") {
-            // 2026-09-13: when the provider said WHEN, repeat that instead of
-            // inviting an identical attempt that would hit the same wall.
-            if let wait = Self.retryAfterPhrase(in: raw) {
-                return "The model is busy right now and asked to be retried \(wait). Your message is saved - use \(retryAction) then."
-            }
-            return "The model is busy right now. Your message is saved - use \(retryAction) to retry."
-        }
-        if d.contains("stream truncated") {
-            return "The reply was cut off. Use Try again to retry."
-        }
-        // (3b) Auth — sweep R4 C15. 401/unauthorized is the most common
-        // self-inflicted failure (expired or mistyped key) and previously fell
-        // through to the raw provider string. This arm is deliberately NARROW —
-        // an explicit 401/invalid-key signal only — so the reasoning above
-        // still holds: a bare "provider error" must NOT be dressed up as an
-        // auth problem, it still falls through raw. A bare "unauthorized"
-        // matcher was dropped (review 2026-08-06): provider errors echoing
-        // tool/request content ("unauthorized file path") would misroute the
-        // user to their API keys; real 401s carry the status code.
-        if d.contains("status 401") || d.contains("code=401")
-            || d.contains("invalid_api_key") || d.contains("invalid api key")
-            || d.contains("authentication_error") || d.contains("invalid x-api-key") {
-            return "The provider rejected the credentials for this model. Reconnect that account in the Providers tab in the sidebar - update its key or sign in again, whichever it uses. Your message is saved, and \(retryAction) sends it once the account is back."
-        }
-        // (4) Default — unchanged behavior so nothing regresses.
+        // (3) Default — unchanged behavior so nothing regresses.
         return "Chat error: \(raw)"
-    }
-
-    /// A provider-stated wait, in ordinary words, from whatever the adapter
-    /// echoed ("retry-after: 30", "try again in 2 minutes"). nil unless the
-    /// provider actually said one — this never invents a time.
-    static func retryAfterPhrase(in raw: String) -> String? {
-        let lowered = raw.lowercased()
-        let patterns = [
-            #"retry[- ]after[:= ]+\s*(\d+)\s*(seconds?|secs?|s\b|minutes?|mins?|m\b)?"#,
-            #"try again in\s+(\d+)\s*(seconds?|secs?|s\b|minutes?|mins?|m\b)"#
-        ]
-        for pattern in patterns {
-            guard let match = lowered.range(of: pattern, options: .regularExpression) else { continue }
-            let text = String(lowered[match])
-            guard let digits = text.range(of: #"\d+"#, options: .regularExpression),
-                  let value = Int(text[digits]), value > 0, value < 86_400 else { continue }
-            let minutes = text.contains("min") || text.range(of: #"\dm\b"#, options: .regularExpression) != nil
-            if minutes { return "in \(value) minute\(value == 1 ? "" : "s")" }
-            if value >= 60 {
-                let m = value / 60
-                return "in about \(m) minute\(m == 1 ? "" : "s")"
-            }
-            return "in \(value) second\(value == 1 ? "" : "s")"
-        }
-        return nil
     }
 
 }

@@ -64,6 +64,7 @@ globalThis.chrome = {
     async getAllFrames() { return structuredClone(webFrames); },
   },
   windows: {
+    onFocusChanged: { addListener() {} },
     async getLastFocused() { return { id: 7, focused: true, type: "normal" }; },
     async create(options) {
       assert.equal(options.focused, false);
@@ -126,6 +127,7 @@ globalThis.chrome = {
           url: webFrames.find((frame) => frame.frameId === (options.frameId ?? 0))?.url,
           title: options.frameId === 0 ? "Fixture" : "Child",
           language: "en",
+          reading: { scope: message.scope ?? "page", mainContentAvailable: true },
           viewport: { width: 1200, height: 800, scrollX: 0, scrollY: 0, documentWidth: 1200, documentHeight: 2000 },
           summary: { text: options.frameId === 0 ? "Top frame" : "Child frame", nodeCount: 1, truncated: false, truncationReasons: [] },
           frame: { name: options.frameId === 0 ? "Fixture" : "Child", url: webFrames.find((frame) => frame.frameId === (options.frameId ?? 0))?.url },
@@ -330,6 +332,19 @@ test("closing a leased tab releases and notifies the host", async () => {
   const released = await eventFor("lease.released", acquire.result.leaseId);
   assert.equal(released.payload.reason, "tab_closed");
   assert.equal(sessionStorage.nativeAgentTabLeasesV1.length, 0);
+});
+
+test("main-content snapshot scope reaches each canonical frame without changing ownership", async () => {
+  const acquired = await sendRequest("acquire-main-content", "lease.acquire", { mode: "create", initialUrl: "https://example.com/article" });
+  const snapshot = await sendRequest("snapshot-main-content", "page.snapshot.read", {
+    leaseId: acquired.result.leaseId, scope: "main_content", maxNodes: 80, maxTextChars: 10000,
+  });
+  assert.equal(snapshot.ok, true);
+  assert.equal(snapshot.result.reading.scope, "main_content");
+  assert.equal(snapshot.result.reading.mainContentAvailable, true);
+  assert.equal(snapshot.result.leaseId, acquired.result.leaseId);
+  assert.equal(snapshot.result.userSequence, acquired.result.userSequence);
+  assert.ok(snapshot.result.nodes.length <= 80);
 });
 
 test("navigate, structured snapshot, fluid form acts, wait, and scroll round-trip on one lease", async () => {

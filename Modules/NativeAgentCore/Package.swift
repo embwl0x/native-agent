@@ -301,7 +301,7 @@ let package = Package(
         ),
         .target(
             name: "NativeAgentTestSupport",
-            dependencies: ["NativeAgentCTestSupport"],
+            dependencies: ["NativeAgentCTestSupport", "NativeAgentCore"],
             path: "Tests/NativeAgentTestSupport"
         ),
         .executableTarget(

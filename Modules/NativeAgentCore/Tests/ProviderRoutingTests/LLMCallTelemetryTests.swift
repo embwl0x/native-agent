@@ -424,7 +424,7 @@ private func openAIResponsesSSE(usage: [String: Any]?) -> Data {
         ]
     }
 
-    @Test func oauthComplete_breakpoints_systemBlocksAndLastTool() async throws {
+    @Test func oauthComplete_breakpoints_systemBlocks() async throws {
         U1StubURLProtocol.reset()
         defer { U1StubURLProtocol.reset() }
         U1StubURLProtocol.responder = { _ in
@@ -436,7 +436,7 @@ private func openAIResponsesSSE(usage: [String: Any]?) -> Data {
         let adapter = makeOAuthAdapter(telemetryRoot: root)
         _ = try await adapter.complete(
             prompt: "hi", system: "persona+pins block",
-            model: "claude-opus-4-8", tools: makeTools()
+            model: "claude-opus-4-8", tools: nil
         )
         let body = try JSONSerialization.jsonObject(
             with: U1StubURLProtocol.lastBody ?? Data()
@@ -449,16 +449,9 @@ private func openAIResponsesSSE(usage: [String: Any]?) -> Data {
         #expect(system[1]["text"] as? String == "persona+pins block")
         #expect((system[1]["cache_control"] as? [String: Any])?["type"] as? String == "ephemeral")
 
-        let tools = body["tools"] as? [[String: Any]] ?? []
-        #expect(tools.count == 2)
-        #expect(tools[0]["cache_control"] == nil)
-        #expect((tools[1]["cache_control"] as? [String: Any])?["type"] as? String == "ephemeral")
-
-        // 3 breakpoints total (last tool + 2 system blocks) — under the
-        // Anthropic max of 4.
+        #expect(body["tools"] == nil)
         let breakpoints = system.filter { $0["cache_control"] != nil }.count
-            + tools.filter { $0["cache_control"] != nil }.count
-        #expect(breakpoints == 3)
+        #expect(breakpoints == 2)
 
         // Telemetry row landed with the parsed usage.
         let rows = readLLMCallRows(dataRoot: root)
@@ -469,36 +462,28 @@ private func openAIResponsesSSE(usage: [String: Any]?) -> Data {
         #expect(payload["streaming"] as? Bool == false)
     }
 
-    @Test func oauthCompleteMessages_sameBreakpoints() async throws {
+    /// The subscription route never carries a native tools array: a
+    /// non-empty one is refused before any request is sent.
+    @Test func oauthCompleteMessages_refusesNativeTools() async throws {
         U1StubURLProtocol.reset()
         defer { U1StubURLProtocol.reset() }
         U1StubURLProtocol.responder = { _ in
             .init(status: 200, body: anthropicMessagesResponse(usage: nil))
         }
         let adapter = makeOAuthAdapter(telemetryRoot: makeTmpDataRoot())
-        _ = try await adapter.completeMessages(
-            messages: [.user("hi")], system: "sys",
-            model: "claude-opus-4-8", tools: makeTools()
-        )
-        let body = try JSONSerialization.jsonObject(
-            with: U1StubURLProtocol.lastBody ?? Data()
-        ) as? [String: Any] ?? [:]
-        let system = body["system"] as? [[String: Any]] ?? []
-        #expect(system.allSatisfy { $0["cache_control"] != nil })
-        let tools = body["tools"] as? [[String: Any]] ?? []
-        #expect(tools.last?["cache_control"] != nil)
-        #expect(tools.first?["cache_control"] == nil)
-        // U1 item 8: UNSEGMENTED tool-capable messages call — identity + sys
-        // + last tool + current message breakpoint = 4 ≤ 4 (budget pin).
-        let messages = body["messages"] as? [[String: Any]] ?? []
-        let messageBlocks: [[String: Any]] = messages.flatMap { msg -> [[String: Any]] in
-            (msg["content"] as? [[String: Any]]) ?? []
+        await #expect(throws: LLMError.self) {
+            _ = try await adapter.completeMessages(
+                messages: [.user("hi")], system: "sys",
+                model: "claude-opus-4-8", tools: makeTools()
+            )
         }
-        let messageBreakpoints = messageBlocks.filter { $0["cache_control"] != nil }.count
-        #expect(messageBreakpoints == 1)
-        let systemBreakpoints = system.filter { $0["cache_control"] != nil }.count
-        let toolBreakpoints = tools.filter { $0["cache_control"] != nil }.count
-        #expect(systemBreakpoints + toolBreakpoints + messageBreakpoints == 4)
+        await #expect(throws: LLMError.self) {
+            _ = try await adapter.complete(
+                prompt: "hi", system: "sys",
+                model: "claude-opus-4-8", tools: makeTools()
+            )
+        }
+        #expect(U1StubURLProtocol.lastBody == nil)
     }
 
     @Test func oauthComplete_noTools_omitsToolsKey() async throws {
@@ -849,114 +834,8 @@ private func openAIResponsesSSE(usage: [String: Any]?) -> Data {
     private static let segDynamic = "Recent memory:\n- recall hit\n\nConversation history:\n[user] hi"
     private static var segCombined: String { segStable + "\n\n" + segDynamic }
 
-    /// U1 item 8 (F1 lane (b)) repin — was
-    /// `oauthCompleteMessages_withSegmentsAndTools_dynamicEndBreakpoint_fourTotal`.
-    /// On tool-capable MESSAGES calls the current MESSAGE breakpoint now
-    /// takes the budget slot the lane-(a) dynamic-end breakpoint used (the
-    /// message breakpoint's prefix covers every system block, so the dynamic
-    /// block is cached from iteration 1's write on — lane (a) subsumed).
-    /// The lever test below pins the OLD layout under
-    /// NATIVE_AGENT_GROWN_PROMPT_COMPAT.
-    @Test func oauthCompleteMessages_withSegmentsAndTools_currentMessageBreakpoint_fourTotal() async throws {
-        U1StubURLProtocol.reset()
-        defer { U1StubURLProtocol.reset() }
-        U1StubURLProtocol.responder = { _ in
-            .init(status: 200, body: anthropicMessagesResponse(usage: nil))
-        }
-        let adapter = makeOAuthAdapter(telemetryRoot: makeTmpDataRoot())
-        let segments = SystemPromptSegments(stable: Self.segStable, dynamic: Self.segDynamic)
-        // LEGACY ARM PIN: production now defaults to v2Prefix, so this test
-        // binds v1Legacy explicitly. Its assertions ARE the byte-identity
-        // guard for the rollback arm.
-        _ = try await ConversationPrefixShape.$override.withValue(.v1Legacy) {
-            try await LLMCallContext.$systemSegments.withValue(segments) {
-                try await adapter.completeMessages(
-                    messages: [.user("hi")], system: Self.segCombined,
-                    model: "claude-opus-4-8", tools: makeTools()
-                )
-            }
-        }
-        let body = try JSONSerialization.jsonObject(
-            with: U1StubURLProtocol.lastBody ?? Data()
-        ) as? [String: Any] ?? [:]
-
-        let system = body["system"] as? [[String: Any]] ?? []
-        #expect(system.count == 3)
-        // [identity + cc] [stable+"\n\n" + cc] [dynamic, NO cc — covered by
-        // the current MESSAGE breakpoint from iteration 1 on].
-        // The "\n\n" separator rides as a suffix on the stable block so the
-        // emitted block texts concatenate byte-for-byte to the combined sys
-        // string.
-        #expect((system[0]["text"] as? String)?.contains("Claude Code") == true)
-        #expect((system[0]["cache_control"] as? [String: Any])?["type"] as? String == "ephemeral")
-        #expect(system[1]["text"] as? String == Self.segStable + "\n\n")
-        #expect((system[1]["cache_control"] as? [String: Any])?["type"] as? String == "ephemeral")
-        #expect(system[2]["text"] as? String == Self.segDynamic)
-        #expect(system[2]["cache_control"] == nil)
-
-        // Current message breakpoint: LAST block of the LAST message.
-        let messages = body["messages"] as? [[String: Any]] ?? []
-        let lastContent = messages.last?["content"] as? [[String: Any]] ?? []
-        #expect((lastContent.last?["cache_control"] as? [String: Any])?["type"] as? String == "ephemeral")
-
-        // Total breakpoints: identity + stable + last tool + current
-        // message = 4 — exactly at Anthropic's 4-breakpoint limit, never
-        // above.
-        let tools = body["tools"] as? [[String: Any]] ?? []
-        let systemBreakpoints = system.filter { $0["cache_control"] != nil }.count
-        let toolBreakpoints = tools.filter { $0["cache_control"] != nil }.count
-        let messageBlocks: [[String: Any]] = messages.flatMap { msg -> [[String: Any]] in
-            (msg["content"] as? [[String: Any]]) ?? []
-        }
-        let messageBreakpoints = messageBlocks.filter { $0["cache_control"] != nil }.count
-        #expect(systemBreakpoints + toolBreakpoints + messageBreakpoints == 4)
-
-        // BYTE IDENTITY: the plain concat of the [stable, dynamic] block
-        // texts — no separator assumed from the API join — must equal the
-        // combined sys string exactly.
-        #expect((system[1]["text"] as? String ?? "") + (system[2]["text"] as? String ?? "") == Self.segCombined)
-    }
-
-    /// Rollback lever: NATIVE_AGENT_GROWN_PROMPT_COMPAT restores the exact
-    /// pre-item-8 wire layout — dynamic-end breakpoint on tool-capable
-    /// requests, NO message breakpoint, still ==4 total.
-    @Test func oauthCompleteMessages_grownPromptCompatLever_restoresDynamicEndShape() async throws {
-        U1StubURLProtocol.reset()
-        defer { U1StubURLProtocol.reset() }
-        U1StubURLProtocol.responder = { _ in
-            .init(status: 200, body: anthropicMessagesResponse(usage: nil))
-        }
-        let adapter = makeOAuthAdapter(telemetryRoot: makeTmpDataRoot())
-        let segments = SystemPromptSegments(stable: Self.segStable, dynamic: Self.segDynamic)
-        _ = try await AnthropicOAuthDirectAdapter.GrownPromptCompat.$compatOverride.withValue(true) {
-            try await LLMCallContext.$systemSegments.withValue(segments) {
-                try await adapter.completeMessages(
-                    messages: [.user("hi")], system: Self.segCombined,
-                    model: "claude-opus-4-8", tools: makeTools()
-                )
-            }
-        }
-        let body = try JSONSerialization.jsonObject(
-            with: U1StubURLProtocol.lastBody ?? Data()
-        ) as? [String: Any] ?? [:]
-
-        let system = body["system"] as? [[String: Any]] ?? []
-        #expect(system.count == 3)
-        #expect((system[2]["cache_control"] as? [String: Any])?["type"] as? String == "ephemeral")
-        let messages = body["messages"] as? [[String: Any]] ?? []
-        let messageBlocks: [[String: Any]] = messages.flatMap { msg -> [[String: Any]] in
-            (msg["content"] as? [[String: Any]]) ?? []
-        }
-        let messageBreakpoints = messageBlocks.filter { $0["cache_control"] != nil }.count
-        #expect(messageBreakpoints == 0)
-        let tools = body["tools"] as? [[String: Any]] ?? []
-        let systemBreakpoints = system.filter { $0["cache_control"] != nil }.count
-        let toolBreakpoints = tools.filter { $0["cache_control"] != nil }.count
-        #expect(systemBreakpoints + toolBreakpoints == 4)
-    }
-
     /// QA-equivalence (adapter layer): the lever moves CACHE MARKERS ONLY.
-    /// A multi-iteration tool conversation encoded under both lever states
+    /// A multi-iteration conversation encoded under both lever states
     /// must produce deep-equal request bodies once every cache_control key
     /// is stripped — model-visible content, order, ids, and roles identical.
     @Test func oauthCompleteMessages_leverStates_bodiesEquivalentModuloCacheControl() async throws {
@@ -983,11 +862,13 @@ private func openAIResponsesSSE(usage: [String: Any]?) -> Data {
 
         func capture(compat: Bool) async throws -> [String: Any] {
             try await AnthropicOAuthDirectAdapter.GrownPromptCompat.$compatOverride.withValue(compat) {
-                try await LLMCallContext.$systemSegments.withValue(segments) {
-                    _ = try await adapter.completeMessages(
-                        messages: convo, system: Self.segCombined,
-                        model: "claude-opus-4-8", tools: makeTools()
-                    )
+                try await AnthropicOAuthDirectAdapter.MessagesCacheHint.$withinTurnReuse.withValue(true) {
+                    try await LLMCallContext.$systemSegments.withValue(segments) {
+                        _ = try await adapter.completeMessages(
+                            messages: convo, system: Self.segCombined,
+                            model: "claude-opus-4-8", tools: nil
+                        )
+                    }
                 }
             }
             return try JSONSerialization.jsonObject(
@@ -1012,16 +893,16 @@ private func openAIResponsesSSE(usage: [String: Any]?) -> Data {
         let oldStripped = stripCacheControl(oldBody) as? [String: Any] ?? [:]
         #expect(NSDictionary(dictionary: newStripped) == NSDictionary(dictionary: oldStripped))
 
-        // And the new shape's current breakpoint sits ONLY on the last block
-        // of the last message — older messages carry none on this structured
-        // tool path.
+        // And the new shape marks only the last block of the current message
+        // and of the retained `count - 3` boundary (text lane).
         let messages = newBody["messages"] as? [[String: Any]] ?? []
         #expect(messages.count == 3)
         for (i, msg) in messages.enumerated() {
             let blocks = msg["content"] as? [[String: Any]] ?? []
             for (j, block) in blocks.enumerated() {
-                let isLastBlockOfLastMessage = i == messages.count - 1 && j == blocks.count - 1
-                #expect((block["cache_control"] != nil) == isLastBlockOfLastMessage)
+                let isMarked = (i == messages.count - 1 || i == messages.count - 3)
+                    && j == blocks.count - 1
+                #expect((block["cache_control"] != nil) == isMarked)
             }
         }
     }
@@ -1069,7 +950,7 @@ private func openAIResponsesSSE(usage: [String: Any]?) -> Data {
         }
         let adapter = makeOAuthAdapter(telemetryRoot: makeTmpDataRoot())
         let segments = SystemPromptSegments(stable: Self.segStable, dynamic: Self.segDynamic)
-        // LEGACY ARM PIN — see the note on the tools variant above.
+        // LEGACY ARM PIN: production defaults to v2Prefix.
         _ = try await ConversationPrefixShape.$override.withValue(.v1Legacy) {
             try await LLMCallContext.$systemSegments.withValue(segments) {
                 try await adapter.completeMessages(
@@ -1086,7 +967,7 @@ private func openAIResponsesSSE(usage: [String: Any]?) -> Data {
         #expect(system.count == 3)
         // NON-tool turn: one call per turn, dynamic churns across turns —
         // a dynamic-end breakpoint would pay the 1.25x write premium with
-        // ~zero read probability. The toolCapable gate must hold it off.
+        // ~zero read probability, so it carries none.
         #expect((system[1]["cache_control"] as? [String: Any])?["type"] as? String == "ephemeral")
         #expect(system[2]["cache_control"] == nil)
         #expect(body["tools"] == nil)

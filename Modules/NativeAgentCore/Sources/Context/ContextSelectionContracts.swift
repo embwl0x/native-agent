@@ -1012,7 +1012,9 @@ public struct ContextSelectionConfiguration: Equatable, Sendable {
     public init(
         maximumCandidates: Int = 256,
         maximumDynamicAtoms: Int = 12,
-        maximumPointers: Int = 8,
+        // 2026-09-23: 0 — skill-heading pointers cost ~800 chars/turn and were
+        // expanded 3 times in 7 days. Truncation pointers are a separate lane.
+        maximumPointers: Int = 0,
         maximumAtomsPerSource: Int = 2,
         maximumAtomsPerKind: Int = 4,
         maximumAtomsPerKindOverrides: [ContextAtomKind: Int] = [.memory: 8, .relationship: 4],

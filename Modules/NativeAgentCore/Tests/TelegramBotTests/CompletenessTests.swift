@@ -551,42 +551,5 @@ struct TelegramBotCompletenessTests {
         #expect(result.captureFilename == "voice_99.ogg")
     }
 
-    @Test func SwiftOpenAIWhisperTranscriber_posts_multipart_transcription_request() async throws {
-        nonisolated(unsafe) var captured: URLRequest?
-        nonisolated(unsafe) var capturedBody: Data?
-        let session = cmpMockSession { req in
-            captured = req
-            capturedBody = drainBodyStream(req)
-            let body = Data(#"{"text":"hello from telegram voice"}"#.utf8)
-            return (cmpHTTPResponse(req.url!, 200), body)
-        }
-        let client = SwiftOpenAIWhisperTranscriber(
-            session: session,
-            endpoint: URL(string: "https://api.openai.test/v1/audio/transcriptions")!,
-            model: "gpt-4o-mini-transcribe",
-            apiKeyOverride: "sk-test",
-            dataRoot: URL(fileURLWithPath: NSTemporaryDirectory())
-        )
-        let result = try await client.transcribe(TelegramMediaAttachment(
-            kind: "voice",
-            fileId: "VFID",
-            mimeType: "audio/webm",
-            sizeBytes: 10,
-            bytes: Data("voice-webm".utf8),
-            captureFilename: "voice.webm"
-        ))
-
-        #expect(result.text == "hello from telegram voice")
-        #expect(result.backend == "openai")
-        #expect(result.model == "gpt-4o-mini-transcribe")
-        #expect(captured?.httpMethod == "POST")
-        #expect(captured?.value(forHTTPHeaderField: "Authorization") == "Bearer sk-test")
-        #expect(captured?.value(forHTTPHeaderField: "Content-Type")?.contains("multipart/form-data") == true)
-        let bodyString = String(data: capturedBody ?? Data(), encoding: .utf8) ?? ""
-        #expect(bodyString.contains("name=\"model\""))
-        #expect(bodyString.contains("gpt-4o-mini-transcribe"))
-        #expect(bodyString.contains("filename=\"voice.webm\""))
-        #expect(bodyString.contains("voice-webm"))
-    }
 
 }

@@ -616,11 +616,28 @@ extension MacFourVerbs {
             } else {
                 body["action"] = .string("AXPress")
             }
-            return await performObservedDispatch(
+            let first = await performObservedDispatch(
                 action: "ax_act",
                 body: body,
                 description: Self.pastTense(verb, direction: direction) + " " + spokenTarget + ".",
                 before: before,
+                target: target,
+                verb: verb.rawValue,
+                attention: attention
+            )
+            // 2026-09-22: a live screen shifts between look and act; one fresh
+            // look and re-resolve by the same name, then one dispatch. No loop.
+            guard !first.ok, Self.string(first.detail["error"])?.hasPrefix("mark_drifted") == true,
+                  case .seen(let fresh) = await sight(part: nil),
+                  case .hit(let again) = Self.resolve(target, among: fresh.targets),
+                  let freshView = again.viewId, let freshMark = again.mark else { return first }
+            body["view"] = .string(freshView)
+            body["mark"] = .int(Int64(freshMark))
+            return await performObservedDispatch(
+                action: "ax_act",
+                body: body,
+                description: Self.pastTense(verb, direction: direction) + " " + Self.spokenName(again, requestedAs: target) + ".",
+                before: fresh,
                 target: target,
                 verb: verb.rawValue,
                 attention: attention

@@ -105,7 +105,6 @@ struct WorkshopPumpLoopRunner: EventDeadlineLoopRunner {
                 store.opsPath,
                 store.statePath,
                 dataRoot.appendingPathComponent("trust/policy.json"),
-                dataRoot.appendingPathComponent("cognition/organism_state.json"),
                 dataRoot.appendingPathComponent("workshop/background_lease.json"),
             ],
             stores: [.desk],

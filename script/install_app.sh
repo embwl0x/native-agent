@@ -74,6 +74,9 @@ if [[ -f "$LOCAL_ENV" ]]; then
     source "$LOCAL_ENV"
 fi
 APP_NAME="NativeAgent"
+# The installed app is used for everyday conversations. Keep ordinary installs
+# optimized; an explicit debug override remains available for debugger work.
+export NATIVEAGENT_BUILD_CONFIG="${NATIVEAGENT_BUILD_CONFIG:-release}"
 APP_DEST="$HOME/Applications/$APP_NAME.app"
 FORCE_CHECKOUT_SWITCH="${FORCE_CHECKOUT_SWITCH:-0}"
 NATIVEAGENT_MAC_BUNDLE_ID="${NATIVEAGENT_MAC_BUNDLE_ID:-io.github.embwl0x.nativeagent.mac}"

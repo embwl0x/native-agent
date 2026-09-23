@@ -1,0 +1,32 @@
+<!doctype html>
+<meta charset="utf-8"><title>Dynamic feed acceptance</title>
+<style>
+body{font:18px system-ui;margin:0 auto;max-width:700px}
+nav{position:sticky;top:0;background:white;padding:16px;z-index:1}
+article{min-height:60vh;border:1px solid #ccc;padding:20px;margin:12px}
+button{font:inherit;padding:10px} #status{position:fixed;bottom:0;background:white}
+</style>
+<nav role="tablist"><button role="tab" aria-selected="true" id="feedTab">Feed</button>
+<button role="tab" aria-selected="false" id="threadTab">Thread</button></nav>
+<main id="items"></main><output id="status">Local fixture only</output>
+<script>
+const items=document.querySelector('#items'); let count=0, pending=false, thread=false;
+function append(){for(let i=0;i<4;i++){const row=document.createElement('article');
+row.textContent=`Feed item ${++count}: fresh content in the scrolling feed.`;items.append(row)}}
+append();
+document.addEventListener('scroll',()=>{
+ if(thread||pending||count>=20||innerHeight+scrollY<document.documentElement.scrollHeight-120)return;
+ pending=true;setTimeout(()=>{append();pending=false},100);
+});
+document.querySelector('#threadTab').onclick=()=>{
+ thread=true;document.querySelector('#threadTab').setAttribute('aria-selected','true');
+ document.querySelector('#feedTab').setAttribute('aria-selected','false');
+ items.replaceChildren();const post=document.createElement('article');post.textContent='Original post: telescope night.';
+ post.style.minHeight='110vh';items.append(post);scrollTo(0,0);
+ setTimeout(()=>{for(const text of ['Reply from Mira: Saturn was clear.','Reply from Rowan: I saw the rings.']){
+ const reply=document.createElement('article');reply.textContent=text;items.append(reply)}},100);
+};
+document.querySelector('#feedTab').onclick=()=>location.reload();
+// Unrelated churn exercises the tab's exact-identity retention.
+setInterval(()=>document.querySelector('#status').textContent=`Local fixture tick ${Date.now()}`,1200);
+</script>

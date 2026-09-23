@@ -32,7 +32,6 @@ struct BotsShelfView: View {
     /// One shelf read in flight, one pending refresh behind it.
     @State private var reloadInFlight = false
     @State private var reloadPending = false
-    @AppStorage(BotRunLimits.minimumIntervalMinutesKey) private var minimumMinutes = 15
     private var root: URL { appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot() }
     private var selected: BotsShelfRecord? { records.first { $0.id == selectedID } }
 
@@ -151,14 +150,6 @@ struct BotsShelfView: View {
                         .buttonStyle(.borderedProminent)
                     }.padding(.vertical, 16)
                 }
-                DisclosureGroup("Scheduling") {
-                    Picker("Minimum interval", selection: $minimumMinutes) {
-                        ForEach(1...15, id: \.self) { Text($0 == 1 ? "1 minute" : "\($0) minutes").tag($0) }
-                    }.frame(maxWidth: 300)
-                    Text("Only you can change this minimum.").font(ShellType.caption).foregroundStyle(NativeAgentShell.secondary)
-                }
-                .font(ShellType.caption).foregroundStyle(NativeAgentShell.tertiary).padding(.top, 12)
-                .onChange(of: minimumMinutes) { _, _ in NotificationCenter.default.post(name: BotRunQueue.didChange, object: nil) }
             }
             .frame(maxWidth: 720, alignment: .leading).padding(.bottom, 20)
         }
@@ -187,9 +178,12 @@ struct BotsShelfView: View {
                     }
                     HStack(spacing: 8) {
                         Button("Run once") { perform { _ = try BotRunQueue(dataRoot: root).enqueueRequest(bot: record.id); notice = "Run queued." } }
-                        Button(record.definition.paused ? "Resume" : "Pause") {
-                            perform { _ = try BotDefinitionStore(dataRoot: root).pause(record.id, paused: !record.definition.paused) }
-                        }.help("Pause scheduled turns. Run once remains available.")
+                        // Pause has nothing to stop on a manual bot with no event.
+                        if record.definition.cadence != .manual || record.definition.eventTrigger != nil || record.definition.paused {
+                            Button(record.definition.paused ? "Resume" : "Pause") {
+                                perform { _ = try BotDefinitionStore(dataRoot: root).pause(record.id, paused: !record.definition.paused) }
+                            }.help("Pause scheduled turns. Run once remains available.")
+                        }
                         Button("Edit") { editedBot = record.definition; editing = true }
                         Button("Continue in Chat", systemImage: "arrow.up.right") { Task { await continueInChat(record) } }.disabled(busy)
                     }.buttonStyle(.bordered).controlSize(.small)

@@ -755,7 +755,7 @@ extension SwiftNativeTurnEngine {
         surface: String,
         userMessage: String,
         sessionId: String,
-        historyLimit: Int = 40,
+        historyLimit: Int = 400,
         historyReader: SessionHistoryReader = SessionHistoryReader()
     ) async throws -> TurnContext {
         return try await buildTurnContextWithHistory(

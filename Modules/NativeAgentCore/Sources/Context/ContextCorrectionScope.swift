@@ -1,4 +1,5 @@
 import Foundation
+import PersistenceCore
 
 /// Applicability is not authority. Existing corrections remain global unless
 /// their canonical memory explicitly supplies topics; attention/utility cannot
@@ -146,7 +147,7 @@ public enum ContextCorrectionScope {
         guard let scopingKind = scopingEntityKind(for: atom) else {
             return engineeringTopicsApply(atom, message: message, recentTurns: recentTurns)
         }
-        let topics = atom.entities.filter { $0.kind == scopingKind }.map(\.label)
+        let topics = scopingTopics(atom, kind: scopingKind)
         guard !topics.isEmpty else {
             return engineeringTopicsApply(atom, message: message, recentTurns: recentTurns)
         }
@@ -167,6 +168,37 @@ public enum ContextCorrectionScope {
         // other. Neither is "the message happened to be long".
         if scopingKind == studioEntityKind, isTasteJudgmentTask(message) { return true }
         return mentions(topics, message: message, recentTurns: recentTurns)
+    }
+
+    /// 2026-09-23: a person's name is not a topic. "user"/"agent" appear in
+    /// nearly every turn, so a correction tagged with one was scoped on paper
+    /// and global in practice. Read once per launch; a rename needs a relaunch.
+    static let personNameTopics: Set<String> = {
+        var names: Set<String> = ["user", "claude", "agent"]
+        // Same profile file ChatCompactionDistiller.configuredAgentName reads.
+        let profile = PersistenceCore.defaultDataRoot()
+            .appendingPathComponent("memory/profile.json")
+        if let data = try? Data(contentsOf: profile),
+           let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let agent = object["name"] as? String,
+           !words(agent).isEmpty {
+            names.insert(words(agent).joined(separator: " "))
+        }
+        return names
+    }()
+
+    static func scopingTopics(_ atom: ContextAtomDraft, kind: String) -> [String] {
+        atom.entities
+            .filter { $0.kind == kind && (kind != entityKind || !personNameTopics.contains(words($0.label).joined(separator: " "))) }
+            .map(\.label)
+    }
+
+    /// 2026-09-23: only a correction carrying a real topic rides as mandatory.
+    /// A topic-less one passes `applies` on every turn, so it competes in the
+    /// ranked lane under the per-turn correction cap instead.
+    public static func hasTopics(_ atom: ContextAtomDraft) -> Bool {
+        guard let kind = scopingEntityKind(for: atom) else { return false }
+        return !scopingTopics(atom, kind: kind).isEmpty
     }
 
     /// The fail-open exit, one question later: global unless this atom's own

@@ -291,6 +291,11 @@ struct ToolPillView: View {
             .onKeyPress(.return) { toggleDetails(); return .handled }
             .onKeyPress(.space) { toggleDetails(); return .handled }
             .accessibilityElement(children: .ignore)
+            // Replacing the child AX tree must retain the disclosure's button
+            // semantics and default action, not just its descriptive text.
+            .accessibilityAddTraits(.isButton)
+            .accessibilityAction { toggleDetails() }
+            .accessibilityIdentifier("chat.tool.details")
             .accessibilityLabel([title, target, summary, outcome.rawValue, durationText, "Details"].filter { !$0.isEmpty }.joined(separator: ". "))
             .accessibilityValue(expanded ? "Expanded" : "Collapsed")
 
@@ -333,7 +338,11 @@ struct ToolPillView: View {
                 .padding(10)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .background(Color.secondary.opacity(0.06), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-                .transition(NativeAgentMotion.reveal(anchor: .top))
+                // Keep selectable detail text inside its own layout while the
+                // row grows. Scaling a text-heavy card across the header made
+                // the two layers briefly overlap during expansion/collapse.
+                .clipped()
+                .transition(.opacity)
             }
         }
         .padding(.leading, 24) // indent tool pills from left margin

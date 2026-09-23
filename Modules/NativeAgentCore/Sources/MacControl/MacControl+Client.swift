@@ -9,7 +9,10 @@ import CoreGraphics
 
 public actor SwiftNativeMacControl: MacControlClient {
     let now: @Sendable () -> Date
-    private let notificationCenterAdapter: NotificationCenterAdapter
+    /// Mac banners are posted by the app's one banner exit, which it injects
+    /// here; a client built without one refuses `notify` instead of posting
+    /// around it.
+    private let notificationCenterAdapter: (any NotificationCenterAdapter)?
     let appleScriptAdapter: AppleScriptAdapter
     let processAdapter: ProcessAdapter
     let fileManagerAdapter: FileManagerAdapter
@@ -76,7 +79,7 @@ public actor SwiftNativeMacControl: MacControlClient {
     public init(
         http: any HTTPClient = URLSessionHTTPClient(),
         now: @escaping @Sendable () -> Date = { Date() },
-        notificationCenterAdapter: NotificationCenterAdapter = SystemNotificationCenterAdapter(),
+        notificationCenterAdapter: (any NotificationCenterAdapter)? = nil,
         appleScriptAdapter: AppleScriptAdapter = SystemAppleScriptAdapter(),
         processAdapter: ProcessAdapter = SystemProcessAdapter(),
         fileManagerAdapter: FileManagerAdapter = SystemFileManagerAdapter(),
@@ -981,6 +984,9 @@ public actor SwiftNativeMacControl: MacControlClient {
         let started = now()
         let receipt: NotificationPostReceipt
         do {
+            guard let notificationCenterAdapter else {
+                throw MacControlError.notificationFailed("no Mac notification poster is wired into this client")
+            }
             receipt = try await notificationCenterAdapter.postNotificationReceipt(
                 title: title,
                 message: message,
@@ -999,7 +1005,7 @@ public actor SwiftNativeMacControl: MacControlClient {
         let durationMs = Int(now().timeIntervalSince(started) * 1000)
         let receiptFields: [String: JSONValue] = [
             "submission": .string(receipt.disposition.rawValue),
-            "authorization": .string(receipt.authorization.rawValue),
+            "access": .string(receipt.authorization.rawValue),
             "request_id": receipt.requestIdentifier.map { .string($0) } ?? .null,
             "delivery_observed": .bool(false),
         ]
@@ -1220,11 +1226,13 @@ public func makeMacControl(
     http: any HTTPClient = URLSessionHTTPClient(),
     policyProvider: (any MacControlPolicyProvider)? = nil,
     auditAppendPath: URL? = nil,
-    operationDataRoot: URL? = nil
+    operationDataRoot: URL? = nil,
+    notificationCenterAdapter: (any NotificationCenterAdapter)? = nil
 ) -> any MacControlClient {
     let dataRoot = operationDataRoot ?? auditAppendPath?.deletingLastPathComponent()
     return SwiftNativeMacControl(
         http: http,
+        notificationCenterAdapter: notificationCenterAdapter,
         policyProvider: policyProvider,
         auditAppendPath: auditAppendPath,
         operationStore: dataRoot.map { MacControlOperationStore(dataRoot: $0) }

@@ -536,7 +536,7 @@ enum AgentBridgeCompletionRouter {
     }
   }
 
-  private static func artifacts(
+  static func artifacts(
     deliveryId: String,
     surface: String,
     text: String,
@@ -817,7 +817,8 @@ struct LiveAgentBridgeCompletionSender: AgentBridgeCompletionSending {
       let destination = TelegramDestination(chatId: chatId, threadId: threadId)
       switch artifact.payload {
       case .text(let text):
-        try await TelegramPollLoop.defaultSendMessage(config.botToken, destination, text)
+        try await TelegramPollLoop.defaultSendMessage(
+          config.botToken, destination, TelegramPollLoop.cleanedPlainText(text))
       case .attachment(let attachment):
         guard let path = attachment.path else { throw DeliveryError.emptyCompletion }
         try await TelegramPollLoop.defaultSendPhoto(

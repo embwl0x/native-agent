@@ -449,7 +449,9 @@ extension SchedulerDueJobRunner {
             title: title,
             message: message,
             source: "rem_cycle",
-            severity: "actionable",
+            // 2026-09-22: info — each proposal already arrives as its own
+            // rem.proposal approval; this card is only the cycle's receipt.
+            severity: "info",
             jobId: job.id,
             itemId: itemId,
             relatedPaths: paths

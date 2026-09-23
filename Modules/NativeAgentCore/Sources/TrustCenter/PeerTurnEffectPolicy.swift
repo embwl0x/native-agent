@@ -1,25 +1,93 @@
 import Foundation
 import PersistenceCore
 
-/// WHAT A PEER MAY MAKE HER DO — one classification, two call sites.
-///
-/// User's ruling, 2026-09-15: "anybody that connects gets the WHOLE Agent — her
-/// memories, fluid context, her personality, everything that makes her Agent.
-/// I didn't want to kill off her personality for that bridge." A peer turn is
-/// an ORDINARY session of hers: same context assembly, same memory, same
-/// recall/history/read tools, her full tool set loaded. The fence is for
-/// EFFECTS only, and it is not a refusal — an effect a peer asks for RAISES
-/// THE ORDINARY PERMISSION CARD to the person, the same path a Trust-gated
-/// action takes today, with the peer named as the requester. Her own
-/// behaviour is the safety: she comes to the person and asks.
-///
-/// So this is a denylist by design, not by oversight. An allowlist is the
-/// right shape for a fence around a stranger; it is the wrong shape here,
-/// because anything it forgets is something she loses. What it must catch is
-/// the small, stable set of verbs that CHANGE something — and a verb-token
-/// rule catches tomorrow's tool the day it lands, as long as it is named like
-/// every other tool in this dispatcher.
+/// Peer sessions receive the ordinary full Agent context and tool policy.
+/// The extra peer approval rule protects destructive/unknown execution without
+/// making conversation itself require repeated approval. `isEffect` remains
+/// a general side-effect classifier; it is not the approval predicate.
 public enum PeerTurnEffectPolicy {
+    /// The extra peer-origin approval rule is narrower than the general
+    /// side-effect classifier. A saved connection authorizes conversation;
+    /// merely reading a reply must not turn the next message into a new ask.
+    /// Normal TrustCenter and domain gates still run independently.
+    public static func requiresPeerApproval(
+        _ tool: String,
+        capabilities: [String],
+        externalToolIsEffect: ((String) -> Bool)? = nil,
+        input: [String: JSONValue] = [:],
+        workspaceRoot: URL? = nil,
+        relativeBases: [URL] = []
+    ) -> Bool {
+        let name = normalized(tool)
+        // These dispatchers own their connection, route and executable checks.
+        // A host-backed message may carry a shell capability for its transport;
+        // that does not make its text an arbitrary local shell command.
+        // 2026-09-22: claude/codex/omp_message are NOT exempt — each wakes a
+        // coding agent with local authority, so a peer's ask gets the card.
+        if ["agent_message", "agent_read", "bot_ask"].contains(name) { return false }
+        let destructive: Set<String> = ["destructive", "filesystem_delete", "system_permission_reset"]
+        if !destructive.isDisjoint(with: capabilities) { return true }
+        // Arbitrary code and unknown external effects cannot be established as
+        // non-destructive from a peer's description. Keep their existing ask.
+        if capabilities.contains("shell") || capabilities.contains("process_spawn") { return true }
+        // 2026-09-22: a write outside her workspace (her data root, the
+        // person's files) is the person's call.
+        if capabilities.contains("filesystem_write"), let workspaceRoot,
+           writesOutsideWorkspace(input: input, workspaceRoot: workspaceRoot, relativeBases: relativeBases) {
+            return true
+        }
+        if name.hasPrefix("mcp__") { return externalToolIsEffect?(name) ?? true }
+        return externalToolIsEffect?(tool) ?? false
+    }
+
+    /// Every target path, resolved the way the file tools will: a relative
+    /// path against the workspace AND every other base a write may use (Full
+    /// Mac file ops resolve against the source repo), `~` expanded, symlinks
+    /// resolved. A `..` component is not resolved confidently, so it counts
+    /// as outside. `content` is skipped so a file body starting with "/" is
+    /// not mistaken for a target.
+    static func writesOutsideWorkspace(input: [String: JSONValue], workspaceRoot: URL,
+                                       relativeBases: [URL]) -> Bool {
+        let fields = input.filter { $0.key != "content" }
+        var targets = SwiftNativeSecurityCenter.pathLikeStrings(in: .object(fields))
+        for key in ["source", "destination", "dest", "src", "to", "from"] {
+            if case .string(let value)? = fields[key] { targets.append(value) }
+        }
+        for raw in targets {
+            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.isEmpty { continue }
+            if trimmed.split(separator: "/").contains("..") { return true }
+            let expanded = HomePath.expand(trimmed)
+            let candidates = expanded.hasPrefix("/")
+                ? [URL(fileURLWithPath: expanded)]
+                : ([workspaceRoot] + relativeBases).map { $0.appendingPathComponent(expanded) }
+            if candidates.contains(where: { candidate in
+                guard let resolved = resolvedWriteTarget(candidate) else { return true }
+                return !SwiftNativeSecurityCenter.isSelfOrAncestor(root: workspaceRoot, of: resolved)
+            }) { return true }
+        }
+        return false
+    }
+
+    /// The real location a write would land: the deepest existing ancestor
+    /// through realpath (so a symlinked directory counts where it points),
+    /// plus the not-yet-created remainder. Nil when that cannot be proven —
+    /// e.g. a dangling symlink — which the caller treats as outside.
+    static func resolvedWriteTarget(_ url: URL) -> URL? {
+        var existing = url.standardizedFileURL
+        var tail: [String] = []
+        while (try? FileManager.default.attributesOfItem(atPath: existing.path)) == nil {
+            guard existing.path != "/" else { return nil }
+            tail.insert(existing.lastPathComponent, at: 0)
+            existing.deleteLastPathComponent()
+        }
+        guard let real = realpath(existing.path, nil) else { return nil }
+        defer { free(real) }
+        var resolved = URL(fileURLWithPath: String(cString: real))
+        for part in tail { resolved.appendPathComponent(part) }
+        return resolved
+    }
+
     /// Effect tools whose NAME does not carry an effect verb, so the token
     /// rule below cannot see them. Durable writes to her own mind, to the
     /// person's configuration, and to the outside world.
@@ -160,7 +228,7 @@ public enum PeerTurnEffectPolicy {
         let who = requester.trimmingCharacters(in: .whitespacesAndNewlines)
         let name = who.isEmpty ? "another agent" : who
         return "\(name) asked for this on the agent bridge, not you. "
-            + "\(tool) changes something, so it waits for you."
+            + "\(tool) may perform a destructive action, so it waits for you."
     }
 
     /// Agent's ruling, 2026-09-15: her OWN memory notes stay allowed on a peer

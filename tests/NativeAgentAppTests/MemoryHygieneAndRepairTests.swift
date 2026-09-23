@@ -1,11 +1,8 @@
 // U3 review blockers (gpt-5.5, 2026-06-10) — approval-gated memory hygiene
 // + memory.repair crash-window reconciliation.
 //
-//   1. The weekly memory_consolidation tick must NOT consolidate (store
-//      mutation, plan law: approval-gated). It stages exactly ONE
-//      self_improvement.apply card with op run_memory_hygiene, idempotent
-//      while one is pending. The direct-consolidate path is reachable only
-//      behind the explicit approvedDirectRun parameter.
+//   1. The direct-consolidate path is reachable only behind the explicit
+//      approvedDirectRun parameter.
 //   2. resolveApproval persists the approval terminal BEFORE the executor
 //      runs; a crash in that window left an approved repair that never
 //      applied and never re-staged. The on-launch reconciliation
@@ -58,63 +55,7 @@ private func legacyNoteLines(root: URL) throws -> [String] {
         .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
 }
 
-private func pendingHygieneCards(root: URL) async throws -> [ApprovalRecord] {
-    let inbox = SwiftNativeApprovalInbox(root: root)
-    let pending = try await inbox.list(
-        filter: ApprovalFilter(status: "pending", action: "self_improvement.apply"))
-    return pending.filter { rec in
-        guard case .object(let obj) = rec.payload,
-              case .object(let apply)? = obj["apply"],
-              case .string(let op)? = apply["op"] else { return false }
-        return op == "run_memory_hygiene"
-    }
-}
-
-// MARK: - 1. weekly hygiene tick stages, never consolidates
-
-@Test
-func weeklyHygieneTick_stagesExactlyOneCard_andNeverConsolidates() async throws {
-    let root = try makeMemTempRoot()
-    defer { try? FileManager.default.removeItem(at: root) }
-    let runner = MemoryConsolidationHygieneRunner(dataRoot: root)
-
-    // Many ticks while the card is pending → exactly ONE staged card.
-    await runner.tick()
-    await runner.tick()
-    await runner.tick()
-    let cards = try await pendingHygieneCards(root: root)
-    #expect(cards.count == 1)
-    let card = try #require(cards.first)
-    #expect(card.action == "self_improvement.apply")
-    #expect(card.title == "Weekly memory hygiene is due")
-    // The inbox actor recomputes payloadPreview from the payload itself —
-    // assert the executable op rides in the payload, where the
-    // applyApprovedSelfImprovement executor reads it.
-    #expect(card.payloadPreview.contains("run_memory_hygiene"))
-
-    // The tick must not have consolidated: no hygiene_last_run.json, no
-    // memory store minted as a side effect of the tick.
-    let lastRun = MemoryConsolidationHygiene.lastRunPath(dataRoot: root)
-    #expect(!FileManager.default.fileExists(atPath: lastRun.path))
-}
-
-@Test
-func weeklyHygieneTick_restagesAfterCardLeavesPending() async throws {
-    let root = try makeMemTempRoot()
-    defer { try? FileManager.default.removeItem(at: root) }
-    let runner = MemoryConsolidationHygieneRunner(dataRoot: root)
-    await runner.tick()
-    let first = try #require(try await pendingHygieneCards(root: root).first)
-
-    // Deny it (weekly skip) — the NEXT weekly tick may legitimately stage a
-    // fresh card; the dedupe is strictly "while one is pending".
-    let inbox = SwiftNativeApprovalInbox(root: root)
-    _ = try await inbox.resolve(first.id, decision: .denied, decidedBy: "test")
-    await runner.tick()
-    let cards = try await pendingHygieneCards(root: root)
-    #expect(cards.count == 1)
-    #expect(cards.first?.id != first.id)
-}
+// MARK: - 1. direct hygiene run
 
 @Test
 func directHygieneRun_requiresTheExplicitApprovalParameter() async throws {
@@ -133,28 +74,6 @@ func directHygieneRun_requiresTheExplicitApprovalParameter() async throws {
 }
 
 // MARK: - 1b. KG orphan sweep rides the hygiene cadence (2026-07-21 audit)
-
-@Test
-func weeklyHygieneTick_cardCarriesKGOrphanPreviewCounts() async throws {
-    let root = try makeMemTempRoot()
-    defer { try? FileManager.default.removeItem(at: root) }
-    // Mint the store FIRST: the read-only preview must never create
-    // memory/memory.sqlite as a tick side effect (the no-mint case is
-    // covered by weeklyHygieneTick_stagesExactlyOneCard_andNeverConsolidates).
-    let storage = try MemoryStorage(dataRoot: root)
-    _ = try await storage.insertMemory(StoredMemory(content: "NativeAgent ships tonight."))
-
-    let runner = MemoryConsolidationHygieneRunner(dataRoot: root)
-    await runner.tick()
-    let card = try #require(try await pendingHygieneCards(root: root).first)
-    guard case .object(let payload) = card.payload,
-          case .string(let proposed)? = payload["proposedChange"] else {
-        Issue.record("staged hygiene card missing proposedChange")
-        return
-    }
-    #expect(proposed.contains("KG sweep preview on approval: 0 orphan entities"),
-            "dry-run orphan counts must ride the staged card: \(proposed)")
-}
 
 @Test
 func approvedHygieneRun_sweepsKGOrphanEntities() async throws {

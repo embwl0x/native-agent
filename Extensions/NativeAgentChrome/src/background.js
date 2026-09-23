@@ -49,7 +49,14 @@ chrome.runtime.onMessage.addListener((message, sender) => {
 });
 
 chrome.tabs.onActivated.addListener(({ tabId }) => {
+  // Initial activation of a newly created standalone window precedes its
+  // lease. Do not queue that creation event to revoke a future lease.
+  if (!leaseManager.restoring && !leaseManager.leaseForTab(tabId)) return;
   void leaseManager.yieldForTab(tabId, "tab_activated").catch(() => {});
+});
+
+chrome.windows.onFocusChanged.addListener((windowId) => {
+  leaseManager.windowFocused(windowId);
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
@@ -99,6 +106,9 @@ async function handleNativeMessage(rawRequest, port) {
 }
 
 async function dispatch(request) {
+  if (request.action === "lease.renew" || request.action === "navigate" || request.action.startsWith("page.")) {
+    await leaseManager.verifyRenderingWindow(request.payload.leaseId);
+  }
   switch (request.action) {
     case "attach":
       return {
@@ -167,7 +177,8 @@ async function navigateLeasedTab(payload, actionId) {
       await leaseManager.yieldForTab(lease.tabId, "tab_activated_during_navigation");
       throw new ProtocolError("focus_invariant_failed", "Navigation unexpectedly activated the leased tab.");
     }
-    await waitForTabComplete(lease.tabId, 30_000, requireCurrentNavigation);
+    // 2026-09-22: under the app's 30s request timeout so the result arrives.
+    await waitForTabComplete(lease.tabId, 25_000, requireCurrentNavigation);
     const tab = await chrome.tabs.get(lease.tabId);
     requireCurrentNavigation();
     if (tab.active === true && lease.originalTab.active !== true) {
@@ -225,8 +236,9 @@ function requireCurrentSnapshotCapture(lease, capture) {
 }
 
 async function readStructuredSnapshotForCapture(payload, lease, capture) {
-  const maxNodes = payload.maxNodes ?? 500;
-  const maxTextChars = payload.maxTextChars ?? 50_000;
+  // 2026-09-22: was 500 / 50,000; a quarter of snapshots overran the 48KB tool-result cap.
+  const maxNodes = payload.maxNodes ?? 120;
+  const maxTextChars = payload.maxTextChars ?? 12_000;
   const discovered = await chrome.webNavigation.getAllFrames({ tabId: lease.tabId });
   requireCurrentSnapshotCapture(lease, capture);
   const ordered = [...(discovered ?? [])].sort((left, right) => {
@@ -263,7 +275,11 @@ async function readStructuredSnapshotForCapture(payload, lease, capture) {
         userSequence: lease.userSequence,
         maxNodes: remainingNodes,
         maxTextChars: Math.max(1, remainingText),
+        scope: payload.scope ?? "page",
       }, { frameId: frame.frameId });
+      if (payload.scope === "main_content" && local.reading?.scope !== "main_content") {
+        throw new ProtocolError("snapshot_scope_unsupported", "This page has an older reader. Reload the page before requesting semantic main content.");
+      }
     } catch (error) {
       requireCurrentSnapshotCapture(lease, capture);
       frames.push({
@@ -296,6 +312,9 @@ async function readStructuredSnapshotForCapture(payload, lease, capture) {
   }
 
   if (!topSnapshot) {
+    if (frames.some((frame) => frame.frameId === 0 && frame.error?.code === "snapshot_scope_unsupported")) {
+      throw new ProtocolError("snapshot_scope_unsupported", "This page has an older reader. Reload the page before requesting semantic main content.");
+    }
     throw new ProtocolError("top_frame_unavailable", "The structured page agent is unavailable in the top frame.");
   }
   const snapshotId = crypto.randomUUID();
@@ -337,6 +356,10 @@ async function readStructuredSnapshotForCapture(payload, lease, capture) {
   const result = boundSnapshotForTransport({
     ...topPage,
     snapshotId,
+    reading: {
+      scope: payload.scope ?? "page",
+      mainContentAvailable: localSnapshots.some(({ local }) => local.reading?.mainContentAvailable === true),
+    },
     nodes,
     frames,
     summary: {

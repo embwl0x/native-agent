@@ -618,7 +618,10 @@ extension SwiftNativeMCPDispatcher {
             guard !query.isEmpty else {
                 throw MCPSubprocessError.malformedResponse("searxng search requires query")
             }
-            let response = try await client.search(query: query)
+            let categories = Self.stringArgument(arguments, key: "categories")
+            let timeRange = Self.stringArgument(arguments, key: "time_range")
+            let response = try await client.search(query: query, categories: categories.isEmpty ? nil : categories,
+                                                   timeRange: timeRange.isEmpty ? nil : timeRange)
             return Self.okMCPResult(response.toJSON())
         case "fetch":
             let url = Self.stringArgument(arguments, key: "url")

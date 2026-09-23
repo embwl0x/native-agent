@@ -165,7 +165,7 @@ func toolContract_floorIsSortedByNameAndNeverTruncated() {
         == floorNames)
     // The bounded catalog cap belongs to the appended run alone.
     let appendedRows = sections.appended.split(separator: "\n").map(String.init)
-    #expect(appendedRows.first == "Also loaded this session:")
+    #expect(appendedRows.first == "Also loaded this session (callable now with the same markers):")
     #expect(appendedRows.contains { $0.contains("40 more tools not listed") })
 }
 
@@ -335,7 +335,7 @@ func toolContract_v1LayoutPutsTheAppendedCatalogInStableSuffixAndReassembles() {
     #expect(out.stable.hasPrefix("PERSONA\n\n"))
     #expect(out.stable.contains("Available Swift tools:"))
     #expect(!out.stable.contains("Also loaded this session:"))
-    #expect(out.stableSuffix.hasPrefix("Also loaded this session:"))
+    #expect(out.stableSuffix.hasPrefix("Also loaded this session (callable now with the same markers):"))
     #expect(out.stableSuffix.contains(lazyA))
     #expect(out.dynamic == "RECALL")
     // The split is a caching hint, never a content change.
@@ -424,7 +424,7 @@ func toolContract_v2DeliversTheAppendedCatalogInTheVolatileBlockAfterTheCapsule(
     #expect(block.contains(lazyA))
     // Its own trailing section, after the capsule — not spliced into it.
     #expect(block.range(of: capsule)!.upperBound
-        <= block.range(of: "Also loaded this session:")!.lowerBound)
+        <= block.range(of: "Also loaded this session (callable now with the same markers):")!.lowerBound)
     #expect(seed.context.systemSegments?.stableSuffix.isEmpty == true)
     #expect(seed.textToolCatalogRidesVolatileBlock)
 
@@ -492,7 +492,7 @@ func toolContract_v1LegacyLayoutIsByteIdenticalUnderEveryBinding() {
     let unbound = layout()
     let v1 = ConversationPrefixShape.$override.withValue(.v1Legacy) { layout() }
     #expect(v1 == unbound)
-    #expect(v1.contains("Also loaded this session:"))
+    #expect(v1.contains("Also loaded this session (callable now with the same markers):"))
     // And the no-segments fallback arm renders the same bytes it always did.
     #expect(
         ConversationPrefixShape.$override.withValue(.v1Legacy) {

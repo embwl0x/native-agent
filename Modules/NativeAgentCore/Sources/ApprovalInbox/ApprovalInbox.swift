@@ -1117,12 +1117,11 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
                 )
             }
             // Telegram is bound to the card's own chat and user. A signed-iOS
-            // decision used to carry no binding at all — any paired client
-            // could approve ANY pending card, including a `mac_shell` a PEER
-            // raised on the agent bridge. Pairing is one shared secret with no
-            // per-client registry, so the client id proves only "some paired
-            // device", never WHICH; the binding that is available is the
-            // card's own origin surface.
+            // decision is verified against its per-device signing key and
+            // paired-device registry by MacSyncActionRouter before dispatch.
+            // This additional check binds the decision to the card's origin:
+            // even a verified phone must not approve a `mac_shell` a peer
+            // raised on the agent bridge.
             //
             // The phone speaks for the person's own surfaces (the Mac window,
             // the desk, a scheduled run) and for the iOS family itself. It does

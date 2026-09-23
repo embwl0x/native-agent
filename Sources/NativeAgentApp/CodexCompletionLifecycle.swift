@@ -51,6 +51,7 @@ struct CodexCompletionLifecycle: Sendable {
     }
 
     private enum CompletionPhase: String, Codable, Sendable {
+        case notStarted = "not_started"
         case claimed
         case responseCached = "response_cached"
         case outcomeUnknown = "outcome_unknown"
@@ -186,6 +187,13 @@ struct CodexCompletionLifecycle: Sendable {
                let sessionId,
                storedSession != sessionId { return .conflict }
             switch state.phase {
+            case .notStarted:
+                state.phase = .claimed
+                state.ownerInstanceId = ownerInstanceId
+                state.detail = nil
+                state.updatedAt = Self.nowISO()
+                try await write(state, to: path)
+                return .start
             case .responseCached:
                 guard let response = state.response else { throw LifecycleError.corruptReceipt }
                 return .cached(response)
@@ -212,6 +220,22 @@ struct CodexCompletionLifecycle: Sendable {
                 try await write(state, to: path)
                 return .outcomeUnknown
             }
+        }
+    }
+
+    /// Only admission rejection before the model closure runs can release a
+    /// claim for retry. A started or uncertain turn must never use this edge.
+    func markNotStarted(deliveryId: String, requestDigest: String) async throws {
+        let path = stateURL(deliveryId)
+        try await persistence.withFileLock(path) {
+            guard var state = try await loadState(path) else { throw LifecycleError.claimMissing }
+            try Self.requireDigest(state, requestDigest)
+            guard state.phase == .claimed, state.ownerInstanceId == ownerInstanceId,
+                  state.response == nil, state.artifacts.isEmpty else { throw LifecycleError.requestConflict }
+            state.phase = .notStarted
+            state.detail = "bridge_admission_full_before_model_start"
+            state.updatedAt = Self.nowISO()
+            try await write(state, to: path)
         }
     }
 

@@ -95,7 +95,7 @@ final class PairedPhoneStore: ObservableObject {
         var errorDescription: String? {
             switch self {
             case .unavailable: "I couldn’t read the paired phones. I haven’t accepted this decision."
-            case .notPaired: "This phone isn’t paired. Open Connectors → iPhone on this Mac to pair it."
+            case .notPaired: "This phone isn’t paired. Open Settings → Pair iPhone / iPad on this Mac to pair it."
             }
         }
     }

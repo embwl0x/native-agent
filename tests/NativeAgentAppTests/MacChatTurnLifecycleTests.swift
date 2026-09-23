@@ -208,7 +208,7 @@ struct MacChatTurnLifecycleTests {
             transcriptProof: .absent,
             observedSignal: .ambiguousTermination
         ) == .outcomeUnknown(
-            reason: "The turn stopped without a provable cancellation receipt."
+            reason: "I'm not sure that finished \u{2014} if my answer isn't here, say it again and I'll pick it up."
         ))
         // Ambiguity survives a consumer-side stop: it still cannot be upgraded
         // into a confirmed cancellation.
@@ -225,13 +225,13 @@ struct MacChatTurnLifecycleTests {
             observedSignal: .none
         )
         #expect(finalWithoutProof == .outcomeUnknown(
-            reason: "The turn ended without a provable terminal outcome."
+            reason: "I'm not sure that finished \u{2014} if my answer isn't here, say it again and I'll pick it up."
         ))
         #expect(noSignal == finalWithoutProof)
         #expect(MacChatTurnLifecycleTerminalResolver.resolve(
             transcriptProof: .unavailable,
             observedSignal: typedFailure
-        ) == .outcomeUnknown(reason: "Canonical turn evidence could not be read safely."))
+        ) == .outcomeUnknown(reason: "I'm not sure that finished \u{2014} if my answer isn't here, say it again and I'll pick it up."))
         #expect(MacChatTurnLifecycleTerminalResolver.signalAfterConsumerCancellation(
             typedFailure
         ) == typedFailure)

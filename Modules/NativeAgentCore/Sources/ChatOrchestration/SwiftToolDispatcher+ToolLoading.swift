@@ -17,6 +17,18 @@ import WorkshopExecution
 
 extension SwiftToolDispatcher {
     func impl_tool_catalog(input: [String: JSONValue], surface: String = "chat") async throws -> JSONValue {
+        if input["load"] == .bool(true) {
+            let result = try await impl_tool_catalog(input: ToolCatalogSelection.searchInput(input), surface: surface)
+            let selected = ToolCatalogSelection.selectedName(in: result)
+            let loading: JSONValue?
+            if let selected {
+                loading = try await impl_tool_load(input: [
+                    "session_id": .string(Self.extractSessionId(from: input)),
+                    "names": .array([.string(selected)]),
+                ], surface: surface)
+            } else { loading = nil }
+            return ToolCatalogSelection.finish(result, selected: selected, loading: loading)
+        }
         let selection = Self.catalogCategorySelection(input["category"])
         if let error = selection.error { return error }
         let group = selection.category.flatMap { ToolPreloadHeuristics.loadGroup(forCategory: $0) }
@@ -376,7 +388,7 @@ extension SwiftToolDispatcher {
                 ("mail", "Mail sending", Set(["mail_send", "mail_reply"]), has("mail", "email")),
                 ("messages", "Messages sending", Set(["messages_send"]), has("message", "messages", "imessage")),
             ] where requested && inCategory(names) {
-                if await !macIntegrationPermissionStore.allows(integration, mode: .write) {
+                if await !macIntegrationPermissionStore.allows(integration, mode: .write, fullMacAdmitted: access.fullMacActive) {
                     reasons.append("\(label) is off in Mac Integration permissions.")
                 }
             }
@@ -721,6 +733,7 @@ extension SwiftToolDispatcher {
     private static func catalogSearchTokenMatches(_ token: String, _ needle: String) -> Bool {
         if token == needle { return true }
         func singular(_ word: String) -> String {
+            if word == "news" || word.hasSuffix("ss") || word.hasSuffix("us") { return word }
             if word.count > 4, word.hasSuffix("ies") { return String(word.dropLast(3)) + "y" }
             if word.count > 3, word.hasSuffix("es") { return String(word.dropLast(2)) }
             if word.count > 3, word.hasSuffix("s") { return String(word.dropLast()) }
@@ -765,6 +778,8 @@ extension SwiftToolDispatcher {
         score > 0 && score * 4 >= bestScore * 3
     }
 
+    private static let catalogMetaToolNames: Set<String> = ["tool_catalog", "list_tools", "tool_load", "tool_unload"]
+
     /// One tool's relevance to a query. Scaled by 100 so a description's
     /// per-token weight stays an integer.
     ///
@@ -791,7 +806,15 @@ extension SwiftToolDispatcher {
             let identifierCharacters = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "_.-"))
             let identifiers = query.lowercased().components(separatedBy: identifierCharacters.inverted)
                 .map { $0.trimmingCharacters(in: CharacterSet(charactersIn: ".")) }
-            if identifiers.contains(lowerName) { return 1_000_000 }
+            // A bare word ("read", "go", "wait") only selects its tool when it
+            // is the whole query; otherwise "read my email" picks `read`.
+            let named = identifiers.contains(lowerName)
+            if named, lowerName.contains("_") || lowerName.contains(".")
+                || query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == lowerName {
+                return 1_000_000
+            }
+            // Catalog plumbing is never an answer unless asked for by name.
+            if !named, catalogMetaToolNames.contains(lowerName) { return 0 }
         }
         let nameTokens = catalogSearchTokens(name)
         let descriptionTokens = catalogSearchTokens(description)
@@ -801,12 +824,22 @@ extension SwiftToolDispatcher {
         // does; later text can supply subject evidence, not its action bonus.
         let purpose = description.components(separatedBy: ". ").first ?? description
         let purposeTokens = catalogSearchTokens(purpose)
+        // A query word that is one of this tool's category aliases ("text"
+        // → messages, "email" → mail, "news" → research) says what the tool
+        // is FOR: purpose subject evidence plus a lift. It still cannot make
+        // a match on its own — that stays the tool's own words or verb.
+        let aliases = ToolPreloadHeuristics.aliases(ofGroups: groups)
+        func namesCategory(_ needle: String) -> Bool {
+            aliases.contains { catalogSearchTokenMatches($0, needle) }
+        }
         let subjects = needles.filter { catalogActionFamily(for: $0) == nil }
         let subjectHits = subjects.filter { subject in
-            (nameTokens + descriptionTokens).contains { catalogSearchTokenMatches($0, subject) }
+            namesCategory(subject)
+                || (nameTokens + descriptionTokens).contains { catalogSearchTokenMatches($0, subject) }
         }.count
         let purposeSubjectHits = subjects.filter { subject in
-            (nameTokens + purposeTokens).contains { catalogSearchTokenMatches($0, subject) }
+            namesCategory(subject)
+                || (nameTokens + purposeTokens).contains { catalogSearchTokenMatches($0, subject) }
         }.count
         // A matching verb alone is not evidence of the requested subject:
         // searching Slack does not make it a match for searching local files.
@@ -837,6 +870,7 @@ extension SwiftToolDispatcher {
             if groupTokens.contains(where: { catalogSearchTokenMatches($0, needle) }) {
                 groupCredit += 100
             }
+            if namesCategory(needle) { groupCredit += 500 }
             // DOING the thing asked for beats sharing a noun with it. Both
             // weights sit above the 400 a plain name-token hit earns, so
             // `rewrite_memory` ("Replace one memory's text") clears
@@ -874,6 +908,11 @@ extension SwiftToolDispatcher {
             : (5_000 * purposeSubjectHits + 1_000 * subjectHits) / subjects.count
         // Reserve the upper tier for exact identifiers, irrespective of the
         // amount of surrounding descriptive language in an unusual query.
-        return min(100_000, total + groupCredit + subjectCoverage + (hasPurposeAction ? 2_000 : 0))
+        let mutatingVerbs = ["send", "create", "delete", "mark", "update", "write"]
+        let readIntent = needles.contains { ["read", "check", "show", "see", "list"].contains($0) }
+            && !needles.contains { mutatingVerbs.contains($0) }
+        let mutatingName = lowerName.split(separator: "_").contains { mutatingVerbs.contains(String($0)) }
+        return min(100_000, max(0, total + groupCredit + subjectCoverage
+            + (hasPurposeAction ? 2_000 : 0) - (readIntent && mutatingName ? 6_000 : 0)))
     }
 }

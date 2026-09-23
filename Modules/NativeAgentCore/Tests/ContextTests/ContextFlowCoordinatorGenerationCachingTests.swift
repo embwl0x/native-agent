@@ -13,7 +13,9 @@ extension ContextFlowCoordinatorTests {
             kind: .correction,
             body: "A cached eligibility walk must retain this explicit correction.",
             authority: .explicitCorrection,
-            policy: .adaptive
+            policy: .adaptive,
+            // 2026-09-23: only a topic-matched correction is mandatory.
+            topics: ["correction"]
         )
         let fixture = try await makeFixture(
             mode: .active,

@@ -135,7 +135,6 @@ extension AppDelegate {
         // main window, so background work (dream cycle, consolidation,
         // proactive triggers) keeps running.
         NSApp.setActivationPolicy(.regular)
-        NativeAgentNotifications.requestAuthorization()
 
         // Speech consent belongs to a voice action. Only reconcile an existing
         // grant here, including changes made in System Settings between launches.
@@ -282,6 +281,7 @@ extension AppDelegate {
             // as fresh resident physiology.
             await GitHubCommandRuntime.shared.replayResidentStateAtLaunch()
             let loops = BackgroundLoopsAssembly.assembleAllLoops()
+            await installBotProviderCheck()
             await BackgroundLoopsManager.shared.start(loops: loops)
             // CRASH RECONCILIATION for the Workshop→memory lane (gpt-5.5
             // review BLOCKING 1, 2026-08-02). Execution-memory writes are handed
@@ -502,10 +502,10 @@ extension AppDelegate {
         // PATCH-2026-05-07: app-owned runtime Auto-register for login start so
         // the menu-bar app is always there. Idempotent — calling register()
         // when already enabled is a no-op.
-        if ProcessInfo.processInfo.environment["NATIVE_AGENT_SKIP_LOGIN_ITEM_REGISTER"] != "1" {
-            Task.detached(priority: .background) {
-                await AppDelegate.registerLoginItemIfNeeded()
-            }
+        // 2026-09-22: a first run registers from finishSuccessfulOnboarding
+        // instead, so a new user is not added to login items before setup.
+        if NativeAgentPublicSafety.hasCompletedOnboarding(dataRoot: NativeAgentPaths.dataRoot) {
+            AppDelegate.registerLoginItemInBackground()
         }
 
     }
@@ -592,7 +592,7 @@ extension AppDelegate {
         }
         group.enter()
         Task.detached {
-            await BackgroundLoopsManager.shared.stop()
+            await BackgroundLoopsManager.shared.shutdown()
             group.leave()
         }
         // Workshop execution memories are written OFF the terminal path by a
@@ -616,6 +616,11 @@ extension AppDelegate {
         group.enter()
         Task.detached {
             await SwiftNativeMCPDispatcher.stopAllSharedPools()
+            group.leave()
+        }
+        group.enter()
+        Task.detached {
+            await SwiftToolDispatcher.closeACPConnections()
             group.leave()
         }
         group.enter()

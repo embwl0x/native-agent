@@ -423,6 +423,7 @@ extension SwiftToolDispatcher {
             response["replyWith"] = .string("codex_message")
         }
         response["notification"] = await postCodexMessageArrivalNotification(
+            surface: surface,
             messageId: messageId,
             text: text,
             priority: priority,
@@ -553,6 +554,7 @@ extension SwiftToolDispatcher {
     }
 
     private func postCodexMessageArrivalNotification(
+        surface: String,
         messageId: String,
         text: String,
         priority: String,
@@ -562,7 +564,8 @@ extension SwiftToolDispatcher {
         if let codexMessageNotificationPermissionOverride {
             allowed = codexMessageNotificationPermissionOverride
         } else {
-            allowed = await MacIntegrationPermissionStore.shared.allows(MacIntegrationID.notifyMac, mode: .write)
+            let admitted = await fullMacYoloAdmitted(tool: "mac_notify", surface: surface)
+            allowed = await macIntegrationPermissionStore.allows(MacIntegrationID.notifyMac, mode: .write, fullMacAdmitted: admitted)
         }
         guard allowed else {
             return .object([

@@ -958,15 +958,6 @@ final class iCloudBridge: ObservableObject {
         return message.verifySignature(secret: refreshed)
     }
 
-    /// 2026-09-06: the Mac's currently published pairing material, read without
-    /// applying it. A build whose Mac has no KVS entitlement publishes pairing
-    /// only through this transport, so without this a manually pasted recovery
-    /// key had nothing to verify against and Re-pair could strand the phone.
-    func publishedPairingSecretFromTransport() async -> Data? {
-        guard let ck = deviceTransport else { return nil }
-        return await ck.peekPairingSecret()
-    }
-
     /// CK-3c: drain the CloudKit transport (incoming + pairing + status) if it is
     /// active; no-op when nil (flag-off). Called from the APNs silent-push
     /// handler. Single-flight — overlapping pushes/re-drains coalesce into at

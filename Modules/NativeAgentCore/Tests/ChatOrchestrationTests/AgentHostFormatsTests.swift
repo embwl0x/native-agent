@@ -16,6 +16,9 @@ import Yams
     }
 
     static let fixtures: [(String, String)] = [
+        ("Antigravity CLI", """
+        {"mcpServers":{"existing":{"command":"node","args":["server.js"],"env":{"EXAMPLE":"fixture"}}},"future":{"preserve":true}}
+        """),
         ("Claude Desktop", """
         {
           "preferences": {"quickEntryShortcut": "off", "futureOption": [1, true]},
@@ -237,7 +240,7 @@ import Yams
 
     @Test func documentedCommandArgumentsKeepMessagesLiteral() throws {
         let text = "--help ; $(touch nope)\nsecond line"
-        for id in ["claude-code", "codex"] {
+        for id in ["claude-code", "codex", "antigravity-cli"] {
             let line = try #require(AgentHostCommandLines.byHostID[id])
             let args = line.argv(message: text, session: nil, resuming: false, replyFilePath: nil)
             #expect(args.last == text || args.last?.hasSuffix("=" + text) == true)

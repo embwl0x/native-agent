@@ -1151,7 +1151,7 @@ private struct SimplicityFixture: View {
                 VStack(alignment: .leading, spacing: 12) {
                     Text("Sign in with your account").font(NativeAgentFont.section)
                     Button("Sign in with ChatGPT") {}
-                    Button("Sign in with Anthropic") {}
+                    Button("Sign in with Claude") {}
                     Button("Sign in with xAI") {}
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)

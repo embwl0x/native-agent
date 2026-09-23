@@ -94,7 +94,7 @@ struct ActivityEventsEvictionTests {
             bytes < JSONLLineCaps.activityTrimTriggerBytes,
             "the feed reached the \(JSONLLineCaps.activityTrimTriggerBytes)-byte trigger (\(bytes)) — this test no longer proves the LINE cap fired"
         )
-        #expect(try lineCount(feed) == cap)
+        #expect(try lineCount(feed) == JSONLLineCaps.activityTrimTargetLines)
 
         // The eviction is FIFO: the newest rows survive, the oldest are gone.
         let text = try String(contentsOf: feed, encoding: .utf8)
@@ -105,7 +105,7 @@ struct ActivityEventsEvictionTests {
                   case .int(let n)? = obj["seq"] else { return nil }
             return n
         }
-        #expect(rows.first.flatMap(seq) == 1)
+        #expect(rows.first.flatMap(seq) == Int64(cap + 1 - JSONLLineCaps.activityTrimTargetLines))
         #expect(rows.last.flatMap(seq) == Int64(cap))
     }
 
@@ -167,7 +167,7 @@ struct ActivityEventsEvictionTests {
             )
         }
         let lines = try lineCount(feed)
-        #expect(lines >= cap)
+        #expect(lines >= JSONLLineCaps.activityTrimTargetLines)
         #expect(
             lines <= cap + stride,
             "overshoot \(lines - cap) lines exceeds the \(stride)-append stride"
@@ -189,7 +189,7 @@ struct ActivityEventsEvictionTests {
             using: SwiftNativePersistenceCore(),
             logLabel: "F8Test"
         )
-        #expect(try lineCount(feed) == JSONLLineCaps.activityEvents)
+        #expect(try lineCount(feed) == JSONLLineCaps.activityTrimTargetLines)
     }
 
     @Test

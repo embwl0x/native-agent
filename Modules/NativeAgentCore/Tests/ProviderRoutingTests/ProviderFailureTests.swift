@@ -89,7 +89,7 @@ import Testing
                 #expect(ProviderRecoveryPolicy.personMessage(error) == ProviderFailure.rateLimited(retryAfter: 37).errorDescription)
             }
         }
-        #expect(ProviderFailure.wire("HTTP 403: usage limit for this billing cycle") == .rateLimited(retryAfter: nil))
+        #expect(ProviderFailure.wire("HTTP 403: usage limit for this billing cycle") == .rateLimited(retryAfter: 3600))
         #expect(ProviderFailure.http(status: 401, detail: "usage limit") == .authExpired)
         #expect(ProviderFailure.http(status: 503, detail: "usage limit") == .overloaded)
     }
@@ -108,7 +108,7 @@ import Testing
     @Test func stringErrorFieldsPreserveContextAndQuotaClassification() {
         for (body, expected) in [
             (#"{"error":"context_length_exceeded"}"#, ProviderFailure.contextTooLong),
-            (#"{"error":"insufficient_quota"}"#, .rateLimited(retryAfter: nil)),
+            (#"{"error":"insufficient_quota"}"#, .rateLimited(retryAfter: 3600)),
             (#"{"error":"invalid request"}"#, .refused),
         ] {
             do {

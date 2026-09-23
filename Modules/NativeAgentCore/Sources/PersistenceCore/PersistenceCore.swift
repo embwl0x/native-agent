@@ -493,6 +493,16 @@ public final class SwiftNativePersistenceCore: PersistenceCoreProtocol {
         return parts
     }
 
+    /// Synchronous append of caller-serialized, newline-terminated lines, for a
+    /// writer that must keep its bytes exact or cannot await. The same
+    /// chokepoint as `appendJSONL` (torn-line repair, O_APPEND, 0600 create);
+    /// the caller holds the feed's lock when it has more than one writer.
+    public static func appendLines(_ data: Data, to path: URL) throws {
+        try FileManager.default.createDirectory(
+            at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try appendBytes(data, to: path)
+    }
+
     /// Append bytes to a file, creating it if absent. Uses POSIX open(O_APPEND)
     /// so concurrent appenders interleave at line boundaries.
     /// `durable: true` adds an `F_FULLFSYNC` before the descriptor closes —

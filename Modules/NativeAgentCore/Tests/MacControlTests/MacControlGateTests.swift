@@ -443,3 +443,28 @@ struct BridgeRequiredTests {
         )
     }
 }
+
+
+@Suite("MacControl admitted Full Mac projection")
+struct AdmittedFullMacPolicyTests {
+    @Test(arguments: [false, true])
+    func legacySwitchesOnlyYieldToAdmittedOperator(admitted: Bool) {
+        var saved = MacControlPolicy.default
+        saved.trustPolicy = MacControlTrustPolicy(permissionLevel: "full_mac_os")
+        let effective = MacControlGate.policyForAdmittedFullMac(saved, admitted: admitted)
+        for category in ["shell", "file_ops", "system", "accessibility", "applescript", "jxa", "shortcuts", "notifications", "spotlight"] {
+            #expect(MacControlGate.gate(effective, category: category, trigger: "ios").allowed == admitted)
+        }
+        #expect(MacControlGate.destructiveActionsAllowed(effective.trustPolicy) == admitted)
+        #expect(effective.requireAppBridgeForTCC == saved.requireAppBridgeForTCC)
+        #expect(!saved.enabled, "Projection cannot mutate stored lower-mode preferences")
+        if !admitted { #expect(effective == saved) }
+    }
+
+    @Test func lowerModeCannotBeProjectedFromCallerBooleanAlone() {
+        var saved = MacControlPolicy.default
+        saved.trustPolicy = MacControlTrustPolicy(permissionLevel: "app_only")
+        #expect(MacControlGate.policyForAdmittedFullMac(saved, admitted: true) == saved)
+        #expect(MacControlGate.policyForAdmittedFullMac(.default, admitted: true) == .default)
+    }
+}

@@ -1,8 +1,9 @@
 # Agent conversations
 
 NativeAgent exposes a small conversation interface over the agents it already
-owns and explicitly configured peers. Find an agent once, address its stable
-reference, carry its conversation identity forward, and read its replies.
+owns and explicitly configured peers. Address an agent by its unique contact
+name, open the conversation, and speak. NativeAgent retains the exact route,
+conversation and reply identities underneath that interface.
 No directory entry grants permission or proves the agent is online.
 
 ## Agent-facing tools
@@ -20,11 +21,17 @@ Natural subagent discovery also includes the conversation tools.
   else, the agent looks that name up among the agent hosts on this Mac and sets
   the connection up itself — see "Connecting by name" below. `disconnect: true`
   with the same name reverses exactly that setup.
-- `agent_message`: send `agent` and `text`, optionally continuing the exact returned
-  `conversation_id`. Local coding options live in `options` and are checked against
-  that executor's actual capabilities.
-- `agent_read`: retrieve the exact returned receipt/task identity or a supported
-  local listing. No background polling or automatic resend is introduced.
+- `agent_message`: send `agent` and `text`. This continues the contact's current
+  conversation scoped to Agent's initiating session. Optional `conversation`
+  selects a human label, creating a separate discussion when that label is new;
+  `new_conversation: true` explicitly starts fresh. A rejected start preserves
+  the old binding. Local coding options remain in `options` and are checked
+  against that executor's actual capabilities.
+- `agent_read`: open the contact's current conversation, or select an existing
+  human label with `conversation`. NativeAgent resolves its retained exact
+  reply locator. Advanced explicit receipt/task identities and supported listing
+  filters remain available. The runtime collects supported pending remote replies;
+  Agent does not need to manage a polling routine. It never automatically resends.
   Default output is a compact conversation view: who replied, their text,
   recorded execution/delivery state and an exact `reply_with` action when the
   source retains a supported conversation handle. Set `details: true` to inspect
@@ -40,10 +47,25 @@ Natural subagent discovery also includes the conversation tools.
   schemas explicitly permit this, including unused coding options.
 
 References are `codex`, `claude`, `omp`, `bot:<UUID>`, and `peer:<UUID>`.
-Display names are labels, not identity. Bots retain their persistent session.
+A display name resolves only when it identifies exactly one contact. Ambiguity
+is a choice, not permission to select a similarly named agent. Stored bindings
+use exact references, never a name alone. Bots retain their persistent session.
 Codex/Claude/OMP continue through the existing bridge owners and receipts. A
 failed resume never falls back to creating another conversation. Both the facade
 and the executed tool's explicit policy rules apply before execution.
+
+For example, `agent_message(agent: "Hermes", text: "Help me plan this change")`
+followed by `agent_message(agent: "Hermes", text: "What about the second option?")`
+continues the same supported conversation. `agent_read(agent: "Hermes")` opens it
+without a copied session or receipt ID. Adding `conversation: "browser work"`
+selects a separate named discussion. This is persistent routing convenience,
+not a second persona, memory system or transcript. Inbound agent turns retain
+the existing full Agent chat composition and peer authority boundary.
+
+Continuity depends on the actual adapter. A send-only desktop contact remains
+send-only, a standalone command cannot acquire history it does not support, and
+missing remote context is reported rather than silently replaced. NativeAgent
+handles those differences and presents the useful result or recovery decision.
 
 Coding-agent reads accept `message_id` or a bounded recent listing; they do not
 accept a conversation filter. Bot exact reads verify the expected bot before
@@ -59,8 +81,9 @@ See the [A2A specification](https://a2a-protocol.org/latest/specification/) and
 [discovery contract](https://a2a-protocol.org/latest/topics/agent-discovery/).
 
 The supported exchange is text SendMessage and GetTask, including task parts,
-artifacts and lifecycle evidence. Carry `contextId` as `conversation_id` and
-`taskId` as `task_id`; a conversation and a task are different identities.
+artifacts and lifecycle evidence. The routing owner retains `contextId` as
+`conversation_id` and `taskId` as `task_id`; advanced callers may still supply
+them explicitly. A conversation and a task are different identities.
 A direct message reply is returned by the send operation; A2A has no GetMessage
 endpoint in this client. Streaming, push notifications, gRPC, cancellation,
 list-tasks, uploads, OAuth negotiation, and required extensions are not advertised
@@ -127,17 +150,53 @@ A row may also carry how that agent's COMMAND LINE takes a prompt and prints a
 reply: the executable name (resolved on PATH plus the directories those agents
 document installing into), the argument template for a first message, the
 template for a later message in the same conversation where the CLI documents a
-resume flag, and where its final message lands. That half of a row is verified
-the same way — the flags in the agent's own documentation, and the exact
-invocation run on this Mac:
+resume flag, and where its final message lands. Flags are checked against the
+agent's documentation and installed CLI help; installed round-trip evidence
+is recorded separately from these declared contracts:
 
 | Agent | First message | Continuing | Reply | Verified against |
 | --- | --- | --- | --- | --- |
 | Claude Code | `claude -p --session-id <uuid> -- <text>` | `claude -p --resume <uuid> -- <text>` | stdout | <https://code.claude.com/docs/en/cli-reference> |
-| Codex | `codex exec --skip-git-repo-check -o reply.txt -- <text>` | not offered — its resume takes an id the CLI mints, so every message is standalone | `reply.txt` in the run's own directory | <https://learn.chatgpt.com/docs/developer-commands?surface=cli> |
+| Codex | `codex exec --json --skip-git-repo-check -o reply.txt -- <text>` | `codex exec resume --json --skip-git-repo-check -o reply.txt -- <uuid> <text>` | `reply.txt` in the run's own directory | <https://learn.chatgpt.com/docs/non-interactive-mode> |
+| Antigravity CLI | `agy --mode plan --sandbox --disable-slash-commands --output-format json --print=<text>` | same flags plus `--conversation <uuid>` | successful JSON result's `response` | <https://www.antigravity.google/docs/cli/headless/> |
 
-Every template ends with the CLI's documented end-of-options marker before the
-message, and each placeholder is substituted as a WHOLE argument, so a message
+Antigravity CLI is a distinct `antigravity-cli` contact, also discoverable as
+`antigravity` or `agy`; it does not relabel the older Gemini ACP route. Its
+documented global `~/.gemini/config/mcp_config.json` uses the existing
+`mcpServers` writer and exact-entry disconnect restoration. The JSON envelope's
+real `conversation_id` is returned and verified on exact-ID resume; only
+`status: SUCCESS` supplies a completed reply. Each turn launches a process in
+the stable contact folder, retaining conversation context through the vendor's
+resume contract, not a warm process. Plan mode, sandboxing, normal permission
+requests and disabled slash-command expansion remain in force. No
+`--continue` or skip-permissions option is used. Installed acceptance is separate
+from the documented contract. Configuration source:
+<https://www.antigravity.google/docs/mcp>.
+
+Antigravity setup discloses and grants only `mcp(<our server>/agent_message)`
+and `mcp(<our server>/agent_reply)` in the CLI's `permissions.allow` list.
+The existing byte-splicing writer records ownership before mutation; disconnect
+removes only grants added for this contact, preserving preexisting grants and
+unrelated later edits. Existing matching Ask/Deny rules and malformed authority
+are refused unchanged. Setup of an existing contact can add the missing scoped
+grants without replacing its identity. No wildcard, shell, file, skip-permissions,
+or Full Mac setting is added or changed. See the [CLI permission contract](https://www.antigravity.google/docs/permissions/).
+Setup still does not send an automatic callback. An ordinary command reply and
+exact-ID continuation work independently; inbound MCP proof remains unverified
+until a real authenticated message arrives.
+
+Codex's universal contact captures its real UUID from the JSONL `thread.started`
+event and returns it as `conversation_id`; a subsequent message resumes that
+exact UUID. It never guesses a rollout path, uses `--last`, or invents a local
+session identity. Missing, malformed, conflicting, or unexpected identities
+produce `continuation_available: false` with an explanation; a returned reply
+remains available but continuity is unverified, and nothing is retried or
+silently replaced with a new conversation. JSON events are never substituted
+for a missing final reply file. Claude Code retains its existing caller-assigned
+UUID contract. The built-in Codex/Claude/OMP builder lanes are unchanged.
+
+Templates use an end-of-options marker or bind the prompt directly as an option
+value, and each placeholder is substituted as a WHOLE argument, so a message
 beginning with a dash stays a message instead of becoming a flag. Both rows were
 run here with exactly that: `--help me pick a word: …` came back as the prompt.
 
@@ -145,7 +204,8 @@ run here with exactly that: `--help me pick a word: …` came back as the prompt
 brings its reply back in the same call: a message goes out and a message comes
 back, in one result. `AgentHostCommandLine` is the whole adapter's input, so no
 routing code branches on an agent's id — the adapter reads the row. The run gets
-an empty directory of its own, stdin closed, and the row's wall-clock limit; the
+the contact's stable working directory, stdin closed, and the row's wall-clock limit; the
+reply file lives in a separate temporary directory for each run. The
 reply is read bounded at 64 KiB and marked `untrusted_remote_data` like every
 other transport's, with `reply_truncated` when there was more. Running another
 program is running another program, so it takes the ordinary path for one: the
@@ -162,9 +222,10 @@ under exactly that set. And when it ends, whether by exiting or by running past
 its limit, its process group is settled — TERM, then KILL after the grace — so
 nothing it backgrounded outlives the turn or the directory it ran in.
 
-`agent_read` has nothing to recover for these contacts: the reply arrived in the
-message's own result, and anything the other agent says on its own arrives as an
-ordinary inbound turn.
+For these command-line contacts the reply arrives in the message's own result;
+there is no independent remote receipt endpoint to poll. The conversation view
+uses retained exchange evidence where available. Anything the other agent says
+on its own still arrives through the ordinary inbound route.
 
 ### Honest states
 
@@ -246,8 +307,18 @@ argument, which every process on the Mac can read — and sends them as
 bearer. The bridge resolves that pair to the contact that owns it
 (`AgentBridgePrincipal`), and the inbound turn is attributed to that contact:
 the transcript's `[from: …, via bridge]` label and the turn header they reads are
-the contact's own name, and an effect that raises a permission card names it as
+the contact's own name, and a destructive action that raises a permission card names it as
 the requester.
+
+Connection approval persists in the existing contact and executable/credential
+binding. Reading an agent reply no longer causes a fresh approval for the next
+message. The additional peer-origin gate uses the shared destructive capability
+classification; routine conversation and non-destructive collaboration retain
+the ordinary tool policy. Arbitrary shell execution and unclassified external
+actions still ask because their safety cannot be established. Revocation,
+changed executable checks, secret protection and explicit user blocks remain.
+Human Full Mac sessions and their settings are unchanged. ACP permissions
+requested by the other program remain that program's separate per-action gate.
 
 The label is presentation only. The lane, its recorded surface and its
 authorship still come from the route, so a contact name can neither claim a lane
@@ -332,8 +403,10 @@ normal relevant memory assembly, recall/search tools, Fluid Context, cognition a
 persistent session history. Agent authorship is retained; ordinary Trust gates
 and the bridge's existing external-MCP restriction remain in force.
 
-Omitting the conversation starts a fresh persistent session. Continue by carrying
-its exact identity; invalid supplied identities are rejected. The NativeAgent
+At the inbound protocol boundary, omitting the conversation starts a fresh
+persistent session. Direct protocol callers continue by carrying its exact
+identity; invalid supplied identities are rejected. The agent-facing facade
+retains that identity for Agent's current conversation. The NativeAgent
 outbound adapter assigns this identity before sending, so a lost acknowledgement
 still leaves a request/session pair for recovery. Generic inbound callers that
 omit an identity receive a new one in the acknowledgement. Legacy named bridge
@@ -341,7 +414,7 @@ endpoints retain their existing selected-session semantics.
 
 Both request and session identities are required for NativeAgent reply recovery.
 Caller request IDs are correlation identifiers, not idempotency guarantees.
-Recoverable receipts include `read_with` containing the exact `agent_read` input;
+Advanced recoverable receipts retain the exact `agent_read` input;
 coding-agent reads use message identity, NativeAgent uses request plus session,
 and A2A tasks use task identity. No locator is invented for A2A direct messages.
 The unified schema uses bounded default reply pages and `offset` continuation.
@@ -371,12 +444,53 @@ NativeAgent reply recovery scans only the existing retained receipt stream, at
 most 16 MiB with 1 MiB rows, and returns at most 16,000 characters per page. It
 requires exact request/session identity; duplicate, malformed, unreadable, changed,
 or oversized evidence is incomplete, never an assertion that a request failed or
-never ran. There is no new transcript, ledger, scheduler or retry queue.
+never ran. Conversation bindings retain exact locators and bounded exchange
+evidence; canonical remote receipts and chat transcripts keep their authority.
+Pending reply collection does not replay sends or become another execution owner.
+
+## Local ACP conversation continuity
+
+Gemini CLI 0.46.0 has an inspected sandbox-launcher incompatibility: it consumes
+non-TTY stdin before entering ACP. The app refuses this exact installed version
+before launch with `incompatible_sandboxed_acp`, `sent: false`, and an actionable
+explanation. See [upstream issue #23959](https://github.com/google-gemini/gemini-cli/issues/23959).
+No fixed release has been verified; reconnect only after a compatible sandboxed
+ACP installation is available. The app does not remove sandboxing, fake sandbox
+state, or generalize this refusal to uninspected versions and other agents.
+
+The conversation binding carries the returned `conversation_id` when continuing
+an ACP conversation; explicit exact-ID continuation remains compatible.
+NativeAgent retains up to eight live ACP connections, each with one active turn
+and a 30-minute idle expiry. This preserves Hermes command-only sessions: Hermes
+does not persist an empty conversation merely because `/model` changed its model.
+The peer owns history and memory; NativeAgent does not create a second transcript.
+
+After a connection closes, Hermes restoration must provide matching session
+identity/provenance or replayed history before the new message is sent. A missing
+session is reported explicitly rather than silently replacing its context.
+Disconnect and app termination close retained children. Executable identity,
+current permissions, and connection configuration remain checked on each turn.
+
+Timeouts before the first attempted prompt write identify connection
+initialization, session startup, or mode setup and explicitly report
+`sent: false`. Check that named startup boundary before explicitly reconnecting.
+Once prompt delivery has been attempted, timeout reports an uncertain outcome;
+never resend automatically. Neither a timeout nor an empty session proves that
+an earlier uncertain message was absent.
+
+An ACP permission request appears in its initiating local chat through the
+existing approval card. It is tied to the live request, cannot authorize replay,
+and remains local-only; cancellation retires the request.
 
 ## Owners
 
-`AgentConversationRouting` and the outer canonical dispatcher own local translation
-before gates. `SwiftToolDispatcher+AgentCommunication` owns the facade's directory,
+`AgentConversationStore` owns `agents/conversations.json`: scoped operational
+bookmarks and a bounded latest-receipt cache, never a transcript or authority
+store. `CanonicalToolNameDispatcher` manages name/label selection and continuity
+around the existing dispatch gates. `AgentConversationRouting` owns local
+translation before those gates. Automatic remote reply recovery runs through
+the existing `DelegationOutcomeEventRunner`; coding-agent callbacks retain
+their existing owners. `SwiftToolDispatcher+AgentCommunication` owns the facade's directory,
 configuration and remote exchanges. `AgentPeerStore` owns contacts and the
 two proof timestamps behind their states, `AgentHostDirectory` owns the
 known-agent table including each row's command line, `AgentHostConfigWriter` owns

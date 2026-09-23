@@ -269,6 +269,13 @@ enum SessionHistoryMessageProjection {
                 pendingRecollection = row.recollectionLabel + " " + body
                 continue
             }
+            // Her kept rows lead the tail: the recollection opens as a user
+            // message so the tail survives the user-first trim below.
+            if out.isEmpty, row.isTool || row.role == "assistant",
+               let recollection = pendingRecollection {
+                pendingRecollection = nil
+                out.append(LLMMessage(role: .user, content: [.text(recollection)]))
+            }
             if row.isTool {
                 flushPendingReplay()
                 let label = Self.replayedToolLabel(
@@ -293,7 +300,7 @@ enum SessionHistoryMessageProjection {
                     pendingRecollection = nil
                     if let last = out.last, last.role == .user {
                         out[out.count - 1] = LLMMessage(
-                            role: .user, content: last.content + [.text(body)]
+                            role: .user, content: last.content + [.text(recollection), .text(body)]
                         )
                     } else {
                         out.append(LLMMessage(
@@ -334,6 +341,13 @@ enum SessionHistoryMessageProjection {
         // rejected outright by the Anthropic wire and reads as a hallucinated
         // opening everywhere else. A leading system row would be equally
         // invalid, and the same loop removes it.
+        // 2026-09-23: unless a recollection is waiting — then IT opens the
+        // conversation as a user message. Dropping her kept rows here left the
+        // recollection alone and she confabulated the lost stretch (00:51).
+        if let recollection = pendingRecollection, out.first?.role == .assistant {
+            pendingRecollection = nil
+            out.insert(LLMMessage(role: .user, content: [.text(recollection)]), at: 0)
+        }
         while let first = out.first, first.role != .user {
             out.removeFirst()
         }

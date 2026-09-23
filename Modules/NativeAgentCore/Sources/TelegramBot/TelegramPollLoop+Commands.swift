@@ -3,6 +3,20 @@ import NativeAgentCore
 import PersistenceCore
 
 extension TelegramPollLoop {
+    /// 2026-09-22: the "Queued" acknowledgement is scaffolding. Once its turn
+    /// starts, delete it; edit it to `runningText` only when this loop has no
+    /// deleteMessage (or the delete fails).
+    func clearQueueAcknowledgement(chatId: Int, messageId: Int, runningText: String) async {
+        if let deleteMessage, (try? await deleteMessage(token, chatId, messageId)) != nil { return }
+        try? await editMessageTextWithReplyMarkup(
+            token,
+            chatId,
+            messageId,
+            runningText,
+            TelegramTurnControlCallback.clearedReplyMarkup
+        )
+    }
+
     /// Returns true only when the command transferred ownership of its durable
     /// inbox claim to a tracked turn. Ordinary commands finish synchronously
     /// and let the poll loop settle their claim.
@@ -527,12 +541,10 @@ extension TelegramPollLoop {
             operation: retryOperation,
             onStart: { messageId in
                 guard let messageId else { return }
-                try? await editMessageTextWithReplyMarkup(
-                    token,
-                    message.chatId,
-                    messageId,
-                    "Running retry · \(preview)",
-                    TelegramTurnControlCallback.clearedReplyMarkup
+                await clearQueueAcknowledgement(
+                    chatId: message.chatId,
+                    messageId: messageId,
+                    runningText: "Running retry · \(preview)"
                 )
             }
         )
@@ -579,8 +591,6 @@ extension TelegramPollLoop {
             text: commandText
         )
         do {
-            let typingTask = await startTypingHeartbeat(destination: message.destination)
-            defer { typingTask?.cancel() }
             let progress = makeProgressSink(delivery: delivery, card: card)
             let generatedImages = TelegramGeneratedImageCollector()
             let capturingProgress: TelegramChatProgressSink = { event in
@@ -647,8 +657,9 @@ extension TelegramPollLoop {
             }
         } catch is CancellationError {
             let notice = "(Stopped.)"
-            await card.transition(.canceled(reason: "Stopped by user"))
-            if await delivery.abortDelivering(notice: notice) {
+            // This task is already cancelled; run the terminal UI work in a fresh one.
+            await Task { await card.transition(.canceled(reason: "Stopped by user")) }.value
+            if await Task(operation: { await delivery.abortDelivering(notice: notice) }).value {
                 await recordReceipt(kind: "stopped_notice", update: update, message: message, text: commandText, reply: notice)
             } else {
                 await recordReceipt(kind: "turn_canceled", update: update, message: message, text: commandText, reply: notice)

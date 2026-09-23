@@ -413,7 +413,9 @@ public actor SwiftNativeSecurityCenter {
         // keep their `.block` and are untouched: an explicitly user-blocked
         // tool, the secret firewall, and the kill switch.
         let peerBridgeOrigin = PeerTurnEffectPolicy.isPeerBridge(surface: origin.surface)
-        let peerBridgeEffect = peerBridgeOrigin && PeerTurnEffectPolicy.isEffect(tool)
+        let peerBridgeEffect = peerBridgeOrigin && PeerTurnEffectPolicy.requiresPeerApproval(
+            tool, capabilities: Array(profile.capabilities), input: input,
+            workspaceRoot: NativeAgentWorkspaceRoot.resolve(dataRoot: dataRoot))
         // A read on the peer bridge skips these gates entirely; an effect
         // downgrades to `.ask` so it reaches the approval card.
         func originGateDecision() -> SecurityToolDecision? {

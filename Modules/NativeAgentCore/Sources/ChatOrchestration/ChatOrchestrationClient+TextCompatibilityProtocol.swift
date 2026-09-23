@@ -7,7 +7,8 @@ extension SwiftNativeChatOrchestrationClient {
     nonisolated static func textCompatibilityCalls(
         nativeCalls: [LLMStreamToolCall],
         ridesNativeTools: Bool,
-        iterAccumulated: String
+        iterAccumulated: String,
+        schemas: [LLMToolSchema] = []
     ) -> [ParsedToolCall] {
         ridesNativeTools
                 ? nativeCalls.map { call in
@@ -18,7 +19,23 @@ extension SwiftNativeChatOrchestrationClient {
                     }
                     return ParsedToolCall(id: call.id, name: call.name, input: input)
                 }
-                : ToolCallParser.parse(iterAccumulated)
+                : ToolCallParser.parse(iterAccumulated, parseInvoke: true).map { call in
+                    // 2026-09-22: <invoke> text "42"/"true" parses as a number/
+                    // bool; a string-schema param gets back the text as written.
+                    guard !call.invokeRawText.isEmpty,
+                          let schema = schemas.first(where: { $0.name == call.name }),
+                          let root = try? JSONSerialization.jsonObject(with: schema.parametersJSON) as? [String: Any],
+                          let properties = root["properties"] as? [String: Any] else { return call }
+                    var input = call.input
+                    for (key, raw) in call.invokeRawText {
+                        guard (properties[key] as? [String: Any])?["type"] as? String == "string" else { continue }
+                        switch input[key] {
+                        case .int?, .double?, .bool?, .null?: input[key] = .string(raw)
+                        default: continue
+                        }
+                    }
+                    return ParsedToolCall(id: call.id, name: call.name, input: input)
+                }
     }
 
     /// User, 2026-09-06: the turn's VISIBLE prose, round by round. `accumulated`
@@ -61,7 +78,7 @@ extension SwiftNativeChatOrchestrationClient {
         // -> bounced, ordinary prose -> shown by the force pass). Keep a <=16-char
         // cross-chunk tail so a candidate forming at the boundary is not split.
         let holdFrom: String.Index
-        if let r = ToolCallParser.earliestPotentialProtocolMarker(in: pending) {
+        if let r = ToolCallParser.earliestPotentialProtocolMarker(in: pending, invoke: true) {
             holdFrom = r.lowerBound
         } else {
             let tail = min(16, pending.count)

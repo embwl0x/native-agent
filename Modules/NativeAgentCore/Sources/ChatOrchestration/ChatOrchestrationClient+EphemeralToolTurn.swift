@@ -75,6 +75,16 @@ extension SwiftNativeChatOrchestrationClient {
             imageBlocks: baseContext.imageBlocks,
             fluidContextTurn: baseContext.fluidContextTurn
         )
+        // 2026-09-22: the Claude subscription refuses a native tools[] array, so
+        // this structured loop failed every background turn bound to it.
+        if Self.providerNeedsTextToolLane(context.providerId ?? LLMCallContext.providerId) {
+            return try await runEphemeralTextLaneTurn(
+                message: message, context: context, requestedModel: modelOverride,
+                fileAccess: fileAccess, attachments: attachments, persona: persona,
+                autonomyResolver: autonomyResolver, verifiedSessionId: verifiedSessionId,
+                requireCompleted: requireCompleted, surface: surface,
+                providerAdmission: providerAdmission)
+        }
         // Ephemeral/execution turns are still turns of the same resident mind.
         // Freeze and commit the existing cognitive projection once, then feed
         // that exact capsule/posture through the ordinary runtime-context seam.
@@ -175,4 +185,85 @@ extension SwiftNativeChatOrchestrationClient {
             providerCallCount: result.providerCallCount
         )
     }
+
+    /// The text tool lane on a throwaway session nothing is written to. The
+    /// admission check runs once up front: this lane has no per-call hook.
+    private func runEphemeralTextLaneTurn(
+        message: String,
+        context: TurnContext,
+        requestedModel: String,
+        fileAccess: String,
+        attachments: [MultimodalAttachment],
+        persona: String?,
+        autonomyResolver: (any AutonomyResolver)?,
+        verifiedSessionId: String?,
+        requireCompleted: Bool,
+        surface: String,
+        providerAdmission: (@Sendable () async throws -> Void)?
+    ) async throws -> ChatResponse {
+        try await providerAdmission?()
+        let lane = EphemeralTextLane(
+            sessionId: UUID().uuidString,
+            autonomyResolver: autonomyResolver,
+            verifiedSessionId: verifiedSessionId
+        )
+        defer {
+            // The per-session tool contract is what the lane still writes: its
+            // state .json, the .json.lock and the .declaration sidecar.
+            let dir = dataRoot
+                .appendingPathComponent("chat", isDirectory: true)
+                .appendingPathComponent("active_tools", isDirectory: true)
+            let fm = FileManager.default
+            for name in (try? fm.contentsOfDirectory(atPath: dir.path)) ?? []
+            where name.hasPrefix(lane.sessionId + ".") {
+                try? fm.removeItem(at: dir.appendingPathComponent(name))
+            }
+        }
+        let execution = try await EphemeralTextLane.$current.withValue(lane) {
+        try await ChatTurnExecution.$current.withValue(nil) {
+        try await LLMCallContext.$admittedModel.withValue(context.modelId) {
+        try await LLMCallContext.$providerId.withValue(context.providerId ?? LLMCallContext.providerId) {
+        try await LLMCallContext.$reasoningEffort.withValue(context.reasoningEffort) {
+        try await LLMCallContext.$serviceTier.withValue(context.serviceTier) {
+            try await executeTextStreamingCompatibilityChat(
+                message: message,
+                sessionId: lane.sessionId,
+                model: context.modelId,
+                reasoningEffort: context.reasoningEffort,
+                fileAccess: fileAccess,
+                attachments: attachments,
+                persona: persona,
+                surface: surface,
+                suppressUserAppend: false,
+                progress: nil
+            )
+        }
+        }
+        }
+        }
+        }
+        }
+        if requireCompleted, execution.turn.completionState != .completed {
+            throw EphemeralToolTurnIncomplete(
+                output: execution.response.output,
+                reason: "worker tool turn ended without a completed final reply; retained output is partial and attempted effects remain unverified"
+            )
+        }
+        await engine.awaitDeferredMemoryPromotion(ticket: execution.turn.memoryPromotionTicket)
+        var response = execution.response
+        response.sessionId = nil
+        response.requestedModel = requestedModel.isEmpty ? nil : requestedModel
+        return response
+    }
+}
+
+/// An ephemeral turn riding the text tool lane. Keyed by its throwaway session
+/// so a nested chat turn inside it still persists and gates normally.
+struct EphemeralTextLane: Sendable {
+    @TaskLocal static var current: EphemeralTextLane?
+    let sessionId: String
+    let autonomyResolver: (any AutonomyResolver)?
+    let verifiedSessionId: String?
+
+    static func owns(_ sessionId: String) -> Bool { current?.sessionId == sessionId }
 }

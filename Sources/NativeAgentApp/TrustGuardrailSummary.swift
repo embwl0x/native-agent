@@ -167,8 +167,8 @@ enum TrustGuardrailSummary {
         case .fullMac:
             value = "Full Mac autonomy active"
             detail = "Enabled routine actions, file changes included, run without asking on this Mac "
-                + "and trusted remote surfaces. External sends, explicit tool blocks, and protected "
-                + "system actions still wait."
+                + "and trusted remote surfaces, including external messages. macOS permissions, "
+                + "account setup, explicit tool blocks, and external-agent safeguards still apply."
             tone = .danger
         case .unavailable:
             value = "Not available"
@@ -309,6 +309,14 @@ enum TrustGuardrailSummary {
     }
 
     private static func externalSendRow(policy: TrustPolicy) -> TrustGuardrailRow {
+        if fullMacActive(policy) {
+            return TrustGuardrailRow(
+                id: "external_send", title: "Sending things to other people",
+                value: "Full Mac sending active",
+                detail: "Admitted Full Mac actions can send through connected accounts without an additional app approval. External-agent safeguards still apply.",
+                systemImage: "paperplane.fill", tone: .caution
+            )
+        }
         // NEVER claim "sends without asking" from this one flag: email and
         // message sends carry their own per-tool send_approval defaults that
         // still stop and ask even when the connector-level flag is off

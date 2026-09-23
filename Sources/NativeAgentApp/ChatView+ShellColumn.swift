@@ -434,7 +434,6 @@ extension ChatView {
                 // that grows re-lays out this pill and not ChatView.
                 .modifier(ChatTurnCardClearancePadding(
                     store: turnCardClearanceStore,
-                    isShowingCard: showThinkingRow,
                     idle: 18
                 ))
                 .transition(latestPillTransition)

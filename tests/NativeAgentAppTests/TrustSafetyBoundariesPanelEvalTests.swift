@@ -68,6 +68,15 @@ struct TrustSafetyBoundariesPanelEvalTests {
         #expect(row(state, "receipts").tone == .unavailable)
     }
 
+    @Test("Full Mac send display overrides legacy connector approval defaults")
+    func fullMacSendingUsesEffectiveGrant() {
+        var loaded = policy(connectorPolicy: .init(defaultEnabled: false, sendExternalMessagesRequiresApproval: true))
+        loaded.permissionLevel = "full_mac_os"
+        loaded.filePolicy = .init(allowedWorkspaceIds: nil, requireBackupBeforeWrite: true, allowDestructiveActions: true, outsideWorkspaceDefault: "allow")
+        let state = TrustSafetyBoundariesPresentation.state(policy: loaded, accessMode: "full")
+        #expect(row(state, "external_send").detail.contains("without an additional app approval"))
+    }
+
     private func row(
         _ state: TrustSafetyBoundariesPresentation.State,
         _ id: String

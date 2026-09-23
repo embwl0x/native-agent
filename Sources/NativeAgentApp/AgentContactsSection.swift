@@ -51,6 +51,7 @@ struct AgentContactRow: Identifiable {
         case .a2a: return "A2A address: " + contact.endpoint.absoluteString
         case .nativeAgent: return "Direct connection: " + contact.endpoint.absoluteString
         case .desktop: return "Through its app window · " + contact.endpoint.absoluteString
+        case .desktopChat: return "Its own chat in the app's window · " + contact.endpoint.absoluteString
         case .mcpHost: return "Settings entry (MCP) · " + contact.endpoint.absoluteString
         }
     }
@@ -249,10 +250,11 @@ struct AgentContactsSection: View {
                                     .controlSize(.small)
                                     .accessibilityLabel("Send a test message to \(row.displayName)")
                                 if !row.builtIn {
-                                Button("Disconnect") { perform(row, .disconnect) }
+                                Button("Disconnect agent") { perform(row, .disconnect) }
                                     .buttonStyle(.bordered)
                                     .controlSize(.small)
-                                    .accessibilityLabel("Disconnect \(row.displayName)")
+                                    .accessibilityLabel("Disconnect \(row.displayName) agent contact")
+                                    .help("Remove this agent connection. Your model provider sign-in stays connected.")
                                 }
                             }
                         }

@@ -11,8 +11,8 @@ public struct SystemToast: Identifiable, Sendable, Equatable {
 
     public enum Kind: String, Sendable { case info, warn, error, success }
 
-    public init(kind: Kind, text: String, autoDismissAfter: TimeInterval? = 3) {
-        self.id = UUID()
+    public init(kind: Kind, text: String, autoDismissAfter: TimeInterval? = 3, id: UUID = UUID()) {
+        self.id = id
         self.kind = kind
         self.text = text
         self.createdAt = Date()

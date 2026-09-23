@@ -356,9 +356,10 @@ enum DeskPageContent {
     /// contradict its own contents.
     /// A missed occurrence is neither running nor paused, so it is counted on
     /// its own: nothing ran, and the page says so instead of staying silent.
-    static func scheduleHeadline(_ jobs: [SchedulerJob], missed: Int = 0) -> String {
-        let running = jobs.filter(\.enabled).count
-        let paused = jobs.count - running
+    /// `bots` is the unpaused bots on a schedule; each one runs on a timer too.
+    static func scheduleHeadline(_ jobs: [SchedulerJob], missed: Int = 0, bots: Int = 0) -> String {
+        let paused = jobs.count - jobs.filter(\.enabled).count
+        let running = jobs.count - paused + bots
         var tail = paused > 0 ? ", \(DeskPageWords.spelledLower(paused)) paused" : ""
         if missed > 0 { tail += ", \(DeskPageWords.spelledLower(missed)) missed" }
         if running == 0 {
@@ -912,10 +913,16 @@ struct DeskPageView: View {
     private var scheduleFold: some View {
         let jobs = appModel.jobs
         DeskPageFoldRow(
-            title: DeskPageContent.scheduleHeadline(jobs, missed: missedBots.count),
+            title: DeskPageContent.scheduleHeadline(jobs, missed: missedBots.count, bots: timedBots.count),
             meta: nil,
             isOpen: binding(Fold.schedule)
         ) {
+            ForEach(timedBots) { bot in
+                DeskPageDetailRow(
+                    title: TodayWords.line(bot.name, limit: 110),
+                    line: bot.line,
+                    meta: bot.nextRun.map { DeskRelativeTimePresentation.text(for: $0, now: now) } ?? "")
+            }
             ForEach(missedBots) { bot in
                 DeskPageDetailRow(
                     title: TodayWords.line(bot.name, limit: 110),
@@ -1114,6 +1121,13 @@ struct DeskPageView: View {
         let missed = await Task.detached(priority: .userInitiated) {
             DeskMissedBot.load(root: PersistenceCore.defaultDataRoot())
         }.value
+        // Unattended work off: no bot runs on its own, so none is on a timer.
+        var timed: [DeskTimedBot] = []
+        if await BackgroundLoopsAssembly.unattendedWorkAllowed(dataRoot: PersistenceCore.defaultDataRoot()) {
+            timed = await Task.detached(priority: .userInitiated) {
+                DeskTimedBot.load(root: PersistenceCore.defaultDataRoot())
+            }.value
+        }
         // Agent, 2026-09-02: thirty-five evolution proposals sat in needs_diff
         // since June and never reached anyone. They are ideas waiting for a
         // diff; the page says so.
@@ -1124,6 +1138,7 @@ struct DeskPageView: View {
         snapshot = loaded
         ideas = waitingIdeas
         missedBots = missed
+        timedBots = timed
         // A completed publish. A pending banner handle gets another look here.
         loadStamp &+= 1
         return true
@@ -1136,6 +1151,8 @@ struct DeskPageView: View {
     @State private var ideas: [EvolutionProposal] = []
     /// Scheduled bot occurrences that never ran, counted apart from the timers.
     @State private var missedBots: [DeskMissedBot] = []
+    /// Unpaused bots on a schedule, counted with the timers.
+    @State private var timedBots: [DeskTimedBot] = []
 
     /// Evolution proposals filed as prose that nobody has turned into a diff.
     @ViewBuilder

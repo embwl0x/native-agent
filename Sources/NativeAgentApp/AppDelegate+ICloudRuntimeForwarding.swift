@@ -1,4 +1,5 @@
 import Foundation
+import os
 import NativeAgentShared
 import NativeAgentCore
 import ChatOrchestration
@@ -321,6 +322,7 @@ extension AppDelegate {
         // iOS "cancelChat" inbox action can `.cancel()` it (in addition to
         // the cancelled.flag the streaming chat path also polls).
         let generatedAttachmentBox = ICloudGeneratedAttachmentBox()
+        let personError = OSAllocatedUnfairLock<String?>(initialState: nil)
         let replyRoute = ChatToolSessionContext.ReplyRoute(
             surface: "ios",
             sourceKey: routeKey,
@@ -391,7 +393,12 @@ extension AppDelegate {
                         // The final turn is authoritative. Earlier deltas may
                         // include pre-tool draft text that should not become
                         // the durable reply once tool-loop synthesis finishes.
-                        accumulated = r.reply
+                        // The phone saw her working as it streamed; the final
+                        // reply is the answer without that commentary.
+                        accumulated = ChatOrchestration.ChatResponse.answerOnly(
+                            r.reply,
+                            workingCommentaryCharacters: r.workingCommentaryCharacters
+                        )
                         generatedAttachmentBox.set(Self.bridgeAttachments(
                             from: ChatGeneratedImageArtifacts.attachments(
                                 from: r.toolDispatches,
@@ -518,6 +525,7 @@ extension AppDelegate {
                     )
                 }
                 sawError = "\(error)"
+                personError.withLock { $0 = ProviderRecoveryPolicy.personMessage(error) }
                 NSLog("[iCloudBridge] forwardToSwiftRuntime: chatStream() failed for msg %@: %@", msg.id, "\(error)")
             }
             return (accumulated, deltaCoalescer.sequence, sawError, toolEventCounter)
@@ -586,10 +594,11 @@ extension AppDelegate {
                         // transcript got a cause-and-recovery sentence. One
                         // failure, one explanation — normalized through the same
                         // function, naming the control this device shows.
-                        "errorDetail": String(AppModel.normalizeStreamErrorText(
+                        // 2026-09-22: a typed provider failure sends its person sentence.
+                        "errorDetail": String((personError.withLock { $0 } ?? AppModel.normalizeStreamErrorText(
                             Self.redactedRemoteErrorDetail(errMsg),
                             retryAction: "Retry"
-                        ).prefix(400)),
+                        )).prefix(400)),
                         "transport": "icloud",
                         "source": "mac",
                         "replyTo": remoteMetadata["clientSurface"] ?? "iphone",

@@ -279,3 +279,72 @@ struct ChromeControlRuntimeTests {
         #expect(try Data(contentsOf: manifestURL) == Data("broken".utf8))
     }
 }
+
+@Suite("Chrome activity lease continuity")
+struct ChromeActivityLeaseTests {
+    @Test("Active work renews near expiry; expired or comfortable leases are never auto-renewed",
+          arguments: [50, -10, 200])
+    func renewOnlyLiveNearExpiry(remainingSeconds: Int) async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("chrome-activity-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let runtime = ChromeControlRuntime(
+            socketPath: directory.appendingPathComponent("s").path,
+            manageNativeHostRegistration: false, authority: { true }
+        )
+        var descriptors: [Int32] = [0, 0]
+        #expect(socketpair(AF_UNIX, SOCK_STREAM, 0, &descriptors) == 0)
+        await runtime.installAcceptedDescriptorForTesting(descriptors[0])
+        let peer = FileHandle(fileDescriptor: descriptors[1], closeOnDealloc: true)
+        let fixture = Task.detached { () throws -> [String] in
+            let framer = NativeMessagingFramer()
+            let formatter = ISO8601DateFormatter()
+            formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            let expiry = Date().addingTimeInterval(Double(remainingSeconds))
+            var actions: [String] = []
+            for _ in 0..<(remainingSeconds == 50 ? 3 : 2) {
+                guard let data = try framer.readMessage(from: peer),
+                      case .object(let request) = try JSONValue.parse(data),
+                      case .string(let id)? = request["id"],
+                      case .string(let action)? = request["action"] else {
+                    throw ChromeControlRuntimeError.invalidResponse
+                }
+                actions.append(action)
+                if action == "lease.renew" {
+                    #expect(request["payload"] == .object([
+                        "leaseId": .string("activity-lease"), "expectedUserSequence": .int(7),
+                        "leaseDurationMs": .int(300_000),
+                    ]))
+                }
+                let deadline = action == "lease.renew" ? Date().addingTimeInterval(300) : expiry
+                let result: JSONValue = action == "page.snapshot.read" ? .object(["text": .string("visible content")]) : .object([
+                    "leaseId": .string("activity-lease"), "userSequence": .int(7),
+                    "renewedAt": .string(formatter.string(from: deadline.addingTimeInterval(-300))),
+                    "expiresAt": .string(formatter.string(from: deadline)),
+                ])
+                let expired = remainingSeconds < 0 && action == "page.snapshot.read"
+                var response: [String: JSONValue] = [
+                    "version": .int(1), "type": .string("response"), "id": .string(id),
+                    "action": .string(action), "ok": .bool(!expired),
+                ]
+                if expired {
+                    response["error"] = .object(["code": .string("lease_expired"), "message": .string("Expired")])
+                } else { response["result"] = result }
+                try framer.writeMessage(JSONValue.object(response).serializedData(pretty: false), to: peer)
+            }
+            return actions
+        }
+        _ = try await runtime.perform(.acquire, payload: ["mode": .string("create")])
+        if remainingSeconds < 0 {
+            await #expect(throws: ChromeControlRuntimeError.extensionRejected(code: "lease_expired", message: "Expired")) {
+                _ = try await runtime.perform(.snapshot, payload: ["leaseId": .string("activity-lease")])
+            }
+        } else {
+            _ = try await runtime.perform(.snapshot, payload: ["leaseId": .string("activity-lease")])
+        }
+        let actions = try await fixture.value
+        #expect(actions == (remainingSeconds == 50
+            ? ["lease.acquire", "lease.renew", "page.snapshot.read"]
+            : ["lease.acquire", "page.snapshot.read"]))
+        await runtime.stop()
+    }
+}

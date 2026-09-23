@@ -549,7 +549,7 @@ actor SwiftNativeAPNSSender {
     private struct APNSConfig: Sendable {
         let teamId: String
         let keyId: String
-        let keyPath: String
+        var keyPath: String
         let topic: String?
         let environment: String?
 
@@ -582,7 +582,7 @@ actor SwiftNativeAPNSSender {
                         + "Use the paired iCloud companion path or configure local APNS provider credentials."
                 ])
             }
-            let config = APNSConfig(
+            var config = APNSConfig(
                 teamId: Self.requiredString(obj, "team_id"),
                 keyId: Self.requiredString(obj, "key_id"),
                 keyPath: Self.requiredString(obj, "key_path"),
@@ -590,13 +590,21 @@ actor SwiftNativeAPNSSender {
                 environment: Self.optionalConfigString(obj, "environment")
             )
             try config.validateCredentialConfig()
-            guard FileManager.default.fileExists(atPath: config.keyPath) else {
+            // 2026-09-22: a stale key_path (moved data root, other Mac) left push
+            // dead while the key sat in config/; look there by name too.
+            let configDir = path.deletingLastPathComponent()
+            let configuredName = URL(fileURLWithPath: config.keyPath).lastPathComponent
+            let candidates = [config.keyPath]
+                + (["AuthKey_\(config.keyId).p8"] + (configuredName.contains(config.keyId) ? [configuredName] : []))
+                    .map { configDir.appendingPathComponent($0).path }
+            guard let found = candidates.first(where: { FileManager.default.fileExists(atPath: $0) }) else {
                 throw NSError(domain: "NativeAgentAPNS", code: -3, userInfo: [
                     NSLocalizedDescriptionKey:
-                        "The configured local APNS provider key is unavailable. "
-                        + "Review the private APNS setup without placing credentials in a public build."
+                        "The APNS key file is missing. Looked for \(config.keyPath) and for "
+                        + "AuthKey_\(config.keyId).p8 in \(configDir.path). Put the .p8 key in one of those places."
                 ])
             }
+            config.keyPath = found
             return config
         }
 

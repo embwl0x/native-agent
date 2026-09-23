@@ -343,9 +343,14 @@ struct OnboardingWizard: View {
                     } : nil)
                     }
                 }
+                .id(state.step)
+                .transition(.identity)
                 .frame(maxWidth: 520)
+                // The step owns its viewport. Native scroll content must not
+                // paint above it over the progress dots or below the nav bar.
+                .clipped()
                 .padding(.horizontal, NativeAgentSpacing.xl)
-                .animation(NativeAgentMotion.standard, value: state.step)
+                .animation(nil, value: state.step)
 
                 if state.step != .identity { Spacer() }
 
@@ -359,8 +364,8 @@ struct OnboardingWizard: View {
                     .padding(.bottom, NativeAgentSpacing.xl)
                 }
             }
-            // Page branches crossfade in place. Keep the shared controls and
-            // layout out of the step animation so old button labels never linger.
+            // Replace step content atomically so translucent steps never overlap.
+            // Progress dots retain their scoped animation above.
             .transaction { $0.animation = nil }
         }
         .background(Color(nsColor: .windowBackgroundColor))
@@ -667,6 +672,7 @@ struct OnboardingWizard: View {
         if !state.profileRepairOnly {
             appModel.markFirstRunWelcomePending()
         }
+        AppDelegate.registerLoginItemInBackground()
         withAnimation(NativeAgentMotion.standard) { state.step = .done }
     }
 
@@ -845,6 +851,9 @@ private struct ProviderConnectStep: View {
 
     /// Scroll target for the nav bar's "Connect a provider" action (sweep R4 C2).
     private static let signInAnchor = "onboarding-provider-signin"
+    private static let signInProviderIDs: Set<String> = [
+        "openai_oauth_direct", "anthropic_oauth_direct", "xai_oauth_direct",
+    ]
 
     var body: some View {
         ScrollViewReader { proxy in
@@ -884,7 +893,6 @@ private struct ProviderConnectStep: View {
                         OAuthSignInButton(provider: .chatgpt) { Task { await reload(connectedId: "openai_oauth_direct") } }
                         Divider()
                         OAuthSignInButton(provider: .anthropic) { Task { await reload(connectedId: "anthropic_oauth_direct") } }
-                        AnthropicSetupTokenInput { Task { await reload(connectedId: "anthropic_oauth_direct") } }
                         Divider()
                         OAuthSignInButton(provider: .xai) { Task { await reload(connectedId: "xai_oauth_direct") } }
                     }
@@ -912,7 +920,9 @@ private struct ProviderConnectStep: View {
                             Button("Retry") { Task { await reload() } }
                                 .disabled(state.providersLoading)
                         }
-                        ForEach(state.providers) { provider in
+                        // 2026-09-22: sign-in rows repeat the buttons above;
+                        // onboarding lists API-key rows only (Providers keeps all).
+                        ForEach(state.providers.filter { !Self.signInProviderIDs.contains($0.provider_id) }) { provider in
                             ProviderRowView(provider: provider) { configureSheet = provider }
                         }
                     }
@@ -968,11 +978,25 @@ private struct ProviderConnectStep: View {
 
 private struct ConfirmStep: View {
     let state: OnboardingWizardState
+    @Environment(\.dynamicTypeSize) private var textSize
+    private var scale: CGFloat { OnboardingInk.textScale(textSize) }
 
     var body: some View {
+        ViewThatFits(in: .vertical) {
+            content.fixedSize(horizontal: false, vertical: true)
+            ScrollView { content }
+                .clipped()
+        }
+    }
+
+    private var content: some View {
         VStack(spacing: NativeAgentSpacing.xl) {
             Text("Ready to finish setup.")
-                .font(NativeAgentFont.display)
+                .font(scale == 1 ? NativeAgentFont.display : .system(
+                    size: NSFont.preferredFont(forTextStyle: .largeTitle).pointSize * scale,
+                    weight: .bold, design: .rounded))
+                .fixedSize(horizontal: false, vertical: true)
+                .multilineTextAlignment(.center)
 
             NativePanel {
                 VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
@@ -990,9 +1014,12 @@ private struct ConfirmStep: View {
             }
 
             Text("Choose Finish setup to save these names and get started. Your setup is saved on this Mac.")
-                .font(NativeAgentFont.label)
+                .font(scale == 1 ? NativeAgentFont.label : .system(
+                    size: NSFont.preferredFont(forTextStyle: .caption1).pointSize * scale,
+                    weight: .semibold))
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 
@@ -1001,17 +1028,28 @@ private struct ConfirmStep: View {
 private struct ConfirmRow: View {
     let label: String
     let value: String
+    @Environment(\.dynamicTypeSize) private var textSize
+    private var scale: CGFloat { OnboardingInk.textScale(textSize) }
 
     var body: some View {
-        HStack {
+        let layout = textSize.isAccessibilitySize
+            ? AnyLayout(VStackLayout(alignment: .leading, spacing: NativeAgentSpacing.xs))
+            : AnyLayout(HStackLayout())
+        layout {
             Text(label + ":")
-                .font(NativeAgentFont.label)
+                .font(scale == 1 ? NativeAgentFont.label : .system(
+                    size: NSFont.preferredFont(forTextStyle: .caption1).pointSize * scale,
+                    weight: .semibold))
                 .foregroundStyle(.secondary)
-                .frame(width: 90, alignment: .leading)
+                .frame(width: textSize.isAccessibilitySize ? nil : 90 * scale, alignment: .leading)
+                .fixedSize(horizontal: false, vertical: true)
             Text(value)
-                .font(NativeAgentFont.body)
+                .font(scale == 1 ? NativeAgentFont.body : .system(
+                    size: NSFont.preferredFont(forTextStyle: .body).pointSize * scale))
                 .fontWeight(.medium)
+                .fixedSize(horizontal: false, vertical: true)
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 

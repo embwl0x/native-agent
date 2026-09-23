@@ -101,7 +101,7 @@ import PersistenceCore
     await writer.ingest(second)
     let writerSnapshot = await writer.snapshot()
     let evidenceIds = writerSnapshot.nodes.map(\.id)
-    await writer.updateAffect(from: CognitiveEvent(
+    await writer.ingest(CognitiveEvent(
         id: "warm-user",
         kind: .userMessageReceived,
         subject: CognitiveSubjectReference(type: "chat.session", id: "restore-artifacts"),
@@ -350,42 +350,6 @@ import PersistenceCore
     let workspace = await reader.workspaceSnapshot()
 
     #expect(workspace.items.contains { $0.node.subjectReference.id == "open-concern" })
-}
-
-@Test func thoughtSeedDecayDeletionDoesNotResurrectAfterRestart() async throws {
-    let root = try tempDataRoot("thought-seed-decay-transaction")
-    let clock = TestClock(Date(timeIntervalSince1970: 1_000))
-    let configuration = CognitiveConfiguration(
-        enabled: true,
-        persistenceEnabled: true,
-        thoughtSeedsEnabled: true,
-        maximumThoughtSeeds: 4
-    )
-    let writerStore = try CognitiveSQLiteStore(dataRoot: root)
-    let writer = makeSubstrate(clock: clock, configuration: configuration, store: writerStore)
-    _ = try #require(await writer.addThoughtSeed(
-        kind: .followUp,
-        text: "This seed should decay away",
-        priority: 0.4
-    ))
-
-    clock.advance(4 * 24 * 60 * 60)
-    await writer.decayThoughtSeeds()
-    #expect(await writer.thoughtSeedSnapshot().isEmpty)
-
-    let readerStore = try CognitiveSQLiteStore(dataRoot: root)
-    let reader = makeSubstrate(clock: clock, configuration: configuration, store: readerStore)
-    try await reader.restorePersistentState()
-    #expect(await reader.thoughtSeedSnapshot().isEmpty)
-    let transitions = try await readerStore.loadReceiptRecords(
-        kindPrefix: "artifact.family_transition",
-        limit: 10
-    )
-    #expect(transitions.contains { record in
-        guard case .object(let payload) = record.payload else { return false }
-        return payload["family"] == .string("thought_seed")
-            && payload["lifecycleRemoved"] == .int(1)
-    })
 }
 
 @Test func thoughtSeedCapacityEvictionDoesNotResurrectAfterRestart() async throws {

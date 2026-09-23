@@ -11,6 +11,9 @@ struct ParsedToolCall: Equatable {
     let id: String
     let name: String
     let input: [String: JSONValue]
+    /// 2026-09-22: <invoke> parameters that were JSON-typed, as written, so a
+    /// string-schema param given text "42" can be restored to the string.
+    var invokeRawText: [String: String] = [:]
 }
 
 // MARK: - Parsing
@@ -27,7 +30,7 @@ struct ToolCallProtocolViolation: Equatable {
     var modelFeedback: String {
         if kind == .malformedToolUseMarker {
             return """
-            NativeAgent tool protocol error: your previous response contained a truncated or malformed tool_use marker. That response was not delivered and no tool was executed. Retry now through the provider's native tool-call channel. If no tool is needed, answer the user directly.
+            NativeAgent tool protocol error: your previous response contained a truncated or malformed tool call. That response was not delivered and no tool was executed. Resend it now as one valid tool call in the format this conversation uses (on the text protocol, exactly <tool_use name="TOOL">{JSON object}</tool_use>). If no tool is needed, answer the user directly.
             """
         }
         return """
@@ -48,15 +51,32 @@ enum ToolCallParser {
     /// function_call), then `<tool_use id="..." name="...">{json}</tool_use>`
     /// markers (both adapters emit this format), then bare JSON content
     /// blocks `{"type":"tool_use","id":...,"name":"...","input":{...}}`.
-    static func parse(_ raw: String) -> [ParsedToolCall] {
+    /// `parseInvoke`: only the text tool lane asks for Claude's `<invoke>`
+    /// form (2026-09-22) — on any other lane it is a quoted example.
+    static func parse(_ raw: String, parseInvoke: Bool = false) -> [ParsedToolCall] {
         guard formattedToolCallViolation(in: raw) == nil else { return [] }
         if let openai = parseOpenAI(raw) {
             let executable = executableCalls(openai)
             if !executable.isEmpty { return executable }
         }
-        let anth = executableCalls(parseAnthropic(raw))
+        let anth = executableCalls(parseAnthropic(raw, parseInvoke: parseInvoke))
         if !anth.isEmpty { return anth }
         return []
+    }
+
+    /// `raw` up to the end of its last tool marker (unchanged when it has none).
+    static func throughLastToolMarker(_ raw: String) -> String {
+        let ends = ["</tool_use>", "</invoke>", "</function_calls>"].compactMap {
+            raw.range(of: $0, options: .backwards)?.upperBound
+        }
+        guard let end = ends.max() else { return raw }
+        let cut = String(raw[..<end])
+        // The API stop swallows the closing tag; replay the block whole.
+        if let open = cut.range(of: "<function_calls>", options: .backwards),
+           cut.range(of: "</function_calls>", range: open.upperBound..<cut.endIndex) == nil {
+            return cut + "\n</function_calls>"
+        }
+        return cut
     }
 
     static func parseIncludingIgnorable(_ raw: String) -> [ParsedToolCall] {
@@ -348,6 +368,8 @@ enum ToolCallParser {
         let patterns = [
             #"<tool_use\s+id="[^"]*"\s+name="[^"]+"\s*>[\s\S]*?</tool_use>"#,
             #"<tool_use\s+name="[^"]+"\s*>[\s\S]*?</tool_use>"#,
+            #"</?function_calls>"#,
+            #"<invoke\s+name="[^"]+"\s*>[\s\S]*?</invoke>"#,
         ]
         for pattern in patterns {
             if let rx = try? NSRegularExpression(pattern: pattern, options: []) {
@@ -380,7 +402,9 @@ enum ToolCallParser {
     /// successful to both the model and the user. Keep the executable parser
     /// strict and let each tool-loop owner feed `modelFeedback` into its next
     /// provider call instead of surfacing the malformed response.
-    static func formattedToolCallViolation(in raw: String) -> ToolCallProtocolViolation? {
+    static func formattedToolCallViolation(
+        in raw: String, toolNames: Set<String> = []
+    ) -> ToolCallProtocolViolation? {
         // Live Telegram incident (2026-08-14): the provider emitted
         // `ool_use name="commit_memory">…</tool_use>`, dropping the opening
         // `<t`. It was neither executable nor caught by the exact-marker
@@ -416,17 +440,34 @@ enum ToolCallParser {
         if regexMatches(headerPattern, in: raw), regexMatches(fencedJSONPattern, in: raw) {
             return ToolCallProtocolViolation(kind: .markdownToolCallBlock)
         }
+
+        // 2026-09-22: a marker whose body is not a JSON object used to run
+        // with {} and fail as "missing X", so the model never learned why.
+        // Only for a real tool name: anything else is prose quoting the syntax.
+        let markerPattern = #"<tool_use\s+(?:id="[^"]*"\s+)?name="([^"]+)"\s*>([\s\S]*?)</tool_use>"#
+        if let rx = try? NSRegularExpression(pattern: markerPattern) {
+            let ns = raw as NSString
+            for m in rx.matches(in: raw, range: NSRange(location: 0, length: ns.length)) {
+                guard toolNames.contains(ns.substring(with: m.range(at: 1))) else { continue }
+                let body = ns.substring(with: m.range(at: 2)).trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !body.isEmpty else { continue }
+                if let d = body.data(using: .utf8), case .object? = try? JSONValue.parse(d) { continue }
+                return ToolCallProtocolViolation(kind: .malformedToolUseMarker)
+            }
+        }
         return nil
     }
 
     /// Earliest text that could become an executable or malformed tool
     /// protocol block. Streaming paths hold this suffix until the completed
     /// iteration can be parsed, so marker-shaped text never reaches a draft.
-    static func earliestPotentialProtocolMarker(in raw: String) -> Range<String.Index>? {
-        let needles = [
+    static func earliestPotentialProtocolMarker(in raw: String, invoke: Bool = false) -> Range<String.Index>? {
+        var needles = [
             "<tool", "tool_use name=\"", "ool_use name=\"",
             "**tool call", "__tool call", "tool call:",
         ]
+        // 2026-09-22: Claude's own call form, which only the text tool lane runs.
+        if invoke { needles += ["<function_calls", "<invoke"] }
         var candidates = needles.compactMap { needle in
             raw.range(of: needle, options: [.caseInsensitive])
         }
@@ -444,8 +485,8 @@ enum ToolCallParser {
     }
 
     /// Visible prose preceding the earliest possible protocol marker, unchanged if absent.
-    static func visiblePrefix(in raw: String) -> String {
-        if let marker = earliestPotentialProtocolMarker(in: raw) {
+    static func visiblePrefix(in raw: String, invoke: Bool = false) -> String {
+        if let marker = earliestPotentialProtocolMarker(in: raw, invoke: invoke) {
             return String(raw[..<marker.lowerBound])
         }
         return raw
@@ -537,10 +578,9 @@ enum ToolCallParser {
     // The legacy form `<tool_use name="X">{json}</tool_use>` is still parsed
     // — id falls back to empty so the tool loop can detect and skip the
     // round-trip ID echo.
-    static func parseAnthropic(_ raw: String) -> [ParsedToolCall] {
-        var calls: [ParsedToolCall] = []
-        // ID-bearing form FIRST so any legacy plain-name marker doesn't
-        // greedy-consume an id-bearing block when both happen to be present.
+    static func parseAnthropic(_ raw: String, parseInvoke: Bool = false) -> [ParsedToolCall] {
+        var positionedCalls: [(Int, ParsedToolCall, Bool)] = []
+        // The two marker patterns do not overlap; collect both before sorting.
         let idPattern = #"<tool_use\s+id="([^"]*)"\s+name="([^"]+)"\s*>([\s\S]*?)</tool_use>"#
         if let rx = try? NSRegularExpression(pattern: idPattern, options: []) {
             let ns = raw as NSString
@@ -554,9 +594,8 @@ enum ToolCallParser {
                    case .object(let o) = parsed {
                     input = o
                 }
-                calls.append(ParsedToolCall(id: id, name: name, input: input))
+                positionedCalls.append((m.range.location, ParsedToolCall(id: id, name: name, input: input), false))
             }
-            if !calls.isEmpty { return calls }
         }
         // Legacy plain-name form. Kept as a back-compat seam.
         let legacyPattern = #"<tool_use\s+name="([^"]+)"\s*>([\s\S]*?)</tool_use>"#
@@ -565,17 +604,54 @@ enum ToolCallParser {
             for m in rx.matches(in: raw, options: [], range: NSRange(location: 0, length: ns.length)) {
                 let name = ns.substring(with: m.range(at: 1))
                 let body = ns.substring(with: m.range(at: 2))
+                // An unclosed legacy marker swallowing a later id-form block.
+                if body.contains("<tool_use") { continue }
                 var input: [String: JSONValue] = [:]
                 if let d = body.data(using: .utf8),
                    let parsed = try? JSONValue.parse(d),
                    case .object(let o) = parsed {
                     input = o
                 }
-                calls.append(ParsedToolCall(id: "", name: name, input: input))
+                positionedCalls.append((m.range.location, ParsedToolCall(id: "", name: name, input: input), false))
             }
-            if !calls.isEmpty { return calls }
+        }
+        // Claude's own trained form, which Opus 5.5 writes despite the
+        // protocol above: <invoke name="X"><parameter name="k">v</parameter></invoke>.
+        // Identical repeats in one reply run once.
+        if parseInvoke,
+           let rx = try? NSRegularExpression(pattern: #"<invoke\s+name="([^"]+)"\s*>([\s\S]*?)</invoke>"#),
+           let prx = try? NSRegularExpression(pattern: #"<parameter\s+name="([^"]+)"\s*>([\s\S]*?)</parameter>"#) {
+            let ns = raw as NSString
+            for m in rx.matches(in: raw, range: NSRange(location: 0, length: ns.length)) {
+                let name = ns.substring(with: m.range(at: 1))
+                let body = ns.substring(with: m.range(at: 2))
+                let bns = body as NSString
+                var input: [String: JSONValue] = [:]
+                var rawText: [String: String] = [:]
+                for p in prx.matches(in: body, range: NSRange(location: 0, length: bns.length)) {
+                    let key = bns.substring(with: p.range(at: 1))
+                    let value = bns.substring(with: p.range(at: 2))
+                    let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if let d = trimmed.data(using: .utf8), let parsed = try? JSONValue.parse(d),
+                       trimmed.first.map({ "{[0123456789-tfn".contains($0) }) == true {
+                        input[key] = parsed
+                        rawText[key] = value
+                    } else { input[key] = .string(value) }
+                }
+                positionedCalls.append((m.range.location, ParsedToolCall(id: "", name: name, input: input, invokeRawText: rawText), true))
+            }
+        }
+        if !positionedCalls.isEmpty {
+            var seenInvokes: Set<String> = []
+            return positionedCalls.sorted { $0.0 < $1.0 }.compactMap { positioned -> ParsedToolCall? in
+                let call = positioned.1
+                guard positioned.2 else { return call }
+                let signature = call.name + ((try? JSONValue.object(call.input).serialize(pretty: false)) ?? "")
+                return seenInvokes.insert(signature).inserted ? call : nil
+            }
         }
         // Bare JSON content-block / array shape.
+        var calls: [ParsedToolCall] = []
         if let d = raw.trimmingCharacters(in: .whitespacesAndNewlines).data(using: .utf8),
            let parsed = try? JSONValue.parse(d) {
             if case .array(let arr) = parsed {

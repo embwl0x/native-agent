@@ -120,6 +120,32 @@ public struct BotRunQueue: Sendable {
         return Set(queued.keys).union(Self.admission.active[rootKey]?.keys.map { $0 } ?? [])
     }
 
+    public enum RequestPresence: Sendable { case queued, running, absent }
+
+    /// Exact queue correlation, plus a conservative live-claim check. A live
+    /// writer may be settling the requested shelf row; absence is definitive
+    /// only once neither the exact queue entry nor any bot writer owns it.
+    /// This never starts, consumes or retries a run.
+    public func presence(bot id: UUID, requestID: UUID) throws -> RequestPresence {
+        Self.admission.lock.lock()
+        defer { Self.admission.lock.unlock() }
+        return try disk.locked {
+            if try readRequests()[id]?.runID == requestID { return .queued }
+            if Self.admission.active[rootKey]?[id] != nil { return .running }
+            let claim = disk.root.appendingPathComponent(id.uuidString).appendingPathComponent("run.lock")
+            try disk.validatePath(claim)
+            let fd = open(claim.path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+            if fd < 0 {
+                if errno == ENOENT { return .absent }
+                throw StandingBotsError.corruptStore("bot run claim unavailable")
+            }
+            defer { close(fd) }
+            if flock(fd, LOCK_EX | LOCK_NB) == 0 { return .absent }
+            if errno == EWOULDBLOCK { return .running }
+            throw StandingBotsError.corruptStore("bot run claim unavailable")
+        }
+    }
+
     func rejectPending(bot: UUID, requestID: UUID) throws {
         try disk.locked {
             var requests = try readRequests()

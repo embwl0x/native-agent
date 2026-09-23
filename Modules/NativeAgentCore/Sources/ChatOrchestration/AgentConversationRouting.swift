@@ -89,8 +89,13 @@ public enum AgentConversationRouting {
                 return Route(tool: "shelf_entry", input: args, agent: canonical)
             }
             args["bot_id"] = .string(botID.uuidString)
-            if let limit = input["limit"] { args["limit"] = try integer(limit, field: "limit", range: 1...100) }
-            return Route(tool: "shelf_read", input: args, agent: canonical)
+            if let limit = input["limit"] {
+                args["limit"] = try integer(limit, field: "limit", range: 1...100)
+                return Route(tool: "shelf_read", input: args, agent: canonical)
+            }
+            // Opening a bot conversation should show its latest actual reply,
+            // not an unread index that disappears after being acknowledged.
+            return Route(tool: "shelf_entry", input: args, agent: canonical)
         }
         guard conversation == nil else { throw invalid("Coding-agent reads currently require message_id without conversation_id; conversation filtering is not supported by delegation_status.") }
         args["agent"] = .string(agent)
@@ -108,6 +113,9 @@ public enum AgentConversationRouting {
         if case .object(let receipt) = result { object = receipt }
         else { object = ["result": result] }
         if object["agent"] == nil { object["agent"] = .string(route.agent) }
+        if route.tool == "bot_ask", object["reply"] == nil {
+            object["reply"] = object["answer"]
+        }
         if object["conversation_id"] == nil {
             if route.agent.hasPrefix("bot:") { object["conversation_id"] = .string(route.agent) }
             else if let value = object["conversationId"] { object["conversation_id"] = value }

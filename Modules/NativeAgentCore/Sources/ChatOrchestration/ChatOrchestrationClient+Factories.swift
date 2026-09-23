@@ -247,8 +247,7 @@ public func makeGatedToolDispatchClient(
         // same chain match nothing. See FirstConversationPersonaExemption.
         firstConversationDataRoot: allowsFirstConversationExemption ? dataRoot : nil,
         // The peer directory supplies display names only, never authority.
-        peerDirectoryDataRoot: dataRoot,
-        jevDataRoot: dataRoot
+        peerDirectoryDataRoot: dataRoot
     )
     if tracePeerTurn {
         // PeerDataTaintDispatcher sits under the tracer (so a refusal is still
@@ -269,7 +268,7 @@ public func makeGatedToolDispatchClient(
     // used to reach `tool_catalog` without the external-MCP name scrub.
     // 2026-09-18: every surface resolves saved peer names from this same root.
     return CanonicalToolNameDispatcher(inner: dispatcher, peerDataRoot: dataRoot,
-        builtInLanes: tools as? any BuiltInAgentLaneProviding)
+        builtInLanes: tools as? any BuiltInAgentLaneProviding, conversationScope: verifiedSessionId)
 }
 
 /// The same registry evidence must reach peer effect gates on every turn chain.

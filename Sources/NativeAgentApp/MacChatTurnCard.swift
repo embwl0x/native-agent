@@ -355,7 +355,7 @@ enum MacChatTurnCardProjection {
         case .canceled:
             return "This turn was stopped"
         case .outcomeUnknown:
-            return "Outcome unknown"
+            return "Not sure that finished."
         }
     }
 
@@ -366,7 +366,7 @@ enum MacChatTurnCardProjection {
         case .stalled:
             return "Nothing has moved for a while. This is an observation, not a verdict \u{2014} it clears on the next sign of work."
         case .outcomeUnknown:
-            return "This turn ended without proof of how it finished. It may or may not have completed."
+            return "I lost my answer to your last message when I restarted \u{2014} say it again and I'll pick it up."
         default:
             return nil
         }
@@ -568,8 +568,12 @@ struct MacChatTurnCard: View {
                     // controls (3) > title (2) > badge (1) > meta (0), and
                     // fixedSize keeps button labels from clipping mid-glyph.
                     if let approval = model.approval, approval.isActionable, let onDecideApproval {
-                        Button("Approve") { onDecideApproval("approved") }
-                            .buttonStyle(.borderless)
+                        Button("Approve") {
+                            guard !isResolvingApproval else { return }
+                            onDecideApproval("approved")
+                        }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
                             .foregroundStyle(NativeAgentTheme.ok)
                             .disabled(isResolvingApproval)
                             .help(isResolvingApproval
@@ -577,10 +581,18 @@ struct MacChatTurnCard: View {
                                   : "Approve \(approval.toolName)")
                             .accessibilityLabel("Approve \(approval.toolName)")
                             .accessibilityIdentifier("chat.turn.approve")
+                            .accessibilityAction {
+                                guard !isResolvingApproval else { return }
+                                onDecideApproval("approved")
+                            }
                             .fixedSize()
                             .layoutPriority(3)
-                        Button("Deny") { onDecideApproval("denied") }
-                            .buttonStyle(.borderless)
+                        Button("Deny") {
+                            guard !isResolvingApproval else { return }
+                            onDecideApproval("denied")
+                        }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
                             .foregroundStyle(NativeAgentTheme.fail)
                             .disabled(isResolvingApproval)
                             .help(isResolvingApproval
@@ -588,6 +600,10 @@ struct MacChatTurnCard: View {
                                   : "Deny \(approval.toolName)")
                             .accessibilityLabel("Deny \(approval.toolName)")
                             .accessibilityIdentifier("chat.turn.deny")
+                            .accessibilityAction {
+                                guard !isResolvingApproval else { return }
+                                onDecideApproval("denied")
+                            }
                             .fixedSize()
                             .layoutPriority(3)
                     } else if let approval = model.approval, !approval.isActionable {

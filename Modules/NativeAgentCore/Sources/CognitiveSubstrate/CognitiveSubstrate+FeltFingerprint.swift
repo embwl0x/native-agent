@@ -1000,7 +1000,13 @@ extension CognitiveSubstrate {
             let token = tokens[index]
             if index + 1 < tokens.count {
                 let next = tokens[index + 1]
-                if next.index == token.index + 1, token.word != next.word {
+                // Neither the sentence nor the two-word fragment always
+                // disambiguates a head correctly (NLTagger calls "pull" a
+                // noun in both "readings pull" and its full sentence). Keep
+                // the existing standalone non-name refusal as a cross-check;
+                // unknown vocabulary and adjective modifiers remain welcome.
+                if next.index == token.index + 1, token.word != next.word,
+                   next.standsAlone, feltWordNamesAThing(next.word) {
                     let pair = "\(token.word) \(next.word)"
                     if pair.count <= maxCharacters, feltPhraseHeadNamesAThing(pair) { return pair }
                 }

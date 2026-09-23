@@ -168,6 +168,7 @@ func chatClient_promotesThroughTurnEngine_after_assistant_turn() async throws {
         model: "test-model", reasoningEffort: "high",
         fileAccess: "workspace", attachments: [], suppressUserAppend: false
     )
+    await client.drainDeferredMemoryPromotion()
     #expect(promoter.count == 1)
     let last = promoter.last
     #expect(last?.0 == "the-user-said-this")

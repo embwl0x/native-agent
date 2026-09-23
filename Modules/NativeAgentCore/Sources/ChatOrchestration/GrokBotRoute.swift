@@ -59,7 +59,8 @@ public struct GrokRequestStore: Sendable {
     }
     public func claimReply(_ reply: GrokReplyInput, peer: String, now: Date = Date()) throws -> GrokPendingRequest {
         try update(reply.message_id, peer: peer) { value in
-            guard value.expiresAt >= now, ["sending", "accepted", "outcome unknown"].contains(value.state) else {
+            // No time limit: Grok may wait on a person's approval. The state check stops duplicates.
+            guard ["sending", "accepted", "outcome unknown"].contains(value.state) else {
                 throw GrokLinkCredential.Failure.invalid
             }
             // Before enqueue: a crash or an ambiguous enqueue never duplicates a turn.
@@ -112,6 +113,9 @@ public enum GrokBotRoute {
         } catch { state = "outcome unknown" } // Never expose URLSession errors/URLs.
         let pending = try store.update(messageID, peer: peer.id) {
             if $0.state == "sending" { $0.state = state }
+        }
+        if pending.state == "accepted" {
+            AgentPeerStore(dataRoot: dataRoot).recordProof(peerID: peer.id, outbound: true)
         }
         return projection(pending)
     }

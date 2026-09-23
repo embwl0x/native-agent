@@ -155,6 +155,44 @@ private func macIntegrationEvalString(_ value: JSONValue, key: String) -> String
     return string
 }
 
+@Test func macIntegrationFullMacCoversFreshDefaultsWithoutChangingPreferences() async throws {
+    let root = try macIntegrationBridgeEvalRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let trust = root.appendingPathComponent("trust")
+    try FileManager.default.createDirectory(at: trust, withIntermediateDirectories: true)
+    try Data(#"{"permissionLevel":"full_mac_os","developerMode":true,"fullMacNeverExpires":true}"#.utf8)
+        .write(to: trust.appendingPathComponent("policy.json"))
+    let permissions = MacIntegrationPermissionStore(dataRoot: root)
+    let bridge = MacIntegrationBridgeProbe()
+    let dispatcher = SwiftToolDispatcher(dataRoot: root, allowProcessGlobalTools: false,
+        macIntegrationBridge: bridge, macIntegrationPermissionStore: permissions)
+    #expect(await permissions.allows(MacIntegrationID.calendar, mode: .write) == false)
+    let allowed = try await dispatcher.dispatch(tool: "mac_calendar_delete_event", input: [:], surface: "chat")
+    #expect(macIntegrationEvalString(allowed, key: "route") == "calendarDeleteEvent")
+    #expect(await bridge.calendarDeleteCallCount() == 1)
+    #expect(await permissions.allows(MacIntegrationID.calendar, mode: .write) == false)
+    let external = try await dispatcher.dispatch(tool: "mac_calendar_delete_event", input: [:], surface: "external_agent")
+    #expect(InlineInteractionNeed.interaction(in: external)?.kind == .permission)
+    #expect(await bridge.calendarDeleteCallCount() == 1)
+    let preloaded = await ToolPreloadHeuristics.filterByMacIntegrationPolicy(
+        ["mail_send", "messages_send"], permissions: permissions, surface: "chat", dataRoot: root)
+    #expect(preloaded == ["mail_send", "messages_send"])
+    #expect(await ToolPreloadHeuristics.filterByMacIntegrationPolicy(
+        ["mail_send"], permissions: permissions, surface: "external_agent", dataRoot: root).isEmpty)
+
+    let security = root.appendingPathComponent("security")
+    try FileManager.default.createDirectory(at: security, withIntermediateDirectories: true)
+    let file = security.appendingPathComponent("mac_integration_permissions.json")
+    let corrupt = Data("{broken".utf8)
+    try corrupt.write(to: file)
+    let denied = try await dispatcher.dispatch(tool: "mac_calendar_delete_event", input: [:], surface: "chat")
+    #expect(InlineInteractionNeed.interaction(in: denied)?.kind == .permission)
+    #expect(await bridge.calendarDeleteCallCount() == 1)
+    #expect(try Data(contentsOf: file) == corrupt)
+    #expect(await permissions.allows("unknown", mode: .write, fullMacAdmitted: true) == false)
+    #expect(await permissions.allows(MacIntegrationID.spotlight, mode: .write, fullMacAdmitted: true) == false)
+}
+
 @Test func macIntegrationBridgeDispatch_routesAllowedCallsAndContainsBackendFailure() async throws {
     let root = try macIntegrationBridgeEvalRoot()
     defer { try? FileManager.default.removeItem(at: root) }

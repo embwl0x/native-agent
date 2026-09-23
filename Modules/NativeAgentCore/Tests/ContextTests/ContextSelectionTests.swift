@@ -828,7 +828,8 @@ struct ContextSelectionTests {
         )
         let generation = generation([pointerAtom])
 
-        let packet = try ContextSelector().select(
+        // The shipped default is 0 (2026-09-23); this pins the lane's mechanics.
+        let packet = try ContextSelector(configuration: ContextSelectionConfiguration(maximumPointers: 8)).select(
             signal("Atlas procedure", generation: generation, budget: 40),
             from: generation
         )

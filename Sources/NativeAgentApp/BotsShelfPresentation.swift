@@ -1,6 +1,7 @@
 import Foundation
 import PersistenceCore
 import StandingBots
+import ChatOrchestration
 
 /// Defaults-backed design experiment, following NativeAgentShellPreference.
 enum BotsShelfPreference {
@@ -43,6 +44,22 @@ struct DeskMissedBot: Identifiable, Equatable, Sendable {
             return DeskMissedBot(id: bot.id, name: bot.name,
                                  line: "Missed · \(run.words).", dueAt: run.dueAt)
         }.sorted { $0.dueAt > $1.dueAt }
+    }
+}
+
+/// An unpaused bot on a schedule, for the Desk's schedule fold. Read-only.
+struct DeskTimedBot: Identifiable, Equatable, Sendable {
+    let id: UUID
+    let name: String
+    let line: String
+    let nextRun: Date?
+
+    static func load(root: URL) -> [DeskTimedBot] {
+        guard let bots = try? BotDefinitionStore(dataRoot: root).list() else { return [] }
+        let dates = (try? BotRunnerScheduler.scheduledDates(dataRoot: root)) ?? [:]
+        return bots.filter { !$0.paused && $0.cadence != .manual }.map { bot in
+            DeskTimedBot(id: bot.id, name: bot.name, line: BotsShelfRecord.cadence(bot.cadence) + ".", nextRun: dates[bot.id])
+        }
     }
 }
 
@@ -187,15 +204,20 @@ struct BotsShelfRecord: Identifiable, Equatable, Sendable {
     var lastGood: ShelfEntry? {
         entries.filter { [.ok, .nothingNew].contains($0.runHealth) }.max { $0.runAt < $1.runAt }
     }
-    var cadence: String {
-        switch definition.cadence {
-        case .manual: "Manual only"
+    var cadence: String { Self.cadence(definition.cadence) }
+    static func cadence(_ cadence: BotCadence) -> String {
+        switch cadence {
+        case .manual: return "Manual only"
         case .interval(let seconds):
-            seconds == 43200 ? "Twice daily" : seconds == 86400 ? "Daily" : seconds == 604800 ? "Weekly"
+            return seconds == 43200 ? "Twice daily" : seconds == 86400 ? "Daily" : seconds == 604800 ? "Weekly"
                 : seconds < 3600 ? "Every \(Int(seconds / 60)) minutes"
                 : seconds.truncatingRemainder(dividingBy: 86400) == 0 ? "Every \(Int(seconds / 86400)) days"
                 : "Every \((seconds / 3600).formatted()) hours"
-        case .cron(let expression, let timeZone): "\(expression) · \(timeZone)"
+        case .cron(_, let timeZone):
+            // "Daily at 23:57", not the raw cron; the zone only when it isn't this Mac's.
+            let said = StandingBotSchedule.describe(cadence)
+            return said.prefix(1).uppercased() + said.dropFirst()
+                + (timeZone == TimeZone.current.identifier ? "" : " · \(timeZone)")
         }
     }
     var state: String {

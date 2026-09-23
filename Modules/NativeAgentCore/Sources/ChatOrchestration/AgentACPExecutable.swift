@@ -50,9 +50,13 @@ public struct AgentACPExecutable: Codable, Sendable, Equatable {
         else { throw AgentACPClient.Failure.executableChanged }
         let handle = try Self.openFile(path: path)
         defer { try? handle.close() }
-            var current = try Self.capture(path: path, handle: handle)
-            current.version = version
-            guard current == self, access(path, X_OK) == 0 else { throw AgentACPClient.Failure.executableChanged }
+        let current = try Self.capture(path: path, handle: handle)
+        // st_dev identifies the current mount and can change across a Mac
+        // restart. Keep it as capture metadata, not durable approval identity.
+        // Never refresh the approval: the exact path, inode and executable
+        // bytes must still match what was approved, immediately before spawn.
+        guard current.path == path, current.inode == inode, current.digest == digest,
+              access(path, X_OK) == 0 else { throw AgentACPClient.Failure.executableChanged }
     }
 
     public var isCurrent: Bool {

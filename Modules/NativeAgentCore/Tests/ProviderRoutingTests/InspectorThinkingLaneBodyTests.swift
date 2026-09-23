@@ -24,7 +24,6 @@ import PersistenceCore
                 system: "sys",
                 coercedModel: "claude-opus-4-8",
                 maxTokens: 4096,
-                tools: nil,
                 stream: true
             )
         }
@@ -94,7 +93,7 @@ import PersistenceCore
         let on = InspectorThinkingLane.$summarizedThinking.withValue(true) {
             AnthropicOAuthDirectAdapter.makeMessagesRequestBody(
                 messages: [.user("x")], system: nil, coercedModel: "claude-opus-4-8",
-                maxTokens: 16, tools: nil, stream: false
+                maxTokens: 16, stream: false
             )
         }
         #expect(on["thinking"] != nil)

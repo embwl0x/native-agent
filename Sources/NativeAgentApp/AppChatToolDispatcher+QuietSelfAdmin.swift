@@ -1,7 +1,5 @@
-import AVFoundation
 import Dispatcher
 import Foundation
-import MultimodalTTS
 import NativeAgentCore
 import PersistenceCore
 import ProviderRouting
@@ -47,7 +45,7 @@ extension AppChatToolDispatcher {
 
     static let quietSelfAdminToolNames: Set<String> = [
         "app_page_read", "app_page_screenshot", "app_settings_list",
-        "app_setting_set", "interaction_act", "voice_render",
+        "app_setting_set", "interaction_act",
     ]
 
     static func canonicalQuietSelfAdminToolName(_ raw: String) -> String? {
@@ -62,8 +60,6 @@ extension AppChatToolDispatcher {
             return "app_setting_set"
         case "interaction_act", "app.interaction_act", "card_act", "answer_card":
             return "interaction_act"
-        case "voice_render", "voice.render", "tts_render":
-            return "voice_render"
         default:
             return nil
         }
@@ -205,7 +201,6 @@ extension AppChatToolDispatcher {
         case "app_settings_list": return await runAppSettingsList(input: input)
         case "app_setting_set": return await runAppSettingSet(input: input, surface: surface)
         case "interaction_act": return await runInteractionAct(input: input, surface: surface)
-        case "voice_render": return await runVoiceRender(input: input)
         default:
             return Self.failure("unknown_tool", "No such quiet tool.", extra: ["tool": .string(tool)])
         }
@@ -482,196 +477,5 @@ extension AppChatToolDispatcher {
         ]
         for (key, value) in detail { receipt[key] = value }
         return .object(receipt)
-    }
-
-    // MARK: - voice_render
-
-    /// Speech with no speaker. Nothing here constructs an `AVAudioPlayer` or an
-    /// `AVAudioEngine` output node: the local route uses
-    /// `AVSpeechSynthesizer.write`, which hands back buffers and never reaches
-    /// an output device, and the cloud route is a plain HTTPS body written to a
-    /// file. There is no code path from this function to the speakers.
-    private func runVoiceRender(input: [String: JSONValue]) async -> JSONValue {
-        let text = Self.text(input["text"])
-        guard !text.isEmpty else {
-            return Self.failure("missing_text", "Pass the words to render.")
-        }
-        guard text.count <= 4096 else {
-            return Self.failure(
-                "text_too_long",
-                "voice_render takes up to 4096 characters; this is \(text.count).")
-        }
-        let requestedRoute = Self.text(input["route"]).lowercased()
-
-        // Rendering is a WRITE: this leaves a file on the person's disk that
-        // outlives the call. It therefore stands behind the same posture gate
-        // app_setting_set stands behind, read the same fresh way.
-        guard let posture = await Self.freshQuietPosture() else {
-            return Self.unreadablePostureFailure()
-        }
-        guard posture.changesAllowed else {
-            return Self.failure(
-                "trust_mode_read_only",
-                "Rendering a voice leaves a file, and \(posture.name) is the posture that writes "
-                + "nothing at all — the person's standing choice, and only they lift it.",
-                extra: ["trust_mode": .string(posture.name)]
-            )
-        }
-
-        let dataRoot = PersistenceCore.defaultDataRoot()
-        let directory = dataRoot.appendingPathComponent("voice_renders", isDirectory: true)
-        do {
-            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        } catch {
-            return Self.failure("render_directory_unavailable", error.localizedDescription)
-        }
-        let stamp = ISO8601DateFormatter().string(from: Date())
-            .replacingOccurrences(of: ":", with: "-")
-        let handle = UUID().uuidString.prefix(8).lowercased()
-
-        if requestedRoute == "cloud" {
-            return await renderCloudVoice(
-                text: text, directory: directory, basename: "voice-\(stamp)-\(handle)")
-        }
-        return await renderLocalVoice(
-            text: text,
-            voice: Self.text(input["voice"]),
-            directory: directory,
-            basename: "voice-\(stamp)-\(handle)"
-        )
-    }
-
-    private func renderLocalVoice(
-        text: String, voice requestedVoice: String, directory: URL, basename: String
-    ) async -> JSONValue {
-        let url = directory.appendingPathComponent("\(basename).caf")
-        let voice: AVSpeechSynthesisVoice? = requestedVoice.isEmpty
-            ? nil
-            : (AVSpeechSynthesisVoice(identifier: requestedVoice)
-                ?? AVSpeechSynthesisVoice(language: requestedVoice))
-        if !requestedVoice.isEmpty, voice == nil {
-            return Self.failure(
-                "unknown_voice",
-                "No Mac voice matches that identifier or language.",
-                extra: ["requested": .string(requestedVoice)]
-            )
-        }
-
-        let utterance = AVSpeechUtterance(string: text)
-        utterance.rate = AVSpeechUtteranceDefaultSpeechRate
-        if let voice { utterance.voice = voice }
-        let voiceName = utterance.voice?.name ?? voice?.name ?? "the Mac default voice"
-        let voiceIdentifier = utterance.voice?.identifier ?? voice?.identifier ?? ""
-
-        let synthesizer = AVSpeechSynthesizer()
-        var file: AVAudioFile?
-        var frames: Int64 = 0
-        var sampleRate: Double = 0
-        var writeFailure: String?
-
-        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-            var finished = false
-            synthesizer.write(utterance) { buffer in
-                guard !finished else { return }
-                guard let pcm = buffer as? AVAudioPCMBuffer else {
-                    finished = true
-                    writeFailure = "The Mac voice returned audio in a shape this cannot write."
-                    continuation.resume()
-                    return
-                }
-                // A zero-length buffer is how AVSpeechSynthesizer says "done".
-                guard pcm.frameLength > 0 else {
-                    finished = true
-                    continuation.resume()
-                    return
-                }
-                do {
-                    if file == nil {
-                        file = try AVAudioFile(
-                            forWriting: url, settings: pcm.format.settings,
-                            commonFormat: pcm.format.commonFormat,
-                            interleaved: pcm.format.isInterleaved
-                        )
-                        sampleRate = pcm.format.sampleRate
-                    }
-                    try file?.write(from: pcm)
-                    frames += Int64(pcm.frameLength)
-                } catch {
-                    finished = true
-                    writeFailure = error.localizedDescription
-                    continuation.resume()
-                }
-            }
-        }
-        file = nil
-
-        if let writeFailure {
-            try? FileManager.default.removeItem(at: url)
-            return Self.failure("render_failed", writeFailure)
-        }
-        guard frames > 0, sampleRate > 0 else {
-            try? FileManager.default.removeItem(at: url)
-            return Self.failure("render_empty", "The Mac voice produced no audio for that text.")
-        }
-        let bytes = (try? FileManager.default
-            .attributesOfItem(atPath: url.path)[.size] as? Int) ?? 0
-        return .object([
-            "status": .string("ok"),
-            "route": .string("mac"),
-            "voice": .string(voiceName),
-            "voice_identifier": .string(voiceIdentifier),
-            "path": .string(url.path),
-            "format": .string("caf"),
-            "bytes": .int(Int64(bytes ?? 0)),
-            "duration_seconds": .double((Double(frames) / sampleRate * 100).rounded() / 100),
-            "characters": .int(Int64(text.count)),
-            "note": .string("Written to a file. Nothing was played and the speakers were not opened."),
-        ])
-    }
-
-    private func renderCloudVoice(text: String, directory: URL, basename: String) async -> JSONValue {
-        let dataRoot = PersistenceCore.defaultDataRoot()
-        let routing = SwiftNativeProviderRouting(dataRoot: dataRoot)
-        let snapshot = try? await routing.checkedRoutingSnapshot()
-        let provider = snapshot.flatMap {
-            ProviderRoutingSurfaceLookup.value($0.activeProviders, "chat")
-        } ?? snapshot
-            .flatMap { ProviderRoutingSurfaceLookup.value($0.preferences, "chat") }
-            .flatMap { routing.inferProviderForModel($0.model) }
-        guard let provider,
-              let model = FirstPartyModelCatalog.speechModel(forProviderID: provider) else {
-            return Self.failure(
-                "route_has_no_speech",
-                "The provider Chat runs on has no cloud voice. Pass route \"mac\" to use the Mac voice."
-            )
-        }
-        let audio: Data
-        do {
-            audio = try await SwiftOpenAITTSClient(model: model)
-                .synthesize(text: text, voice: VoicePreference.cloudVoice(), format: "mp3")
-        } catch {
-            return Self.failure("render_failed", error.localizedDescription)
-        }
-        let url = directory.appendingPathComponent("\(basename).mp3")
-        do {
-            try audio.write(to: url, options: .atomic)
-        } catch {
-            return Self.failure("render_failed", error.localizedDescription)
-        }
-        // A metadata read, not a player: nothing is scheduled and no output
-        // device is opened.
-        let duration = (try? await AVURLAsset(url: url).load(.duration)).map(CMTimeGetSeconds) ?? 0
-        return .object([
-            "status": .string("ok"),
-            "route": .string("cloud"),
-            "voice": .string(VoicePreference.cloudVoice()),
-            "model": .string(model),
-            "path": .string(url.path),
-            "format": .string("mp3"),
-            "bytes": .int(Int64(audio.count)),
-            "duration_seconds": .double(duration.isFinite ? (duration * 100).rounded() / 100 : 0),
-            "characters": .int(Int64(text.count)),
-            "note": .string("Written to a file. Nothing was played and the speakers were not opened."),
-        ])
     }
 }

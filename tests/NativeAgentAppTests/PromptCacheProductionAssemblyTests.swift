@@ -73,7 +73,7 @@ private struct CachedRequest: Sendable {
             ConversationPrefixShape.$override.withValue(.v2Prefix) {
                 AnthropicOAuthDirectAdapter.makeMessagesRequestBody(
                     messages: [.user("fixture")], system: system,
-                    coercedModel: "claude-opus-4-8", maxTokens: 128, tools: tools, stream: false)
+                    coercedModel: "claude-opus-4-8", maxTokens: 128, stream: false)
             }
         }
         var blocks = body["system"] as? [[String: Any]] ?? []
@@ -85,7 +85,10 @@ private struct CachedRequest: Sendable {
             "stableUTF8": Array(segments.stable.utf8),
             "stableSuffixUTF8": Array(segments.stableSuffix.utf8),
             "system": blocks,
-            "tools": body["tools"] ?? []
+            "tools": tools.map { [
+                "name": $0.name, "description": $0.description,
+                "input_schema": (try? JSONSerialization.jsonObject(with: $0.parametersJSON)) ?? [:],
+            ] as [String: Any] }
         ], options: [.sortedKeys])
     }
 

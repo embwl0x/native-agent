@@ -4,6 +4,7 @@ import Foundation
 import KnowledgeGraph
 import NativeAgentCore
 import PersistenceCore
+import NativeAgentTestSupport
 
 // MARK: - Helpers
 

@@ -27,6 +27,8 @@ public enum OpenAIExecutionControls {
         "gpt-5.6-terra",
         "gpt-5.6-luna",
         FirstPartyModelCatalog.gpt6AstraModelID,
+        "gpt-6-sol",
+        "gpt-6-luna",
     ]
 
     public static func supportedReasoningEfforts(
@@ -36,7 +38,7 @@ public enum OpenAIExecutionControls {
         let normalizedModel = model.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         switch transport {
         case .publicAPI:
-            if normalizedModel == FirstPartyModelCatalog.gpt6AstraModelID {
+            if normalizedModel.hasPrefix("gpt-6-") {
                 return publicGPT6AstraEfforts
             }
             if normalizedModel == "gpt-5.6" || normalizedModel.hasPrefix("gpt-5.6-") {
@@ -45,9 +47,9 @@ public enum OpenAIExecutionControls {
             return standardEfforts
         case .chatGPTOAuth, .codexCLI:
             switch normalizedModel {
-            case FirstPartyModelCatalog.gpt6AstraModelID: return accountGPT6AstraEfforts
+            case FirstPartyModelCatalog.gpt6AstraModelID, "gpt-6-sol": return accountGPT6AstraEfforts
             case "gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra": return accountSolTerraEfforts
-            case "gpt-5.6-luna": return accountLunaEfforts
+            case "gpt-5.6-luna", "gpt-6-luna": return accountLunaEfforts
             default: return standardEfforts
             }
         }

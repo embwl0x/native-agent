@@ -103,10 +103,8 @@ enum NativeAgentPaths {
             if !existing.isEmpty {
                 let backup = root.deletingLastPathComponent()
                     .appendingPathComponent("\(InstallPaths.current.name("NativeAgent")).pre-public-backup.\(Self.utcBackupStamp())", isDirectory: true)
-                try fm.createDirectory(at: backup, withIntermediateDirectories: true)
-                for item in existing {
-                    try fm.moveItem(at: item, to: backup.appendingPathComponent(item.lastPathComponent))
-                }
+                try fm.moveItem(at: root, to: backup)
+                try fm.createDirectory(at: root, withIntermediateDirectories: true)
                 backupURL = backup
             }
 

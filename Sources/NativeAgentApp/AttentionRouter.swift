@@ -254,7 +254,9 @@ struct AttentionOutcome: Sendable {
 }
 
 actor AttentionRouter {
-    static let shared = AttentionRouter()
+    static let shared = AttentionRouter(telegramSender: { text in
+        try await AttentionRouter.sendToOwnerTelegram(text, dataRoot: PersistenceCore.defaultDataRoot())
+    })
 
     typealias PhoneSender = @Sendable (
         _ title: String,
@@ -394,6 +396,20 @@ actor AttentionRouter {
     ) -> Bool {
         guard let window = TurnQuietHoursWindow.read(dataRoot: dataRoot) else { return false }
         return window.contains(hour: calendar.component(.hour, from: date))
+    }
+
+    /// Should the Mac banner for this fact be held for quiet hours? The banner
+    /// is a way out too, so it obeys the same class-decided window as the
+    /// push. Read apart from `route`'s outcome because a switched-off phone
+    /// returns before the quiet-hours check, and the phone switch does not
+    /// govern the banner. The push ledger is NOT consulted: a delivered push
+    /// says nothing about whether the banner posted.
+    static func holdsMacBanner(
+        _ importance: AttentionImportance,
+        dataRoot: URL = PersistenceCore.defaultDataRoot(),
+        at date: Date = Date()
+    ) -> Bool {
+        honorsQuietHours(importance) && inQuietHours(at: date, dataRoot: dataRoot)
     }
 
     // MARK: - Durable dedupe ledger
@@ -670,6 +686,32 @@ actor AttentionRouter {
         return try await send.value
     }
 
+    /// 2026-09-22: urgent alerts go to the single private (positive id) chat
+    /// in telegram/session_map.json, on the bot's own send path. Zero or
+    /// several private chats means no clear owner: throw, and the phone takes it.
+    static func sendToOwnerTelegram(_ text: String, dataRoot: URL) async throws {
+        let mapURL = dataRoot
+            .appendingPathComponent("telegram", isDirectory: true)
+            .appendingPathComponent("session_map.json")
+        var privateChats: [Int] = []
+        if let data = try? Data(contentsOf: mapURL),
+           let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let chats = root["chats"] as? [String: Any] {
+            privateChats = chats.keys.compactMap { Int($0) }.filter { $0 > 0 }
+        }
+        guard privateChats.count == 1, let chatId = privateChats.first,
+              let config = TelegramBot.TelegramConfig.loadFromDisk(dataRoot: dataRoot),
+              config.enabled, !config.botToken.isEmpty,
+              config.allowedChatIds.contains(Int64(chatId)) || config.allowedUserIds.contains(Int64(chatId))
+        else {
+            throw NSError(domain: "AttentionRouter", code: 1, userInfo: [
+                NSLocalizedDescriptionKey: "No single private Telegram chat to notify."
+            ])
+        }
+        try await TelegramPollLoop.defaultSendMessage(
+            config.botToken, TelegramDestination(chatId: chatId), TelegramPollLoop.cleanedPlainText(text))
+    }
+
     /// The default way back into an originating conversation: the SAME
     /// transports the completion router already answers turns on, given the
     /// same route. Nothing new is authorized here — if the turn could be
@@ -714,7 +756,7 @@ actor AttentionRouter {
             try await TelegramPollLoop.defaultSendMessage(
                 config.botToken,
                 TelegramDestination(chatId: chatId, threadId: threadId),
-                text
+                TelegramPollLoop.cleanedPlainText(text)
             )
         case .slack:
             var input: [String: JSONValue] = [

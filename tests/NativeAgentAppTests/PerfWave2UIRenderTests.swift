@@ -440,11 +440,11 @@ struct SelfImprovementEqualityGateTests {
     }
 }
 
-// MARK: - F14 follow-up: whatsRunning writer coalescing
+// MARK: - F14 follow-up: refresh gate and status coalescing
 
-@Suite("Perf wave 2 — whatsRunning idle-poll coalescing")
+@Suite("Perf wave 2 — refresh gate and idle-poll coalescing")
 @MainActor
-struct WhatsRunningCoalescingTests {
+struct RefreshGateCoalescingTests {
 
     @Test func latest_snapshot_gate_rejects_an_older_completion() {
         var gate = LatestSnapshotRefreshGate()
@@ -467,79 +467,12 @@ struct WhatsRunningCoalescingTests {
         )
     }
 
-    /// The whole reason the helper is safe here: `WhatsRunningPresentation`
-    /// projects exactly three things off the status — nil-ness, `isStale`, and
-    /// `lastSuccessAt != nil`. This walks every transition and asserts the
-    /// coalesced status renders IDENTICALLY to the always-stamp version.
-    @Test func coalesced_status_renders_identically_across_every_transition() {
-        let snapshot = WhatsRunning(items: [], count: 0)
-        let transitions: [(previous: AppModel.PanelRefreshStatus?, failed: [String])] = [
-            (nil, []),                                                  // first-ever success
-            (nil, ["running work"]),                                    // first-ever failure
-            (status(attempt: 100, success: 100, failed: []), []),       // idle success → success
-            (status(attempt: 100, success: 100, failed: []), ["running work"]), // success → failure
-            (status(attempt: 100, success: 100, failed: ["running work"]), ["running work"]), // failure → same failure, had a last-good
-            (status(attempt: 100, success: nil, failed: ["running work"]), ["running work"]), // failure → same failure, never succeeded
-            (status(attempt: 100, success: nil, failed: ["running work"]), []), // failure → recovery
-        ]
-        let now = Date(timeIntervalSince1970: 500)
-
-        for (previous, failed) in transitions {
-            let alwaysStamp = AppModel.nextRefreshStatus(
-                previous: previous, failedEndpoints: failed, at: now
-            )
-            let toStore = AppModel.staleFlagOnlyStatusToStore(
-                previous: previous, failedEndpoints: failed, at: now
-            )
-            // What the field actually holds after the coalesced write.
-            let coalesced = toStore ?? previous
-
-            #expect(
-                WhatsRunningPresentation.make(snapshot: snapshot, status: coalesced)
-                    == WhatsRunningPresentation.make(snapshot: snapshot, status: alwaysStamp),
-                "coalescing changed what the panel renders for failed=\(failed), previous=\(String(describing: previous?.failedEndpoints))"
-            )
-        }
-    }
-
     /// The waste being removed: an idle, fully-successful poll writes nothing.
     @Test func idle_successful_poll_stores_nothing() {
         let previous = status(attempt: 100, success: 100, failed: [])
         #expect(AppModel.staleFlagOnlyStatusToStore(
             previous: previous, failedEndpoints: [], at: Date(timeIntervalSince1970: 500)
         ) == nil)
-    }
-
-    /// Guard: the snapshot write must stay equality-gated too. Gating only the
-    /// status would buy nothing — `WhatsRunningPanel` reads `whatsRunning`
-    /// directly, so the snapshot write is what was redrawing it.
-    @Test func loadWhatsRunning_gates_both_the_snapshot_and_the_status() throws {
-        let source = try AppSourceScraping.appSource("AppModel+HealthEmbeddings.swift")
-        let body = try #require(AppSourceScraping.looseFunctionBody(named: "loadWhatsRunning", in: source))
-        #expect(body.contains("let refreshGeneration = whatsRunningRefreshGate.begin()"))
-        #expect(body.contains("guard whatsRunningRefreshGate.isCurrent(refreshGeneration) else { return }"))
-        #expect(body.contains("if whatsRunning != fetched { whatsRunning = fetched }"),
-                "the whatsRunning snapshot lost its equality gate")
-        #expect(body.contains("staleFlagOnlyStatusToStore"),
-                "the whatsRunning status writer lost its coalescing")
-        #expect(!body.contains("whatsRunningRefreshStatus = Self.nextRefreshStatus"),
-                "an unconditional status stamp came back")
-    }
-
-    @MainActor
-    @Test func identical_snapshot_performs_no_observable_write() {
-        let model = AppModel()
-        let snapshot = WhatsRunning(items: [], count: 0)
-        model.whatsRunning = snapshot
-
-        let flag = FireFlag()
-        withObservationTracking {
-            _ = model.whatsRunning
-        } onChange: {
-            flag.fired = true
-        }
-        if model.whatsRunning != snapshot { model.whatsRunning = snapshot }
-        #expect(flag.fired == false)
     }
 }
 

@@ -443,10 +443,24 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
         }
         _ = NativePrivateFile.write(Data(token.utf8), to: tokenFileURL)
         _ = NativePrivateFile.write(descriptor, to: descriptorFileURL)
+        // 2026-09-22: connected peers get the address only; they authenticate
+        // with their own secret (contactHeaders), never the main bearer.
+        let peerDir = AgentHostDirectory.peerDescriptorDirectory(dataRoot: NativeAgentPaths.dataRoot)
+        try? FileManager.default.createDirectory(at: peerDir, withIntermediateDirectories: true)
+        try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: peerDir.path)
+        if let peerDescriptor = try? JSONSerialization.data(
+            withJSONObject: ["schemaVersion": 1, "url": "http://127.0.0.1:\(port)"], options: [.prettyPrinted]) {
+            _ = NativePrivateFile.write(peerDescriptor, to: peerDescriptorFileURL)
+        }
+    }
+
+    private var peerDescriptorFileURL: URL {
+        URL(fileURLWithPath: AgentHostDirectory.bridgeDescriptorPath(dataRoot: NativeAgentPaths.dataRoot))
     }
 
     private func removeDiscoveryFiles() {
         _ = tokenFileURL.path.withCString { Darwin.unlink($0) }
+        _ = peerDescriptorFileURL.path.withCString { Darwin.unlink($0) }
         _ = descriptorFileURL.path.withCString { Darwin.unlink($0) }
     }
 
@@ -1164,10 +1178,12 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
         // never the request body, so the table is being asked exactly the
         // question it exists to answer: did an agent compose these words, or is
         // this lane carrying the human's?
+        let claudeReplyID = sender == "claude" ? (json["reply_to"] as? String).flatMap(Self.validClaudeReplyID) : nil
         let origin = ChatMessageOrigin(
             surface: Self.bridgeSurfaceName(forSender: sender),
             agent: sender,
-            authored: Self.laneAuthorship(forSender: sender)
+            authored: Self.laneAuthorship(forSender: sender),
+            replyTo: claudeReplyID
         )
         // The in-band label. A peer that proved WHICH contact it is — its
         // connection's own key, resolved by `AgentBridgePrincipal` — is named
@@ -1180,6 +1196,8 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
         var text: String
         if sender == "claude" {
             text = "[from: claude, via bridge] \(rawText)"
+        } else if defaultSender == "agent" {
+            text = "[from: \(label), via bridge] \(AgentBridgeSurface.quotingImpersonation(rawText))"
         } else {
             text = "[from: \(label), via bridge] \(rawText)"
         }
@@ -1322,6 +1340,8 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
                 sessionId: sessionId,
                 persona: persona,
                 origin: origin,
+                claudeReplyID: claudeReplyID,
+                claudeReplyText: rawText,
                 requestID: requestID,
                 started: started,
                 runTurn: ackMode != "enqueue_only",
@@ -1332,6 +1352,7 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
         // U5 W-G: bound the work phase. The latch makes the work Task and the
         // deadline timer race for the single response write; the loser no-ops.
         let progress = chatNoticeSink(requestID: requestID, sessionID: sessionId)
+        let bridgeTurnMessage = Self.withImageSkipNote(text, imageSkips)
         let workLatch = WorkLatch()
         _ = Task.detached(priority: .userInitiated) { [weak self] in
             guard let self else { return }
@@ -1388,8 +1409,9 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
                                         reasoningEffort: nil
                                     )
                                 ) {
-                                    try await client.chat(
-                                        message: Self.withImageSkipNote(text, imageSkips),
+                                    try await BridgeChatAdmission.shared.run(sessionID: sessionId) {
+                                        try await client.chat(
+                                        message: bridgeTurnMessage,
                                         sessionId: sessionId,
                                         model: "",
                                         reasoningEffort: "",
@@ -1401,8 +1423,9 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
                                         // reply destination for async follow-up work.
                                         surface: "chat",
                                         suppressUserAppend: false,
-                                        progress: progress
-                                    )
+                                            progress: progress
+                                        )
+                                    }
                                 }
                         }
                         let generated = try await ChatPersistenceContext
@@ -1468,8 +1491,9 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
                     }
                     resp = try await ChatPersistenceContext
                         .$originProvenance.withValue(origin) {
-                            try await client.chat(
-                                message: Self.withImageSkipNote(text, imageSkips),
+                            try await BridgeChatAdmission.shared.run(sessionID: sessionId) {
+                                try await client.chat(
+                                message: bridgeTurnMessage,
                                 sessionId: sessionId,
                                 model: "",
                                 reasoningEffort: "",
@@ -1478,11 +1502,15 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
                                 persona: persona,
                                 surface: "chat",
                                 suppressUserAppend: false,
-                                progress: progress
-                            )
+                                    progress: progress
+                                )
+                            }
                         }
                 }
                 await Self.publishChatTurnCompleted(sessionID: resp.sessionId ?? sessionId)
+                if let claudeReplyID {
+                    Self.recordClaudeReply(to: claudeReplyID, text: rawText, sessionId: resp.sessionId ?? sessionId)
+                }
                 let durationMs = Int(Date().timeIntervalSince(started) * 1000)
                 let trimmedReply = resp.output.trimmingCharacters(in: .whitespacesAndNewlines)
                 let attachmentPayload = Self.bridgeAttachmentPayload(resp.attachments)
@@ -1562,6 +1590,22 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
                     responseObject["completionDelivery"] = completionDelivery.jsonObject
                 }
                 self.writeProjectedMessage(conn, projection: responseProjection, status: 200, obj: responseObject)
+            } catch is BridgeChatAdmission.Full {
+                // Queue capacity was refused before the chat closure ran. Keep
+                // exact completion identity but allow a later delivery retry.
+                var retryable = !lifecycleClaimed
+                if lifecycleClaimed, !responseCached, let deliveryId, let completionRequestDigest {
+                    do {
+                        try await CodexCompletionLifecycle.shared.markNotStarted(
+                            deliveryId: deliveryId, requestDigest: completionRequestDigest)
+                        retryable = true
+                    } catch { retryable = false }
+                }
+                guard workLatch.claim() else { return }
+                self.writeProjectedMessage(conn, projection: responseProjection, status: retryable ? 429 : 503, obj: [
+                    "requestId": requestID, "status": "not_started", "retryable": retryable,
+                    "error": "bridge_chat_queue_full", "detail": "No model turn started; this chat's bridge queue is full.",
+                ])
             } catch is CancellationError {
                 await Self.publishChatTurnCompleted(sessionID: sessionId)
                 // 2026-07-21 gpt-5.5 review: the bridge deadline cancels the
@@ -1811,7 +1855,7 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
                 "path": messageReplyURL(home: home).path,
                 "format": "jsonl",
                 "match": ["requestId": requestID],
-                "retention": "Best-effort local receipt; periodically retains newest \(JSONLLineCaps.bridgeMessageReplies) rows. No fixed availability guarantee. A missing row does not prove failure.",
+                "retention": "Best-effort local receipt; trims to the newest ~4 MB once the file passes 8 MB. No fixed availability guarantee. A missing row does not prove failure.",
             ],
             "detail": "The HTTP wait ended; the original turn was not cancelled. Inspect its eventual receipt by requestId or its transcript. Do not resend the work merely because the receipt is not present yet.",
         ]
@@ -1860,6 +1904,8 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
         sessionId: String?,
         persona: String?,
         origin: ChatMessageOrigin,
+        claudeReplyID: String?,
+        claudeReplyText: String,
         requestID: String,
         started: Date,
         /// false = notice delivery: append the row, answer the ack, run NO
@@ -1955,45 +2001,6 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
                 await Self.publishChatTurnCompleted(sessionID: enqueued.sessionId)
                 return
             }
-            // Jev lane 5 (advisory), inbound side: say what kind of message
-            // this is. Only a blocker or a question leaves a line — a reported
-            // result or a claimed completion is a claim, never a verified
-            // success, so it is logged and goes no further. Fails open: any
-            // error and the turn is untouched.
-            //
-            // FIRE AND FORGET: the turn below does not wait on it. The line it
-            // may leave rides the log and the NEXT turn's brief, because
-            // holding an inbound message for a 2 s advisory classification is
-            // a real delay in exchange for a hint.
-            let inboundText = text
-            let inboundSession = enqueued.sessionId
-            Task.detached(priority: .utility) {
-                let root = NativeAgentPaths.dataRoot
-                // The turn this line is meant for is the one about to run, so
-                // the stamp to match is whatever had completed when the
-                // classification STARTED. If a turn finishes while it runs,
-                // that turn has already seen this message and the line is
-                // stale. Written through the one serialized writer, so this
-                // and the post-turn check can never both be mid-write.
-                let observed = await JevShadow.CarryForward.shared
-                    .latestTurn(sessionID: inboundSession)
-                guard let line = try? await JevShadow.classifyInbound(
-                    text: inboundText,
-                    sessionID: inboundSession,
-                    dataRoot: root
-                ) else { return }
-                await JevShadow.CarryForward.shared.write(
-                    "A check of the message that arrived suggests, as a hint only: \(line)",
-                    dataRoot: root,
-                    sessionID: inboundSession,
-                    requiring: observed,
-                    lane: .shadowRank
-                    // No `sourceTurn`: the turn this line is about is the one
-                    // about to run, and it has no identity yet here. `observed`
-                    // is the PREVIOUS completed turn — a wrong source on the
-                    // row is worse than none, so the field stays empty.
-                )
-            }
             do {
                 // Pin the turn's runId to the enqueued row's runId so history
                 // exclusion drops the pre-appended user row (else the message
@@ -2004,7 +2011,8 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
                     .withValue(origin) {
                         try await ChatPersistenceContext.$pinnedTurnRunID
                             .withValue(enqueued.runId) {
-                                try await client.chat(
+                                try await BridgeChatAdmission.shared.run(sessionID: enqueued.sessionId) {
+                                    try await client.chat(
                                     message: text,
                                     sessionId: enqueued.sessionId,
                                     model: "",
@@ -2018,12 +2026,16 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
                                         requestID: requestID,
                                         sessionID: enqueued.sessionId,
                                         runID: enqueued.runId
+                                        )
                                     )
-                                )
+                                }
                             }
                     }
                 }
                 await Self.publishChatTurnCompleted(sessionID: resp.sessionId ?? enqueued.sessionId)
+                if let claudeReplyID {
+                    Self.recordClaudeReply(to: claudeReplyID, text: claudeReplyText, sessionId: resp.sessionId ?? enqueued.sessionId)
+                }
                 let durationMs = Int(Date().timeIntervalSince(started) * 1000)
                 let trimmedReply = resp.output.trimmingCharacters(in: .whitespacesAndNewlines)
                 let attachmentPayload = Self.bridgeAttachmentPayload(resp.attachments)
@@ -2210,6 +2222,39 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
         }
     }
 
+    /// 2026-09-22: a live Claude answers Agent in a bridge chat, never in the
+    /// wake job, so her delegations all read unanswered. A `reply_to` naming a
+    /// real inbox message is recorded beside that inbox for the projection.
+    static func validClaudeReplyID(_ messageID: String) -> String? {
+        let dir = messageReplyURL().deletingLastPathComponent()
+        guard !messageID.isEmpty, messageID.utf8.count <= 128,
+              !DelegationStatusProjector.requestTexts(inbox: dir.appendingPathComponent("claude-inbox.jsonl"),
+                                                      ids: [messageID], field: "messageId").isEmpty else { return nil }
+        return messageID
+    }
+
+    static func recordClaudeReply(to messageID: String, text: String, sessionId: String?) {
+        let dir = messageReplyURL().deletingLastPathComponent()
+        let row: [String: Any] = [
+            "messageId": messageID, "sessionId": sessionId ?? NSNull(),
+            "replyTextHead": text.count > 400 ? String(text.prefix(399)) + "…" : text,
+            "createdAt": ISO8601DateFormatter().string(from: Date()),
+        ]
+        guard var line = try? JSONSerialization.data(withJSONObject: row) else { return }
+        line.append(0x0A)
+        let file = dir.appendingPathComponent("claude-replies.jsonl")
+        messageReplyLock.lock()
+        defer { messageReplyLock.unlock() }
+        if let handle = try? FileHandle(forWritingTo: file) {
+            _ = try? handle.seekToEnd()
+            try? handle.write(contentsOf: line)
+            try? handle.close()
+        } else {
+            FileManager.default.createFile(atPath: file.path, contents: line, attributes: [.posixPermissions: 0o600])
+        }
+        _ = try? enforceJSONLLineCap(at: file, maxLines: 500, trimWhenBytesExceed: 1_048_576)
+    }
+
     private static func persistMessageReply(_ payload: [String: Any], requestID: String) {
         messageReplyLock.lock()
         defer { messageReplyLock.unlock() }
@@ -2253,10 +2298,13 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
                 try handle.synchronize()
                 try handle.close()
             }
-            let dropped = try enforceJSONLLineCap(
+            // 2026-09-22: a byte cap, not a line cap. Rows are big (~2KB), so
+            // the file sat past the 8MiB trigger but under 5000 lines and was
+            // re-read whole on every append without ever trimming.
+            let dropped = try enforceJSONLByteCap(
                 at: file,
-                maxLines: JSONLLineCaps.bridgeMessageReplies,
-                trimWhenBytesExceed: 8 * 1024 * 1024
+                maxBytes: 8 << 20,
+                trimToBytes: 4 << 20
             )
             if dropped > 0 {
                 NSLog(

@@ -90,6 +90,8 @@ extension AppModel {
             "openai_oauth_direct.json",
             "openai.json",
             "openrouter.json",
+            "moonshot.json",
+            "kimi-code.json",
             "xai_oauth_direct.json",
         ]
         if credentialFiles.contains(where: { hasContent(providers.appendingPathComponent($0)) }) {
@@ -123,7 +125,8 @@ extension AppModel {
         }
 
         // 4. Environment API keys the credential resolver honors.
-        let keyVars = ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY", "XAI_API_KEY"]
+        let keyVars = ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY",
+                       "MOONSHOT_API_KEY", "KIMI_CODE_API_KEY", "XAI_API_KEY"]
         if keyVars.contains(where: { environment[$0]?.isEmpty == false }) { return true }
 
         // FIRSTRUN-1: deliberately NO bare-binary branch here. `codex` being

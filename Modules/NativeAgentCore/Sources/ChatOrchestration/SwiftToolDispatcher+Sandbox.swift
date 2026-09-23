@@ -502,8 +502,12 @@ extension SwiftToolDispatcher {
     }
 
     func fullMacToolAccess(surface: String = "chat") async -> FullMacToolAccess {
-        let policy = await SwiftNativeTrustCenter(dataRoot: dataRoot).loadTrustPolicy()
-        let macPolicy = MacControlPolicy.fromTrustPolicyObject(policy)
+        let snapshot = try? await SwiftNativeTrustCenter(dataRoot: dataRoot).loadAuthorizationSnapshotChecked()
+        let policy = snapshot?.policy ?? [:]
+        let admitted = await fullMacYoloAdmitted(tool: "mac_control", surface: surface)
+        let macPolicy = MacControlGate.policyForAdmittedFullMac(
+            MacControlPolicy.fromTrustPolicyObject(policy), admitted: admitted
+        )
         let trust = macPolicy.trustPolicy ?? MacControlTrustPolicy()
         let fullMacActive = MacControlGate.fullMacActive(trust)
         let trigger = Self.fullMacTrigger(forSurface: surface)
@@ -724,8 +728,8 @@ extension SwiftToolDispatcher {
     /// agent-native surface. `screen` and `wait` are perception and gate on the
     /// READ tier; `act` and `go` move the world and gate on app-control, the
     /// same strength as the injection tools whose organs `act` drives.
-    /// No frame ids, no handles, no drift codes reach the caller — replies are
-    /// words plus a structured `detail` side-channel.
+    /// Ordinary calls use words. The workspace can request structured controls
+    /// and return their exact binding, through the same action gate and owner.
     func impl_mac_four_verbs_tool(
         tool: String,
         input: [String: JSONValue],
@@ -795,8 +799,20 @@ extension SwiftToolDispatcher {
         let reply: MacFourVerbsReply
         switch tool {
         case "screen":
-            reply = await verbs.screen(part: str("part"), app: str("app"))
+            reply = await verbs.screen(part: str("part"), app: str("app"), structured: input["structured"] == .bool(true))
         case "act":
+            // 2026-09-22: models send "" for unused fields; empty is absent, not a selection.
+            let absent: [JSONValue?] = [nil, .null, .string("")]
+            if !absent.contains(input["handle"]) || !absent.contains(input["frame_id"]) {
+                guard let handle = str("handle"), let frame = str("frame_id"), let verb = str("verb"),
+                      ["to", "to_app", "seconds", "repeat", "interval", "holding", "button", "scroll_amount"].allSatisfy({ input[$0] == nil || input[$0] == .null }) else {
+                    throw AutonomyGateError.toolDenied(reason: "An exact screen selection requires handle and frame_id together, with no physical gesture or repeat options. Look again if the selection is stale.")
+                }
+                reply = await verbs.actSelection(verb: verb, handle: handle, frameID: frame,
+                    text: input["text"].flatMap { if case .string(let text) = $0 { return text }; return nil },
+                    direction: str("direction"))
+                break
+            }
             guard let verb = str("verb"), let target = str("target") else {
                 throw AutonomyGateError.toolDenied(
                     reason: "act needs `verb` and `target` — say what to do and the name of the thing"
@@ -1094,30 +1110,29 @@ extension SwiftToolDispatcher {
         return result.toJSON()
     }
 
-    /// Whether Trust Center's Activity Capture toggle is on for this data root.
+    /// Discover activity queries only when capture is on and agent access is
+    /// granted directly or by Full Mac. Dispatch rechecks actual-origin authority.
     ///
     /// Lives in THIS file, not in SwiftToolDispatcher.swift where it is called
     /// from, so that `import ActivityWatch` stays confined to one file — the
     /// property ActivityWatchArchitectureTests pins. Cheap: one small JSON read,
     /// on the catalog path only, and a missing/garbage file reads as `false`.
-    func activityCaptureEnabled() -> Bool {
+    func activityCaptureEnabled() async -> Bool {
         guard let policy = try? ActivityPolicyStore(dataRoot: dataRoot).loadChecked() else {
             return false
         }
-        return policy.captureEnabled && policy.allowModelAccess
+        guard policy.captureEnabled else { return false }
+        if policy.allowModelAccess { return true }
+        return await fullMacYoloAdmitted(tool: "activity_query", surface: "chat")
     }
 
     /// W7 — `activity_query`: the ONE read path into the ambient activity
     /// watcher's local store.
     ///
-    /// Three refusals, in this order, each of them explicit rather than a 404:
+    /// Full Mac admits bounded activity answers on authenticated operator
+    /// surfaces. Without that authority, the existing local-only model-access
+    /// opt-in remains required. Capture off and malformed policies still refuse.
     ///
-    ///  1. **Remote surfaces are refused.** The tool is Mac-local by decision
-    ///     (build plan W7, gpt-5.5 BLOCKING B2): answering on the iOS/HTTP
-    ///     bridge would pull activity data off the Mac and put the answer
-    ///     through iCloud/chat-sync, which breaks the constraint the whole
-    ///     feature was approved under. Refused with a message that says so, so
-    ///     the next reader sees a decision instead of an omission.
     ///  2. **Capture off → refused.** `ActivityQueryService.run` re-reads the
     ///     Trust Center policy and throws when the toggle is off, with a
     ///     message naming where to turn it on and stating honestly that
@@ -1127,7 +1142,7 @@ extension SwiftToolDispatcher {
     ///     wrong day.
     ///
     /// ZERO ADDITIONAL LLM CALLS. Everything below is parsing, `Calendar`
-    /// arithmetic and SQL. With separate Agent Access consent, the bounded
+    /// arithmetic and SQL. With Agent Access or admitted Full Mac, the bounded
     /// result returns to the already-selected chat provider as the next tool
     /// result. It is not persisted into the cognitive substrate and is excluded
     /// from memory promotion.
@@ -1141,7 +1156,8 @@ extension SwiftToolDispatcher {
                 reason: "SwiftToolDispatcher: '\(tool)' has no Swift activity-query implementation"
             )
         }
-        guard !ActivityQueryService.isRefusedSurface(surface) else {
+        let fullMacAdmitted = await fullMacYoloAdmitted(tool: tool, surface: surface)
+        guard fullMacAdmitted || !ActivityQueryService.isRefusedSurface(surface) else {
             throw AutonomyGateError.toolDenied(
                 reason: ActivityQueryService.QueryError.remoteSurfaceRefused(surface: surface).description
             )
@@ -1226,7 +1242,7 @@ extension SwiftToolDispatcher {
                 bundleID: stringArg("bundle_id"),
                 timezone: timezone,
                 rowCap: intArg("limit") ?? ActivityQueryService.maxRows
-            ))
+            ), fullMacAdmitted: fullMacAdmitted)
         } catch let error as ActivityQueryService.QueryError {
             // Surfaced as a tool denial, not a crash and not an empty answer:
             // "capture is off" must never look like "you did nothing today".

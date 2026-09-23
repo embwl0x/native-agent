@@ -9,8 +9,19 @@ or activates that tab.
 Tab leases are now real, bounded, renewable, persisted in
 `chrome.storage.session`, and recovered across Manifest V3 service-worker
 restarts. Physical pointer, keyboard, wheel, touch, or tab-activation evidence
-terminally yields the lease without closing the tab. The extension never
-activates an agent-created tab.
+terminally yields the lease without closing the tab. Default grouped tabs remain
+inactive. Creating an X/Twitter post URL automatically opens a separate ordinary
+window with `focused: false` and its own active
+tab. It never selects a tab in the user's window. Window focus, additional tabs,
+minimization, or trusted interaction ends control; cleanup closes only the exact
+created tab while its window remains unfocused. The create-only `rendering_mode`
+option can explicitly select `visible_work_window` or `grouped_background`.
+Automatic matching requires the exact X/Twitter hosts and a username/status/id
+path, HTTP(S), no credentials or nonstandard port. Claims and other URLs are
+unchanged. Resident verification read multiple actual replies on one X thread
+with visible rendering, zero takeover sequence and successful tab cleanup. This
+is not a universal guarantee: macOS occlusion can still suspend rendering. Snapshot
+`rendering` reports actual visibility and readiness, not completeness of a feed.
 
 The first group is placed in the last-focused normal Chrome window, without
 selecting a tab or focusing a window. Later work reuses the exact group's live
@@ -53,6 +64,18 @@ Mutation freshness and outcome-unknown rules remain unchanged.
 Native modal dialogs retain their container identity; background nodes remain
 readable but advertise no actions while a modal is open. Page-level scrolling
 also requires a current target inside the modal rather than moving its backdrop.
+
+Version 0.4.11 reads the current viewport, including the summary, instead of
+repeating a prefix of the entire document after every scroll. Offscreen feed
+articles do not spend the walk budget before visible replies. Container text
+includes its direct prose rather than repeating all offscreen descendants. Scroll replies
+allow a bounded 750 ms rendering interval and report whether the DOM changed;
+they never claim that a website finished fetching its feed. Read again or use
+the existing bounded wait when the site is still loading.
+
+The app renews a still-valid tab lease near expiry when performing authorized
+browsing work. Idle expiry, user takeover and revocation remain terminal; there
+is no heartbeat that holds a tab indefinitely and no automatic reacquisition.
 
 Run the focused extension tests with:
 
@@ -99,9 +122,9 @@ reloading the extension.
 # Dynamic feed navigation
 
 Unrelated feed mutations may retain an exact same-origin anchor inside a navigation
-landmark for up to 60 seconds. Only click can use this retained address; its URL,
+landmark, or an unchanged tab inside a tablist, for up to 60 seconds. Only click can use this retained address; its URL,
 name, element, ancestor chain, page URL, visibility and enabled state must still
-match. Changes inside the navigation landmark, ancestor attributes, removal,
+match. Tab selection and controlled-panel identity must also match. Changes inside the navigation landmark, ancestor attributes, removal,
 user takeover, navigation, or an open modal require fresh evidence. Other actions
 and feed controls keep whole-snapshot invalidation. This is not a stale-click retry
 or selector guess: the page revalidates the original observed control synchronously.

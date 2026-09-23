@@ -106,17 +106,6 @@ public actor SwiftNativeTelegramBot: TelegramBotProtocol {
         let voiceBackend = cfg?.voiceTranscriptionBackend ?? TelegramConfig.defaultVoiceTranscriptionBackend
         let voiceModel = cfg?.voiceTranscriptionModel ?? TelegramConfig.defaultVoiceTranscriptionModel
         let voiceMaxBytes = cfg?.voiceMaxBytes ?? TelegramConfig.defaultVoiceMaxBytes
-        let voiceBackendSupported = TelegramVoiceTranscriptionBackends.isSupported(voiceBackend)
-        let voiceRequiresAPIKey = TelegramVoiceTranscriptionBackends.requiresAPIKey(voiceBackend)
-        let voiceKeyConfigured: Bool = {
-            guard voiceBackendSupported else { return false }
-            guard voiceRequiresAPIKey else { return true }
-            return LLMCredentialResolver.resolveAPIKey(
-                envVar: "OPENAI_API_KEY",
-                providerConfigFile: "openai.json",
-                dataRoot: dataRoot
-            ) != nil
-        }()
         let extras: [String: JSONValue] = [
             "allowedChatIds": .array((cfg?.allowedChatIds.sorted() ?? []).map { .string(String($0)) }),
             "allowedUserIds": .array((cfg?.allowedUserIds.sorted() ?? []).map { .string(String($0)) }),
@@ -130,9 +119,6 @@ public actor SwiftNativeTelegramBot: TelegramBotProtocol {
                 "backend": .string(voiceBackend),
                 "model": .string(voiceModel),
                 "maxBytes": .int(Int64(voiceMaxBytes)),
-                "backendSupported": .bool(voiceBackendSupported),
-                "keyConfigured": .bool(voiceKeyConfigured),
-                "requiresAPIKey": .bool(voiceRequiresAPIKey),
             ]),
             "receipts": .array(receipts),
             "blocked": .array(blocked),
@@ -277,7 +263,10 @@ extension SwiftNativeTelegramBot {
             // misclassified as a Telegram outage by the poll loop.
             throw CancellationError()
         } catch {
-            throw TelegramBotError.unavailable
+            // 2026-09-22: keep the cause. A bare `.unavailable` read as offline,
+            // so real TLS/DNS/proxy faults were silent; isOfflineError still
+            // matches genuine offline URLError codes in this description.
+            throw TelegramBotError.underlying(String(describing: error))
         }
         let http = response as? HTTPURLResponse
         let status = http?.statusCode ?? 0

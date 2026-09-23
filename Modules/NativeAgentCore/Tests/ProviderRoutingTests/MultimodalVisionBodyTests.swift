@@ -25,7 +25,7 @@ import NativeAgentCore
         let msg = LLMMessage.userWithImages("what is this?", images: [Self.imageBlock()])
         let body = AnthropicOAuthDirectAdapter.makeMessagesRequestBody(
             messages: [msg], system: "sys", coercedModel: "claude-opus-4-8",
-            maxTokens: 4096, tools: nil, stream: false
+            maxTokens: 4096, stream: false
         )
         let messages = body["messages"] as! [[String: Any]]
         let content = messages[0]["content"] as! [[String: Any]]
@@ -44,7 +44,7 @@ import NativeAgentCore
     @Test func anthropic_textOnly_byteIdenticalSingleTextBlock() {
         let body = AnthropicOAuthDirectAdapter.makeMessagesRequestBody(
             messages: [.user("hi there")], system: "sys", coercedModel: "claude-opus-4-8",
-            maxTokens: 4096, tools: nil, stream: false
+            maxTokens: 4096, stream: false
         )
         let messages = body["messages"] as! [[String: Any]]
         let content = messages[0]["content"] as! [[String: Any]]
@@ -62,7 +62,7 @@ import NativeAgentCore
         ]
         let body = AnthropicOAuthDirectAdapter.makeMessagesRequestBody(
             messages: [.userWithImages("two", images: imgs)], system: nil,
-            coercedModel: "claude-opus-4-8", maxTokens: 4096, tools: nil, stream: false
+            coercedModel: "claude-opus-4-8", maxTokens: 4096, stream: false
         )
         let content = (body["messages"] as! [[String: Any]])[0]["content"] as! [[String: Any]]
         #expect(content.count == 3)
@@ -117,7 +117,7 @@ import NativeAgentCore
 @Test func anthropic_textOnly_fullBody_noVisionArtifacts() throws {
     let body = AnthropicOAuthDirectAdapter.makeMessagesRequestBody(
         messages: [.user("hi there")], system: "sys", coercedModel: "claude-opus-4-8",
-        maxTokens: 4096, tools: nil, stream: false
+        maxTokens: 4096, stream: false
     )
     // Top-level key set: exactly the legacy keys, nothing new.
     #expect(Set(body.keys) == ["model", "max_tokens", "messages", "system"])

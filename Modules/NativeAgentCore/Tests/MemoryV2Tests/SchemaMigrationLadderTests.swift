@@ -90,6 +90,7 @@ struct SchemaMigrationLadderTests {
         "v6_embedding_epochs",
         "v7_temporal_evidence",
         "v8_kg_memory_index",
+        "v9_drop_embedding_previous",
     ]
 
     /// Write a memory.sqlite that looks like a v1-era install: v1 tables, rows,
@@ -190,7 +191,7 @@ struct SchemaMigrationLadderTests {
 
         let tableNames = try tables(at: path)
         for table in ["kg_entities", "kg_relationships",
-                      "memory_embedding_state", "memory_embedding_previous"] {
+                      "memory_embedding_state"] {
             #expect(tableNames.contains(table), "\(table) missing after upgrade")
         }
 
@@ -241,7 +242,7 @@ struct SchemaMigrationLadderTests {
         #expect(try tables(at: upgradedPath) == tables(at: freshPath))
         for table in ["memories", "proposals", "tombstones",
                       "kg_entities", "kg_relationships",
-                      "memory_embedding_state", "memory_embedding_previous"] {
+                      "memory_embedding_state"] {
             #expect(
                 try columns(at: upgradedPath, table: table) == columns(at: freshPath, table: table),
                 "column surface diverges on \(table) between the upgrade path and a fresh create"

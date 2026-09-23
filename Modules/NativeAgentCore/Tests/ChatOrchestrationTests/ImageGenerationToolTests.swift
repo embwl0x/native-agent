@@ -20,27 +20,6 @@ private func realPNG(red: CGFloat = 0) -> Data {
     return data as Data
 }
 
-private func completedImageStream(
-    _ data: Data = realPNG(),
-    returnedToolQuality: String? = nil,
-    observedQuality: String? = nil
-) -> Data {
-    var item: [String: Any] = [
-        "id": "ig_test", "type": "image_generation_call", "status": "completed",
-        "action": "edit", "result": data.base64EncodedString(),
-    ]
-    if let observedQuality { item["quality"] = observedQuality }
-    var response: [String: Any] = [
-        "id": "resp_image_test", "status": "completed",
-        "model": "response-model-observed", "output": [item],
-    ]
-    if let returnedToolQuality {
-        response["tools"] = [["type": "image_generation", "quality": returnedToolQuality]]
-    }
-    let payload = try! JSONSerialization.data(withJSONObject: ["type": "response.completed", "response": response])
-    return Data("data: ".utf8) + payload + Data("\n\ndata: [DONE]\n\n".utf8)
-}
-
 private func makeImageRoot(imageAllowed: Bool) async throws -> URL {
     let root = FileManager.default.temporaryDirectory
         .appendingPathComponent("imagegen-\(UUID().uuidString)", isDirectory: true)
@@ -129,44 +108,6 @@ private func capturedHeader(_ name: String) -> String? {
     }?.value
 }
 
-private func base64URL(_ data: Data) -> String {
-    data.base64EncodedString()
-        .replacingOccurrences(of: "+", with: "-")
-        .replacingOccurrences(of: "/", with: "_")
-        .replacingOccurrences(of: "=", with: "")
-}
-
-private func makeCodexAccessJWT(accountID: String, exp: Int = Int(Date().timeIntervalSince1970) + 3600) throws -> String {
-    let header = try JSONSerialization.data(withJSONObject: ["alg": "none", "typ": "JWT"])
-    let payload = try JSONSerialization.data(withJSONObject: [
-        "exp": exp,
-        "https://api.openai.com/auth": [
-            "chatgpt_account_id": accountID,
-        ],
-    ] as [String: Any])
-    return "\(base64URL(header)).\(base64URL(payload)).signature"
-}
-
-private func writeCodexAuthJSON(root: URL, accountID: String = "acct_image_test") throws -> (URL, String) {
-    let authPath = root
-        .appendingPathComponent("codex_home", isDirectory: true)
-        .appendingPathComponent("auth.json", isDirectory: false)
-    try FileManager.default.createDirectory(
-        at: authPath.deletingLastPathComponent(),
-        withIntermediateDirectories: true
-    )
-    let token = try makeCodexAccessJWT(accountID: accountID)
-    let payload: [String: Any] = [
-        "tokens": [
-            "access_token": token,
-            "refresh_token": "rt_image_test",
-            "account_id": accountID,
-        ],
-    ]
-    try JSONSerialization.data(withJSONObject: payload).write(to: authPath)
-    return (authPath, token)
-}
-
 private final class CapturedCodexInvocation: @unchecked Sendable {
     var invocation: CodexImageGenerationInvocation?
     var called = false
@@ -188,7 +129,7 @@ struct ImageGenerationToolTests {
     @Test func recoveryCopyNamesVisibleActionsAndCodexPrerequisites() throws {
         let trust = try #require(ImageGenerationToolError.trustDenied.errorDescription)
         #expect(trust.hasPrefix("[trust_denied]"))
-        #expect(trust.contains("In Trust, turn on ‘Allow Codex image generation’"))
+        #expect(trust.contains("In Trust, turn on ‘Allow image generation’"))
         let codex = try #require(ImageGenerationToolError.codexUnavailable.errorDescription)
         #expect(codex.hasPrefix("[image_generation_codex_unavailable]"))
         #expect(codex.contains("Codex command-line tool installed on this Mac and signed in"))
@@ -239,35 +180,6 @@ struct ImageGenerationToolTests {
         #expect(!FileManager.default.fileExists(atPath: root.appendingPathComponent("studio").path))
     }
 
-    // Explicit opt-in only: authorized subscription acceptance, never part of ordinary tests.
-    @Test(.enabled(if: ProcessInfo.processInfo.environment["NATIVE_AGENT_IMAGE_ACCEPTANCE_ROOT"] != nil))
-    func codexLiveGenerationAndReferenceEditAcceptance() async throws {
-        let path = try #require(ProcessInfo.processInfo.environment["NATIVE_AGENT_IMAGE_ACCEPTANCE_ROOT"])
-        let auth = try #require(ProcessInfo.processInfo.environment["NATIVE_AGENT_IMAGE_ACCEPTANCE_AUTH"])
-        let root = URL(fileURLWithPath: path, isDirectory: true)
-        // Require a fresh private output root, separate from the running app's state.
-        #expect(!FileManager.default.fileExists(atPath: root.path))
-        guard !FileManager.default.fileExists(atPath: root.path) else { return }
-        try await SwiftNativePersistenceCore().writeJSON(.object(["multimodalPolicy": .object(["image_generation_openai": .bool(true)])]), to: root.appendingPathComponent("trust/policy.json"))
-        let client = SwiftCodexOAuthImageGenerationClient(authPathOverride: URL(fileURLWithPath: auth), dataRoot: root)
-        let dispatcher = SwiftToolDispatcher(dataRoot: root)
-        let prompt = "Create a polished editorial still life: a small ceramic teal observatory on a warm ivory desk, a brass telescope, one vivid orange sphere on the left, soft morning light, finely textured handmade materials, clean negative space. A small printed card says AGENT in precise dark lettering. Square composition."
-        let request = try CodexImageGenerationRequest(prompt: prompt, size: nil, quality: nil, outputFormat: "png", count: 1, timeoutSeconds: 600).normalized()
-        let generated = try await client.generate(request)
-        let receipt = try await dispatcher.persistCodexImageGenerationResult(generated, request: request, prompt: prompt)
-        try await SwiftNativePersistenceCore().writeJSON(receipt, to: root.appendingPathComponent("generation-receipt.json"))
-        let source = try #require(generated.sourceImages.first)
-        // Continue through the production artifact/file authorization gate.
-        let reference = try #require(try await dispatcher.imageGenerationReferences(.array([.string(source.path)])).first)
-        let editPrompt = "Edit the supplied image: change ONLY the vivid orange sphere on the left to a vivid violet cube. Preserve the ceramic teal observatory, telescope, AGENT card, desk, lighting, camera and all other details."
-        let editRequest = try CodexImageGenerationRequest(prompt: editPrompt, size: "auto", quality: "auto", outputFormat: "webp", count: 1, timeoutSeconds: 600, action: "edit", references: [reference]).normalized()
-        let edited = try await client.generate(editRequest)
-        let editReceipt = try await dispatcher.persistCodexImageGenerationResult(edited, request: editRequest, prompt: editPrompt)
-        try await SwiftNativePersistenceCore().writeJSON(editReceipt, to: root.appendingPathComponent("edit-receipt.json"))
-        #expect(edited.sourceImages.count == 1)
-        print("Codex image acceptance receipts: \(root.path)")
-    }
-
     @Test func codexDefaultsAliasesAndUnsupportedControls() throws {
         let base = CodexImageGenerationRequest(prompt: "moon", size: nil, quality: nil, outputFormat: "png", count: 1, timeoutSeconds: 600)
         let defaults = try base.normalized()
@@ -293,155 +205,6 @@ struct ImageGenerationToolTests {
         #expect(throws: ImageGenerationToolError.self) { try bad.normalized() }
     }
 
-    @Test func codexStreamRequiresFinalSuccessAndIgnoresPartialPreview() throws {
-        let partial = "data: {\"type\":\"response.image_generation_call.partial_image\",\"partial_image_b64\":\"\(realPNG().base64EncodedString())\"}\n\n"
-        #expect(SwiftCodexOAuthImageGenerationClient.parseCodexImageSSE(Data(partial.utf8)).error != nil)
-        let itemOnly = "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"image_generation_call\",\"status\":\"completed\",\"result\":\"AA==\"}}\n\n"
-        #expect(SwiftCodexOAuthImageGenerationClient.parseCodexImageSSE(Data(itemOnly.utf8)).error != nil)
-        // Failure events must precede the SSE [DONE] transport terminator.
-        let complete = Data(String(decoding: completedImageStream(), as: UTF8.self).replacingOccurrences(of: "data: [DONE]", with: "").utf8)
-        let parsed = SwiftCodexOAuthImageGenerationClient.parseCodexImageSSE(complete + Data(partial.utf8))
-        #expect(parsed.error == nil)
-        #expect(parsed.imageBase64 == realPNG().base64EncodedString())
-        #expect(parsed.evidence["imageModel"] == .string("unknown"))
-        for type in ["response.failed", "response.incomplete", "error"] {
-            let failed = complete + Data("data: {\"type\":\"\(type)\"}\n\n".utf8)
-            #expect(SwiftCodexOAuthImageGenerationClient.parseCodexImageSSE(failed).imageBase64 == nil)
-        }
-    }
-
-    @Test func codexReferencesAndFormatReachSubscriptionRequest() async throws {
-        ImageGenerationStubURLProtocol.reset()
-        let root = try await makeImageRoot(imageAllowed: true)
-        defer { try? FileManager.default.removeItem(at: root) }
-        let (authPath, _) = try writeCodexAuthJSON(root: root)
-        let reference = CodexImageReference(data: realPNG(), mimeType: "image/png")
-        let secondReference = CodexImageReference(data: realPNG(red: 1), mimeType: "image/png")
-        ImageGenerationStubURLProtocol.responseData = completedImageStream()
-        let client = SwiftCodexOAuthImageGenerationClient(session: imageStubSession(), authPathOverride: authPath, dataRoot: root)
-        let result = try await client.generate(CodexImageGenerationRequest(prompt: "make it green", size: "auto", quality: "auto", outputFormat: "jpeg", count: 1, timeoutSeconds: 60, action: "edit", references: [reference, secondReference]))
-        let body = ImageGenerationStubURLProtocol.capturedBody
-        let messages = try #require(body["input"] as? [[String: Any]])
-        let content = try #require(messages.first?["content"] as? [[String: Any]])
-        #expect(content.count == 3)
-        #expect(content[1]["image_url"] as? String == reference.dataURL)
-        #expect(content[2]["image_url"] as? String == secondReference.dataURL)
-        #expect(reference.dataURL != secondReference.dataURL)
-        let tool = try #require((body["tools"] as? [[String: Any]])?.first)
-        #expect(tool["action"] as? String == "edit")
-        #expect(tool["quality"] as? String == "auto")
-        #expect(tool["size"] as? String == "auto")
-        #expect(tool["output_format"] as? String == "jpeg")
-        #expect(body["previous_response_id"] == nil)
-        #expect(result.evidence.description.contains(reference.sha256))
-        #expect(!result.evidence.description.contains(reference.dataURL))
-    }
-
-    @Test func codexReturnedModelConfigurationStaysDistinctFromExecutionModel() async throws {
-        let root = try await makeImageRoot(imageAllowed: true)
-        defer { try? FileManager.default.removeItem(at: root) }
-        let (authPath, _) = try writeCodexAuthJSON(root: root)
-        let client = SwiftCodexOAuthImageGenerationClient(session: imageStubSession(), authPathOverride: authPath, dataRoot: root)
-        let request = CodexImageGenerationRequest(prompt: "moon", size: nil, quality: nil, outputFormat: "png", count: 1, timeoutSeconds: 60)
-        let dispatcher = SwiftToolDispatcher(dataRoot: root)
-        for (toolModels, itemModel, expectedBackend) in [
-            ([String](), "", "unknown"),
-            (["gpt-image-2-codex"], "", "gpt-image-2-codex"),
-            (["gpt-image-2-codex"], "executed-image-model", "gpt-image-2-codex"),
-            (["alias-a", "alias-b"], "", "unknown"),
-            (["  "], "  ", "unknown"),
-        ] {
-            ImageGenerationStubURLProtocol.reset()
-            let response: [String: Any] = ["type": "response.completed", "response": [
-                "status": "completed", "model": "orchestrator-observed",
-                "tools": toolModels.map { ["type": "image_generation", "model": $0] },
-                "output": [["type": "image_generation_call", "status": "completed", "model": itemModel,
-                    "result": realPNG().base64EncodedString()]],
-            ]]
-            let json = try JSONSerialization.data(withJSONObject: response)
-            ImageGenerationStubURLProtocol.responseData = Data("data: ".utf8) + json + Data("\n\n".utf8)
-            let result = try await client.generate(request)
-            let persisted = try await dispatcher.persistCodexImageGenerationResult(result, request: request, prompt: request.prompt)
-            guard case .object(let receipt) = persisted, case .object(let evidence)? = result.evidence.first else {
-                Issue.record("missing image receipt"); continue
-            }
-            let executionModel = itemModel.trimmingCharacters(in: .whitespaces).isEmpty ? "unknown" : itemModel
-            #expect(receipt["model"] == .string(executionModel))
-            #expect(receipt["imageModel"] == .string(executionModel))
-            #expect(receipt["backendToolModel"] == .string(expectedBackend))
-            #expect(receipt["backendToolModelEvidenceSource"] == .string(expectedBackend == "unknown" ? "unknown" : "response.completed.response.tools[type=image_generation].model"))
-            #expect(receipt["modelVersion"] == .string("unverified"))
-            #expect(receipt["responseModel"] == .string("orchestrator-observed"))
-            #expect(evidence["requestedImageModel"] == .string("gpt-image-2"))
-        }
-    }
-
-    @Test func codexQualityEvidencePreservesHighAndSurfacesBackendMismatch() async throws {
-        ImageGenerationStubURLProtocol.reset()
-        let root = try await makeImageRoot(imageAllowed: true)
-        defer { try? FileManager.default.removeItem(at: root) }
-        let (authPath, _) = try writeCodexAuthJSON(root: root)
-        let client = SwiftCodexOAuthImageGenerationClient(session: imageStubSession(), authPathOverride: authPath, dataRoot: root)
-        let dispatcher = SwiftToolDispatcher(dataRoot: root)
-        var generated: [CodexImageGenerationResult] = []
-        let cases: [(requested: String, returned: String?, observed: String?, fulfillment: String)] = [
-            ("high", "high", "high", "fulfilled"),
-            ("high", "medium", "medium", "not_fulfilled"),
-            ("high", "high", nil, "unknown"),
-            ("auto", "medium", "medium", "backend_selected"),
-        ]
-        for row in cases {
-            ImageGenerationStubURLProtocol.responseData = completedImageStream(
-                returnedToolQuality: row.returned,
-                observedQuality: row.observed
-            )
-            let request = try CodexImageGenerationRequest(
-                prompt: "moon", size: "1536x1024", quality: row.requested,
-                outputFormat: "png", count: 1, timeoutSeconds: 60
-            ).normalized()
-            let result = try await client.generate(request)
-            generated.append(result)
-            guard case .object(let evidence) = try #require(result.evidence.first) else {
-                Issue.record("missing quality evidence"); continue
-            }
-            #expect((ImageGenerationStubURLProtocol.capturedBody["tools"] as? [[String: Any]])?.first?["quality"] as? String == row.requested)
-            #expect(evidence["requestedQuality"] == .string(row.requested))
-            #expect(evidence["outboundQuality"] == .string(row.requested))
-            #expect(evidence["outboundQualityEvidenceSource"] == .string("outbound_request.tools[type=image_generation].quality"))
-            #expect(evidence["qualityRequestForwarding"] == .string("exact"))
-            #expect(evidence["returnedToolQuality"] == .string(row.returned ?? "unknown"))
-            #expect(evidence["observedQuality"] == .string(row.observed ?? "unknown"))
-            #expect(evidence["qualityFulfillment"] == .string(row.fulfillment))
-            let instructions = try #require(ImageGenerationStubURLProtocol.capturedBody["instructions"] as? String)
-            #expect(instructions.contains("quality=\(row.requested), size=1536x1024"))
-            #expect(evidence["controllerSettingsEvidenceSource"] == .string("outbound_request.instructions"))
-            let persisted = try await dispatcher.persistCodexImageGenerationResult(result, request: request, prompt: request.prompt)
-            guard case .object(let receipt) = persisted else { Issue.record("missing persisted quality receipt"); continue }
-            #expect(receipt["qualityFulfillment"] == .string(row.fulfillment))
-            if row.fulfillment == "not_fulfilled" { #expect(receipt["qualityWarning"] != nil) }
-            else { #expect(receipt["qualityWarning"] == nil) }
-        }
-
-        let sourceImages = try [
-            #require(generated[0].sourceImages.first),
-            #require(generated[1].sourceImages.first),
-        ]
-        let mixed = CodexImageGenerationResult(
-            runId: UUID().uuidString.lowercased(), model: "unknown", sourceImages: sourceImages,
-            reply: "", stdout: "", stderr: "", exitCode: 0, timedOut: false, durationMs: 1,
-            evidence: [generated[0].evidence[0], generated[1].evidence[0]]
-        )
-        let mixedRequest = try CodexImageGenerationRequest(
-            prompt: "two moons", size: "1536x1024", quality: "high",
-            outputFormat: "png", count: 2, timeoutSeconds: 60
-        ).normalized()
-        let mixedPersisted = try await dispatcher.persistCodexImageGenerationResult(mixed, request: mixedRequest, prompt: mixedRequest.prompt)
-        guard case .object(let mixedReceipt) = mixedPersisted else { Issue.record("missing mixed receipt"); return }
-        #expect(mixedReceipt["qualityFulfillment"] == .string("not_fulfilled"))
-        #expect(mixedReceipt["observedQuality"] == .string("unknown"))
-        #expect(mixedReceipt["qualityWarning"] != nil)
-    }
-
     @Test func disabledImagesRequestCapabilityBeforeProviderControls() async throws {
         let root = try await makeImageRoot(imageAllowed: false)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -461,21 +224,6 @@ struct ImageGenerationToolTests {
                 #expect(InlineInteractionNeed.interaction(in: result)?.target == "image_generation")
             }
         }
-    }
-
-    @Test func codexInvalidRasterAndHTTPFailureCannotSucceedOrFallback() async throws {
-        ImageGenerationStubURLProtocol.reset()
-        let root = try await makeImageRoot(imageAllowed: true)
-        defer { try? FileManager.default.removeItem(at: root) }
-        let (authPath, _) = try writeCodexAuthJSON(root: root)
-        let client = SwiftCodexOAuthImageGenerationClient(session: imageStubSession(), authPathOverride: authPath, dataRoot: root)
-        let request = CodexImageGenerationRequest(prompt: "moon", size: nil, quality: nil, outputFormat: "png", count: 1, timeoutSeconds: 60)
-        ImageGenerationStubURLProtocol.responseData = completedImageStream(Data([0x89, 0x50, 0x4e, 0x47]))
-        await #expect(throws: ImageGenerationToolError.invalidImageData) { _ = try await client.generate(request) }
-        ImageGenerationStubURLProtocol.responseStatus = 400
-        ImageGenerationStubURLProtocol.responseData = Data("unsupported action".utf8)
-        await #expect(throws: ImageGenerationToolError.apiError(status: 400, message: "unsupported action")) { _ = try await client.generate(request) }
-        #expect(ImageGenerationStubURLProtocol.capturedURL?.host == "chatgpt.com")
     }
 
     @Test func codexReferenceFileGatesAndInputErrors() async throws {
@@ -529,148 +277,6 @@ struct ImageGenerationToolTests {
         guard case .object(let obj) = result else { Issue.record("missing failure"); return }
         #expect(obj["status"] == .string("needs_input"))
         #expect(InlineInteractionNeed.interaction(in: result)?.target == "image_generation")
-    }
-
-    @Test func codexOAuthImageClientUsesResponsesImageGenerationTool() async throws {
-        ImageGenerationStubURLProtocol.reset()
-        let root = try await makeImageRoot(imageAllowed: true)
-        defer { try? FileManager.default.removeItem(at: root) }
-        let (authPath, token) = try writeCodexAuthJSON(root: root, accountID: "acct_image_123")
-        let imageB64 = realPNG().base64EncodedString()
-        ImageGenerationStubURLProtocol.responseData = Data("""
-        event: response.output_text.delta
-        data: {"type":"response.output_text.delta","delta":"Generated a small moon."}
-
-        event: response.output_item.done
-        data: {"type":"response.output_item.done","item":{"id":"ig_test","type":"image_generation_call","status":"completed","result":"\(imageB64)"}}
-
-        data: {"type":"response.completed","response":{"id":"resp_test","status":"completed","model":"response-model-observed"}}
-
-        data: [DONE]
-
-        """.utf8)
-        let client = SwiftCodexOAuthImageGenerationClient(
-            session: imageStubSession(),
-            authPathOverride: authPath,
-            dataRoot: root
-        )
-
-        let request = try CodexImageGenerationRequest(
-            prompt: "small moon watercolor",
-            size: "landscape",
-            quality: "high",
-            outputFormat: "webp",
-            count: 1,
-            timeoutSeconds: 60
-        ).normalized()
-        let result = try await client.generate(request)
-
-        #expect(result.model == "unknown")
-        guard case .object(let evidence) = try #require(result.evidence.first) else { Issue.record("missing evidence"); return }
-        #expect(evidence["imageModel"] == .string("unknown"))
-        #expect(evidence["responseModel"] == .string("response-model-observed"))
-        #expect(evidence["toolCallId"] == .string("ig_test"))
-        #expect(evidence["requestedImageModel"] == .string("gpt-image-2"))
-        #expect(result.reply == "Generated a small moon.")
-        #expect(result.sourceImages.count == 1)
-        let source = try #require(result.sourceImages.first)
-        #expect(source.pathExtension == "png")
-        #expect(try Data(contentsOf: source) == realPNG())
-        #expect(ImageGenerationStubURLProtocol.capturedURL?.absoluteString == "https://chatgpt.com/backend-api/codex/responses")
-        #expect(ImageGenerationStubURLProtocol.capturedMethod == "POST")
-        #expect(capturedHeader("Authorization") == "Bearer \(token)")
-        #expect(capturedHeader("chatgpt-account-id") == "acct_image_123")
-        #expect(
-            capturedHeader("originator")
-                == OpenAIOAuthDirectAdapter.codexBackendOriginator
-        )
-        #expect(
-            capturedHeader("User-Agent")
-                == OpenAIOAuthDirectAdapter.codexBackendUserAgent
-        )
-        #expect(capturedHeader("Accept") == "text/event-stream")
-        #expect(capturedHeader("Content-Type") == "application/json")
-        #expect(ImageGenerationStubURLProtocol.capturedBody["model"] as? String == nativeAgentPrimaryModel)
-        #expect(ImageGenerationStubURLProtocol.capturedBody["store"] as? Bool == false)
-        #expect(ImageGenerationStubURLProtocol.capturedBody["stream"] as? Bool == true)
-        let tools = try #require(ImageGenerationStubURLProtocol.capturedBody["tools"] as? [[String: Any]])
-        let tool = try #require(tools.first)
-        #expect(tool["type"] as? String == "image_generation")
-        #expect(tool["model"] as? String == "gpt-image-2")
-        #expect(tool["size"] as? String == "1536x1024")
-        #expect(tool["quality"] as? String == "high")
-        #expect(tool["output_format"] as? String == "webp")
-        #expect(evidence["actualFormat"] == .string("png"))
-        #expect(evidence["requestedOutputFormat"] == .string("webp"))
-        #expect(evidence["formatFulfillment"] == .string("not_fulfilled"))
-        #expect(evidence["sizeFulfillment"] == .string("not_fulfilled"))
-        let dispatcher = SwiftToolDispatcher(dataRoot: root)
-        let receipt = try await dispatcher.persistCodexImageGenerationResult(
-            result, request: request, prompt: request.prompt)
-        guard case .object(let fields) = receipt else { Issue.record("missing control receipt"); return }
-        #expect(fields["formatFulfillment"] == .string("not_fulfilled"))
-        #expect(fields["sizeFulfillment"] == .string("not_fulfilled"))
-        guard case .array(let warnings)? = fields["controlWarnings"] else { Issue.record("missing warnings"); return }
-        #expect(warnings.count >= 2)
-        let toolChoice = try #require(ImageGenerationStubURLProtocol.capturedBody["tool_choice"] as? [String: Any])
-        #expect(toolChoice["mode"] as? String == "required")
-        let allowed = try #require(toolChoice["tools"] as? [[String: Any]])
-        #expect(allowed.first?["type"] as? String == "image_generation")
-    }
-
-    @Test func codexOAuthImageGenerationTrustDeniedBeforeNetworkOrAuth() async throws {
-        ImageGenerationStubURLProtocol.reset()
-        let root = try await makeImageRoot(imageAllowed: false)
-        defer { try? FileManager.default.removeItem(at: root) }
-        let (authPath, _) = try writeCodexAuthJSON(root: root)
-        let client = SwiftCodexOAuthImageGenerationClient(
-            session: imageStubSession(),
-            authPathOverride: authPath,
-            dataRoot: root
-        )
-
-        await #expect(throws: ImageGenerationToolError.trustDenied) {
-            _ = try await client.generate(CodexImageGenerationRequest(
-                prompt: "small moon watercolor",
-                size: nil,
-                quality: nil,
-                outputFormat: "png",
-                count: 1,
-                timeoutSeconds: 60
-            ))
-        }
-        #expect(ImageGenerationStubURLProtocol.capturedURL == nil)
-    }
-
-    @Test func codexOAuthImageClientSurfacesCurrentNestedBackendError() async throws {
-        ImageGenerationStubURLProtocol.reset()
-        let root = try await makeImageRoot(imageAllowed: true)
-        defer { try? FileManager.default.removeItem(at: root) }
-        let (authPath, _) = try writeCodexAuthJSON(root: root)
-        ImageGenerationStubURLProtocol.responseData = Data("""
-        data: {"type":"error","error":{"type":"service_unavailable_error","code":"server_is_overloaded","message":"Our servers are currently overloaded. Please try again later."}}
-
-        data: [DONE]
-
-        """.utf8)
-        let client = SwiftCodexOAuthImageGenerationClient(
-            session: imageStubSession(),
-            authPathOverride: authPath,
-            dataRoot: root
-        )
-
-        await #expect(throws: ImageGenerationToolError.invalidResponse(
-            "Our servers are currently overloaded. Please try again later. [code=server_is_overloaded]"
-        )) {
-            _ = try await client.generate(CodexImageGenerationRequest(
-                prompt: "small moon watercolor",
-                size: nil,
-                quality: nil,
-                outputFormat: "png",
-                count: 1,
-                timeoutSeconds: 60
-            ))
-        }
     }
 
     @Test func codexImageClientUsesImagegenAndCollectsArtifact() async throws {
@@ -743,7 +349,7 @@ struct ImageGenerationToolTests {
         #expect(try FileManager.default.contentsOfDirectory(atPath: invocation.cwd.path).isEmpty)
         #expect(invocation.environment["CODEX_HOME"] == codexHome.path)
         let imageFlag = try #require(invocation.arguments.firstIndex(of: "--image"))
-        #expect(try Data(contentsOf: URL(fileURLWithPath: invocation.arguments[imageFlag + 1])) == realPNG())
+        #expect(!FileManager.default.fileExists(atPath: invocation.arguments[imageFlag + 1]))
         guard case .object(let evidence) = try #require(result.evidence.first) else { Issue.record("missing builtin receipt"); return }
         #expect(evidence["transport"] == .string("codex_builtin"))
         #expect(evidence["sandbox"] == .string("read-only"))
@@ -1032,4 +638,28 @@ struct ImageGenerationToolTests {
     guard case .object(let row) = receipt else { Issue.record("missing receipt"); return }
     #expect(row["provider"] == .string("codex_cli"))
     #expect(row["message"] == .string("Generated 1 image through Codex CLI."))
+}
+
+
+@Test func imageGenerationFullMacAdmissionIsScopedToRequestedOperation() async throws {
+    let root = try await makeImageRoot(imageAllowed: false)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let client = SwiftOpenAIImageGenerationClient(apiKeyOverride: "", dataRoot: root)
+    let request = OpenAIImageGenerationRequest(
+        prompt: "", model: "gpt-image-2", size: nil, quality: nil,
+        outputFormat: "png", count: 1
+    )
+    // No network or spend: an admitted request reaches input validation, while
+    // the same backend outside the turn still requires its ordinary permission.
+    await #expect(throws: ImageGenerationToolError.trustDenied) {
+        _ = try await client.generate(request)
+    }
+    await ImageGenerationAdmission.$fullMacAdmitted.withValue(true) {
+        await #expect(throws: ImageGenerationToolError.missingPrompt) {
+            _ = try await client.generate(request)
+        }
+    }
+    await #expect(throws: ImageGenerationToolError.trustDenied) {
+        _ = try await client.generate(request)
+    }
 }

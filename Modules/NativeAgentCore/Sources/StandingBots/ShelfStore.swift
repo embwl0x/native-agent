@@ -81,6 +81,35 @@ public struct ShelfStore: Sendable {
         }
     }
 
+    /// Latest append for only the helpers already open in a workspace. This
+    /// is an owner read, never an acknowledgement or a new execution.
+    public func latestEntries(botIDs: Set<UUID>) throws -> [ShelfEntry] {
+        guard botIDs.count <= 24 else { throw StandingBotsError.invalidValue("too many open helpers") }
+        return try disk.locked {
+            var index = try loadIndex()
+            if index.latestByBot == nil {
+                // One checked index upgrade, not a complete shelf scan for
+                // every file event in every listening conversation.
+                var latest: [UUID: Book] = [:]
+                for book in try books() {
+                    if latest[book.entry.botId].map({ $0.sequence < book.sequence }) ?? true {
+                        latest[book.entry.botId] = book
+                    }
+                }
+                index.latestByBot = latest.mapValues { $0.entry.id }
+                try disk.write(index, at: indexPath)
+            }
+            return try botIDs.compactMap { bot in
+                guard let id = index.latestByBot?[bot] else { return nil }
+                guard let book = try disk.read(Book.self, at: indexedPath(id)), book.entry.botId == bot else {
+                    throw StandingBotsError.corruptStore("latest helper result index")
+                }
+                try validate(book.entry)
+                return book.entry
+            }
+        }
+    }
+
     /// Last successful append, including a successful check that found nothing new.
     public func lastGood(bot: UUID) throws -> ShelfEntry? {
         try disk.locked {
@@ -95,29 +124,34 @@ public struct ShelfStore: Sendable {
         }
     }
 
-    /// Ascending append order. `since` is an exclusive run-time filter; `topic` is a literal,
+    /// Ascending append order by default; newestFirst browses recent history.
+    /// `since` is an exclusive run-time filter; `topic` is a literal,
     /// case-insensitive search of headline/findings/change/uncertainties. Cursors are query-bound.
     /// `readerId` selects unread entries for that reader only (e.g. "agent" vs "ui:user").
     /// Reads never acknowledge entries. Start with nil cursor to revisit unread holes or refresh.
     public func shelfRead(bot: UUID? = nil, since: Date? = nil, topic: String? = nil,
-                          limit: Int = 20, cursor: String? = nil, readerId: String? = nil) throws -> ShelfReadPage {
+                          limit: Int = 20, cursor: String? = nil, readerId: String? = nil,
+                          newestFirst: Bool = false) throws -> ShelfReadPage {
         guard (1...Self.maximumPageSize).contains(limit) else { throw StandingBotsError.invalidValue("limit must be 1...100") }
         if let since, !since.timeIntervalSince1970.isFinite { throw StandingBotsError.invalidValue("since") }
         if let readerId { try validateReader(readerId) }
-        let query = Query(bot: bot, since: since, topic: topic?.trimmingCharacters(in: .whitespacesAndNewlines), readerId: readerId)
+        let query = Query(bot: bot, since: since, topic: topic?.trimmingCharacters(in: .whitespacesAndNewlines), readerId: readerId,
+                          newestFirst: newestFirst ? true : nil)
         let after: UInt64
         if let cursor {
             guard let bytes = Data(base64Encoded: cursor),
                   let decoded = try? JSONDecoder().decode(PageCursor.self, from: bytes),
                   decoded.version == 1, decoded.query == query else { throw StandingBotsError.invalidCursor }
             after = decoded.after
-        } else { after = 0 }
+        } else { after = newestFirst ? UInt64.max : 0 }
         return try disk.locked {
             let seen = try readerId.map { try readerState($0).readEntryIds } ?? []
             // Read one lookahead row; only returned rows can move the continuation boundary.
-            let selected = try books().lazy.filter { book in
+            let all = try books()
+            let ordered = newestFirst ? Array(all.reversed()) : all
+            let selected = ordered.lazy.filter { book in
                 let entry = book.entry
-                return book.sequence > after && !seen.contains(entry.id)
+                return (newestFirst ? book.sequence < after : book.sequence > after) && !seen.contains(entry.id)
                     && (bot == nil || entry.botId == bot)
                     && (since == nil || entry.runAt > since!)
                     && matches(entry, topic: query.topic)
@@ -133,8 +167,10 @@ public struct ShelfStore: Sendable {
             }
             let hasMore = candidates.count > limit
             let next = try page.last.map { try disk.encode(PageCursor(version: 1, query: query, after: $0.sequence)).base64EncodedString() }
-            // Even a terminal nonempty page has a continuation for later appends.
-            return ShelfReadPage(rows: rows, nextCursor: next ?? cursor,
+            // Ascending readers can continue for later appends. Descending
+            // history ends at the oldest row; refresh from nil for new arrivals.
+            let continuation = newestFirst && !hasMore ? nil : (next ?? cursor)
+            return ShelfReadPage(rows: rows, nextCursor: continuation,
                                  truncated: hasMore || rows.contains(where: \.headlineTruncated))
         }
     }
@@ -222,6 +258,7 @@ public struct ShelfStore: Sendable {
         var sequence: UInt64 = 0
         var lastGood: [UUID: UUID] = [:]
         var lastEntry: UUID? = nil
+        var latestByBot: [UUID: UUID]? = nil
     }
     private var indexPath: URL { disk.root.appendingPathComponent("shelf-index.json") }
     private var pendingPath: URL { disk.root.appendingPathComponent("shelf-pending.json") }
@@ -266,6 +303,10 @@ public struct ShelfStore: Sendable {
         if [.ok, .nothingNew].contains(book.entry.runHealth) {
             let previous = try index.lastGood[book.entry.botId].flatMap { try disk.read(Book.self, at: indexedPath($0)) }
             if previous == nil || previous!.sequence <= book.sequence { index.lastGood[book.entry.botId] = book.entry.id }
+        }
+        if index.latestByBot != nil {
+            let previous = try index.latestByBot?[book.entry.botId].flatMap { try disk.read(Book.self, at: indexedPath($0)) }
+            if previous == nil || previous!.sequence <= book.sequence { index.latestByBot?[book.entry.botId] = book.entry.id }
         }
         try disk.write(index, at: indexPath)
         try disk.validatePath(pendingPath)
@@ -336,6 +377,8 @@ private struct Query: Codable, Equatable {
     let since: Date?
     let topic: String?
     let readerId: String?
+    // Optional preserves legacy ascending cursor decoding/equality.
+    var newestFirst: Bool? = nil
 }
 
 private struct PageCursor: Codable {

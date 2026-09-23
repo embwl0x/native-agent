@@ -27,6 +27,7 @@ struct ActivityCognitionSubscriptionEvalTests {
         let runtime = NativeCognitionRuntime(
             dataRoot: root,
             configurationOverride: .allPhasesEnabled,
+            organismConfigurationOverride: .disabled,
             microcycleSchedulingMode: .manuallyFlushed,
             installedPhysiologySoakEnabled: false
         )
@@ -44,18 +45,19 @@ struct ActivityCognitionSubscriptionEvalTests {
 
         await runtime.publishRuntimeChange(reason: "activity-subscription-eval")
         await waitForSubscription(subscription) {
-            $0.lastRevision == 2 && $0.refreshCount == 2
+            $0.lastRevision != nil && $0.refreshCount >= 2
         }
+        let firstRevision = try #require(subscription.lastRevision)
         #expect(subscription.peakConcurrentRefreshes == 1)
 
         for index in 2...32 {
             await runtime.publishRuntimeChange(reason: "activity-subscription-burst-\(index)")
         }
-        await waitForSubscription(subscription) { $0.lastRevision == 33 }
+        await waitForSubscription(subscription) { $0.lastRevision == firstRevision + 31 }
         #expect(subscription.peakConcurrentRefreshes == 1)
 
         let repeated = NativeCognitionRuntimeChange(
-            revision: 33,
+            revision: firstRevision + 31,
             occurredAt: Date(),
             reason: "same-revision"
         )

@@ -38,9 +38,31 @@ extension MacFourVerbs {
             if let hint {
                 let byRole = candidates.filter { $0.kind == hint }
                 if byRole.count == 1 { return .hit(byRole[0]) }
-                if byRole.count > 1 { return .ambiguous(byRole) }
+                if byRole.count > 1 { return tiebreak(byRole).map { .hit($0) } ?? .ambiguous(byRole) }
             }
-            return .ambiguous(candidates)
+            return tiebreak(candidates).map { .hit($0) } ?? .ambiguous(candidates)
+        }
+
+        // 2026-09-22: a control and its own caption/window routinely share a
+        // name. Two decisive cues only: the strictly longest matched span of
+        // her words, else the lone control among plain text/containers.
+        func tiebreak(_ candidates: [ActTarget]) -> ActTarget? {
+            let spans = candidates.map { candidate -> Int in
+                let label = normalize(candidate.label ?? "")
+                guard !label.isEmpty, !needle.isEmpty else { return 0 }
+                if label.contains(needle) { return needle.count }
+                return needle.contains(label) ? label.count : 0
+            }
+            if let best = spans.max(), best > 0, spans.filter({ $0 == best }).count == 1,
+               let index = spans.firstIndex(of: best) {
+                return candidates[index]
+            }
+            let controls: Set<String> = ["button", "link", "radio", "tab", "checkbox"]
+            let plain: Set<String> = ["text", "group", "window", "web area"]
+            let picked = candidates.filter { controls.contains($0.kind) }
+            guard picked.count == 1,
+                  candidates.allSatisfy({ controls.contains($0.kind) || plain.contains($0.kind) }) else { return nil }
+            return picked[0]
         }
 
         // A region's rendered kind is itself a valid name ("web area",
@@ -77,7 +99,16 @@ extension MacFourVerbs {
                 let ordinalMatches = address.kind == "row"
                     ? candidate.ordinal == address.ordinal
                     : candidate.kind == address.kind && candidate.roleOrdinal == address.ordinal
-                return ordinalMatches && candidate.label.map(normalize) == address.label
+                // 2026-09-22: live labels grow a value suffix ("Home - Memory
+                // usage - 78.0 MB"); a copied prefix agrees only when the rest is
+                // such a suffix, so a stale "Delete" never reaches "Delete All".
+                let label = candidate.label.map(normalize) ?? ""
+                let raw = (candidate.label ?? "").lowercased()
+                    .split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+                let suffix = raw.hasPrefix(address.label) ? raw.dropFirst(address.label.count) : ""
+                let valueSuffix = [" - ", " (", ":"].contains { suffix.hasPrefix($0) }
+                    || suffix.first?.isNumber == true
+                return ordinalMatches && (label == address.label || valueSuffix)
             }
             return narrow(matches, respectingQualifier: false)
                 ?? .none(nearest: nearest(to: address.label, among: targets))
@@ -233,9 +264,11 @@ extension MacFourVerbs {
         // published by the perception compiler, so a bare `sidebar` can
         // resolve only when exactly one such visible landmark exists.
         for name in Set(MacPerceptionCompiler.landmarkKinds.values) { out[name] = name }
-        // Two synonyms a person actually says, mapped onto the same vocabulary.
+        // Synonyms a person actually says, mapped onto the same vocabulary.
         out["field"] = "text"
         out["textfield"] = "text"
+        out["icon"] = "button"
+        out["window"] = "window"
         return out
     }()
 

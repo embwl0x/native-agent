@@ -68,7 +68,8 @@ extension CognitiveSubstrate {
         reason: String,
         demand: CognitiveReflectionDemand = .requested,
         materialExcerpt: String? = nil,
-        materialProvenance: String? = nil
+        materialProvenance: String? = nil,
+        sameSourceCooldown: TimeInterval? = nil
     ) async -> CognitiveReflectionPlan {
         await waitForMaintenanceTransition()
         let admission = await reflectionAdmission(demand: demand)
@@ -140,6 +141,20 @@ extension CognitiveSubstrate {
         // reentrant, or Settings may have disabled/lowered the budget.
         let recheck = await reflectionAdmission(demand: demand)
         guard recheck.admitted else { return .refused(recheck) }
+        // 2026-09-22: the scheduled pass re-reflected on the exact material an
+        // event-driven pass had just read (6 of 24 within the hour).
+        if let sameSourceCooldown {
+            let sources = Set(recordedSourceIds)
+            let cutoff = now.addingTimeInterval(-sameSourceCooldown)
+            if reflectionReceipts.values.contains(where: {
+                !$0.cancelled && $0.createdAt >= cutoff && Set($0.request.sourceNodeIds) == sources
+            }) {
+                var skip = recheck
+                skip.admitted = false
+                skip.reason = "same source material reflected on within \(Int(sameSourceCooldown / 3600))h"
+                return .refused(skip)
+            }
+        }
         let reservation = ReflectionReservation(id: dependencies.makeUUID(), since: dependencies.now())
         reflectionReservation = reservation
         return .admitted(CognitiveReflectionRequest(

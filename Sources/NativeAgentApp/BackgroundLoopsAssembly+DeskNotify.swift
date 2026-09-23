@@ -1,5 +1,6 @@
 import Foundation
 import BackgroundLoops
+import ChatOrchestration
 import PersistenceCore
 
 // MARK: - Desk notify loop (desk-side push, NO cognition)
@@ -56,15 +57,25 @@ private struct DeskNotifyRunner: EventDeadlineLoopRunner {
             return nil
         }
         let notify = DeskNotifyEvaluator.nextMeaningfulDeadline(state, after: now)
+        let nagConfig = await DeskNagConfigStore(dataRoot: dataRoot).load()
+        let quietEnd: Date? = {
+            guard nagConfig.enabled || DeskNotifyEvaluator.decisions(state, now: now).contains(where: { $0.level != .urgent }),
+                  AttentionRouter.holdsMacBanner(.ownerWaiting, dataRoot: dataRoot, at: now),
+                  let window = TurnQuietHoursWindow.read(dataRoot: dataRoot) else { return nil }
+            var calendar = Calendar(identifier: .gregorian)
+            calendar.timeZone = .current
+            return calendar.nextDate(after: now, matching: DateComponents(hour: window.endHour, minute: 0, second: 0),
+                                     matchingPolicy: .nextTime, repeatedTimePolicy: .first, direction: .forward)
+        }()
         // Nag lane deadlines (mute end / earliest in-scope defer end) share the
         // tick — load() is the same read-only, file-creating-nothing call the
         // nag pass uses for its inertness pre-check.
         let nag = DeskNagEvaluator.nextMeaningfulDeadline(
             state: state,
-            config: await DeskNagConfigStore(dataRoot: dataRoot).load(),
+            config: nagConfig,
             after: now
         )
-        return [notify, nag].compactMap { $0 }.min()
+        return [notify, nag, quietEnd].compactMap { $0 }.min()
     }
 
     func tick() async {
@@ -88,11 +99,15 @@ private struct DeskNotifyRunner: EventDeadlineLoopRunner {
         // nothing to do with the notify evaluator's decisions (gpt-5.5
         // campaign review, BLOCKING 1: the old early-return starved the nag
         // lane whenever no item was marked direct/urgent).
-        let nagCount = await runNagPass(state: state, failures: &failures)
+        let quietHours = AttentionRouter.holdsMacBanner(.ownerWaiting, dataRoot: dataRoot)
+        let nagCount = quietHours ? 0 : await runNagPass(state: state, failures: &failures)
         if decisions.isEmpty && nagCount == 0 && failures.isEmpty {
             return .skipped(reason: "no Desk notification due")
         }
-        for decision in decisions {
+        // Quiet hours hold a direct ping's Mac banner exactly as they hold its
+        // push. Nothing is stamped, so it still lands on the first tick after
+        // the window. An urgent item is never held: it posts and routes now.
+        for decision in decisions where !quietHours || decision.level == .urgent {
             // Dual delivery: Mac banner + paired-device push (the same backends
             // mac_notify / mobile_notify use). Best-effort; outcomes logged so a
             // failure isn't silent. v1 marks after attempting; success-gated retry
@@ -279,11 +294,6 @@ private struct DeskNotifyRunner: EventDeadlineLoopRunner {
         // The banner carries the handle it is about, so a click lands on that
         // item instead of on the app's front page. The unmute digest is about
         // no single item and carries nothing.
-        let macResult = await NativeAgentNotifications.postAndReport(
-            title: title,
-            body: body,
-            userInfo: deskHandle.map { [NativeAgentNotificationRoute.deskHandleKey: $0] } ?? [:]
-        )
         let mobileOK = (try? await AttentionRouter.shared.route(
             eventId: "desk_nag:\(label)",
             importance: .ownerWaiting,
@@ -291,7 +301,15 @@ private struct DeskNotifyRunner: EventDeadlineLoopRunner {
             body: body,
             userInfo: ["screen": "inbox", "source": "desk"]
         )) != nil
-        if !macResult.posted {
+        // The banner obeys the router's quiet hours, like the push.
+        let macPosted = await AttentionRouter.holdsMacBanner(.ownerWaiting, dataRoot: dataRoot)
+            ? true
+            : NativeAgentNotifications.postAndReport(
+                title: title,
+                body: body,
+                userInfo: deskHandle.map { [NativeAgentNotificationRoute.deskHandleKey: $0] } ?? [:]
+            ).posted
+        if !macPosted {
             NSLog("desk_notify: nag Mac banner failed for \(label)")
             failures.append("\(label) nag Mac banner")
         }

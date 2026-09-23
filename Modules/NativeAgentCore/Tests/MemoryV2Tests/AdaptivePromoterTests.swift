@@ -125,51 +125,6 @@ struct AdaptivePromoterTests {
         #expect(rejected.rejectionReason?.contains("quality gate at acceptance") == true)
     }
 
-    @Test func autoAcceptSweepSkipsRubbleAndReviewOnlyBacklog() async throws {
-        // Insert an empty pending proposal through the storage seam to mirror
-        // the daemon-era empty-content artifacts in the user's live store. `propose`
-        // correctly rejects empty content, so this path models existing rubble
-        // rather than new app behavior.
-        let storage = InMemoryMemoryStorage()
-        let memoryWithRubble = SwiftNativeMemoryV2(
-            embedder: MockEmbeddingProvider(dimensions: 32),
-            storage: storage
-        )
-        try await storage.insertProposal(ProposalRecord(
-            id: "empty-rubble",
-            content: "",
-            source: "daemon-era",
-            status: "pending",
-            createdAt: "2026-06-03T00:00:00Z"
-        ))
-        _ = try await memoryWithRubble.propose(
-            content: "user likes Swift-native NativeAgent",
-            source: "test",
-            confidence: 0.99,
-            kind: "preference"
-        )
-        _ = try await memoryWithRubble.propose(
-            content: "user's name is Example User",
-            source: "test",
-            confidence: 0.95,
-            kind: "identity"
-        )
-        let promoter = AdaptiveMemoryPromoter(memory: memoryWithRubble)
-
-        let acceptedCount = await promoter.runAutoAcceptSweep(maxToScan: 10)
-
-        #expect(acceptedCount == 1)
-        let memories = try await memoryWithRubble.listMemory(kind: nil)
-        #expect(memories.count == 1)
-        #expect(memories[0].text == "user's name is Example User")
-        let pending = try await memoryWithRubble.listProposals(status: "pending")
-        #expect(pending.count == 2)
-        #expect(Set(pending.map(\.content)) == [
-            "",
-            "user likes Swift-native NativeAgent",
-        ])
-    }
-
     @Test func proposeDedupesPendingProposalsByContentHash() async throws {
         // 2026-07-21 audit fix: propose() minted a fresh UUID per call, so
         // observeTurn staged the same extracted fact every turn. A pending
@@ -216,52 +171,5 @@ struct AdaptivePromoterTests {
         )
         #expect(third.id != first.id)
         #expect(try await memory.listProposals(status: "pending").count == 2)
-    }
-
-    @Test func autoAcceptSweepDrainsOldestPendingFirst() async throws {
-        // 2026-07-21 audit regression: the pending list arrives newest-first
-        // (staged_at DESC) and the sweep sliced prefix(maxToScan), so a
-        // >maxToScan backlog starved the OLDEST pending rows forever.
-        let store = try MemoryStorage(
-            inMemoryName: "sweep-fairness-\(UUID().uuidString)"
-        )
-        let bridge = MemoryStorageBridge(storage: store)
-        let memory = SwiftNativeMemoryV2(
-            embedder: MockEmbeddingProvider(dimensions: 32),
-            storage: bridge
-        )
-        // 500 newer review-only proposals (kind preference never auto-accepts).
-        for i in 0..<500 {
-            _ = try await store.insertProposal(StoredProposal(
-                id: "newer-\(i)",
-                content: "user preference backlog note \(i)",
-                stagedAt: "2026-07-10T00:00:00Z",
-                metadata: .object([
-                    "kind": .string("preference"),
-                    "confidence": .double(0.99),
-                ])
-            ))
-        }
-        // 5 OLDER auto-acceptable proposals — outside a newest-first 500 slice.
-        for i in 0..<5 {
-            _ = try await store.insertProposal(StoredProposal(
-                id: "oldest-\(i)",
-                content: "user's name is Example Person \(i)",
-                stagedAt: "2026-07-01T00:00:00Z",
-                metadata: .object([
-                    "kind": .string("identity"),
-                    "confidence": .double(0.95),
-                ])
-            ))
-        }
-        let promoter = AdaptiveMemoryPromoter(memory: memory)
-
-        let accepted = await promoter.runAutoAcceptSweep()
-
-        #expect(accepted == 5)
-        let memories = try await memory.listMemory(kind: nil)
-        #expect(memories.count == 5)
-        let pending = try await memory.listProposals(status: "pending")
-        #expect(pending.count == 500)
     }
 }

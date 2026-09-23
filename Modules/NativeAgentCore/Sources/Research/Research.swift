@@ -75,14 +75,22 @@ public struct ResearchSearchResult: Sendable, Equatable {
 
 public struct ResearchSearchResponse: Sendable, Equatable {
     public let results: [ResearchSearchResult]
+    /// 2026-09-23: SearXNG engines that failed ("name: reason"). Without them an
+    /// empty search reads as "nothing exists" when the engines were just down.
+    public let unresponsiveEngines: [String]
 
-    public init(results: [ResearchSearchResult]) {
+    public init(results: [ResearchSearchResult], unresponsiveEngines: [String] = []) {
         self.results = results
+        self.unresponsiveEngines = unresponsiveEngines
     }
 
     /// Mirrors Python's `{"results": [...]}` response.
     public func toJSON() -> JSONValue {
-        .object(["results": .array(results.map { $0.toJSON() })])
+        var obj: [String: JSONValue] = ["results": .array(results.map { $0.toJSON() })]
+        if !unresponsiveEngines.isEmpty {
+            obj["unresponsive_engines"] = .array(unresponsiveEngines.map(JSONValue.string))
+        }
+        return .object(obj)
     }
 }
 
@@ -189,7 +197,7 @@ public struct ResearchLabRun: Sendable, Equatable {
 
 // MARK: - Errors
 
-public enum ResearchClientError: Error, Sendable, Equatable {
+public enum ResearchClientError: LocalizedError, Sendable, Equatable {
     /// `searxng_base_url` is empty in config — matches Python's
     /// `raise ValueError("SearXNG base URL is not configured")` at
     /// the retired daemon.
@@ -198,6 +206,21 @@ public enum ResearchClientError: Error, Sendable, Equatable {
     case malformedResponse(String)
     case transport(String)
     case localServerNotRunning(String)
+
+    /// Keep the actual read failure useful in ordinary Workspace recovery.
+    /// NSError's synthesized enum number otherwise hides even an HTTP refusal.
+    public var errorDescription: String? {
+        switch self {
+        case .notConfigured:
+            return "Web search is not configured. Open a known website in Browser, or set up a search connection."
+        case .malformedResponse(let detail):
+            return "The source could not be read: \(detail.prefix(400)). Check the address or open it in Browser."
+        case .transport(let detail):
+            return "The source could not be reached: \(detail.prefix(400)). Check the connection or open it in Browser."
+        case .localServerNotRunning:
+            return "The configured local research service is not running. Start it or use another available research route."
+        }
+    }
 }
 
 // MARK: - Protocol
@@ -212,7 +235,7 @@ public protocol ResearchClientProtocol: Sendable {
     /// Run a SearXNG query against the configured base URL, parse the top
     /// 10 results, write a receipt JSON to `data/research/<uuid>.json`,
     /// return `{results: [...]}`.
-    func search(query: String) async throws -> ResearchSearchResponse
+    func search(query: String, categories: String?, timeRange: String?) async throws -> ResearchSearchResponse
 
     /// GET an http/https URL with a 1MB response-body bound, extract supported
     /// text, and preserve it with explicit coverage in the source receipt.
@@ -232,6 +255,16 @@ public protocol ResearchClientProtocol: Sendable {
     /// entries alongside the run so the Mac activity feed and trace ledger stay
     /// complete for research-lab runs.
     func runResearchLab(objective: String, maxResults: Int) async throws -> ResearchLabRun
+}
+
+public extension ResearchClientProtocol {
+    func search(query: String) async throws -> ResearchSearchResponse {
+        try await search(query: query, categories: nil, timeRange: nil)
+    }
+
+    func search(query: String, categories: String?) async throws -> ResearchSearchResponse {
+        try await search(query: query, categories: categories, timeRange: nil)
+    }
 }
 
 // MARK: - Network + Docker dependency boundaries (test seams)

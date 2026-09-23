@@ -87,11 +87,31 @@ enum TriggerNotifierBinding {
                     )
                 }
             if let existingId { return .duplicate(existingId: existingId) }
+            if case .string("trigger:morning_brief")? = normalizedObj["source"] {
+                await archiveSupersededMorningBriefs(dataRoot: dataRoot)
+            }
             return .appended
         } catch {
             NSLog("trigger_mirror: REAL-inbox card write FAILED for %@: %@",
                   triggerName, String(describing: error))
             return .failed
+        }
+    }
+
+    /// 2026-09-22: every brief stayed unread beside the next one. Only the
+    /// newest brief stays active; runs after each brief and once at launch.
+    static func archiveSupersededMorningBriefs(
+        dataRoot: URL = PersistenceCore.defaultDataRoot()
+    ) async {
+        do {
+            _ = try await LiveNotificationInbox(path: LiveNotificationInbox.livePath(dataRoot: dataRoot))
+                .archiveSupersededActiveRows(
+                    source: "trigger:morning_brief",
+                    groupField: "source",
+                    readAt: ISO8601DateFormatter().string(from: Date())
+                )
+        } catch {
+            NSLog("trigger_mirror: morning brief reconciliation failed: %@", String(describing: error))
         }
     }
 

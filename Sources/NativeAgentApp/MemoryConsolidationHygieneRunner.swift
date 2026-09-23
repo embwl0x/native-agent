@@ -32,6 +32,11 @@
 //
 // The retired JSONL loop type and its isolated tests are gone; this runner is
 // the only implementation behind the canonical scheduler slot.
+//
+// 2026-09-22 (User: "run hygiene weekly on its own"): the weekly tick now calls
+// runOnce directly instead of filing a "hygiene is due" card, and approves
+// the gate's probe-checked swap card itself (weekly tick only; the manual
+// button still leaves the swap card for User). Hygiene still only archives.
 
 import Foundation
 import ApprovalInbox
@@ -68,10 +73,14 @@ enum MemoryConsolidationHygiene {
     /// path MUTATES the store (auto-accept / merge / archive), so the only
     /// legal callers are the ones that already carry an explicit approval —
     /// NativeClient.runMemoryHygiene (MemoryView manual button + the
-    /// approved run_memory_hygiene op). The weekly tick stages an approval
-    /// card instead (see MemoryConsolidationHygieneRunner.tick).
+    /// approved run_memory_hygiene op) and, since 2026-09-22, the weekly
+    /// tick on User's standing word.
     @discardableResult
-    static func runOnce(dataRoot: URL, approvedDirectRun: Bool) async throws -> MemoryHygieneReport {
+    static func runOnce(
+        dataRoot: URL,
+        approvedDirectRun: Bool,
+        autoApproveSwap: Bool = false
+    ) async throws -> MemoryHygieneReport {
         guard approvedDirectRun else { throw DirectRunNotApprovedError() }
         let storage = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
         let before = (try? await storage.listMemories(persona: nil, status: nil, limit: nil).count) ?? 0
@@ -86,9 +95,31 @@ enum MemoryConsolidationHygiene {
         // what actually happened.
         let outcome = try await consolidator.consolidateGated()
         let result: ConsolidationReport
-        let status: String
+        var status: String
         let reason: String?
         var consolidationRunId: String?
+        // 2026-09-22 (User: "run hygiene weekly on its own"): the weekly tick
+        // approves its own swap card and applies it through the gate's
+        // reconcile, which still stale-refuses, backs up, and only archives.
+        func autoApply(_ approvalId: String) async -> (applied: Bool, detail: String)? {
+            guard autoApproveSwap else { return nil }
+            do {
+                _ = try await SwiftNativeApprovalInbox(root: dataRoot).resolve(
+                    approvalId, decision: .approved,
+                    provenance: .local(decidedBy: "weekly_memory_hygiene"))
+            } catch {
+                return (false, "auto-approve of swap card \(approvalId.prefix(8)) failed: \(error)")
+            }
+            let outcomes = await MemoryConsolidationGate.reconcile(dataRoot: dataRoot)
+            let applied = outcomes.contains {
+                switch $0 {
+                case .applied, .alreadyApplied: return true
+                default: return false
+                }
+            }
+            return (applied, "weekly swap auto-approved: "
+                + (outcomes.isEmpty ? "no outcome" : outcomes.map { "\($0)" }.joined(separator: "; ")))
+        }
         // gpt-5.5 review (2026-07-24 MED): candidate-run errors must survive
         // every outcome path — MemoryHygieneReport has no errors field, so
         // they ride the reason string.
@@ -104,9 +135,14 @@ enum MemoryConsolidationHygiene {
             if let approval = try? await SwiftNativeApprovalInbox(root: dataRoot).get(approvalId) {
                 consolidationRunId = MemoryConsolidationGate.runId(of: approval.payload)
             }
-            reason = withPlanErrors(
-                "changes staged for approval (card \(approvalId.prefix(8))) — nothing applied until approved in Activity",
-                plan)
+            if let auto = await autoApply(approvalId) {
+                status = auto.applied ? (plan.errors.isEmpty ? "ok" : "partial") : "failed"
+                reason = withPlanErrors(auto.detail, plan)
+            } else {
+                reason = withPlanErrors(
+                    "changes staged for approval (card \(approvalId.prefix(8))) — nothing applied until approved in Activity",
+                    plan)
+            }
         case .alreadyStaged(let approvalId):
             result = ConsolidationReport(
                 processed: 0, autoAccepted: 0, duplicatesMerged: 0,
@@ -115,6 +151,8 @@ enum MemoryConsolidationHygiene {
             if let approval = try? await SwiftNativeApprovalInbox(root: dataRoot).get(approvalId) {
                 consolidationRunId = MemoryConsolidationGate.runId(of: approval.payload)
             }
+            // Never auto-approve a card this run did not stage: it may be a
+            // manual run's card waiting on User.
             reason = "a consolidation card is already pending approval (card \(approvalId.prefix(8))) — no new run"
         case .refusedRegression(let scores, let plan):
             result = plan
@@ -174,9 +212,7 @@ enum MemoryConsolidationHygiene {
             // is the approval card / manual button that authorized this
             // runOnce (approvedDirectRun == true above), so no new ungated
             // mutation path is created; approvedOverThreshold is honest
-            // because the approval IS the threshold confirmation. The
-            // weekly staged card carries the dry-run counts (see
-            // MemoryConsolidationHygieneRunner.stageHygieneApprovalIfNeeded).
+            // because the approval IS the threshold confirmation.
             let facts = try await listGCFacts(storage)
             let gc = try await indexer.collectGarbage(
                 liveFacts: facts, apply: true, approvedOverThreshold: true)
@@ -275,9 +311,8 @@ enum MemoryConsolidationHygiene {
 /// runTickOnce keep routing here; the in-app cadence matches the weekly
 /// design (the OS scheduler slot is the primary driver).
 ///
-/// The tick NEVER consolidates — it stages one approval card whose
-/// approve-executor (NativeClient.applyApprovedSelfImprovement, op
-/// `run_memory_hygiene`) runs the consolidator. See the file header.
+/// The tick runs MemoryConsolidationHygiene.runOnce directly. See the file
+/// header.
 struct MemoryConsolidationHygieneRunner: LoopRunner {
     let loopId: String = "memory_consolidation"
     let interval: TimeInterval
@@ -287,17 +322,10 @@ struct MemoryConsolidationHygieneRunner: LoopRunner {
     /// THIS type — it is what assembleAllLoops actually registers for the
     /// "memory_consolidation" slot. The override previously existed only on
     /// the retired JSONL loop rather than this registered type, so the live
-    /// slot silently rode the scheduler's 300s default. The weekly tick is normally a cheap
-    /// approval-card staging pass, but it takes the inbox file lock and
-    /// scans the pending set — give it the same wide weekly-loop budget as
-    /// its siblings rather than gambling on the default.
+    /// slot silently rode the scheduler's 300s default. The weekly tick runs the
+    /// full hygiene pass — give it the same wide weekly-loop budget as its
+    /// siblings rather than gambling on the default.
     var tickTimeoutOverride: TimeInterval? { 3600 }
-
-    /// The op the staged card applies on approval — must stay inside
-    /// NativeClient.applyApprovedSelfImprovement's 3-op allow-list (and
-    /// WeeklySelfImprovementLoop.applyOps).
-    static let applyOp = "run_memory_hygiene"
-    static let approvalAction = "self_improvement.apply"
 
     init(dataRoot: URL, interval: TimeInterval = 7 * 24 * 60 * 60) {
         self.dataRoot = dataRoot
@@ -309,15 +337,15 @@ struct MemoryConsolidationHygieneRunner: LoopRunner {
     }
 
     func tickOutcome() async -> LoopTickOutcome {
-        // Settings ▸ "Nightly memory consolidation": off means this tick stages
-        // no card. Read fresh on the tick, so a flip lands on the next run.
+        // Settings ▸ "Nightly memory consolidation": off means this tick does
+        // not run. Read fresh on the tick, so a flip lands on the next run.
         guard MemoryPolicyGate.consolidationEnabled(dataRoot: dataRoot) else {
             return .skipped(reason:
-                "Memory consolidation is turned off in Settings, so no hygiene card was staged.")
+                "Memory consolidation is turned off in Settings, so hygiene did not run.")
         }
         let yolo = await SwiftNativeSecurityCenter(dataRoot: dataRoot)
             .fullMacYoloAuthority(
-                tool: Self.approvalAction,
+                tool: "self_improvement.apply",
                 origin: SecurityOriginContext(
                     surface: "desk",
                     source: "memory_consolidation_background",
@@ -326,17 +354,15 @@ struct MemoryConsolidationHygieneRunner: LoopRunner {
             )
         // User, 2026-09-04: only an EXPLICIT block stops the tick. 8eccf9a1
         // (Full Mac, prompt-free) also skipped whenever Full Mac was admitted,
-        // and on a Mac that never expires that meant the weekly card was never
-        // staged again after 08-28, silently: the skip stamped the loop as run
-        // and wrote no failure. Staging the card is not a prompt; it is the
-        // loop's product, and Full Mac admits the card the same way it admits
-        // everything else.
+        // and on a Mac that never expires that meant weekly hygiene never ran
+        // again after 08-28, silently: the skip stamped the loop as run and
+        // wrote no failure.
         if yolo.state == .explicitlyBlocked {
             let now = Date()
             let report = MemoryHygieneReport(
                 id: "hygiene-\(UUID().uuidString.lowercased())",
                 status: "refused",
-                reason: "Memory consolidation is explicitly blocked; no approval was staged.",
+                reason: "Memory consolidation is explicitly blocked; hygiene did not run.",
                 version: "swift-memory-v2-consolidator",
                 createdAt: ISO8601DateFormatter().string(from: now),
                 beforeCount: nil,
@@ -353,101 +379,19 @@ struct MemoryConsolidationHygieneRunner: LoopRunner {
             try? MemoryConsolidationHygiene.write(report, dataRoot: dataRoot)
             return .skipped(reason: report.reason ?? "memory hygiene deferred")
         }
-        guard let approvalID = await Self.stageHygieneApprovalIfNeeded(dataRoot: dataRoot) else {
-            return .failed(error: "memory hygiene approval scan or staging failed")
-        }
-        return .completed(result: "memory hygiene approval ready: \(approvalID)")
-    }
-
-    /// Stage ONE `self_improvement.apply` card carrying op
-    /// `run_memory_hygiene`, mirroring the body shape
-    /// makeWeeklySelfImprovementLoop's stageProposal writes (so the
-    /// existing approve-executor and approval UI treat it identically).
-    ///
-    /// Idempotent: when a pending self_improvement.apply card with this op
-    /// already exists, its id is returned and nothing is staged. A failed
-    /// pending-scan stages NOTHING (fail closed — we can't know, so we
-    /// don't risk a duplicate; the next weekly tick retries). Returns the
-    /// approval id when a card exists after this call, nil otherwise.
-    @discardableResult
-    static func stageHygieneApprovalIfNeeded(dataRoot: URL) async -> String? {
-        let inbox = SwiftNativeApprovalInbox(root: dataRoot)
-        let pending: [ApprovalRecord]
         do {
-            pending = try await inbox.list(
-                filter: ApprovalFilter(status: "pending", action: approvalAction))
+            let report = try await MemoryConsolidationHygiene.runOnce(
+                dataRoot: dataRoot, approvedDirectRun: true, autoApproveSwap: true)
+            if report.status == "failed" {
+                return .failed(error: "memory hygiene: \(report.reason ?? "swap not applied")")
+            }
+            if report.status == "staged" {
+                return .skipped(reason: report.reason ?? "a consolidation card is already pending")
+            }
+            return .completed(result: "memory hygiene \(report.status ?? "done")"
+                + (report.reason.map { ": \($0)" } ?? ""))
         } catch {
-            FileHandle.standardError.write(Data(
-                "MemoryConsolidationHygieneRunner: pending-scan failed; staging nothing: \(error)\n".utf8))
-            return nil
+            return .failed(error: "memory hygiene failed: \(error)")
         }
-        if let existing = pending.first(where: { Self.applyOpOf($0.payload) == applyOp }) {
-            return existing.id
-        }
-        // 2026-07-21 audit: dry-run KG orphan-sweep preview rides in the
-        // card text so User approves with the counts in view — the approved
-        // apply (MemoryConsolidationHygiene.runOnce) runs the real GC.
-        // Best-effort: a preview failure stages the card without counts
-        // rather than skipping the weekly hygiene stage entirely. Skipped
-        // outright when no memory store exists yet — a READ-ONLY preview
-        // must never mint memory/memory.sqlite as a side effect of a tick.
-        var kgPreviewNote = ""
-        let memoryStorePath = dataRoot
-            .appendingPathComponent("memory", isDirectory: true)
-            .appendingPathComponent("memory.sqlite")
-        if FileManager.default.fileExists(atPath: memoryStorePath.path),
-           let storage = try? await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot),
-           let indexer = try? SwiftNativeKnowledgeGraphIndexer(memorySQLitePath: await storage.path),
-           let facts = try? await MemoryConsolidationHygiene.listGCFacts(storage),
-           let preview = try? await indexer.collectGarbage(liveFacts: facts, apply: false) {
-            kgPreviewNote = " KG sweep preview on approval: \(preview.candidates.count) orphan "
-                + "entit\(preview.candidates.count == 1 ? "y" : "ies") would be swept."
-        }
-        let proposedChange = "Run the MemoryV2 consolidation/hygiene pass over "
-            + "memory/memory.sqlite: merge duplicate proposals, auto-accept "
-            + "high-durability facts, archive stale/superseded memories, "
-            + "clean broken or duplicate active semantic memories, and sweep "
-            + "orphaned knowledge-graph entities/edges."
-            + kgPreviewNote
-            + " Nothing changes until you approve."
-        let body: JSONValue = .object([
-            "title": .string("Weekly memory hygiene is due"),
-            "action": .string(approvalAction),
-            "reason": .string(
-                "The weekly memory_consolidation tick fired. Memory hygiene "
-                + "mutates the store, so it stages this card instead of running "
-                + "silently — approve to run it now, deny to skip this week."),
-            "payload": .object([
-                "kind": .string("self_improvement"),
-                "evidence": .string(
-                    "Weekly memory_consolidation background tick (every store "
-                    + "mutation is approval-gated per the u3-memory-quality plan)."),
-                "proposedChange": .string(proposedChange),
-                "apply": .object([
-                    "op": .string(applyOp),
-                    "target": .string(""),
-                ]),
-            ]),
-            "payloadPreview": .string("[\(applyOp)] " + String(proposedChange.prefix(180))),
-        ])
-        do {
-            let rec = try await inbox.create(body)
-            FileHandle.standardError.write(Data(
-                "MemoryConsolidationHygieneRunner: staged weekly hygiene approval \(rec.id)\n".utf8))
-            return rec.id
-        } catch {
-            // tick() must not throw (LoopRunner contract) — log and let the
-            // next scheduled tick retry.
-            FileHandle.standardError.write(Data(
-                "MemoryConsolidationHygieneRunner: stage failed: \(error)\n".utf8))
-            return nil
-        }
-    }
-
-    private static func applyOpOf(_ payload: JSONValue) -> String? {
-        guard case .object(let obj) = payload,
-              case .object(let apply)? = obj["apply"],
-              case .string(let op)? = apply["op"] else { return nil }
-        return op
     }
 }

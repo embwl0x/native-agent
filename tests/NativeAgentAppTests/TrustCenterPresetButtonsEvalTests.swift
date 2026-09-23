@@ -48,7 +48,7 @@ struct TrustCenterPresetButtonsEvalTests {
                 approval = "Edits inside your workspaces run on their own; writes outside them wait for your approval."
             case .fullMac:
                 reach = "It can reach files anywhere on this Mac, inside and outside your workspaces. macOS still asks separately for access to protected folders."
-                approval = "Enabled routine actions, file changes included, run without asking on this Mac and trusted remote surfaces. External sends, explicit tool blocks, and protected system actions still wait."
+                approval = "Enabled routine actions, file changes included, run without asking on this Mac and trusted remote surfaces, including external messages. macOS permissions, account setup, explicit tool blocks, and external-agent safeguards still apply."
             case nil:
                 reach = "It can reach files in your workspace folders. Files outside them are off limits."
                 approval = "NativeAgent's own memory and notes update without asking; file changes ask you first."
@@ -66,7 +66,11 @@ struct TrustCenterPresetButtonsEvalTests {
             let backups = try #require(rows.first { $0.id == "backups" })
             let send = try #require(rows.first { $0.id == "external_send" })
             #expect([backups.value, backups.detail] == ["Backup required before changes", "Before an allowed file write, a backup is required so you can restore the previous version."])
-            #expect([send.value, send.detail] == ["Asks before sending", "Email, messages, and posts wait for your approval before they leave this Mac."])
+            if preset == .fullMac {
+                #expect([send.value, send.detail] == ["Full Mac sending active", "Admitted Full Mac actions can send through connected accounts without an additional app approval. External-agent safeguards still apply."])
+            } else {
+                #expect([send.value, send.detail] == ["Asks before sending", "Email, messages, and posts wait for your approval before they leave this Mac."])
+            }
         }
     }
 

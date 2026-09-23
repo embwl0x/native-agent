@@ -245,7 +245,7 @@ enum TurnRegression {
         )
         let sent = seed.context
         let schemas = sent.toolSchemas
-        let body = ConversationPrefixShape.$override.withValue(seed.shape) {
+        var body = ConversationPrefixShape.$override.withValue(seed.shape) {
             LLMCallContext.$systemSegments.withValue(sent.systemSegments) {
                 ConversationPrefixBoundary.$currentUserIndex.withValue(seed.currentUserIndex) {
                     AnthropicOAuthDirectAdapter.makeMessagesRequestBody(
@@ -253,11 +253,15 @@ enum TurnRegression {
                         system: sent.systemPrompt,
                         coercedModel: model,
                         maxTokens: maxTokens,
-                        tools: schemas.isEmpty ? nil : schemas,
                         stream: stream
                     )
                 }
             }
+        }
+        // The OAuth builder never sends a tools array; the advertised run the
+        // native lanes carry is projected here so tool-order pins still bite.
+        if !schemas.isEmpty {
+            body["tools"] = schemas.map { ["name": $0.name, "description": $0.description] }
         }
         return Turn(index: index, seed: seed, telemetry: telemetry, body: body)
     }

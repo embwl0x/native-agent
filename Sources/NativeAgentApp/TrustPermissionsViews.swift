@@ -23,11 +23,15 @@ struct ChromeControlPermissionsView: View {
     @State private var chromeSetupMessage: String?
     @State private var connectionState: ChromeControlConnectionState = .extensionNotLoaded
 
+    private var fullMacActive: Bool {
+        appModel.trustPolicy.map(AppModel.fullMacGrantIsActive) ?? false
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
                 Toggle("Chrome control", isOn: Binding(
-                    get: { enabled },
+                    get: { enabled || fullMacActive },
                     set: { newValue in
                         enabled = newValue
                         Task {
@@ -38,8 +42,8 @@ struct ChromeControlPermissionsView: View {
                         }
                     }
                 ))
-                .disabled(isSaving)
-                .help("Allows me to use background tabs in Chrome while you are signed in. Off by default.")
+                .disabled(isSaving || fullMacActive)
+                .help("Full Mac grants Chrome control. In narrower modes, use this switch. The Chrome extension must still be installed.")
                 EffectTimingTag(timing: .now)
                 Spacer()
             }
@@ -47,7 +51,7 @@ struct ChromeControlPermissionsView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
-            Text(connectionState.status(enabled: enabled))
+            Text(connectionState.status(enabled: enabled || fullMacActive))
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .accessibilityIdentifier("trust.chrome.status")
@@ -89,27 +93,8 @@ struct ChromeControlPermissionsView: View {
     }
 
     private func setUpChrome() {
-        // A plain copy in the home folder: Chrome's picker cannot browse into the app itself.
-        guard let folder = ChromeExtensionFolder.prepare() else {
-            chromeSetupMessage = "This copy of NativeAgent is missing the bundled Chrome extension or has incomplete extension files. Chrome setup cannot continue. Install an app release that includes the extension, or follow the source-checkout instructions in the extension README."
-            return
-        }
-        NSWorkspace.shared.activateFileViewerSelecting([folder])
-        guard let chrome = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.google.Chrome"),
-              let extensions = URL(string: "chrome://extensions") else {
-            chromeSetupMessage = "Extension folder: \(folder.path)\nGoogle Chrome could not be found. Install Chrome, then click Set up Chrome again."
-            return
-        }
-        chromeSetupMessage = "Extension folder: \(folder.path)"
-        NSWorkspace.shared.open(
-            [extensions], withApplicationAt: chrome,
-            configuration: NSWorkspace.OpenConfiguration()
-        ) { _, error in
-            if error != nil {
-                Task { @MainActor in
-                    chromeSetupMessage = "Extension folder: \(folder.path)\nChrome could not open the extensions page. Open Chrome and enter chrome://extensions in the address bar, then follow the three steps above."
-                }
-            }
+        Task {
+            chromeSetupMessage = await ChromeExtensionFolder.setUp().message
         }
     }
 }
@@ -120,22 +105,9 @@ struct MultimodalPermissionsView: View {
     @AppStorage("voiceAutoRead") private var voiceAutoRead = false
     @State private var draftPolicy = TrustMultimodalPolicy()
     @State private var isSaving = false
-    @State private var voiceOutputReadAttempted = false
-    @State private var voiceOutputSaveFailure: String?
-    @State private var completedVoiceOutputRead = false
-    @State private var voiceOutputReadGate = LatestAsyncRequestGate()
 
     private var currentPolicy: TrustMultimodalPolicy {
         draftPolicy
-    }
-
-    private var voiceOutputState: VoiceOutputSettingsPresentation.State {
-        VoiceOutputSettingsPresentation.resolve(
-            trustPolicy: appModel.trustPolicy,
-            hasReadAttempted: voiceOutputReadAttempted,
-            isSaving: isSaving,
-            saveFailure: voiceOutputSaveFailure
-        )
     }
 
     var body: some View {
@@ -159,46 +131,12 @@ struct MultimodalPermissionsView: View {
                 Spacer()
             }
             HStack {
-                // 2026-09-06: this said DOC/DOCX attachments are "parsed into
-                // chat context". They are not — nothing reads a Word file, and
-                // a switch that promises a capability the app does not have is
-                // worse than no switch. Disabled and told the truth until the
-                // extraction exists; the stored key is left alone so turning it
-                // on later needs no migration.
-                Toggle("Allow reading Word documents", isOn: policyBinding(\.file_ingestion_docx))
-                    .disabled(true)
-                    // 2026-09-06: the copy said DOC as well as DOCX. Both
-                    // attachment resolvers accept only .docx — an older .doc is
-                    // not carried at all, it is refused at the picker.
-                    .help("Not available yet. A .docx attachment is carried with the message but its text is not read into the conversation — attach a PDF, or paste the text. An older .doc file is not accepted at all.")
-                EffectTimingTag(timing: .now)
-                Spacer()
-            }
-            HStack {
-                Toggle("Allow Codex image generation", isOn: policyBinding(\.image_generation_openai))
-                    .help("Allows me to create images using your Codex or ChatGPT sign-in, or another OpenAI connection you have set up.")
+                Toggle("Allow image generation", isOn: policyBinding(\.image_generation_openai))
+                    .help("Lets me make images when you ask for one.")
                 EffectTimingTag(timing: .now)
                 Spacer()
             }
             Divider()
-            VStack(alignment: .leading, spacing: 4) {
-                Label(voiceOutputState.title, systemImage: voiceOutputState.systemImage)
-                    .font(.subheadline.weight(.medium))
-                    .foregroundStyle(voiceOutputState.status == "warn" ? Color.orange : Color.secondary)
-                Text(voiceOutputState.detail)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-                if voiceOutputState.canRetry {
-                    Button("Reload voice permissions", systemImage: "arrow.clockwise") {
-                        Task { await reloadVoiceOutputPolicy() }
-                    }
-                    .controlSize(.small)
-                    .disabled(isSaving)
-                    .accessibilityIdentifier("trust.multimodal.voice-output.reload")
-                }
-            }
-            .accessibilityIdentifier("trust.multimodal.voice-output.status")
             HStack {
                 Toggle("Read replies aloud automatically", isOn: $voiceAutoRead)
                     .help("Reads new replies aloud using your saved voice settings. OpenAI voice access needs separate permission.")
@@ -206,28 +144,8 @@ struct MultimodalPermissionsView: View {
                 EffectTimingTag(timing: .now)
                 Spacer()
             }
-            HStack {
-                Toggle("Use higher-quality OpenAI voice", isOn: Binding(
-                    get: { voiceOutputState.remoteVoiceEnabled ?? false },
-                    set: { newValue in
-                        saveVoiceOutputPolicy(remoteVoiceEnabled: newValue)
-                    }
-                ))
-                .disabled(!voiceOutputState.canChangeRemoteVoice || isSaving)
-                .accessibilityIdentifier("trust.multimodal.voice-output.openai")
-                EffectTimingTag(timing: .now)
-                Spacer()
-            }
-            Text("OpenAI TTS uses your subscription quota. Requires Trust Center TTS access and an OpenAI platform key.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
         }
-        .task {
-            guard !completedVoiceOutputRead else { return }
-            syncDraftPolicy()
-            await reloadVoiceOutputPolicy()
-        }
-        .onDisappear { _ = voiceOutputReadGate.begin() }
+        .task { syncDraftPolicy() }
         .onChange(of: appModel.trustPolicy) { _, _ in
             if !isSaving { syncDraftPolicy() }
         }
@@ -249,46 +167,6 @@ struct MultimodalPermissionsView: View {
             _ = await appModel.saveMultimodalPolicy(next)
             isSaving = false
             syncDraftPolicy()
-        }
-    }
-
-    private func saveVoiceOutputPolicy(remoteVoiceEnabled: Bool) {
-        guard var next = appModel.trustPolicy?.multimodalPolicy else {
-            voiceOutputSaveFailure = "Reload the Trust policy before changing the OpenAI voice setting."
-            return
-        }
-        next.tts_openai = remoteVoiceEnabled
-        draftPolicy = next
-        voiceOutputSaveFailure = nil
-        Task {
-            isSaving = true
-            let saved = await appModel.saveMultimodalPolicy(next)
-            isSaving = false
-            if saved {
-                voiceOutputSaveFailure = nil
-            } else {
-                voiceOutputSaveFailure = appModel.statusText
-            }
-            syncDraftPolicy()
-        }
-    }
-
-    private func reloadVoiceOutputPolicy() async {
-        guard !Task.isCancelled else { return }
-        let request = voiceOutputReadGate.begin()
-        voiceOutputReadAttempted = true
-        do {
-            let policy = try await appModel.client.getTrustPolicy()
-            guard !Task.isCancelled, voiceOutputReadGate.accepts(request) else { return }
-            appModel.trustPolicy = policy
-            voiceOutputSaveFailure = nil
-            syncDraftPolicy()
-            completedVoiceOutputRead = true
-        } catch {
-            guard !Task.isCancelled, voiceOutputReadGate.accepts(request) else { return }
-            appModel.trustPolicy = nil
-            appModel.statusText = "Voice output policy unavailable: \(error.localizedDescription)"
-            completedVoiceOutputRead = true
         }
     }
 
@@ -613,7 +491,7 @@ struct WorkshopPermissionsView: View {
                 EffectTimingTag(timing: .now)
                 Spacer()
             }
-            Text("Desk execution follows app-wide tool autonomy. Read-only tools run without prompting; sends and destructive actions require approval.")
+            Text("Desk execution follows app-wide tool autonomy. Admitted Full Mac actions run without an additional app approval; narrower modes may ask before sends or destructive actions.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }

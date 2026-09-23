@@ -5,6 +5,12 @@ import ProviderRouting
 import Dispatcher
 import ImageIO
 
+// Admission is bound only around an explicitly requested image tool call.
+// Backend clients keep their default-deny policy for callers outside that turn.
+enum ImageGenerationAdmission {
+    @TaskLocal static var fullMacAdmitted = false
+}
+
 // MARK: - OpenAI image generation tool
 
 enum ImageGenerationToolError: Error, Equatable, Sendable, LocalizedError {
@@ -29,7 +35,7 @@ enum ImageGenerationToolError: Error, Equatable, Sendable, LocalizedError {
     var errorDescription: String? {
         switch self {
         case .trustDenied:
-            return "[trust_denied] Image generation is disabled. In Trust, turn on ‘Allow Codex image generation’, then try again. This permission also applies to the OpenAI API option."
+            return "[trust_denied] Image generation is disabled. In Trust, turn on ‘Allow image generation’, then try again."
         case .missingPrompt:
             return "prompt is required"
         case .unsupportedProvider(let provider):
@@ -177,6 +183,7 @@ final class SwiftCodexImageGenerationClient: @unchecked Sendable {
             _ = chmod(url.path, 0o600)
             return url.path
         }
+        defer { for path in referencePaths { try? FileManager.default.removeItem(atPath: path) } }
         let prompt = Self.codexPrompt(for: request, prompt: trimmedPrompt)
             + (referencePaths.isEmpty ? "" : "\nEdit targets/reference paths, in order: \(referencePaths.joined(separator: ", ")). These images are attached; use the built-in referenced_image_paths parameter with these exact paths.")
         var arguments = Self.codexExecArguments(
@@ -254,8 +261,8 @@ final class SwiftCodexImageGenerationClient: @unchecked Sendable {
                 "requestedOutputFormat": .string(request.outputFormat), "requestedBackground": .string(request.background),
                 "actualFormat": .string(raster.format), "actualWidth": .int(Int64(raster.width)), "actualHeight": .int(Int64(raster.height)),
                 "actualHasAlpha": .bool(raster.hasAlpha),
-                "sizeFulfillment": .string(SwiftCodexOAuthImageGenerationClient.sizeFulfillment(requested: request.size ?? "auto", observed: "\(raster.width)x\(raster.height)")),
-                "formatFulfillment": .string(SwiftCodexOAuthImageGenerationClient.qualityFulfillment(requested: request.outputFormat, observed: raster.format)),
+                "sizeFulfillment": .string(SwiftCodexImageGenerationClient.sizeFulfillment(requested: request.size ?? "auto", observed: "\(raster.width)x\(raster.height)")),
+                "formatFulfillment": .string(SwiftCodexImageGenerationClient.qualityFulfillment(requested: request.outputFormat, observed: raster.format)),
                 "actionFulfillment": .string("unknown"),
             ])
         }
@@ -275,6 +282,7 @@ final class SwiftCodexImageGenerationClient: @unchecked Sendable {
     }
 
     private func imageGenerationAllowed() async -> Bool {
+        if ImageGenerationAdmission.fullMacAdmitted { return true }
         let path = dataRoot
             .appendingPathComponent("trust", isDirectory: true)
             .appendingPathComponent("policy.json")
@@ -490,382 +498,6 @@ final class SwiftCodexImageGenerationClient: @unchecked Sendable {
             ?? .distantPast
     }
 
-    private static func truncatedPrompt(_ prompt: String) -> String {
-        let scalars = prompt.unicodeScalars
-        guard scalars.count > maxPromptScalars else { return prompt }
-        return String(String.UnicodeScalarView(scalars.prefix(maxPromptScalars)))
-    }
-}
-
-final class SwiftCodexOAuthImageGenerationClient: @unchecked Sendable {
-    static let codexEndpoint = URL(string: "https://chatgpt.com/backend-api/codex/responses")!
-    /// The image model this transport's API names, read from the route's
-    /// catalog row rather than written here (2026-09-13 rulings).
-    static var imageModel: String {
-        FirstPartyModelCatalog.imageRoute(forProviderID: "codex")?.model ?? ""
-    }
-    static let maxPromptScalars = 16_000
-    static let maxImageCount = 4
-    static let defaultTimeoutSeconds = 600
-
-    private static let instructions = "You are an assistant that must fulfill image generation requests by using the image_generation tool when provided."
-
-    private let session: URLSession
-    private let endpoint: URL
-    private let authAdapter: OpenAIOAuthDirectAdapter
-    private let dataRoot: URL
-    private let persistence: any PersistenceCoreProtocol
-
-    init(
-        session: URLSession = OpenAIOAuthDirectAdapter.productionSession,
-        endpoint: URL = SwiftCodexOAuthImageGenerationClient.codexEndpoint,
-        authPathOverride: URL? = nil,
-        dataRoot: URL? = nil,
-        persistence: any PersistenceCoreProtocol = SwiftNativePersistenceCore()
-    ) {
-        self.session = session
-        self.endpoint = endpoint
-        self.dataRoot = dataRoot ?? PersistenceCore.defaultDataRoot()
-        self.persistence = persistence
-        self.authAdapter = OpenAIOAuthDirectAdapter(
-            session: session,
-            endpoint: endpoint,
-            authPathOverride: authPathOverride,
-            telemetryDataRootOverride: dataRoot
-        )
-    }
-
-    func generate(_ request: CodexImageGenerationRequest) async throws -> CodexImageGenerationResult {
-        guard await imageGenerationAllowed() else { throw ImageGenerationToolError.trustDenied }
-
-        let trimmedPrompt = request.prompt.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedPrompt.isEmpty else { throw ImageGenerationToolError.missingPrompt }
-
-        let runId = UUID().uuidString.lowercased()
-        let request = try request.normalized()
-        let count = request.count
-        let timeoutSeconds = max(30, min(1800, request.timeoutSeconds))
-        let started = DispatchTime.now().uptimeNanoseconds
-        let outputDir = dataRoot
-            .appendingPathComponent("generated_images", isDirectory: true)
-            .appendingPathComponent("codex_oauth_runs", isDirectory: true)
-        try FileManager.default.createDirectory(at: outputDir, withIntermediateDirectories: true)
-
-        var sources: [URL] = []
-        var replyParts: [String] = []
-        var evidence: [JSONValue] = []
-        for idx in 0..<count {
-            let image = try await collectImage(
-                prompt: Self.truncatedPrompt(trimmedPrompt),
-                request: request,
-                timeoutSeconds: timeoutSeconds
-            )
-            let path = outputDir.appendingPathComponent("\(runId)-\(idx + 1).\(image.format)", isDirectory: false)
-            try image.data.write(to: path, options: .atomic)
-            _ = chmod(path.path, 0o600)
-            sources.append(path)
-            evidence.append(image.evidence)
-            let reply = image.reply.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !reply.isEmpty { replyParts.append(reply) }
-        }
-
-        let durationMs = Int((DispatchTime.now().uptimeNanoseconds &- started) / 1_000_000)
-        let observedModels = Set(evidence.compactMap { value -> String? in
-            guard case .object(let row) = value, case .string(let model)? = row["imageModel"] else { return nil }
-            return model
-        })
-        return CodexImageGenerationResult(
-            runId: runId,
-            model: observedModels.count == 1 ? observedModels.first! : "unknown",
-            sourceImages: sources,
-            reply: replyParts.joined(separator: "\n"),
-            stdout: "",
-            stderr: "",
-            exitCode: 0,
-            timedOut: false,
-            durationMs: durationMs,
-            evidence: evidence
-        )
-    }
-
-    private func imageGenerationAllowed() async -> Bool {
-        let path = dataRoot
-            .appendingPathComponent("trust", isDirectory: true)
-            .appendingPathComponent("policy.json")
-        let policy = await persistence.readJSON(path, defaultValue: .object([:]))
-        guard case let .object(root) = policy,
-              case let .object(mm)? = root["multimodalPolicy"],
-              case let .bool(allowed)? = mm["image_generation_openai"] else {
-            return false
-        }
-        return allowed
-    }
-
-    private struct CollectedImage: Sendable, Equatable {
-        var data: Data
-        var reply: String
-        var format: String
-        var evidence: JSONValue
-    }
-
-    private func collectImage(prompt: String, request: CodexImageGenerationRequest, timeoutSeconds: Int) async throws -> CollectedImage {
-        let body = Self.codexResponsesPayload(prompt: prompt, request: request)
-        let bodyData: Data
-        do {
-            bodyData = try JSONSerialization.data(withJSONObject: body)
-        } catch {
-            throw ImageGenerationToolError.invalidResponse("encode Codex image request: \(error.localizedDescription)")
-        }
-
-        // User, 2026-09-06: the token the last attempt actually sent, handed to
-        // the forced refresh so a rotation another caller already performed is
-        // taken instead of burning a second single-use refresh_token — the
-        // same rule the chat loops follow.
-        var lastSentAccessToken: String?
-        for attempt in 0...1 {
-            let context: CodexOAuthAccessContext
-            do {
-                context = try await authAdapter.codexAccessContext(
-                    forceRefresh: attempt == 1,
-                    staleToken: attempt == 1 ? lastSentAccessToken : nil
-                )
-            } catch is CancellationError {
-                throw CancellationError()
-            } catch {
-                throw ImageGenerationToolError.codexUnavailable
-            }
-
-            lastSentAccessToken = context.accessToken
-            var urlRequest = URLRequest(url: endpoint)
-            urlRequest.httpMethod = "POST"
-            urlRequest.timeoutInterval = TimeInterval(timeoutSeconds)
-            urlRequest.setValue("Bearer \(context.accessToken)", forHTTPHeaderField: "Authorization")
-            urlRequest.setValue(context.accountID, forHTTPHeaderField: "chatgpt-account-id")
-            urlRequest.setValue(
-                OpenAIOAuthDirectAdapter.codexBackendOriginator,
-                forHTTPHeaderField: "originator"
-            )
-            urlRequest.setValue(
-                OpenAIOAuthDirectAdapter.codexBackendUserAgent,
-                forHTTPHeaderField: "User-Agent"
-            )
-            urlRequest.setValue("responses=experimental", forHTTPHeaderField: "OpenAI-Beta")
-            urlRequest.setValue("text/event-stream", forHTTPHeaderField: "Accept")
-            urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            urlRequest.httpBody = bodyData
-
-            let data: Data
-            let response: URLResponse
-            do {
-                (data, response) = try await session.data(for: urlRequest)
-            } catch {
-                if error is CancellationError { throw CancellationError() }
-                let nsError = error as NSError
-                if nsError.domain == NSURLErrorDomain && nsError.code == NSURLErrorCancelled {
-                    throw CancellationError()
-                }
-                throw ImageGenerationToolError.transport(message: nsError.localizedDescription)
-            }
-
-            guard let http = response as? HTTPURLResponse else {
-                throw ImageGenerationToolError.transport(message: "non-HTTP response")
-            }
-            if http.statusCode == 401 {
-                if attempt == 0 { continue }
-                throw ImageGenerationToolError.authRejected
-            }
-            guard (200..<300).contains(http.statusCode) else {
-                throw ImageGenerationToolError.apiError(
-                    status: http.statusCode,
-                    message: Self.boundedBodyString(data)
-                )
-            }
-
-            let parsed = Self.parseCodexImageSSE(data)
-            if let error = parsed.error {
-                throw ImageGenerationToolError.invalidResponse(error)
-            }
-            guard let b64 = parsed.imageBase64,
-                  let imageData = Data(base64Encoded: b64),
-                  let raster = CodexImageRaster.inspect(imageData) else {
-                throw ImageGenerationToolError.invalidImageData
-            }
-            var evidence = parsed.evidence
-            evidence["actualFormat"] = .string(raster.format)
-            evidence["actualWidth"] = .int(Int64(raster.width))
-            evidence["actualHeight"] = .int(Int64(raster.height))
-            evidence["requestedImageModel"] = .string(Self.imageModel)
-            // The model this turn was admitted on, not one named here: the
-            // receipt has to match what actually ran (2026-09-13).
-            evidence["requestedResponseModel"] = .string(Self.responseModel())
-            evidence["requestedSize"] = .string(request.size ?? "1024x1024")
-            evidence["requestedQuality"] = .string(request.quality ?? "medium")
-            let outboundQuality = ((body["tools"] as? [[String: Any]])?
-                .first { $0["type"] as? String == "image_generation" }?["quality"] as? String)?
-                .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "unknown"
-            evidence["outboundQuality"] = .string(outboundQuality)
-            evidence["outboundQualityEvidenceSource"] = .string(outboundQuality == "unknown"
-                ? "unknown" : "outbound_request.tools[type=image_generation].quality")
-            evidence["qualityRequestForwarding"] = .string(outboundQuality == "unknown"
-                ? "unknown" : (outboundQuality == (request.quality ?? "medium") ? "exact" : "not_forwarded"))
-            evidence["requestedOutputFormat"] = .string(request.outputFormat)
-            evidence["requestedAction"] = .string(request.action)
-            evidence["referenceSHA256"] = .array(request.references.map { .string($0.sha256) })
-            let observedQuality: String
-            if case .string(let value)? = evidence["quality"] {
-                let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-                observedQuality = normalized.isEmpty ? "unknown" : normalized
-            }
-            else { observedQuality = "unknown" }
-            evidence["observedQuality"] = .string(observedQuality)
-            evidence["qualityFulfillment"] = .string(Self.qualityFulfillment(
-                requested: request.quality ?? "medium",
-                observed: observedQuality
-            ))
-            evidence["controllerSettings"] = .string(Self.controllerSettings(request))
-            evidence["controllerSettingsEvidenceSource"] = .string("outbound_request.instructions")
-            evidence["sizeFulfillment"] = .string(Self.sizeFulfillment(
-                requested: request.size ?? "1024x1024", observed: "\(raster.width)x\(raster.height)"))
-            evidence["formatFulfillment"] = .string(Self.qualityFulfillment(
-                requested: request.outputFormat, observed: raster.format))
-            let observedAction: String
-            if case .string(let value)? = evidence["action"] { observedAction = value }
-            else { observedAction = "unknown" }
-            evidence["actionFulfillment"] = .string(Self.qualityFulfillment(
-                requested: request.action, observed: observedAction))
-            return CollectedImage(data: imageData, reply: parsed.reply, format: raster.format, evidence: .object(evidence))
-        }
-        throw ImageGenerationToolError.codexUnavailable
-    }
-
-    /// The model this image turn rides: the one the turn was admitted on. Image
-    /// generation happens inside an ordinary turn, so the answer is already
-    /// bound in `LLMCallContext` — naming a model here would override the
-    /// person's Providers choice with one chosen in code (2026-09-13).
-    static func responseModel() -> String {
-        let admitted = LLMCallContext.admittedModel?
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        guard admitted.isEmpty else { return admitted }
-        // Reached only when an image call arrives outside a turn's admission:
-        // the FIRST row of this route's own catalog, computed, so the request
-        // still names a model that route serves instead of nothing at all.
-        return FirstPartyModelCatalog
-            .models(forProviderID: "openai_oauth_direct").first?.id ?? ""
-    }
-
-    static func codexResponsesPayload(prompt: String, request: CodexImageGenerationRequest) -> [String: Any] {
-        let content: [[String: Any]] = [["type": "input_text", "text": truncatedPrompt(prompt)]]
-            + request.references.map { ["type": "input_image", "image_url": $0.dataURL] }
-        return [
-            "model": responseModel(),
-            "store": false,
-            "instructions": instructions + "\n" + controllerSettings(request),
-            "input": [["type": "message", "role": "user", "content": content]],
-            "tools": [[
-                "type": "image_generation",
-                // Installed Codex 0.153.4 still requests this identifier. The server's
-                // rollout is not an exposed Flare/Sunburst selection contract.
-                "model": imageModel,
-                "size": request.size ?? "1024x1024",
-                "quality": request.quality ?? "medium",
-                "output_format": request.outputFormat,
-                "background": "opaque",
-                "action": request.action,
-            ]],
-            "tool_choice": ["type": "allowed_tools", "mode": "required", "tools": [["type": "image_generation"]]],
-            "stream": true,
-        ]
-    }
-
-    // Codex may normalize the tool configuration to auto. Keep the caller's
-    // choices visible to the controller as well; this is intent, not proof of fulfillment.
-    static func controllerSettings(_ request: CodexImageGenerationRequest) -> String {
-        """
-        The caller selected these image_generation settings: quality=\(request.quality ?? "medium"), size=\(request.size ?? "1024x1024"), output_format=\(request.outputFormat), action=\(request.action).
-        Preserve each explicit setting when calling image_generation; do not replace it with an automatic or cheaper choice. For settings equal to auto, choose according to the image request. These settings describe tool arguments, not text to draw in the image. Use the supplied reference images in their given order. If the tool cannot honor a setting, do not claim that it did.
-        """
-    }
-
-    struct ParsedCodexImageSSE: Sendable, Equatable {
-        var imageBase64: String?
-        var reply: String
-        var error: String?
-        var evidence: [String: JSONValue]
-    }
-
-    static func parseCodexImageSSE(_ data: Data) -> ParsedCodexImageSSE {
-        var completed = false
-        var item: [String: Any]?
-        var itemEvidenceSource = "unknown"
-        var textDeltas: [String] = []
-        var errorMessage: String?
-        var evidence: [String: JSONValue] = [:]
-        for event in SSEEventParser.parse(data: data) {
-            let raw = event.data.trimmingCharacters(in: .whitespacesAndNewlines)
-            if raw.isEmpty || raw == "[DONE]" { continue }
-            guard let payloadData = raw.data(using: .utf8),
-                  let payload = try? JSONSerialization.jsonObject(with: payloadData) as? [String: Any] else { continue }
-            let type = payload["type"] as? String ?? event.event ?? ""
-            if type == "response.output_text.delta", let delta = payload["delta"] as? String { textDeltas.append(delta) }
-            if type == "error" || type == "response.failed" || type == "response.incomplete" {
-                let response = payload["response"] as? [String: Any] ?? [:]
-                let error = payload["error"] as? [String: Any] ?? response["error"] as? [String: Any] ?? [:]
-                let message = error["message"] as? String ?? payload["message"] as? String ?? "Codex image response failed or incomplete"
-                let code = error["code"] as? String ?? error["type"] as? String
-                errorMessage = message + (code.map { " [code=\($0)]" } ?? "")
-            }
-            if type == "response.output_item.done", let candidate = payload["item"] as? [String: Any],
-               candidate["type"] as? String == "image_generation_call", candidate["status"] as? String == "completed" {
-                item = candidate
-                itemEvidenceSource = "response.output_item.done.item"
-            }
-            if type == "response.completed", let response = payload["response"] as? [String: Any] {
-                completed = response["status"] as? String == "completed"
-                if !completed { errorMessage = "Codex image response did not complete successfully" }
-                evidence["responseId"] = .string(response["id"] as? String ?? "unknown")
-                evidence["responseModel"] = .string(response["model"] as? String ?? "unknown")
-                let tools = (response["tools"] as? [[String: Any]] ?? []).filter { $0["type"] as? String == "image_generation" }
-                let models = Set(tools.map { ($0["model"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "" })
-                let backendModel = models.count == 1 ? models.first! : ""
-                evidence["backendToolModel"] = .string(backendModel.isEmpty ? "unknown" : backendModel)
-                evidence["backendToolModelEvidenceSource"] = .string(!backendModel.isEmpty && backendModel != "unknown"
-                    ? "response.completed.response.tools[type=image_generation].model" : "unknown")
-                let qualities = Set(tools.map { ($0["quality"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "" })
-                let returnedToolQuality = qualities.count == 1 ? qualities.first! : ""
-                evidence["returnedToolQuality"] = .string(returnedToolQuality.isEmpty ? "unknown" : returnedToolQuality)
-                evidence["returnedToolQualityEvidenceSource"] = .string(returnedToolQuality.isEmpty
-                    ? "unknown" : "response.completed.response.tools[type=image_generation].quality")
-                if let output = response["output"] as? [[String: Any]] {
-                    for candidate in output where candidate["type"] as? String == "image_generation_call" {
-                        if candidate["status"] as? String == "completed" {
-                            item = candidate
-                            itemEvidenceSource = "response.completed.response.output[type=image_generation_call]"
-                        }
-                        else { errorMessage = "Codex image tool did not complete successfully" }
-                    }
-                }
-            }
-        }
-        let result = item?["result"] as? String
-        if errorMessage == nil && (!completed || result?.isEmpty != false) {
-            errorMessage = "Codex stream ended without a completed response and image tool result; partial previews are not artifacts"
-        }
-        evidence["tool"] = .string("image_generation")
-        evidence["toolCallId"] = .string(item?["id"] as? String ?? "unknown")
-        let imageModel = (item?["model"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        evidence["imageModel"] = .string(imageModel.isEmpty ? "unknown" : imageModel)
-        evidence["modelVersion"] = .string("unverified")
-        for key in ["action", "quality", "size", "output_format", "background"] {
-            evidence[key] = .string(item?[key] as? String ?? "unknown")
-        }
-        let itemQuality = (item?["quality"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        evidence["observedQualityEvidenceSource"] = .string(itemQuality.isEmpty || itemQuality == "unknown"
-            ? "unknown" : "\(itemEvidenceSource).quality")
-        return ParsedCodexImageSSE(imageBase64: errorMessage == nil ? result : nil,
-            reply: textDeltas.joined().trimmingCharacters(in: .whitespacesAndNewlines),
-            error: errorMessage, evidence: evidence)
-    }
-
     static func qualityFulfillment(requested: String, observed: String) -> String {
         let requested = requested.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let observed = observed.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -919,16 +551,6 @@ final class SwiftCodexOAuthImageGenerationClient: @unchecked Sendable {
         guard scalars.count > maxPromptScalars else { return prompt }
         return String(String.UnicodeScalarView(scalars.prefix(maxPromptScalars)))
     }
-
-    private static func boundedBodyString(_ data: Data, maxBytes: Int = 4_096) -> String {
-        guard !data.isEmpty else { return "empty error body" }
-        let prefix = data.prefix(maxBytes)
-        let text = String(decoding: prefix, as: UTF8.self)
-        if data.count > maxBytes {
-            return text + "\n...(truncated \(data.count - maxBytes) bytes)"
-        }
-        return text
-    }
 }
 
 struct OpenAIImageGenerationRequest: Sendable, Equatable {
@@ -980,6 +602,7 @@ final class SwiftOpenAIImageGenerationClient: @unchecked Sendable {
     }
 
     private func imageGenerationAllowed() async -> Bool {
+        if ImageGenerationAdmission.fullMacAdmitted { return true }
         let path = dataRoot
             .appendingPathComponent("trust", isDirectory: true)
             .appendingPathComponent("policy.json")
@@ -1098,7 +721,14 @@ final class SwiftOpenAIImageGenerationClient: @unchecked Sendable {
 }
 
 extension SwiftToolDispatcher {
-    func impl_image_generate(input: [String: JSONValue]) async -> JSONValue {
+    func impl_image_generate(input: [String: JSONValue], surface: String = "unknown") async -> JSONValue {
+        let admitted = await fullMacYoloAdmitted(tool: "image_generate", surface: surface)
+        return await ImageGenerationAdmission.$fullMacAdmitted.withValue(admitted) {
+            await impl_admitted_image_generate(input: input)
+        }
+    }
+
+    private func impl_admitted_image_generate(input: [String: JSONValue]) async -> JSONValue {
         let input = input.filter {
             if case .string(let text) = $0.value { return !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
             return true
@@ -1156,9 +786,7 @@ extension SwiftToolDispatcher {
             switch provider {
             case "codex", "codex_cli":
                 // Trust precedes file reads as well as OAuth/network access.
-                let policy = await SwiftNativePersistenceCore().readJSON(dataRoot.appendingPathComponent("trust/policy.json"), defaultValue: .object([:]))
-                guard case let .object(root) = policy,
-                      case let .object(mm)? = root["multimodalPolicy"], mm["image_generation_openai"] == .bool(true) else {
+                guard await imageGenerationTrustAllowed() else {
                     throw ImageGenerationToolError.trustDenied
                 }
                 for key in ["prompt", "description", "provider", "backend", "model", "size", "quality", "output_format", "format", "action", "background"] {
@@ -1177,7 +805,7 @@ extension SwiftToolDispatcher {
                     quality: jsonString(input["quality"]),
                     outputFormat: jsonString(input["output_format"] ?? input["format"]) ?? "png",
                     count: jsonInt(input["n"] ?? input["count"]) ?? 1,
-                    timeoutSeconds: jsonInt(input["timeout_seconds"]) ?? SwiftCodexOAuthImageGenerationClient.defaultTimeoutSeconds,
+                    timeoutSeconds: jsonInt(input["timeout_seconds"]) ?? SwiftCodexImageGenerationClient.defaultTimeoutSeconds,
                     action: jsonString(input["action"]) ?? "auto",
                     references: references,
                     background: jsonString(input["background"]) ?? "auto"
@@ -1393,7 +1021,7 @@ extension SwiftToolDispatcher {
             if FileManager.default.fileExists(atPath: destination.path) {
                 try FileManager.default.removeItem(at: destination)
             }
-            try FileManager.default.copyItem(at: source, to: destination)
+            try FileManager.default.moveItem(at: source, to: destination)
             _ = chmod(destination.path, 0o600)
             let byteSize = (try? destination.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
             imageRows.append(.object([
@@ -1401,7 +1029,6 @@ extension SwiftToolDispatcher {
                 "path": .string(destination.path),
                 "filename": .string(filename),
                 "byteSize": .int(Int64(byteSize)),
-                "codexSourcePath": .string(source.path),
             ]))
         }
 
@@ -1693,6 +1320,7 @@ extension SwiftToolDispatcher {
     /// The Trust flag both image backends read, checked before the route is
     /// resolved so a disabled capability still says exactly that.
     private func imageGenerationTrustAllowed() async -> Bool {
+        if ImageGenerationAdmission.fullMacAdmitted { return true }
         let policy = await SwiftNativePersistenceCore()
             .readJSON(dataRoot.appendingPathComponent("trust/policy.json"), defaultValue: .object([:]))
         guard case let .object(root) = policy,

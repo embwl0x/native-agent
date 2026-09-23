@@ -155,6 +155,21 @@ extension SwiftToolDispatcher {
             )
         }
 
+        // 2026-09-22: triage view. The board shows 25 rows with no dates, so
+        // staleness was unjudgeable; list every open top-level item, oldest first.
+        if optionalString(input, "sort") == "stale", handle?.isEmpty != false, query?.isEmpty != false {
+            let open = state.topLevel.filter { !$0.status.isTerminal }.sorted {
+                $0.updatedAt != $1.updatedAt ? $0.updatedAt < $1.updatedAt : $0.handle < $1.handle
+            }
+            return .object([
+                "status": .string("ok"), "sort": .string("stale"), "count": .int(Int64(open.count)),
+                "items": .array(open.map {
+                    .object(["id": .string($0.handle), "title": .string(String($0.title.prefix(160))),
+                             "status": .string($0.status.rawValue), "updated": .string(String($0.updatedAt.prefix(10)))])
+                }),
+            ])
+        }
+
         let rawMatches: [DeskItem]
         if let handle, !handle.isEmpty {
             rawMatches = state.items.filter { $0.handle == handle || $0.alias == handle }
@@ -174,6 +189,10 @@ extension SwiftToolDispatcher {
             }
         } else {
             rawMatches = []
+        }
+
+        if input["structured"] == .bool(true) {
+            return Self.workspaceDesk(state: state, input: input, handle: handle, query: query, matches: rawMatches)
         }
 
         let isFiltered = (handle?.isEmpty == false) || (query?.isEmpty == false)

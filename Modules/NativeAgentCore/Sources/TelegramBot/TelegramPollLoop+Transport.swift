@@ -154,6 +154,27 @@ extension TelegramPollLoop {
         }
     }
 
+    public static let defaultDeleteMessage: @Sendable (String, Int, Int) async throws -> Void = { token, chatId, messageId in
+        try await _tgRetryAfterFloodControl(chatId: chatId) {
+            _ = try await _tgPostJSON(
+                token: token,
+                method: "deleteMessage",
+                resultType: Bool.self,
+                validateResult: { $0 }
+            ) {
+                let body: [String: Any] = ["chat_id": chatId, "message_id": messageId]
+                return try JSONSerialization.data(withJSONObject: body)
+            }
+        }
+    }
+
+    /// 2026-09-22: the plain-text cleanup a live reply gets, for senders that
+    /// hand raw model text to `defaultSendMessage` (bridge, attention). Not
+    /// applied inside the shared sender: a second pass is not idempotent.
+    public static func cleanedPlainText(_ text: String) -> String {
+        TelegramRichMessageRenderer.sanitize(TelegramRichMessageRenderer.stripBoldMarkers(text))
+    }
+
     public static let defaultSendMessage: @Sendable (String, TelegramDestination, String) async throws -> Void = { token, destination, text in
         try await sendMessage(
             token: token,
@@ -250,6 +271,16 @@ extension TelegramPollLoop {
         }
     }
 
+    // Bot API JSON calls are finite requests, not long-poll/streaming work.
+    // A request timeout alone resets as bytes arrive; bound the whole resource
+    // too so a stalled send cannot hold the shared chat lane indefinitely.
+    private static let deliverySession: URLSession = {
+        let configuration = URLSessionConfiguration.default
+        configuration.timeoutIntervalForRequest = 20
+        configuration.timeoutIntervalForResource = 30
+        return URLSession(configuration: configuration)
+    }()
+
     /// Build each JSON request inside its caller's existing retry attempt.
     /// Keep serialization lazy so an invalid bot URL still fails first.
     private static func _tgPostJSON<Result: Decodable & Sendable>(
@@ -258,7 +289,7 @@ extension TelegramPollLoop {
         resultType: Result.Type,
         allowMessageNotModified: Bool = false,
         validateResult: (Result) -> Bool = { _ in true },
-        session: URLSession = .shared,
+        session: URLSession = deliverySession,
         timeoutInterval: TimeInterval? = nil,
         body: () throws -> Data
     ) async throws -> TelegramValidatedResult<Result> {
@@ -458,7 +489,8 @@ extension TelegramPollLoop {
                 token: token,
                 method: "sendChatAction",
                 resultType: Bool.self,
-                validateResult: { $0 }
+                validateResult: { $0 },
+                timeoutInterval: 5
             ) {
                 var body = _tgDestinationBody(destination)
                 body["action"] = action

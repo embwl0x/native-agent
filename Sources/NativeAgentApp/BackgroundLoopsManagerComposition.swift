@@ -286,6 +286,10 @@ public actor BackgroundLoopsManager {
         await coreManager.stop()
     }
 
+    public func shutdown() async {
+        await coreManager.shutdown()
+    }
+
     public func status() async -> [LoopStatus] {
         await coreManager.status().map(LoopStatus.init)
     }

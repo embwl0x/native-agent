@@ -32,16 +32,7 @@ struct MacIntegrationBridgeImpl: MacIntegrationToolBridge {
     func macNotify(input: [String: JSONValue]) async throws -> JSONValue {
         // Mirror the shape NativeClient.runMacNotify uses so the chat-tool
         // path returns the same envelope the connector-action path does.
-        let title = NativeAgentNotificationDefaults.title(
-            (input["title"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)).flatMap { $0.isEmpty ? nil : $0 }
-        )
-        let message = (input["message"]?.stringValue ?? input["body"]?.stringValue ?? "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !message.isEmpty else {
-            throw NSError(domain: "NativeAgentMacIntegrationBridge", code: -400, userInfo: [
-                NSLocalizedDescriptionKey: "mac_notify requires message",
-            ])
-        }
+        let (title, message) = try NativeAgentNotificationDefaults.parseInput(input, toolName: "mac_notify")
         let result = await NativeAgentNotifications.postAndReport(title: title, body: message)
         var obj = result.deliveryFields()
         obj.merge([
@@ -52,16 +43,7 @@ struct MacIntegrationBridgeImpl: MacIntegrationToolBridge {
     }
 
     func mobileNotify(input: [String: JSONValue]) async throws -> JSONValue {
-        let title = NativeAgentNotificationDefaults.title(
-            (input["title"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)).flatMap { $0.isEmpty ? nil : $0 }
-        )
-        let message = (input["message"]?.stringValue ?? input["body"]?.stringValue ?? "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !message.isEmpty else {
-            throw NSError(domain: "NativeAgentMacIntegrationBridge", code: -400, userInfo: [
-                NSLocalizedDescriptionKey: "mobile_notify requires message",
-            ])
-        }
+        let (title, message) = try NativeAgentNotificationDefaults.parseInput(input, toolName: "mobile_notify")
         let source = input["source"]?.stringValue ?? "chat_tool"
         // B5 review round 2 (MED): pass through the same routing params the
         // AppChatToolDispatcher shim preserves (screen/urgency, + surface when

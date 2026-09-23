@@ -49,11 +49,12 @@ extension SwiftToolDispatcher {
     /// The bot bot_create would write. Shared by dispatch and the pre-approval
     /// check; it touches no file.
     private func botCreateCandidate(_ args: [String: JSONValue]) async throws -> BotDefinition {
-        let args = args.filter { $0.value != .null && ($0.key == "output_format" || $0.value != .string("")) }
-        try botKeys(args, allowed: ["name", "brief", "cadence", "provider", "model", "reasoning_effort", "fast", "daily_token_ceiling", "budget", "output_format"])
+        let args = args.filter { $0.value != .null && (["output_format", "schedule", "timezone"].contains($0.key) || $0.value != .string("")) }
+        try botKeys(args, allowed: ["name", "brief", "cadence", "schedule", "timezone", "details", "provider", "model", "reasoning_effort", "fast", "daily_token_ceiling", "budget", "output_format"])
+        _ = try botDetails(args)
         var bot = BotDefinition(name: try botString(args["name"], field: "name"),
                                 brief: try botString(args["brief"], field: "brief"),
-                                cadence: try args["cadence"].map(botCadence) ?? .manual,
+                                cadence: try botRequestedCadence(args) ?? .manual,
                                 budget: try args["budget"].map(botBudget)
                                     ?? BotBudget(tokens: BotRunLimits.maximumTokens, seconds: BotRunLimits.maximumSeconds),
                                 outputFormat: try args["output_format"].map { try botDecode(String.self, $0, field: "output_format") })
@@ -73,15 +74,16 @@ extension SwiftToolDispatcher {
     /// The bot bot_update would write, read from the store and edited in
     /// memory. Shared by dispatch and the pre-approval check; it writes nothing.
     private func botUpdateCandidate(_ args: [String: JSONValue], definitions: BotDefinitionStore) async throws -> BotDefinition {
-        try botKeys(args, allowed: Set(botReferenceKeys + ["fields"]))
+        try botKeys(args, allowed: Set(botReferenceKeys + ["fields", "details"]))
+        _ = try botDetails(args)
         let fields = try botObject(args["fields"], field: "fields")
-        try botKeys(fields, allowed: ["name", "brief", "cadence", "provider", "model", "reasoning_effort", "fast", "daily_token_ceiling", "budget", "output_format"])
-        let edits = fields.filter { ($0.key == "output_format" || $0.value != .string("")) }
+        try botKeys(fields, allowed: ["name", "brief", "cadence", "schedule", "timezone", "provider", "model", "reasoning_effort", "fast", "daily_token_ceiling", "budget", "output_format"])
+        let edits = fields.filter { $0.value != .null && (["output_format", "schedule", "timezone"].contains($0.key) || $0.value != .string("")) }
         guard !edits.isEmpty else { throw StandingBotsError.invalidValue("fields must contain at least one setting") }
         var bot = try definitions.get(botReference(args, definitions: definitions))
         if let value = edits["name"] { bot.name = try botString(value, field: "name") }
         if let value = edits["brief"] { bot.brief = try botString(value, field: "brief") }
-        if let value = edits["cadence"] { bot.cadence = try botCadence(value) }
+        if let cadence = try botRequestedCadence(edits) { bot.cadence = cadence }
         if let value = edits["provider"] { bot.provider = try botString(value, field: "provider") }
         if let value = edits["model"] { bot.model = try botString(value, field: "model") }
         if let value = edits["reasoning_effort"] { bot.reasoningEffort = try botString(value, field: "reasoning_effort") }
@@ -182,20 +184,32 @@ extension SwiftToolDispatcher {
                 ])
                 return .object(result)
             case "bot_create":
-                return try botDefinitionJSON(definitions.create(try await botCreateCandidate(args)))
+                return try botDefinitionJSON(definitions.create(try await botCreateCandidate(args)),
+                    details: botDetails(args), operation: (args["schedule"] ?? .null) == .null
+                        && (args["cadence"] ?? .null) == .null ? "created without timing" : "created")
             case "bot_update":
-                return try botDefinitionJSON(definitions.update(try await botUpdateCandidate(args, definitions: definitions)))
+                return try botDefinitionJSON(definitions.update(try await botUpdateCandidate(args, definitions: definitions)),
+                    details: botDetails(args), operation: "updated")
             case "bot_delete":
                 try botKeys(args, allowed: Set(botReferenceKeys))
                 try definitions.delete(botReference(args, definitions: definitions))
                 return .object(["status": .string("deleted"), "detail": .string("The session and saved replies are kept.")])
             case "bot_pause":
-                try botKeys(args, allowed: Set(botReferenceKeys + ["paused"]))
+                try botKeys(args, allowed: Set(botReferenceKeys + ["paused", "details"]))
                 let paused = try botDecode(Bool.self, args["paused"], field: "paused")
-                return try botDefinitionJSON(definitions.pause(botReference(args, definitions: definitions), paused: paused))
+                let details = try botDetails(args)
+                return try botDefinitionJSON(definitions.pause(botReference(args, definitions: definitions), paused: paused),
+                    details: details, operation: paused ? "paused" : "resumed")
             case "bot_list":
-                try botKeys(args, allowed: [])
-                return .object(["status": .string("ok"), "bots": .array(try definitions.list().map(botDefinitionJSON))])
+                try botKeys(args, allowed: ["details", "include_models", "id"])
+                let details = try botDetails(args)
+                let includeModels = try args["include_models"].map { try botDecode(Bool.self, $0, field: "include_models") } ?? false
+                let selected = try args["id"].map { _ in try definitions.get(botReference(args, definitions: definitions)) }
+                var result: [String: JSONValue] = ["status": .string("ok"), "bots": .array(try (selected.map { [$0] } ?? definitions.list()).map {
+                    try botDefinitionJSON($0, details: details)
+                })]
+                if includeModels { result["model_choices"] = await SwiftNativeProviderRouting(dataRoot: dataRoot).botModelChoices() }
+                return .object(result)
             case "bot_run_once":
                 try botKeys(args, allowed: Set(botReferenceKeys))
                 let bot = try definitions.get(botReference(args, definitions: definitions))
@@ -207,13 +221,29 @@ extension SwiftToolDispatcher {
                 return .object(["status": .string("queued"), "id": .string(bot.id.uuidString),
                                 "requestId": .string(requestID.uuidString)])
             case "shelf_entry":
-                let args = args.filter { $0.value != .string("") }
-                try botKeys(args, allowed: ["id", "bot_id"])
-                let savedEntry = try shelf.entry(botID(args["id"]))
-                if let expected = args["bot_id"] {
-                    guard savedEntry.botId == (try botID(expected)) else {
+                let args = args.filter { $0.value != .null && $0.value != .string("") }
+                try botKeys(args, allowed: ["id", "bot_id", "bot", "name"])
+                let savedEntry: ShelfEntry
+                if let id = args["id"] {
+                    savedEntry = try shelf.entry(botID(id))
+                    if let expected = args["bot_id"], savedEntry.botId != (try botID(expected)) {
                         throw StandingBotsError.invalidValue("This shelf entry belongs to a different bot. Use the exact message_id returned by the selected bot.")
                     }
+                    let named = args.filter { $0.key == "bot" || $0.key == "name" }
+                    if !botSuppliedReferences(named).isEmpty,
+                       savedEntry.botId != (try botReference(named, definitions: definitions)) {
+                        throw StandingBotsError.invalidValue("This shelf entry belongs to a different bot.")
+                    }
+                } else {
+                    let selected = try definitions.get(botReference(args, definitions: definitions))
+                    guard let latest = try shelf.entriesByBot()[selected.id]?.last(where: {
+                        !$0.uncertainties.contains("Run receipt pending finalization.")
+                    }) else {
+                        return .object(["status": .string("empty"), "agent_name": .string(selected.name),
+                            "session_id": .string(selected.sessionID),
+                            "detail": .string("No settled reply yet. This does not start or repeat a run.")])
+                    }
+                    savedEntry = latest
                 }
                 // Through the shared approval boundary: an approval decided
                 // from Telegram or the iPhone settles here too, so the tool
@@ -222,6 +252,9 @@ extension SwiftToolDispatcher {
                 var result = try botJSON(entry)
                 if case .object(var fields) = result {
                     fields["status"] = .string("ok")
+                    fields["answer"] = .string(entry.actualReply)
+                    fields["run_status"] = .string(entry.runtimeStatus.rawValue)
+                    fields["status_detail"] = entry.statusDetail.map(JSONValue.string) ?? .null
                     if let name = try? definitions.get(entry.botId).name {
                         fields["agent_name"] = .string(name)
                     }
@@ -231,7 +264,7 @@ extension SwiftToolDispatcher {
                 return result
             case "shelf_read":
                 let args = args.filter { $0.value != .string("") }
-                try botKeys(args, allowed: ["bot", "bot_id", "name", "since", "topic", "limit", "cursor"])
+                try botKeys(args, allowed: ["id", "bot", "bot_id", "name", "since", "topic", "limit", "cursor", "include_read", "newest_first"])
                 let bot = botSuppliedReferences(args).isEmpty
                     ? nil : try botReference(args, definitions: definitions)
                 let since = try args["since"].map { value in
@@ -248,9 +281,15 @@ extension SwiftToolDispatcher {
                 let topic = try args["topic"].map { try botDecode(String.self, $0, field: "topic") }
                 let cursor = try args["cursor"].map { try botString($0, field: "cursor") }
                 let limit = try args["limit"].map { try botDecode(Int.self, $0, field: "limit") } ?? 20
+                let includeRead = try args["include_read"].flatMap { $0 == .null ? nil : $0 }
+                    .map { try botDecode(Bool.self, $0, field: "include_read") } ?? false
+                let newestFirst = try args["newest_first"].flatMap { $0 == .null ? nil : $0 }
+                    .map { try botDecode(Bool.self, $0, field: "newest_first") } ?? false
                 let page = try shelf.shelfRead(bot: bot, since: since, topic: topic, limit: limit,
-                                              cursor: cursor, readerId: Self.standingBotReaderID)
-                let agentName = bot.flatMap { try? definitions.get($0).name }
+                                              cursor: cursor, readerId: includeRead ? nil : Self.standingBotReaderID, newestFirst: newestFirst)
+                // One definition read for this page, including an unfiltered
+                // shelf. A missing/deleted helper keeps its exact saved ID.
+                let agentNames = Dictionary(uniqueKeysWithValues: ((try? definitions.list()) ?? []).map { ($0.id, $0.name) })
                 var shortenedChange = false
                 // Entries first, then the approval boundary (which reads the
                 // pending set last), so a remotely decided approval settles for
@@ -260,7 +299,7 @@ extension SwiftToolDispatcher {
                     shortenedChange = shortenedChange || entry.changedSinceLastGood.count > 240
                     return .object([
                         "id": .string(row.id.uuidString), "bot": .string(row.botId.uuidString),
-                        "agent_name": agentName.map(JSONValue.string) ?? .null,
+                        "agent_name": agentNames[row.botId].map(JSONValue.string) ?? .null,
                         "runAt": try botJSON(row.runAt), "headline": .string(row.headline),
                         "status": .string(entry.runtimeStatus.rawValue),
                         "session_id": .string(entry.sessionID ?? "bot-" + entry.botId.uuidString.lowercased()),
@@ -269,12 +308,14 @@ extension SwiftToolDispatcher {
                 }
                 let result: JSONValue = .object([
                     "status": .string("ok"),
+                    "view": .string(includeRead ? "saved_replies" : "unread_replies"),
+                    "order": .string(newestFirst ? "newest_first" : "oldest_first"),
                     "entries": .array(rows), "nextCursor": page.nextCursor.map(JSONValue.string) ?? .null,
                     "truncated": .bool(page.truncated || shortenedChange),
                 ])
                 // Finish every read and response conversion before acknowledging.
                 // Lookahead rows, filtered rows and unread earlier gaps stay unread.
-                if !page.rows.isEmpty {
+                if !includeRead, !page.rows.isEmpty {
                     try shelf.acknowledge(readerId: Self.standingBotReaderID, entryIds: page.rows.map(\.id))
                 }
                 return result
@@ -346,7 +387,7 @@ private func botSuppliedReferences(_ args: [String: JSONValue]) -> [(key: String
 
 /// The bot named by `id` / `bot_id` / `bot` / `name`: a UUID, or a bot name
 /// matched case-insensitively — exactly, else by unique prefix.
-private func botReference(_ args: [String: JSONValue], definitions: BotDefinitionStore) throws -> UUID {
+func botReference(_ args: [String: JSONValue], definitions: BotDefinitionStore) throws -> UUID {
     let supplied = botSuppliedReferences(args)
     let shelf = (try? definitions.list()) ?? []
     func refuse(_ lead: String) -> StandingBotsError {
@@ -406,17 +447,76 @@ private func botCadence(_ value: JSONValue?) throws -> BotCadence {
     return try botDecode(BotCadence.self, .object(object), field: "cadence")
 }
 
+/// Both pre-approval and persistence call this adapter; cadence validity and
+/// the operator's minimum interval still belong to BotDefinitionStore.
+private func botRequestedCadence(_ args: [String: JSONValue]) throws -> BotCadence? {
+    let args = args.filter { $0.value != .null }
+    guard args["schedule"] != nil else {
+        guard args["timezone"] == nil else {
+            throw StandingBotsError.invalidValue("timezone requires a daily or weekdays schedule; legacy cron uses its own timeZone")
+        }
+        return try args["cadence"].map(botCadence)
+    }
+    guard args["cadence"] == nil else {
+        throw StandingBotsError.invalidValue("Use schedule or cadence, not both")
+    }
+    return try StandingBotSchedule.parse(
+        botString(args["schedule"], field: "schedule"),
+        timezone: args["timezone"].map { try botString($0, field: "timezone") })
+}
+
+private func botDetails(_ args: [String: JSONValue]) throws -> Bool {
+    guard let value = args["details"], value != .null else { return false }
+    return try botDecode(Bool.self, value, field: "details")
+}
+
 private func botJSON<T: Encodable>(_ value: T) throws -> JSONValue {
     let encoder = JSONEncoder()
     encoder.dateEncodingStrategy = .iso8601
     return try JSONDecoder().decode(JSONValue.self, from: encoder.encode(value))
 }
 
-private func botDefinitionJSON(_ bot: BotDefinition) throws -> JSONValue {
+private func botDefinitionJSON(_ bot: BotDefinition, details: Bool = false, operation: String? = nil) throws -> JSONValue {
     guard case .object(var fields) = try botJSON(bot) else { throw StandingBotsError.invalidValue("bot") }
+    if !details {
+        let visible: Set<String> = ["id", "name", "brief", "provider", "model", "reasoningEffort", "fast",
+                                   "cadence", "paused", "budget", "outputFormat", "eventTrigger"]
+        fields = fields.filter { visible.contains($0.key) }
+    }
     fields["status"] = .string("ok")
     fields["session_id"] = .string(bot.sessionID)
     fields["daily_token_ceiling"] = .int(Int64(bot.dailyTokenCeiling ?? BotRunLimits.dailyTokens))
+    fields["schedule"] = .string(StandingBotSchedule.describe(bot.cadence))
+    fields["output_format"] = .string(bot.outputFormat ?? "")
+    if case .cron(_, let zone) = bot.cadence { fields["timezone"] = .string(zone) }
+    fields["scheduler_status"] = .string(bot.paused ? "paused" : bot.cadence == .manual ? "manual" : "scheduled")
+    let reference = JSONValue.string(bot.name)
+    fields["actions"] = .object([
+        "talk": .object(["tool": .string("agent_message"),
+            "input": .object(["agent": reference, "text": .string("<your message>")])]),
+        "open_reply": .object(["tool": .string("agent_read"), "input": .object(["agent": reference])]),
+        "run_once": .object(["tool": .string("bot_run_once"), "input": .object(["bot": reference])]),
+        bot.paused ? "resume" : "pause": .object(["tool": .string("bot_pause"),
+            "input": .object(["bot": reference, "paused": .bool(!bot.paused)])])
+    ])
+    if let operation {
+        fields["operation"] = .string(operation)
+        switch operation {
+        case "created":
+            fields["detail"] = .string("Saved; this call did not run the helper. Send a message or run once when ready. Scheduled turns follow the saved timing.")
+        case "created without timing":
+            fields["operation"] = .string("created")
+            fields["detail"] = .string("Saved as manual; this call did not run the helper. No timing was given: ask the person when it should run, such as daily at 09:00, weekdays at 08:30 or weekly on monday at 09:00, then set it with bot_update schedule.")
+        case "paused":
+            fields["detail"] = .string("Scheduled turns are paused. Any in-flight run is not cancelled. Manual messages and run once remain available; context and saved replies are preserved.")
+        case "resumed":
+            fields["detail"] = .string(bot.cadence == .manual
+                ? "Unpaused with the same context and saved replies. Timing is manual, so no scheduled run was started."
+                : "Scheduled turns are enabled with the same context and saved replies. This call did not start a run.")
+        default:
+            fields["detail"] = .string("Settings saved. The existing session and saved replies are preserved; this call did not start a run.")
+        }
+    }
     fields.removeValue(forKey: "sources")
     return .object(fields)
 }

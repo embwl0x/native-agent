@@ -444,8 +444,24 @@ extension AppModel {
             // account's own default, from its catalog — rather than an empty
             // Chat choice that would read as "not set up" straight after a
             // successful sign-in. Everything else follows Chat from this.
-            if let model = await routing.defaultModelForProviderID(providerId),
+            if var model = await routing.defaultModelForProviderID(providerId),
                !model.isEmpty {
+                // 2026-09-22: a new ChatGPT account starts on gpt-6-sol, but
+                // only when its signed cache lists it; the catalog's first row
+                // (gpt-5.6-sol) stays the universally safe default.
+                if CodexSelectableModelCatalog.isAccountBackedProvider(providerId),
+                   model == FirstPartyModelCatalog.chatGPTAccountFallbackModels.first?.id,
+                   CodexSelectableModelCatalog.signedCacheLists(
+                       "gpt-6-sol",
+                       providerID: providerId,
+                       cacheURL: providerId == "openai_oauth_direct"
+                           ? CodexSelectableModelCatalog.chatGPTOAuthCacheCandidate(
+                               dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()
+                           )
+                           : CodexSelectableModelCatalog.cacheCandidate()
+                   ) {
+                    model = "gpt-6-sol"
+                }
                 _ = try? await routing.saveModelConfig(JSONValue.object([
                     "surface": JSONValue.string("chat"),
                     "model": JSONValue.string(model),

@@ -197,7 +197,7 @@ struct BackgroundLifecycleWiringContractTests {
 
     @Test("login-item registration is skipped only by the exact string \"1\"")
     func loginItemSkipFlagIsExactMatch() throws {
-        let launch = try AppSourceScraping.appSource("AppDelegate+Launch.swift")
+        let launch = try AppSourceScraping.appSource("AppDelegate+ProcessLifecycle.swift")
         // An `!= "1"` guard is the whole contract: "true"/"0"/"" must all still
         // register. A loosened truthy parse would silently stop auto-launch for
         // anyone with the var set to anything at all.

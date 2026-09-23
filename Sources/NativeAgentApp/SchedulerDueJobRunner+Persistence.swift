@@ -306,15 +306,6 @@ extension SchedulerDueJobRunner {
         var errors: [JSONValue] = []
         var notDelivered: [JSONValue] = []
 
-        let mac = await NativeAgentNotifications.postAndReport(title: title, body: body)
-        if mac.posted {
-            delivered.append(.string("mac"))
-        } else if let error = mac.error {
-            errors.append(.string("mac: \(error)"))
-        } else {
-            errors.append(.string("mac: \(mac.delivery)"))
-        }
-
         do {
             // 2026-09-13: urgency is projected by the router from the class
             // below. An overnight dream/REM card is news; it no longer pierces
@@ -340,8 +331,12 @@ extension SchedulerDueJobRunner {
             // chose no channel delivered nothing, and both were being recorded
             // as "push".
             switch outcome.deliveryProjection {
-            case .accepted, .queued:
+            case .accepted:
                 delivered.append(.string("push"))
+            case .queued:
+                // 2026-09-22: queued is CloudKit-only with APNS down; nothing
+                // has reached the phone yet.
+                notDelivered.append(.string("push: queued (APNS unavailable)"))
             case .previouslyHandled:
                 delivered.append(.string("push_already_delivered"))
             case .failed:
@@ -355,11 +350,25 @@ extension SchedulerDueJobRunner {
             errors.append(.string("push: \(error.localizedDescription)"))
         }
 
+        // The Mac banner obeys the router's quiet hours, like the push.
+        var macFields: JSONValue?
+        if AttentionRouter.holdsMacBanner(.informational) {
+            notDelivered.insert(.string("mac: deferred"), at: 0)
+        } else {
+            let mac = await NativeAgentNotifications.postAndReport(title: title, body: body)
+            if mac.posted {
+                delivered.insert(.string("mac"), at: 0)
+            } else {
+                errors.insert(.string("mac: \(mac.error ?? mac.delivery)"), at: 0)
+            }
+            macFields = .object(mac.deliveryFields())
+        }
+
         var fields: [String: JSONValue] = [
             "delivered": .array(delivered),
             "errors": .array(errors),
-            "mac": .object(mac.deliveryFields()),
         ]
+        if let macFields { fields["mac"] = macFields }
         if !notDelivered.isEmpty { fields["not_delivered"] = .array(notDelivered) }
         return .object(fields)
     }

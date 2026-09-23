@@ -90,9 +90,19 @@ import Browser
 // connector-action route in this file uses an instance; the bridge needs an
 // equivalent for parity).
 struct TrustCenterMacControlPolicyProvider: MacControlPolicyProvider {
+    var dataRoot: URL = PersistenceCore.defaultDataRoot()
+    // Supplied only by the local workbench call site, never decoded from a
+    // remote request body. Raw HTTP/iOS callers leave this nil.
+    var operatorOrigin: SecurityOriginContext? = nil
+
     func currentPolicy() async -> MacControlPolicy? {
-        let policy = await SwiftNativeTrustCenter().loadTrustPolicy()
-        return MacControlPolicy.fromTrustPolicyObject(policy)
+        guard let snapshot = try? await SwiftNativeTrustCenter(dataRoot: dataRoot).loadAuthorizationSnapshotChecked() else { return nil }
+        let policy = MacControlPolicy.fromTrustPolicyObject(snapshot.policy)
+        guard let operatorOrigin else { return policy }
+        let authority = await SwiftNativeSecurityCenter(dataRoot: dataRoot).fullMacYoloAuthority(
+            tool: "mac_control", origin: operatorOrigin
+        )
+        return MacControlGate.policyForAdmittedFullMac(policy, admitted: authority.admitted)
     }
 }
 

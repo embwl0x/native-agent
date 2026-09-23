@@ -65,6 +65,18 @@ public struct ChatResponse: Sendable, Codable, Equatable {
     /// waiting for one. The approval record stays canonical about whether it
     /// still is.
     public var pendingApprovalID: String? = nil
+    /// Leading characters of `output` that are pre-tool working commentary
+    /// (see `TurnEngineResult.workingCommentaryCharacters`).
+    public var workingCommentaryCharacters: Int? = nil
+
+    /// The reply with its working commentary dropped. Surfaces outside the
+    /// Mac show progress while she works, then only the final answer. Any
+    /// offset that doesn't line up falls back to the whole reply.
+    public static func answerOnly(_ reply: String, workingCommentaryCharacters: Int?) -> String {
+        guard let cut = workingCommentaryCharacters, cut > 0, cut < reply.count else { return reply }
+        let answer = String(reply.dropFirst(cut)).trimmingCharacters(in: .whitespacesAndNewlines)
+        return answer.isEmpty ? reply : answer
+    }
 
     public init(
         runId: String,

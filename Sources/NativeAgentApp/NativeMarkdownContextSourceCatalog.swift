@@ -49,7 +49,41 @@ struct NativeMarkdownContextSourceCatalog: Sendable, Equatable {
             .appendingPathComponent("skills", isDirectory: true)
             .appendingPathComponent("bodies", isDirectory: true)
             .standardizedFileURL
+        return try scan(
+            bodiesRoot: bodiesRoot,
+            allowedRoot: canonicalPersonaRoot,
+            locatorPrefix: "skills/bodies",
+            fileManager: fileManager
+        )
+    }
 
+    /// Runtime skills she saves (data/skills/bodies). 2026-09-22: the allowed
+    /// root is that directory alone, never the whole data root.
+    static func runtime(
+        dataRoot: URL,
+        fileManager: FileManager = .default
+    ) throws -> Self {
+        let bodiesRoot = dataRoot.standardizedFileURL.resolvingSymlinksInPath()
+            .appendingPathComponent("skills", isDirectory: true)
+            .appendingPathComponent("bodies", isDirectory: true)
+            .standardizedFileURL
+        guard fileManager.fileExists(atPath: bodiesRoot.path) else {
+            return Self(allowedRoots: [], registrations: [])
+        }
+        return try scan(
+            bodiesRoot: bodiesRoot,
+            allowedRoot: bodiesRoot,
+            locatorPrefix: "runtime-skills/bodies",
+            fileManager: fileManager
+        )
+    }
+
+    private static func scan(
+        bodiesRoot: URL,
+        allowedRoot canonicalPersonaRoot: URL,
+        locatorPrefix: String,
+        fileManager: FileManager
+    ) throws -> Self {
         guard fileManager.fileExists(atPath: bodiesRoot.path) else {
             return Self(allowedRoots: [canonicalPersonaRoot], registrations: [])
         }
@@ -131,7 +165,7 @@ struct NativeMarkdownContextSourceCatalog: Sendable, Equatable {
             }
             .prefix(maximumSourceCount)
             .map { candidate in
-                let locator = "skills/bodies/\(candidate.key)"
+                let locator = "\(locatorPrefix)/\(candidate.key)"
                 let descriptor = ContextSourceDescriptor(
                     id: ContextStableID.source(owner: owner, locator: locator),
                     owner: owner,

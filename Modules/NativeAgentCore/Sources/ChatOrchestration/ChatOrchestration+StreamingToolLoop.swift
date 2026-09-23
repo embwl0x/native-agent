@@ -650,7 +650,8 @@ extension SwiftNativeTurnEngine {
             }
             }
 
-            if let violation = ToolCallParser.formattedToolCallViolation(in: iterAccumulated) {
+            if let violation = ToolCallParser.formattedToolCallViolation(
+                in: iterAccumulated, toolNames: Set(ctx.toolsAvailable)) {
                 lastProtocolViolation = violation
                 violationNudgeCount += 1
                 if violationNudgeCount > 2 { break }
@@ -750,7 +751,7 @@ extension SwiftNativeTurnEngine {
                 // turns leave `turnInterstitialProse` empty, so they persist
                 // exactly `reply` as before.
                 return await finishCompletedTurn(
-                    reply: turnInterstitialProse + reply,
+                    reply: Self.joinedProse(turnInterstitialProse, reply),
                     ctx: ctx,
                     dispatches: dispatches,
                     startNs: startNs,
@@ -786,7 +787,7 @@ extension SwiftNativeTurnEngine {
             // the XML dialect, so text-parsed iterations contribute nothing at
             // all, exactly as before this fix.
             if !streamedCalls.isEmpty {
-                turnInterstitialProse += ToolCallParser.stripToolUseMarkers(iterEmittedProse)
+                turnInterstitialProse = Self.joinedProse(turnInterstitialProse, ToolCallParser.stripToolUseMarkers(iterEmittedProse))
             }
             // Shared post-dispatch round (C2): identical to the non-streaming
             // loop — assistant blocks → shared dispatch core → no-progress guard
@@ -863,5 +864,13 @@ extension SwiftNativeTurnEngine {
             additionalStructuredToolCallSignal: lastProviderHadToolCalls,
             visiblePartial: ToolCallParser.visiblePrefix(in: visibleText)
         )
+    }
+
+    /// 2026-09-22: each round's narration and the answer were concatenated
+    /// bare ("worth it.Exactly."). A blank line keeps them apart; the
+    /// commentary offset lands before the separator, which the fold trims.
+    nonisolated static func joinedProse(_ head: String, _ tail: String) -> String {
+        let blank = { (text: String) in text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        return blank(head) || blank(tail) ? head + tail : head + "\n\n" + tail
     }
 }

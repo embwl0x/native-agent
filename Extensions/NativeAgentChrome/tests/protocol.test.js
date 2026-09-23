@@ -23,6 +23,20 @@ function request(action, payload = {}) {
   };
 }
 
+test("snapshot scope is a bounded semantic choice, never an arbitrary selector", () => {
+  for (const scope of ["page", "main_content"]) {
+    assert.equal(validateRequest(request("page.snapshot.read", { leaseId: "ours", scope })).payload.scope, scope);
+  }
+  assert.throws(() => validateRequest(request("page.snapshot.read", { leaseId: "ours", scope: "#password" })), /scope/);
+});
+
+test("rendered work windows are an explicit create-only option", () => {
+  assert.equal(validateRequest(request("lease.acquire", { mode: "create", renderingMode: "grouped_background" })).payload.renderingMode, "grouped_background");
+  assert.equal(validateRequest(request("lease.acquire", { mode: "create", renderingMode: "visible_work_window" })).payload.renderingMode, "visible_work_window");
+  assert.throws(() => validateRequest(request("lease.acquire", { mode: "claim", renderingMode: "visible_work_window", tabId: 1, expectedTab: { url: "https://x.com", title: "X" } })), /created tabs only/);
+  assert.throws(() => validateRequest(request("lease.acquire", { mode: "create", renderingMode: "foreground" })), /created tabs only/);
+});
+
 test("pins the v1 host identity and complete action vocabulary", () => {
   assert.equal(HOST_ID, "com.nativeagent.chrome");
   assert.equal(PROTOCOL_VERSION, 1);

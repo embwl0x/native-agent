@@ -27,6 +27,11 @@ extension AppChatToolDispatcher {
                 ("description", .string(desc)),
             ])
         }
+        func nullable(_ schema: JSONValue) -> JSONValue {
+            guard case .object(var value) = schema, let type = value["type"] else { return schema }
+            value["type"] = .array([type, .string("null")])
+            return .object(value)
+        }
         func enumStringSchema(_ values: [String], _ desc: String) -> JSONValue {
             obj([
                 ("type", .string("string")),
@@ -53,29 +58,13 @@ extension AppChatToolDispatcher {
         }
         return [
             LLMToolSchema(
-                name: "mac.notify",
-                description: "Post a local macOS notification to the user. Use this only when a short visible Mac alert is useful.",
-                parametersJSON: params(
-                    properties: [
-                        ("title", strSchema("Short notification title. Defaults to the configured assistant name.")),
-                        ("message", strSchema("required. Short notification body; must be non-empty — an empty string is refused.")),
-                    ],
-                    required: ["message"]
-                )
-            ),
-            LLMToolSchema(
-                name: "mobile.notify",
-                description: "Send the user a paired-iPhone notification. Public CloudKit builds queue an Apple-presented visual push that does not require the companion app to be open; configured direct APNS remains an optional parallel route. Provider-safe alias: mobile_notify. Use for short attention-worthy updates, not long prose.",
-                parametersJSON: params(
-                    properties: [
-                        ("title", strSchema("Short notification title. Defaults to the configured assistant name.")),
-                        ("message", strSchema("required. Short notification body; must be non-empty — an empty string is refused.")),
-                        ("screen", strSchema("iOS screen to open, such as inbox or activity. Defaults to inbox.")),
-                        ("source", strSchema("Source label for audit metadata. Defaults to chat_tool.")),
-                        ("urgency", strSchema("Urgency label such as normal or urgent. Defaults to normal.")),
-                    ],
-                    required: ["message"]
-                )
+                name: "chat_reply",
+                description: "Reply to an exact opened human conversation using its saved destination. workspace binds the selected conversation and latest message for you. Does not create a user turn or change the foreground chat. For your current active conversation, answer normally instead. An uncertain delivery must not be resent automatically.",
+                parametersJSON: params(properties: [
+                    ("conversation_session_id", strSchema("Exact conversation_session_id from chat_conversations.")),
+                    ("last_message_id", strSchema("Exact last_message_id from the opened conversation; changed conversations must be read again.")),
+                    ("text", strSchema("The assistant reply, up to 16000 characters."))
+                ], required: ["conversation_session_id", "last_message_id", "text"])
             ),
             LLMToolSchema(
                 name: "reflex_review",
@@ -177,21 +166,6 @@ extension AppChatToolDispatcher {
                 )
             ),
             LLMToolSchema(
-                name: "voice_render",
-                description: "Turn text into speech as a file, with nothing played: the audio never reaches an output device. Returns the path, the byte count, the duration in seconds, and which voice spoke. Use it to check how a reply sounds, or how long it runs, without making a sound on the Mac. Writing that file is refused only in Safe, the same as app_setting_set.",
-                parametersJSON: params(
-                    properties: [
-                        ("text", strSchema("The words to speak. Up to 4096 characters.")),
-                        ("route", enumStringSchema(
-                            ["mac", "cloud"],
-                            "mac uses the on-device voice (default). cloud uses the connected account's speech model and needs one."
-                        )),
-                        ("voice", strSchema("Mac route only: a voice identifier or a language such as en-GB. Omit for the system default.")),
-                    ],
-                    required: ["text"]
-                )
-            ),
-            LLMToolSchema(
                 name: "doctor_status",
                 description: "Run NativeAgent's read-only Doctor checks without repairs and return the bounded check results. The global status keeps every warning visible; active_path_status separately reports the path serving this turn, while maintenance_status covers dormant or aggregate integration upkeep only when the active provider is independently confirmed ready.",
                 parametersJSON: params(properties: [], required: [])
@@ -203,12 +177,12 @@ extension AppChatToolDispatcher {
             ),
             LLMToolSchema(
                 name: "browser.status",
-                description: "Return visible NativeAgent Browser status and recent browser run receipts. Provider-safe alias: browser_status.",
+                description: "Return visible NativeAgent Browser status and recent browser run receipts.",
                 parametersJSON: params(properties: [], required: [])
             ),
             LLMToolSchema(
                 name: "browser.open_url",
-                description: "Open an http/https URL in the visible NativeAgent Browser and record a browser run receipt. Provider-safe alias: browser_open_url.",
+                description: "Open an http/https URL in the visible NativeAgent Browser and record a browser run receipt.",
                 parametersJSON: params(
                     properties: [
                         ("url", strSchema("HTTP or HTTPS URL to open.")),
@@ -220,21 +194,8 @@ extension AppChatToolDispatcher {
                 )
             ),
             LLMToolSchema(
-                name: "browser.navigate",
-                description: "Navigate the visible NativeAgent Browser to an http/https URL and record a browser run receipt. Provider-safe alias: browser_navigate.",
-                parametersJSON: params(
-                    properties: [
-                        ("url", strSchema("HTTP or HTTPS URL to navigate to.")),
-                        ("capture_source", boolSchema("After navigation, capture visible page text to a source receipt. Defaults false.")),
-                        ("capture_screenshot", boolSchema("After navigation, capture a PNG screenshot receipt. Defaults false.")),
-                        ("dry_run", boolSchema("If true, only record a dry-run browser receipt. Defaults false.")),
-                    ],
-                    required: ["url"]
-                )
-            ),
-            LLMToolSchema(
                 name: "browser.read_text",
-                description: "Read visible page text from the current NativeAgent Browser page and persist a source receipt. Current page must be http/https. Provider-safe alias: browser_read_text.",
+                description: "Read visible page text from the current NativeAgent Browser page and persist a source receipt. Current page must be http/https.",
                 parametersJSON: params(
                     properties: [
                         ("dry_run", boolSchema("If true, record a dry-run receipt without reading the page. Defaults false.")),
@@ -244,7 +205,7 @@ extension AppChatToolDispatcher {
             ),
             LLMToolSchema(
                 name: "browser.read_links",
-                description: "Read links from the current NativeAgent Browser page and persist a link-source receipt. Current page must be http/https. Provider-safe alias: browser_read_links.",
+                description: "Read links from the current NativeAgent Browser page and persist a link-source receipt. Current page must be http/https.",
                 parametersJSON: params(
                     properties: [
                         ("dry_run", boolSchema("If true, record a dry-run receipt without reading links. Defaults false.")),
@@ -254,7 +215,7 @@ extension AppChatToolDispatcher {
             ),
             LLMToolSchema(
                 name: "browser.screenshot",
-                description: "Capture a PNG screenshot from the current NativeAgent Browser page and persist a screenshot receipt. Current page must be http/https. Provider-safe alias: browser_screenshot.",
+                description: "Capture a PNG screenshot from the current NativeAgent Browser page and persist a screenshot receipt. Current page must be http/https.",
                 parametersJSON: params(
                     properties: [
                         ("dry_run", boolSchema("If true, record a dry-run receipt without capturing an image. Defaults false.")),
@@ -263,12 +224,23 @@ extension AppChatToolDispatcher {
                 )
             ),
             LLMToolSchema(
+                name: "browser.chrome_status",
+                description: "Check the real Chrome extension connection and Chrome control permission without opening apps or changing settings. A prepared folder or past connection is not proof the extension is currently loaded.",
+                parametersJSON: params(properties: [], required: [])
+            ),
+            LLMToolSchema(
+                name: "browser.chrome_setup",
+                description: "Set up Chrome from chat using the same owner as Trust: prepare the bundled extension in a visible folder, reveal it and open Chrome's extensions page. Use when asked to set up Chrome; this changes focus. Loading the unpacked extension remains a Chrome step; use normal authorized Mac controls to help, then check browser.chrome_status. Never claims installation from copying files, and never changes permissions.",
+                parametersJSON: params(properties: [("dry_run", boolSchema("Describe current connection without preparing files or opening apps."))], required: [])
+            ),
+            LLMToolSchema(
                 name: "browser.chrome_acquire",
-                description: "Acquire a short-lived real Chrome tab lease. Creates an inactive background tab by default; claiming requires an exact tab id, URL, and title. Chrome control must be on in Trust Center.",
+                description: "Open a real Chrome tab for this conversation. Creates an inactive background tab by default; claiming requires an exact tab id, URL, and title. Later Chrome calls can omit lease_id and expected_user_sequence to use this conversation's current tab. Routine activity renews its live lease automatically; expired or user-yielded tabs are never reclaimed. Chrome control must be on in Trust Center.",
                 parametersJSON: params(
                     properties: [
                         ("mode", enumStringSchema(["create", "claim"], "Create an inactive tab in the purple NativeAgent group alongside the user's tabs in their existing Chrome window, or claim an exact existing user tab. Defaults create; never claim a user tab just to start ordinary browsing.")),
                         ("initial_url", strSchema("Optional HTTP(S) URL for a created background tab.")),
+                        ("rendering_mode", strSchema("Create only: optional grouped_background or visible_work_window. X/Twitter post URLs automatically use their own unfocused visible work window to load replies; other URLs default to grouped background tabs. Never selects your existing tabs. Inspect snapshot rendering evidence; visibility does not guarantee complete content.")),
                         ("tab_id", intSchema("Exact Chrome tab id for claim mode.")),
                         ("expected_url", strSchema("Exact current URL for claim mode.")),
                         ("expected_title", strSchema("Exact current title for claim mode.")),
@@ -279,38 +251,39 @@ extension AppChatToolDispatcher {
             ),
             LLMToolSchema(
                 name: "browser.chrome_renew",
-                description: "Extend an existing real Chrome tab lease before it expires. The lease is the only thing that keeps a Chrome task alive; without a renew every task has a hard 60-second ceiling. Renewing does not touch the page.",
+                description: "Explicitly extend a live Chrome tab lease. Normal browsing already renews the lease near its deadline; routine work does not require renewal calls. Idle expiry and user takeover are respected. Omit lease_id and expected_user_sequence for this conversation's current tab.",
                 parametersJSON: params(
                     properties: [
-                        ("lease_id", strSchema("Lease id from browser.chrome_acquire.")),
-                        ("expected_user_sequence", intSchema("User sequence from the lease; a renew fails if the user has touched the tab since.")),
+                        ("lease_id", nullable(strSchema("Optional exact lease; omit to use this verified conversation’s current Chrome tab."))),
+                        ("expected_user_sequence", nullable(intSchema("Optional observed user sequence; omit for this conversation's current tab. Renewal refuses user takeover."))),
                         ("lease_duration_ms", intSchema("New lease duration from 30000 through 300000 milliseconds. Defaults 60000.")),
                     ],
-                    required: ["lease_id", "expected_user_sequence"]
+                    required: []
                 )
             ),
             LLMToolSchema(
                 name: "browser.chrome_navigate",
-                description: "Navigate an already-leased real Chrome background tab without activating it.",
+                description: "Navigate this conversation's current Chrome tab without activating it. Omit lease_id and expected_user_sequence to retain the tab opened or read in this conversation; explicit IDs still select a specific tab.",
                 parametersJSON: params(
                     properties: [
-                        ("lease_id", strSchema("Lease id from browser.chrome_acquire.")),
-                        ("expected_user_sequence", intSchema("User sequence from the lease; normally 0.")),
+                        ("lease_id", nullable(strSchema("Optional exact lease; omit to use this verified conversation’s current Chrome tab."))),
+                        ("expected_user_sequence", nullable(intSchema("Optional exact sequence; omit for this conversation's current tab."))),
                         ("url", strSchema("HTTP(S) destination.")),
                     ],
-                    required: ["lease_id", "expected_user_sequence", "url"]
+                    required: ["url"]
                 )
             ),
             LLMToolSchema(
                 name: "browser.chrome_snapshot",
-                description: "Read a fresh structured Chrome page: bounded text, article/container hierarchy and actionable node IDs. Use parentNodeId to distinguish repeated controls under different posts/articles; aria-labelledby names are resolved. Layout-only wrappers are omitted. Password values are omitted. After navigation or a stale-node refusal, read again; never guess IDs or repeat a possibly dispatched external action.",
+                description: "Read a fresh structured Chrome page: bounded text, article/container hierarchy and actionable node IDs. Choose main_content to read visible semantic main/article regions without navigation and sidebar links consuming the budget; page reads the whole viewport. Neither scope claims offscreen content is loaded. Use parentNodeId to distinguish repeated controls under different posts/articles; aria-labelledby names are resolved. Layout-only wrappers and password values are omitted. After navigation or a stale-node refusal, read again; never guess IDs or repeat a possibly dispatched external action. Page text comes only from returned nodes; use main_content to read an article.",
                 parametersJSON: params(
                     properties: [
-                        ("lease_id", strSchema("Lease id from browser.chrome_acquire.")),
-                        ("max_nodes", intSchema("Maximum structured nodes, 1 through 500.")),
-                        ("max_text_chars", intSchema("Maximum readable text characters, 1 through 50000.")),
+                        ("lease_id", nullable(strSchema("Optional exact lease; omit to use this verified conversation’s current Chrome tab."))),
+                        ("max_nodes", intSchema("Maximum structured nodes, 1 through 80. Defaults 80.")),
+                        ("max_text_chars", intSchema("Maximum readable text characters, 1 through 40000. Defaults 12000.")),
+                        ("scope", enumStringSchema(["page", "main_content"], "Page viewport or semantic main/article content within it. A main_content read reports when no semantic content region was found; use page to retain surrounding controls.")),
                     ],
-                    required: ["lease_id"]
+                    required: []
                 )
             ),
             LLMToolSchema(
@@ -318,12 +291,12 @@ extension AppChatToolDispatcher {
                 description: "Click one actionable node from the exact structured Chrome snapshot that exposed it.",
                 parametersJSON: params(
                     properties: [
-                        ("lease_id", strSchema("Lease id from browser.chrome_acquire.")),
-                        ("expected_user_sequence", intSchema("User sequence from the lease.")),
+                        ("lease_id", nullable(strSchema("Optional exact lease; omit to use this verified conversation’s current Chrome tab."))),
+                        ("expected_user_sequence", nullable(intSchema("Optional exact sequence; omit to retain the sequence observed for this conversation’s current tab."))),
                         ("snapshot_id", strSchema("Exact snapshot id.")),
                         ("node_id", strSchema("Exact actionable node id.")),
                     ],
-                    required: ["lease_id", "expected_user_sequence", "snapshot_id", "node_id"]
+                    required: ["snapshot_id", "node_id"]
                 )
             ),
             LLMToolSchema(
@@ -331,14 +304,14 @@ extension AppChatToolDispatcher {
                 description: "Scroll the leased real Chrome page or a scrollable node from a structured snapshot without activation. Reports actual movedX/movedY, scrolled=false when unchanged, and vertical remainingUp/remainingDown plus atTop/atBottom. These are immediate position observations, not proof a dynamic feed finished loading. Read a fresh snapshot after scrolling; use the named scrollable container for nested feeds.",
                 parametersJSON: params(
                     properties: [
-                        ("lease_id", strSchema("Lease id from browser.chrome_acquire.")),
-                        ("expected_user_sequence", intSchema("User sequence from the lease.")),
+                        ("lease_id", nullable(strSchema("Optional exact lease; omit to use this verified conversation’s current Chrome tab."))),
+                        ("expected_user_sequence", nullable(intSchema("Optional exact sequence; omit to retain the sequence observed for this conversation’s current tab."))),
                         ("snapshot_id", strSchema("Snapshot id when targeting a node. For page scrolling omit both optional IDs or supply both as empty strings.")),
                         ("target_node_id", strSchema("Optional scrollable node id. Node scrolling requires both exact IDs from a fresh snapshot.")),
                         ("delta_x", intSchema("Horizontal scroll delta.")),
                         ("delta_y", intSchema("Vertical scroll delta.")),
                     ],
-                    required: ["lease_id", "expected_user_sequence", "delta_x", "delta_y"]
+                    required: ["delta_x", "delta_y"]
                 )
             ),
             LLMToolSchema(
@@ -346,13 +319,13 @@ extension AppChatToolDispatcher {
                 description: "Replace the value of an editable non-password node from the exact current Chrome snapshot. Returns one outcome receipt and never retries an ambiguous dispatch.",
                 parametersJSON: params(
                     properties: [
-                        ("lease_id", strSchema("Lease id from browser.chrome_acquire.")),
-                        ("expected_user_sequence", intSchema("User sequence from the lease.")),
+                        ("lease_id", nullable(strSchema("Optional exact lease; omit to use this verified conversation’s current Chrome tab."))),
+                        ("expected_user_sequence", nullable(intSchema("Optional exact sequence; omit to retain the sequence observed for this conversation’s current tab."))),
                         ("snapshot_id", strSchema("Exact current snapshot id.")),
                         ("node_id", strSchema("Editable node id that advertised fill.")),
                         ("value", strSchema("Replacement text, at most 50000 characters.")),
                     ],
-                    required: ["lease_id", "expected_user_sequence", "snapshot_id", "node_id", "value"]
+                    required: ["snapshot_id", "node_id", "value"]
                 )
             ),
             LLMToolSchema(
@@ -360,14 +333,14 @@ extension AppChatToolDispatcher {
                 description: "Append text sequentially to an editable non-password node from the exact current Chrome snapshot. Runs up to 20 seconds or the remaining lease and returns exact Unicode progress. For partial completion, observe a fresh snapshot and continue only the remaining text; never resend the original full text blindly.",
                 parametersJSON: params(
                     properties: [
-                        ("lease_id", strSchema("Lease id from browser.chrome_acquire.")),
-                        ("expected_user_sequence", intSchema("User sequence from the lease.")),
+                        ("lease_id", nullable(strSchema("Optional exact lease; omit to use this verified conversation’s current Chrome tab."))),
+                        ("expected_user_sequence", nullable(intSchema("Optional exact sequence; omit to retain the sequence observed for this conversation’s current tab."))),
                         ("snapshot_id", strSchema("Exact current snapshot id.")),
                         ("node_id", strSchema("Editable node id that advertised type.")),
                         ("text", strSchema("Text to append, at most 50000 characters.")),
                         ("delay_ms", intSchema("Optional delay between characters, 0 through 250 milliseconds.")),
                     ],
-                    required: ["lease_id", "expected_user_sequence", "snapshot_id", "node_id", "text"]
+                    required: ["snapshot_id", "node_id", "text"]
                 )
             ),
             LLMToolSchema(
@@ -375,13 +348,13 @@ extension AppChatToolDispatcher {
                 description: "Select one or more exact option values from the select.options list in a fresh Chrome snapshot. That list includes labels, values, selected/disabled state and option groups (up to 100, with explicit truncation). Disabled or changed choices refuse. Form controls expose formState.required, valid and failures; correct invalid fields and observe again before submission. Returns one outcome receipt.",
                 parametersJSON: params(
                     properties: [
-                        ("lease_id", strSchema("Lease id from browser.chrome_acquire.")),
-                        ("expected_user_sequence", intSchema("User sequence from the lease.")),
+                        ("lease_id", nullable(strSchema("Optional exact lease; omit to use this verified conversation’s current Chrome tab."))),
+                        ("expected_user_sequence", nullable(intSchema("Optional exact sequence; omit to retain the sequence observed for this conversation’s current tab."))),
                         ("snapshot_id", strSchema("Exact current snapshot id.")),
                         ("node_id", strSchema("Select node id that advertised select.")),
                         ("values", stringArraySchema("One or more exact option values; single-select nodes require exactly one.")),
                     ],
-                    required: ["lease_id", "expected_user_sequence", "snapshot_id", "node_id", "values"]
+                    required: ["snapshot_id", "node_id", "values"]
                 )
             ),
             LLMToolSchema(
@@ -389,8 +362,8 @@ extension AppChatToolDispatcher {
                 description: "Press one bounded key or chord on a non-password node from the exact current frame-aware Chrome snapshot. Returns one outcome receipt and never retries an ambiguous dispatch.",
                 parametersJSON: params(
                     properties: [
-                        ("lease_id", strSchema("Lease id from browser.chrome_acquire.")),
-                        ("expected_user_sequence", intSchema("User sequence from the lease.")),
+                        ("lease_id", nullable(strSchema("Optional exact lease; omit to use this verified conversation’s current Chrome tab."))),
+                        ("expected_user_sequence", nullable(intSchema("Optional exact sequence; omit to retain the sequence observed for this conversation’s current tab."))),
                         ("snapshot_id", strSchema("Exact current snapshot id.")),
                         ("node_id", strSchema("Node id that advertised keypress.")),
                         ("key", enumStringSchema([
@@ -399,7 +372,7 @@ extension AppChatToolDispatcher {
                             "Backspace", "Delete", "Space", "Control+A", "Meta+A"
                         ], "Bounded key or chord.")),
                     ],
-                    required: ["lease_id", "expected_user_sequence", "snapshot_id", "node_id", "key"]
+                    required: ["snapshot_id", "node_id", "key"]
                 )
             ),
             LLMToolSchema(
@@ -407,13 +380,13 @@ extension AppChatToolDispatcher {
                 description: "Idempotently set a checkbox, radio, or switch node from the exact current frame-aware Chrome snapshot. Returns one outcome receipt.",
                 parametersJSON: params(
                     properties: [
-                        ("lease_id", strSchema("Lease id from browser.chrome_acquire.")),
-                        ("expected_user_sequence", intSchema("User sequence from the lease.")),
+                        ("lease_id", nullable(strSchema("Optional exact lease; omit to use this verified conversation’s current Chrome tab."))),
+                        ("expected_user_sequence", nullable(intSchema("Optional exact sequence; omit to retain the sequence observed for this conversation’s current tab."))),
                         ("snapshot_id", strSchema("Exact current snapshot id.")),
                         ("node_id", strSchema("Checkable node id that advertised set_checked.")),
                         ("checked", boolSchema("Exact checked state to apply.")),
                     ],
-                    required: ["lease_id", "expected_user_sequence", "snapshot_id", "node_id", "checked"]
+                    required: ["snapshot_id", "node_id", "checked"]
                 )
             ),
             LLMToolSchema(
@@ -421,12 +394,12 @@ extension AppChatToolDispatcher {
                 description: "Double-click one node that advertised double_click in the exact current frame-aware Chrome snapshot. Returns one outcome receipt and never retries an ambiguous dispatch.",
                 parametersJSON: params(
                     properties: [
-                        ("lease_id", strSchema("Lease id from browser.chrome_acquire.")),
-                        ("expected_user_sequence", intSchema("User sequence from the lease.")),
+                        ("lease_id", nullable(strSchema("Optional exact lease; omit to use this verified conversation’s current Chrome tab."))),
+                        ("expected_user_sequence", nullable(intSchema("Optional exact sequence; omit to retain the sequence observed for this conversation’s current tab."))),
                         ("snapshot_id", strSchema("Exact current snapshot id.")),
                         ("node_id", strSchema("Node id that advertised double_click.")),
                     ],
-                    required: ["lease_id", "expected_user_sequence", "snapshot_id", "node_id"]
+                    required: ["snapshot_id", "node_id"]
                 )
             ),
             LLMToolSchema(
@@ -434,13 +407,13 @@ extension AppChatToolDispatcher {
                 description: "Drag a node advertising drag onto a node advertising drop from one exact fresh Chrome snapshot and frame. Uses synthetic HTML drag events and the page's DataTransfer handlers without activating the tab. Target must accept dragover; dropDispatched is not proof of a successful move: read a fresh snapshot. Does not implement OS/file dragging or pointer-only canvas gestures; never retry an unknown outcome automatically.",
                 parametersJSON: params(
                     properties: [
-                        ("lease_id", strSchema("Exact source and target tab lease.")),
-                        ("expected_user_sequence", intSchema("User sequence from the lease.")),
+                        ("lease_id", nullable(strSchema("Optional exact source and target lease; omit for this conversation's current tab."))),
+                        ("expected_user_sequence", nullable(intSchema("Optional exact sequence; omit to retain the sequence observed for this conversation’s current tab."))),
                         ("snapshot_id", strSchema("Fresh snapshot containing both endpoints.")),
                         ("node_id", strSchema("Source node advertising drag.")),
                         ("target_node_id", strSchema("Target node advertising drop; acceptance is checked during the operation.")),
                     ],
-                    required: ["lease_id", "expected_user_sequence", "snapshot_id", "node_id", "target_node_id"]
+                    required: ["snapshot_id", "node_id", "target_node_id"]
                 )
             ),
             LLMToolSchema(
@@ -448,8 +421,8 @@ extension AppChatToolDispatcher {
                 description: "Wait a bounded time for a current snapshot node state or for leased-tab navigation to settle. Returns one observational outcome receipt.",
                 parametersJSON: params(
                     properties: [
-                        ("lease_id", strSchema("Lease id from browser.chrome_acquire.")),
-                        ("expected_user_sequence", intSchema("User sequence from the lease.")),
+                        ("lease_id", nullable(strSchema("Optional exact lease; omit to use this verified conversation’s current Chrome tab."))),
+                        ("expected_user_sequence", nullable(intSchema("Optional exact sequence; omit to retain the sequence observed for this conversation’s current tab."))),
                         ("condition", enumStringSchema(["element_state", "navigation_settled"], "Wait condition.")),
                         ("snapshot_id", strSchema("Exact current snapshot id for element_state.")),
                         ("node_id", strSchema("Node id that advertised wait for element_state.")),
@@ -457,7 +430,7 @@ extension AppChatToolDispatcher {
                         ("timeout_ms", intSchema("Bounded timeout from 100 through 10000 milliseconds. Defaults 5000.")),
                         ("settle_ms", intSchema("Extra navigation quiet interval from 0 through 2000 milliseconds.")),
                     ],
-                    required: ["lease_id", "expected_user_sequence", "condition"]
+                    required: ["condition"]
                 )
             ),
             LLMToolSchema(
@@ -465,11 +438,11 @@ extension AppChatToolDispatcher {
                 description: "Release a real Chrome tab lease. Claimed and active tabs remain open; an untouched inactive agent-created tab closes by default.",
                 parametersJSON: params(
                     properties: [
-                        ("lease_id", strSchema("Lease id to release.")),
+                        ("lease_id", nullable(strSchema("Optional exact lease; omit to release this conversation's current tab."))),
                         ("close_created_tab", obj([("type", .array([.string("boolean"), .string("null")])),
                                                    ("description", .string("Close an inactive agent-created tab. Defaults true."))])),
                     ],
-                    required: ["lease_id"]
+                    required: []
                 )
             ),
         ]

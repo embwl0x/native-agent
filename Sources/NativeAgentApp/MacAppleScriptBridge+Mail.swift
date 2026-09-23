@@ -8,45 +8,7 @@ extension MacAppleScriptBridge {
     /// List the N most recent messages in inbox. Input: "limit" (default 10, max 50).
     /// Returns: {status, count, messages: [{subject, sender, date, snippet}]}
     public static func mailListRecent(input: [String: JSONValue]) async throws -> JSONValue {
-        let source = mailListRecentScript(input: input)
-        do {
-            let raw = try await runAppleScript(source)
-            if let setup = readSetupEnvelope(raw: raw, integration: "mail") { return setup }
-            let messages = parseMailRecords(raw)
-            return .object([
-                "status": .string("completed"),
-                "count": .int(Int64(messages.count)),
-                "messages": .array(messages),
-            ])
-        } catch let AppleScriptError.permissionDenied(app) {
-            return deniedEnvelope(integration: "mail", app: app)
-        } catch {
-            return failedEnvelope(integration: "mail", error: error)
-        }
-    }
-
-    static func mailListRecentScript(input: [String: JSONValue]) -> String {
-        let limit = clampedInt(input["limit"], defaultValue: 10, min: 1, max: 50)
-        return """
-        tell application "Mail"
-            set enabledAccounts to (accounts whose enabled is true)
-            if (count of enabledAccounts) is 0 then return "__NATIVEAGENT_MAIL_NOT_CONFIGURED__"
-            set messageCount to count of messages of inbox
-            if messageCount > \(limit) then set messageCount to \(limit)
-            set output to ""
-            set countMsg to 0
-            repeat with i from 1 to messageCount
-                set msg to message i of inbox
-                set output to output & (subject of msg) & "|||" & (sender of msg) & "|||" & ((date received of msg) as string) & "|||"
-                try
-                    set output to output & (text 1 thru 200 of (content of msg))
-                end try
-                set output to output & "###"
-                set countMsg to countMsg + 1
-            end repeat
-            return output
-        end tell
-        """
+        try await mailWorkspaceRead(input: input)
     }
 
     /// Search inbox by subject/sender/body fragment. Input: "query" (required),
@@ -56,43 +18,7 @@ extension MacAppleScriptBridge {
         guard let query = inputString(input["query"]), !query.isEmpty else {
             return failedEnvelope(integration: "mail", reason: "missing_query")
         }
-        let limit = clampedInt(input["limit"], defaultValue: 10, min: 1, max: 50)
-        let escapedQuery = escapeForAppleScript(query)
-        let source = """
-        tell application "Mail"
-            set enabledAccounts to (accounts whose enabled is true)
-            if (count of enabledAccounts) is 0 then return "__NATIVEAGENT_MAIL_NOT_CONFIGURED__"
-            set q to "\(escapedQuery)"
-            set msgList to (messages of inbox whose (subject contains q) or (sender contains q) or (content contains q))
-            set output to ""
-            set countMsg to 0
-            repeat with i from 1 to (count of msgList)
-                if countMsg ≥ \(limit) then exit repeat
-                set msg to item i of msgList
-                set output to output & (subject of msg) & "|||" & (sender of msg) & "|||" & ((date received of msg) as string) & "|||"
-                try
-                    set output to output & (text 1 thru 200 of (content of msg))
-                end try
-                set output to output & "###"
-                set countMsg to countMsg + 1
-            end repeat
-            return output
-        end tell
-        """
-        do {
-            let raw = try await runAppleScript(source)
-            if let setup = readSetupEnvelope(raw: raw, integration: "mail") { return setup }
-            let messages = parseMailRecords(raw)
-            return .object([
-                "status": .string("completed"),
-                "count": .int(Int64(messages.count)),
-                "messages": .array(messages),
-            ])
-        } catch let AppleScriptError.permissionDenied(app) {
-            return deniedEnvelope(integration: "mail", app: app)
-        } catch {
-            return failedEnvelope(integration: "mail", error: error)
-        }
+        return try await mailWorkspaceRead(input: input, query: query)
     }
 
     /// Send mail via Mail.app. Required: "to" (string or array), "subject", "body".
@@ -295,12 +221,15 @@ extension MacAppleScriptBridge {
         return .object(result)
     }
 
-    /// Reply to a thread. Required: "subject" (the message to reply to),
-    /// "body". Optional: "sender" for disambiguation, "reply_all" (bool,
+    /// Reply by exact inbox/message identity, or a unique subject/sender.
+    /// Required: body. Optional: sender for legacy disambiguation, reply_all (bool,
     /// default false).
     /// Returns: {status, action: "sent_reply", subject}.
     public static func mailReply(input: [String: JSONValue]) async throws -> JSONValue {
-        guard let subject = inputString(input["subject"]), !subject.isEmpty else {
+        let exact = mailExactLocator(input)
+        if input["message_id"] != nil && exact == nil { return failedEnvelope(integration: "mail", reason: "invalid_message_locator") }
+        let subject = inputString(input["subject"]) ?? ""
+        guard exact != nil || !subject.isEmpty else {
             return failedEnvelope(integration: "mail", reason: "missing_subject")
         }
         guard let body = inputString(input["body"]), !body.isEmpty else {
@@ -316,13 +245,16 @@ extension MacAppleScriptBridge {
         }
         let subjectAS = escapeForAppleScript(subject)
         let bodyAS = escapeForAppleScript(body)
-        let whereClause = Self.mailMatchWhereClause(subjectAS: subjectAS, sender: sender)
+        let whereClause = exact.map { "id is \($0.id)" } ?? Self.mailMatchWhereClause(subjectAS: subjectAS, sender: sender)
+        let identityCheck = exact.map { "if ((message id of originalMsg) as text) is not \"\(escapeForAppleScript($0.messageID))\" then return \"-2\"" } ?? ""
         let replyAllPhrase = replyAll ? "with reply to all" : "without reply to all"
         let source = """
         tell application "Mail"
             set hits to (messages of inbox whose \(whereClause))
             if (count of hits) is 0 then return "0"
+            if (count of hits) is not 1 then return "-2"
             set originalMsg to first item of hits
+            \(identityCheck)
             set replyMsg to reply originalMsg opening window false \(replyAllPhrase)
             tell replyMsg
                 set content to "\(bodyAS)"
@@ -340,6 +272,7 @@ extension MacAppleScriptBridge {
             // "Mail sent it". -1 is now Mail's own refusal.
             let raw = try await runAppleScript(source)
             let code = Int(raw.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
+            if code == -2 { return failedEnvelope(integration: "mail", reason: "message_changed_or_ambiguous_refresh_inbox") }
             if code < 0 {
                 return failedEnvelope(integration: "mail", reason: "mail_refused_send")
             }

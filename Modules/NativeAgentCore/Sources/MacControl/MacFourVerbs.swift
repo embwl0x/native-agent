@@ -13,8 +13,9 @@ import PersistenceCore
 // `window_not_key` — rather than in the work she was doing. THIS FILE IS THE
 // REPLACEMENT SURFACE, and its whole contract is stated in one line:
 //
-//     SHE NEVER SEES a frame id, a handle token, a drift code, or a refusal she
-//     cannot act on.
+//     Ordinary interaction uses names and actionable words. Workspace screens
+//     may additionally carry exact control bindings; the workspace, rather
+//     than Agent, manages those tokens and fresh selections after refusal.
 //
 // EYES `screen(part:)` · HANDS `act(verb:target:text:)` · LEGS `go(name:)` ·
 // PATIENCE `wait(until:seconds:)`. Nothing else.

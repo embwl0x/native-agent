@@ -78,7 +78,9 @@ actor TelegramAssistantDeliveryDriver {
 
     func onDelta(_ accumulated: String) async {
         guard lane != .terminal else { return }
-        let safeAccumulated = TelegramRichMessageRenderer.sanitize(accumulated)
+        let safeAccumulated = TelegramRichMessageRenderer.sanitize(
+            TelegramRichMessageRenderer.stripBoldMarkers(accumulated)
+        )
         guard !safeAccumulated.isEmpty else { return }
         latestAccumulatedText = safeAccumulated
         switch lane {
@@ -116,7 +118,9 @@ actor TelegramAssistantDeliveryDriver {
         guard lane != .terminal else {
             return .outcomeUnknown(reason: "assistant delivery was already terminal")
         }
-        let safeReply = TelegramRichMessageRenderer.sanitize(reply)
+        let safeReply = TelegramRichMessageRenderer.sanitize(
+            TelegramRichMessageRenderer.stripBoldMarkers(reply)
+        )
         guard !safeReply.isEmpty else {
             lane = .terminal
             return .failed(reason: "reply contained no safe user-visible content")
@@ -204,7 +208,8 @@ actor TelegramAssistantDeliveryDriver {
 
     private func reportFailure(step: String, error: Error) async {
         await recordFailure(
-            "Telegram assistant \(step) failed for chat \(destination.chatId): \(Self.safeReason(error))"
+            "Telegram assistant \(step) failed for chat \(destination.chatId): "
+                + (TelegramTurnPresentationReducer.sanitized(String(describing: error)) ?? "delivery failed")
         )
     }
 
@@ -221,9 +226,15 @@ actor TelegramAssistantDeliveryDriver {
         }
     }
 
+    /// Person-facing: this lands on the work card, so no raw Swift/NSError text.
     private static func safeReason(_ error: Error) -> String {
-        TelegramTurnPresentationReducer.sanitized(String(describing: error))
-            ?? "delivery failed"
+        let dropped: Set<Int> = [
+            NSURLErrorTimedOut, NSURLErrorNetworkConnectionLost, NSURLErrorNotConnectedToInternet,
+        ]
+        let nsError = error as NSError
+        return nsError.domain == NSURLErrorDomain && dropped.contains(nsError.code)
+            ? "the connection dropped"
+            : "Telegram didn't confirm it"
     }
 
     private static func draftId(for turnId: UUID) -> Int {

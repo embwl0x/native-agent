@@ -396,6 +396,7 @@ extension BuiltInToolSchemaFactory {
                     parametersJSON: params(
                         properties: [
                             ("pixels", boolSchema("Set true for actual primary-desktop pixels to verify visual outcomes, including NativeAgent's visible window, overlapping windows and Liquid Glass. Requires existing Full Mac read authority and Screen Recording permission. No AX/self-read, focus change or permission prompt. Omit app and part. Image is transient and bounded to 1600px; capture success is not action verification. Default false keeps the structured screen read.")),
+                            ("structured", boolSchema("Include bounded, already-redacted controls for workspace selections in detail.controls. Each control's handle is bound to that result's frame_id; return both to act for an exact selection. Default false keeps the concise natural screen.")),
                             ("part", strSchema("Optional: a section, thing, or status readout to inspect by name. Use hud/readouts for observed status values, or a label such as Last drag or Energy to reveal a readout hidden by the ordinary display cap.")),
                             ("app", strSchema("Optional: read this running app's front window instead of whatever is in front, without activating it (\"Mail\", \"Safari\"). If nothing by that name is running, or the name matches more than one, the answer says so and names what is running.")),
                         ],
@@ -497,6 +498,8 @@ extension BuiltInToolSchemaFactory {
                         properties: [
                             ("verb", enumStringSchema(["click", "open", "type", "select", "toggle", "scroll", "dismiss", "hover", "move", "drag", "hold", "key"], "What to do.")),
                             ("target", strSchema("The thing, by name as the screen shows it — a label, a partial label, an ordinal like 'row 3', or a numbered unlabeled target like 'visual region 2'. For hold, `key w d` holds W and D simultaneously for seconds; space-separated keys/chords and bare modifiers are supported. For key, a space-separated sequence remains sequential.")),
+                            ("handle", strSchema("Optional exact control handle from screen structured:true. Requires its frame_id. Used by workspace selections; no name fallback or repeated action if stale. Supports click, open, type, select, toggle, scroll without physical gesture options.")),
+                            ("frame_id", strSchema("Required with handle: the same screen's detail.controls.frame_id. Old frames are refused; read the screen again to get current choices.")),
                             ("text", strSchema("For `type`: the text to put in the target.")),
                             ("direction", enumStringSchema(["up", "down", "left", "right"], "For `scroll`: which way to move. Left/right sends horizontal wheel input.")),
                             ("scroll_amount", intSchema("For scroll: wheel magnitude in lines, 1 for fine adjustment through120. Use0 (or omit) for ordinary/default behavior, including all non-scroll verbs. An explicit amount requests wheel input rather than page-key fallback.", minimum: 0, maximum: 120)),

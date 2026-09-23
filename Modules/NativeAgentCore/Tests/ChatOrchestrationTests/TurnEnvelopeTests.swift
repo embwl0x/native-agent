@@ -7,6 +7,7 @@ import TrustCenter
 import DreamREMCycle
 import NativeAgentCore
 @testable import ChatOrchestration
+import NativeAgentTestSupport
 
 // MARK: - One Thread, Many Surfaces — Phase 1 tests
 //

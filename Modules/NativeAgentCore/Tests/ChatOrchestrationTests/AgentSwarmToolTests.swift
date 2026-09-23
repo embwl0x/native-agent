@@ -148,7 +148,7 @@ private func tempSwarmToolRoot() throws -> URL {
         Issue.record("expected object")
         return
     }
-    #expect(object["policyDefaultModel"] == .string("claude-opus-4-8"))
+    #expect(object["policyDefaultModel"] == .string("claude-opus-5-5"))
     #expect(object["policyDefaultEffort"] == .string("high"))
 }
 
@@ -171,7 +171,7 @@ private func tempSwarmToolRoot() throws -> URL {
         Issue.record("expected object")
         return
     }
-    #expect(object["policyDefaultModel"] == .string("claude-opus-4-8"))
+    #expect(object["policyDefaultModel"] == .string("claude-opus-5-5"))
 }
 
 @Test func swiftToolDispatcher_corruptSwarmsRoutingFailsClosedBeforeExecution() async throws {

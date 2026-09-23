@@ -91,9 +91,6 @@ struct TelegramVoiceTranscriptionStatus: Codable, Hashable {
     var backend: String
     var model: String
     var maxBytes: Int
-    var backendSupported: Bool
-    var keyConfigured: Bool
-    var requiresAPIKey: Bool?
 }
 
 struct TelegramReceipt: Identifiable, Codable, Hashable {
@@ -745,20 +742,4 @@ struct EmbeddingsInstallState: Codable, Hashable {
     var failed: Int?
     var reason: String?
     var lastUpdatedAt: String?
-}
-
-// PATCH-2026-05-08: wave3-whats-running Feature B models
-struct WhatsRunningItem: Codable, Hashable, Identifiable {
-    var id: String
-    var kind: String
-    var label: String
-    var startedAt: String?
-    var startsAt: String?
-    var cancellable: Bool
-    var cancelHint: String?
-}
-
-struct WhatsRunning: Codable, Hashable {
-    var items: [WhatsRunningItem]
-    var count: Int?  // Fix 9: optional — can be derived from items.count if missing
 }

@@ -94,6 +94,12 @@ actor ProviderToolResultRecoveryStore {
     /// spills; `remove(scope:)` — which every loop calls in its `defer` — clears
     /// it. Handles in a live scope survive the idle TTL.
     private var liveScopes: Set<Scope> = []
+    private struct ReadCursor {
+        let handle: String
+        let nextPage: Int?
+        let query: String?
+    }
+    private var readCursors: [Scope: ReadCursor] = [:]
 
     init(root: URL = FileManager.default.temporaryDirectory
         .appendingPathComponent(InstallPaths.current.name("NativeAgent"), isDirectory: true)
@@ -210,6 +216,53 @@ actor ProviderToolResultRecoveryStore {
         sessionId: String?,
         turnId: String?,
         query: String? = nil
+    ) -> JSONValue {
+        let result = readPage(handle: handle, page: page, sessionId: sessionId, turnId: turnId, query: query)
+        if let scope = Scope(sessionId: sessionId, turnId: turnId),
+           case .object(let object) = result, object["status"] == .string("completed") {
+            let next: Int?
+            if case .int(let value)? = object["next_page"] { next = Int(exactly: value) }
+            else { next = nil }
+            readCursors[scope] = ReadCursor(handle: handle, nextPage: next, query: query)
+        }
+        return result
+    }
+
+    /// Continue the exact last read in this turn, preserving its query/mode.
+    /// Before the first read only an unambiguous retained result is selected.
+    func continueReading(handle: String?, sessionId: String?, turnId: String?) -> JSONValue {
+        cleanupExpired(now: Date())
+        guard let scope = Scope(sessionId: sessionId, turnId: turnId) else {
+            return .object(["status": .string("failed"), "reason": .string("missing_result_scope")])
+        }
+        if let cursor = readCursors[scope], handle == nil || handle == cursor.handle {
+            guard let next = cursor.nextPage else {
+                return .object(["status": .string("completed"), "result_handle": .string(cursor.handle),
+                    "has_more": .bool(false), "reading_complete": .bool(true),
+                    "recovery_only": .bool(true),
+                    "verification_scope": .string("retained_tool_response_not_external_outcome"),
+                    "original_result_class": .string(entries[cursor.handle]?.resultClass.rawValue ?? "unknown"),
+                    "detail": .string("You reached the end of this retained result. No operation was repeated.")])
+            }
+            return page(handle: cursor.handle, page: next, sessionId: sessionId, turnId: turnId, query: cursor.query)
+        }
+        let candidates = entries.values.filter { $0.scope == scope && (handle == nil || $0.handle == handle) }
+            .sorted { $0.createdAt < $1.createdAt }
+        guard candidates.count == 1, let entry = candidates.first else {
+            return .object([
+                "status": .string("failed"),
+                "reason": .string(candidates.isEmpty ? "result_handle_unavailable" : "choose_result"),
+                "results": .array(candidates.map { .object(["result_handle": .string($0.handle), "tool": .string($0.toolName)]) }),
+                "recovery_hint": .string(candidates.isEmpty
+                    ? "No matching retained result is readable in this turn. Inspect its durable receipt or original status; never repeat a write to recover output."
+                    : "Several results are retained. Choose result_handle once; subsequent continue reads keep its position."),
+            ])
+        }
+        return page(handle: entry.handle, page: 0, sessionId: sessionId, turnId: turnId, query: "")
+    }
+
+    private func readPage(
+        handle: String, page: Int, sessionId: String?, turnId: String?, query: String?
     ) -> JSONValue {
         cleanupExpired(now: Date())
         guard let scope = Scope(sessionId: sessionId, turnId: turnId),
@@ -351,6 +404,7 @@ actor ProviderToolResultRecoveryStore {
     }
 
     private func remove(handle: String) {
+        for scope in readCursors.keys.filter({ readCursors[$0]?.handle == handle }) { readCursors.removeValue(forKey: scope) }
         guard let entry = entries.removeValue(forKey: handle) else { return }
         totalBytes = max(0, totalBytes - entry.bytes)
         try? FileManager.default.removeItem(at: entry.url)
@@ -359,6 +413,16 @@ actor ProviderToolResultRecoveryStore {
 
 extension SwiftToolDispatcher {
     func impl_tool_result_page(input: [String: JSONValue]) async -> JSONValue {
+        if input["continue"] == .bool(true) {
+            guard ["page", "query", "raw"].allSatisfy({ input[$0] == nil || input[$0] == .null }) else {
+                return .object(["status": .string("failed"), "reason": .string("conflicting_read_selection"),
+                    "recovery_hint": .string("Use continue:true alone (optional result_handle), or select an explicit page/query/raw mode. Continue retains the previous mode and position.")])
+            }
+            let handle = jsonString(input["result_handle"])?.trimmingCharacters(in: .whitespacesAndNewlines)
+            return await ProviderToolResultRecoveryStore.shared.continueReading(
+                handle: handle?.isEmpty == false ? handle : nil,
+                sessionId: Self.extractSessionId(from: input), turnId: TurnTraceContext.turnId)
+        }
         guard case .string(let handle)? = input["result_handle"], !handle.isEmpty else {
             return .object([
                 "status": .string("failed"),

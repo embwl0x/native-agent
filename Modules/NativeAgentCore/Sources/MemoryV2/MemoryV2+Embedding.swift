@@ -188,7 +188,9 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
     public static let allowedModelExtensions: Set<String> = ["mlpackage", "mlmodelc", "mlmodel"]
     private static let bundledEpochLock = NSLock()
     nonisolated(unsafe) private static var cachedDefaultBundledEpoch: MemoryEmbeddingEpoch?
-    nonisolated(unsafe) private static var cachedExtrasEpoch: (fingerprint: String, epoch: MemoryEmbeddingEpoch)?
+    // 2026-09-22: digest kept apart from epoch so init (own id/dims) can share
+    // the hash without handing bundledEmbeddingEpoch an epoch it did not build.
+    nonisolated(unsafe) private static var cachedExtrasEpoch: (fingerprint: String, digest: String, epoch: MemoryEmbeddingEpoch?)?
 
     /// Cheap change detector for an installed extras model: every file under
     /// the package plus the manifest and vocab, as relative path, size and
@@ -277,7 +279,24 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
         guard FileManager.default.fileExists(atPath: modelURL.path) else {
             throw EmbeddingError.modelNotFound(path: modelURL.path)
         }
-        let modelArtifactDigest = try Self.modelArtifactDigest(modelURL: modelURL)
+        // 2026-09-22 WHY: launch hashed the 637 MB package here and again in
+        // bundledEmbeddingEpoch; both now share its fingerprint-keyed digest.
+        let modelArtifactDigest: String
+        let fingerprint = vocabURL.map { Self.extrasFingerprint(InstalledExtrasModel(
+            modelURL: modelURL, vocabURL: $0, modelID: modelId, dimensions: dimensions)) }
+        Self.bundledEpochLock.lock()
+        let cachedDigest = Self.cachedExtrasEpoch.flatMap { $0.fingerprint == fingerprint ? $0.digest : nil }
+        Self.bundledEpochLock.unlock()
+        if let cachedDigest {
+            modelArtifactDigest = cachedDigest
+        } else {
+            modelArtifactDigest = try Self.modelArtifactDigest(modelURL: modelURL)
+            if let fingerprint {
+                Self.bundledEpochLock.lock()
+                Self.cachedExtrasEpoch = (fingerprint, modelArtifactDigest, nil)
+                Self.bundledEpochLock.unlock()
+            }
+        }
         self.embeddingEpoch = try Self.epoch(
             modelURL: modelURL,
             vocabURL: vocabURL,
@@ -439,6 +458,13 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
         return try withCompileCacheLock(cacheRoot: root) {
             try fm.createDirectory(at: cacheDir, withIntermediateDirectories: true)
             if fm.fileExists(atPath: cached.path) {
+                // 2026-09-22: prune on a hit too. Pruning only after a compile
+                // left an old OS's 1.3GB folder behind until the next recompile.
+                pruneCompileCache(cacheDir: cacheDir, keeping: cached)
+                pruneOperatingSystemCaches(
+                    modelRoot: cacheDir.deletingLastPathComponent(),
+                    keeping: cacheDir
+                )
                 return cached
             }
 
@@ -514,6 +540,8 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
     static func pruneCompileCache(
         cacheDir: URL,
         keeping current: URL,
+        // Two, not one: another process may hold the previous URL between
+        // compileAndCache and MLModel(contentsOf:). Old-OS dirs prune to one.
         maximumEntries: Int = 2,
         fileManager fm: FileManager = .default
     ) {
@@ -540,7 +568,7 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
     static func pruneOperatingSystemCaches(
         modelRoot: URL,
         keeping current: URL,
-        maximumEntries: Int = 2,
+        maximumEntries: Int = 1,
         fileManager fm: FileManager = .default
     ) {
         guard maximumEntries > 0,
@@ -674,21 +702,20 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
             // directory's own mtime does not move when a child is rewritten).
             let fingerprint = extrasFingerprint(installed)
             bundledEpochLock.lock()
-            if let cached = cachedExtrasEpoch, cached.fingerprint == fingerprint {
-                bundledEpochLock.unlock()
-                return cached.epoch
-            }
+            let cached = cachedExtrasEpoch.flatMap { $0.fingerprint == fingerprint ? $0 : nil }
             bundledEpochLock.unlock()
+            if let epoch = cached?.epoch { return epoch }
+            let digest = try cached?.digest ?? modelArtifactDigest(modelURL: installed.modelURL)
             let resolvedEpoch = try epoch(
                 modelURL: installed.modelURL,
                 vocabURL: installed.vocabURL,
                 dimensions: installed.dimensions,
                 modelID: installed.modelID,
                 maximumSequenceLength: 128,
-                modelArtifactDigest: try modelArtifactDigest(modelURL: installed.modelURL)
+                modelArtifactDigest: digest
             )
             bundledEpochLock.lock()
-            cachedExtrasEpoch = (fingerprint, resolvedEpoch)
+            cachedExtrasEpoch = (fingerprint, digest, resolvedEpoch)
             bundledEpochLock.unlock()
             return resolvedEpoch
         }

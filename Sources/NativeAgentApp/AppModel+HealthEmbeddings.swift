@@ -134,57 +134,5 @@ extension AppModel {
         }
     }
 
-    // PATCH-2026-05-08: wave3-whats-running Feature B — load what's running
-    @MainActor
-    func loadWhatsRunning() async {
-        let refreshGeneration = whatsRunningRefreshGate.begin()
-        // Fix 10: catch and log instead of silently swallowing
-        // Render-cost audit F14 (wave 2). This is the 10 s `chat-whats-running`
-        // poll (`ChatRuntimeStatusChrome.swift:70-77`), so on an idle system it
-        // fires 6×/min with a byte-identical answer. Both writes were
-        // unconditional and Observation fires on *write*, not on *change*, so
-        // every tick redrew `WhatsRunningPanel`.
-        //
-        // The status goes through `staleFlagOnlyStatusToStore` — valid here
-        // because the ONLY reader is `WhatsRunningPresentation.make`
-        // (`ChatRuntimeStatusChrome.swift:241-271`) and it projects exactly
-        // three things: `status == nil`, `status?.isStale`, and
-        // `status?.lastSuccessAt != nil`. The helper stores the first-ever
-        // status (so nil-ness is preserved) and stores whenever
-        // `failedEndpoints` differs (so `isStale` and the success→failure and
-        // failure→success transitions are preserved); the only skipped case is
-        // "same failure set as last time", where carrying the previous
-        // timestamps forward leaves `lastSuccessAt`'s nil-ness identical to
-        // what `nextRefreshStatus` would have produced. Nothing renders the
-        // timestamps themselves.
-        //
-        // The snapshot itself is equality-gated separately: `WhatsRunning` is
-        // `Hashable` (Models/ConfigProviderDoctorModels.swift:828). Gating the
-        // status alone would have bought nothing — `WhatsRunningPanel` reads
-        // `appModel.whatsRunning` directly, so the snapshot write is the one
-        // that was actually redrawing it.
-        func storeStatus(failedEndpoints: [String]) {
-            if let next = Self.staleFlagOnlyStatusToStore(
-                previous: whatsRunningRefreshStatus,
-                failedEndpoints: failedEndpoints,
-                at: Date()
-            ) {
-                whatsRunningRefreshStatus = next
-            }
-        }
-        do {
-            let fetched = try await client.getWhatsRunning()
-            guard !Task.isCancelled else { return }
-            guard whatsRunningRefreshGate.isCurrent(refreshGeneration) else { return }
-            if whatsRunning != fetched { whatsRunning = fetched }
-            storeStatus(failedEndpoints: [])
-        } catch {
-            guard !Task.isCancelled else { return }
-            print("[NativeAgent] loadWhatsRunning failed: \(error)")
-            guard whatsRunningRefreshGate.isCurrent(refreshGeneration) else { return }
-            storeStatus(failedEndpoints: ["running work"])
-        }
-    }
-
     // PATCH-2026-05-08: wave2-chat-ux slash /compact support
 }

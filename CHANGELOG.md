@@ -4,6 +4,26 @@ Reverse-chronological. Each phase: 1–2 lines.
 
 ---
 
+## 0.4.17 — a steadier agent that works well with others (2026-09-23)
+
+### Other agents
+- Muse (Meta) connects as one continuing side chat. Grok no longer gets stuck after a missed reply and late replies still arrive. ACP agents continue their session. Disconnect needs the exact contact. Nothing is typed into another app while the Mac is locked.
+
+### Chat
+- Claude Opus 5.5, GPT-6 Sol and GPT-6 Luna. Tool calls on Claude sign-in are wrapped so the reply stops after the calls and results are always real. One context rule for every model: compact at the Settings limit or 60% of the window, replay history up to that point, 40K recollection. Chat compaction is back in Settings. Tool search finds mail, messages and news by plain words.
+
+### Web search
+- Search works again, with categories (news) and a time range.
+
+### Telegram and iPhone
+- Clean Telegram text (italics, links, inline code), queued notice removed when the turn starts, working notes dropped from final replies, urgent alerts to Telegram, plain error cards.
+
+### Helpers
+- Daily, weekdays or weekly at a clock time; Run once keeps the schedule.
+
+### Reliability
+- Quiet hours hold Desk reminders until they end. Memory dedupe respects numbers and negation. First-launch backup is one atomic move. Background loops never start after quit. Classic sidebar retired.
+
 ## 0.4.16 — setup that tells the truth (2026-09-20)
 
 ### Chrome

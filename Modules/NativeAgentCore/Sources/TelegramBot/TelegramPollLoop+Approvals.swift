@@ -290,8 +290,6 @@ extension TelegramPollLoop {
                     message: nil,
                     text: nil
                 )
-                let typingTask = await startTypingHeartbeat(destination: destination)
-                defer { typingTask?.cancel() }
                 do {
                     let progress = makeProgressSink(delivery: delivery, card: card)
                     let reply = try await runChatHandlerWithRetry(
@@ -325,9 +323,10 @@ extension TelegramPollLoop {
                         ))
                     }
                 } catch is CancellationError {
-                    await card.transition(.canceled(reason: "Stopped by user"))
+                    // This task is already cancelled; run the terminal UI work in a fresh one.
+                    await Task { await card.transition(.canceled(reason: "Stopped by user")) }.value
                 } catch {
-                    await card.transition(.failed(reason: String(describing: error)))
+                    await card.transition(.failed(reason: Self.chatErrorNotice(for: error)))
                     let safeError = Self._tgRedactToken(String(describing: error))
                     let notice = "\(acknowledgement) NativeAgent could not continue the reply automatically: \(safeError)"
                     if !(await delivery.abortDelivering(notice: notice)) {

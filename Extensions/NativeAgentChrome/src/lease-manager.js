@@ -17,6 +17,8 @@ export class TabLeaseManager {
     this.pendingOperation = Promise.resolve();
     this.restoring = false;
     this.activatedDuringRestore = new Set();
+    this.focusedDuringRestore = new Set();
+    this.focusedDuringCreation = null;
   }
 
   restore() {
@@ -27,6 +29,7 @@ export class TabLeaseManager {
       } finally {
         this.restoring = false;
         this.activatedDuringRestore.clear();
+        this.focusedDuringRestore.clear();
       }
     });
   }
@@ -51,6 +54,15 @@ export class TabLeaseManager {
       }
       this.leases.set(row.leaseId, row);
       seenTabs.add(row.tabId);
+      if (row.renderingMode === "visible_work_window" && row.state === "active" && Date.parse(row.expiresAt) > this.now()) {
+        const window = await this.chrome.windows.get(row.windowId, { populate: true }).catch(() => null);
+        if (!window || this.focusedDuringRestore.has(row.windowId) || window.focused || window.state === "minimized" || window.tabs?.length !== 1
+          || window.tabs[0].id !== row.tabId || window.tabs[0].active !== true) {
+          this.leases.delete(row.leaseId);
+          changed = true;
+          continue;
+        }
+      }
       if (row.state === "releasing" || Date.parse(row.expiresAt) > this.now()) {
         try { await this.scheduleExpiry(row); } catch { /* Recover the other leases. */ }
       }
@@ -73,13 +85,15 @@ export class TabLeaseManager {
   async acquireLocked(payload) {
     let tab;
     let ownership;
+    const rendered = payload.mode === "create" && (payload.renderingMode === "visible_work_window"
+      || (payload.renderingMode === undefined && isXPostURL(payload.initialUrl)));
     if (payload.mode === "create") {
-      tab = this.workspace ? await this.workspace.createTab(payload.initialUrl) : await this.chrome.tabs.create({
+      tab = rendered ? await this.createRenderedTab(payload.initialUrl) : this.workspace ? await this.workspace.createTab(payload.initialUrl) : await this.chrome.tabs.create({
         active: false,
         ...(payload.initialUrl ? { url: payload.initialUrl } : {}),
       });
       ownership = "created";
-      if (tab.active === true) {
+      if (tab.active === true && !rendered) {
         if (Number.isInteger(tab.id)) await this.bestEffortRemoveTab(tab.id);
         throw new ProtocolError(
           "focus_invariant_failed",
@@ -101,7 +115,7 @@ export class TabLeaseManager {
       throw new ProtocolError("tab_unavailable", "Chrome did not return a stable tab id.");
     }
     if (this.leaseForTab(tab.id)) {
-      if (ownership === "created") await this.bestEffortRemoveTab(tab.id);
+      if (ownership === "created" && !rendered) await this.bestEffortRemoveTab(tab.id);
       throw new ProtocolError("tab_already_leased", "The tab already belongs to a NativeAgent lease.");
     }
 
@@ -112,6 +126,7 @@ export class TabLeaseManager {
       tabId: tab.id,
       windowId: tab.windowId,
       ownership,
+      ...(rendered ? { renderingMode: "visible_work_window" } : {}),
       state: "active",
       userSequence: 0,
       createdAt: new Date(nowMs).toISOString(),
@@ -130,7 +145,9 @@ export class TabLeaseManager {
       await this.scheduleExpiry(lease);
     } catch (error) {
       this.leases.delete(lease.leaseId);
-      if (ownership === "created") await this.bestEffortRemoveTab(tab.id);
+      if (ownership === "created" && (!rendered || await this.renderedTabSafeToClose({ ...lease, state: "releasing" }))) {
+        await this.bestEffortRemoveTab(tab.id);
+      }
       throw error;
     }
     const result = publicLease(lease);
@@ -184,7 +201,10 @@ export class TabLeaseManager {
         // An already-closed ephemeral tab is still a complete release.
         currentTab = undefined;
       }
-      if (currentTab && currentTab.active !== true && !this.activatedDuringRestore.has(lease.tabId)) {
+      const renderedCleanup = currentTab && lease.renderingMode === "visible_work_window"
+        && await this.renderedTabSafeToClose(lease);
+      if (currentTab && (lease.renderingMode === "visible_work_window" ? renderedCleanup : currentTab.active !== true)
+        && !this.activatedDuringRestore.has(lease.tabId)) {
         // Removal failures retain pending ownership for retry.
         await this.chrome.tabs.remove(lease.tabId);
         tabClosed = true;
@@ -264,6 +284,70 @@ export class TabLeaseManager {
     return lease;
   }
 
+  // A distinct, ordinary Chrome window supplies real rendering opportunity;
+  // never spoof visibility or activate a tab in the user's existing window.
+  async createRenderedTab(url) {
+    const before = await this.chrome.windows.getLastFocused({ windowTypes: ["normal"] });
+    this.focusedDuringCreation = new Set();
+    let tab;
+    try {
+      const created = await this.chrome.windows.create({ focused: false, type: "normal", url: url ?? "about:blank" });
+      tab = created?.tabs?.[0];
+      if (!Number.isInteger(tab?.id) || !Number.isInteger(created?.id)) {
+        throw new ProtocolError("workspace_unavailable", "Chrome did not return a stable work window and tab.");
+      }
+      const current = await this.chrome.windows.get(created.id, { populate: true });
+      const after = await this.chrome.windows.getLastFocused({ windowTypes: ["normal"] });
+      if (current.focused || current.state === "minimized" || after.id !== before.id
+        || this.focusedDuringCreation.has(created.id) || current.tabs?.length !== 1
+        || current.tabs[0].id !== tab.id || current.tabs[0].active !== true) {
+        throw new ProtocolError("workspace_changed", "Chrome's unfocused work window changed during creation; no control was acquired.");
+      }
+      return current.tabs[0];
+    } catch (error) {
+      if (Number.isInteger(tab?.id) && !this.focusedDuringCreation.has(tab.windowId)) {
+        const window = await this.chrome.windows.get(tab.windowId, { populate: true }).catch(() => null);
+        if (window && !window.focused && window.tabs?.length === 1 && window.tabs[0].id === tab.id) {
+          await this.bestEffortRemoveTab(tab.id);
+        }
+      }
+      throw error;
+    } finally {
+      // Failed setup deliberately preserves a possibly user-taken window.
+      this.focusedDuringCreation = null;
+    }
+  }
+
+  windowFocused(windowId) {
+    if (this.restoring) this.focusedDuringRestore.add(windowId);
+    this.focusedDuringCreation?.add(windowId);
+    for (const lease of this.leases.values()) {
+      if (lease.renderingMode !== "visible_work_window" || lease.windowId !== windowId) continue;
+      lease.state = "yielding"; // immediately blocks effects before serial persistence
+      void this.yieldForTab(lease.tabId, "work_window_focused").catch(() => {});
+    }
+  }
+
+  async verifyRenderingWindow(leaseId) {
+    const lease = this.requireActiveLease(leaseId);
+    if (lease.renderingMode !== "visible_work_window") return;
+    let window;
+    try { window = await this.chrome.windows.get(lease.windowId, { populate: true }); } catch { /* closed */ }
+    this.requireActiveLease(leaseId);
+    if (!window || window.focused || window.state === "minimized" || window.tabs?.length !== 1
+      || window.tabs[0].id !== lease.tabId || window.tabs[0].active !== true) {
+      await this.yieldForTab(lease.tabId, "work_window_changed");
+      throw new ProtocolError("workspace_changed", "The rendered work window was focused, closed, minimized or changed; control was yielded.");
+    }
+  }
+
+  async renderedTabSafeToClose(lease) {
+    const window = await this.chrome.windows.get(lease.windowId, { populate: true }).catch(() => null);
+    return lease.state === "releasing" && window && !window.focused && window.tabs?.length === 1
+      && window.tabs[0].id === lease.tabId && !this.activatedDuringRestore.has(lease.tabId)
+      && !this.focusedDuringRestore.has(lease.windowId);
+  }
+
   requireActiveLease(leaseId) {
     const lease = this.requireLease(leaseId);
     if (lease.state !== "active") {
@@ -327,6 +411,16 @@ export class TabLeaseManager {
   }
 }
 
+function isXPostURL(value) {
+  if (typeof value !== "string") return false;
+  try {
+    const url = new URL(value);
+    return ["http:", "https:"].includes(url.protocol) && !url.username && !url.password && !url.port
+      && ["x.com", "www.x.com", "twitter.com", "www.twitter.com"].includes(url.hostname)
+      && /^\/[A-Za-z0-9_]{1,15}\/status\/[0-9]+\/?$/.test(url.pathname);
+  } catch { return false; }
+}
+
 function validStoredLease(row) {
   return row !== null
     && typeof row === "object"
@@ -334,6 +428,7 @@ function validStoredLease(row) {
     && Number.isInteger(row.tabId)
     && Number.isInteger(row.windowId)
     && (row.ownership === "created" || row.ownership === "claimed")
+    && (row.renderingMode === undefined || (row.renderingMode === "visible_work_window" && row.ownership === "created"))
     && (row.state === "active" || (row.state === "releasing"
       && typeof row.closeCreatedTab === "boolean" && typeof row.releaseReason === "string"))
     && Number.isInteger(row.userSequence)

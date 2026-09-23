@@ -34,7 +34,6 @@ struct SettingsViewFull: View {
     @EnvironmentObject private var bridgeClient: MacBridgeClient
     @StateObject private var store = SettingsStore()
     @State private var showRePairSheet = false
-    @State private var showRePairConfirm = false
     @State private var repairResult: String?
     @State private var isForceRefreshing = false
     @State private var pushReceipts = PushReceiptLedger.load()
@@ -153,7 +152,6 @@ struct SettingsViewFull: View {
                 }
                 DisclosureGroup("Connection diagnostics") {
                     LabeledContent("Pairing version", value: "\(pairingStore.knownSecretVersion)")
-                    Button("Replace pairing…", role: .destructive) { showRePairConfirm = true }
                 }
             }
 
@@ -227,19 +225,6 @@ struct SettingsViewFull: View {
                 .receive(on: RunLoop.main)
         ) { _ in
             pushReceipts = PushReceiptLedger.load()
-        }
-        .confirmationDialog("Replace the current pairing?", isPresented: $showRePairConfirm, titleVisibility: .visible) {
-            Button("Re-pair", role: .destructive) {
-                if pairingStore.clearPairing() {
-                    bridgeClient.disconnect()
-                    showRePairSheet = true
-                } else {
-                    repairResult = "The signing key could not be removed securely. Pairing was left unchanged."
-                }
-            }
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text("This removes the current signing key. iPhone actions will pause until pairing completes again.")
         }
         .fullScreenCover(isPresented: $showRePairSheet) {
             PairingView(onSkip: {

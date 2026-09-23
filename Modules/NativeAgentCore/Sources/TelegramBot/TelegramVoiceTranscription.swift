@@ -27,70 +27,23 @@ public protocol TelegramVoiceTranscribing: Sendable {
 public enum TelegramVoiceTranscriptionBackends {
     public static let appleSpeech = "apple_speech"
     public static let appleSpeechModel = "apple-speech"
-    public static let openAI = "openai"
-    public static let openAIModel = "gpt-4o-mini-transcribe"
 
-    public static func canonical(_ raw: String) -> String {
-        let normalized = raw
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
-            .replacingOccurrences(of: "-", with: "_")
-        switch normalized {
-        case "", "apple", "apple_speech", "speech", "sfspeech", "sfspeechrecognizer", "native", "local":
-            return appleSpeech
-        case "openai", "openai_whisper", "whisper", "whisper_api":
-            return openAI
-        default:
-            return normalized
-        }
-    }
-
-    public static func defaultModel(for backend: String) -> String {
-        isOpenAI(backend) ? openAIModel : appleSpeechModel
-    }
-
-    public static func isAppleSpeech(_ backend: String) -> Bool {
-        canonical(backend) == appleSpeech
-    }
-
-    public static func isOpenAI(_ backend: String) -> Bool {
-        canonical(backend) == openAI
-    }
-
-    public static func isSupported(_ backend: String) -> Bool {
-        isAppleSpeech(backend) || isOpenAI(backend)
-    }
-
-    public static func requiresAPIKey(_ backend: String) -> Bool {
-        isOpenAI(backend)
-    }
+    /// Apple Speech is the only backend; any stored value reads as it.
+    public static func canonical(_ raw: String) -> String { appleSpeech }
 }
 
 public enum TelegramVoiceTranscriptionError: Error, Equatable, LocalizedError, Sendable {
     case missingAudioBytes
-    case notConfigured
-    case authRejected
-    case apiError(status: Int, message: String?)
     case malformedResponse
     case conversionFailed(String)
     case speechPermissionDenied(String)
     case speechUnavailable(String)
     case speechRecognitionFailed(String)
-    case transport(String)
 
     public var errorDescription: String? {
         switch self {
         case .missingAudioBytes:
             return "voice transcription: missing audio bytes"
-        case .notConfigured:
-            return "voice transcription: no OpenAI platform key configured"
-        case .authRejected:
-            return "voice transcription: OpenAI token rejected"
-        case .apiError(let status, let message):
-            if let message, !message.isEmpty {
-                return "voice transcription: HTTP \(status): \(message)"
-            }
-            return "voice transcription: HTTP \(status)"
         case .malformedResponse:
             return "voice transcription: malformed response"
         case .conversionFailed(let message):
@@ -101,8 +54,6 @@ public enum TelegramVoiceTranscriptionError: Error, Equatable, LocalizedError, S
             return "voice transcription: Apple Speech unavailable: \(message)"
         case .speechRecognitionFailed(let message):
             return "voice transcription: Apple Speech recognition failed: \(message)"
-        case .transport(let message):
-            return "voice transcription: \(message)"
         }
     }
 }
@@ -259,24 +210,6 @@ enum TelegramVoiceAudioPreparer {
         }
     }
 
-    static func transcodeToM4AAttachment(_ attachment: TelegramMediaAttachment) async throws -> TelegramMediaAttachment {
-        let prepared = try await prepareURL(
-            attachment,
-            readableExtensions: ["m4a"],
-            missingConverterMessage: "audio is not readable by AVFoundation on this Mac, and no ffmpeg binary was found"
-        )
-        defer { prepared.cleanup() }
-        let converted = try Data(contentsOf: prepared.url)
-        return TelegramMediaAttachment(
-            kind: attachment.kind,
-            fileId: attachment.fileId,
-            mimeType: "audio/mp4",
-            sizeBytes: converted.count,
-            bytes: converted,
-            captureFilename: "telegram_voice_\(UUID().uuidString).m4a"
-        )
-    }
-
     static func fileExtension(for filename: String?) -> String? {
         guard let filename, !filename.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return nil
@@ -285,18 +218,6 @@ enum TelegramVoiceAudioPreparer {
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
         return ext.isEmpty ? nil : ext
-    }
-
-    static func mimeType(for filename: String?) -> String {
-        switch fileExtension(for: filename) {
-        case "mp3": return "audio/mpeg"
-        case "mp4", "m4a": return "audio/mp4"
-        case "mpeg", "mpga": return "audio/mpeg"
-        case "wav": return "audio/wav"
-        case "webm": return "audio/webm"
-        case "oga", "ogg", "opus": return "audio/ogg"
-        default: return "application/octet-stream"
-        }
     }
 
     private static func fileExtension(forMIMEType mimeType: String?) -> String? {
@@ -414,6 +335,8 @@ public final class SwiftAppleSpeechTranscriber: TelegramVoiceTranscribing {
     /// the injectable form lets the headless denial boundary be exercised
     /// without changing a machine's TCC state.
     private let speechAuthorizationStatus: @Sendable () -> SFSpeechRecognizerAuthorizationStatus
+    /// Words the recognizer should expect, read per note (the agent's name).
+    private let contextualStrings: @Sendable () -> [String]
 
     public init(
         localeIdentifier: String = Locale.current.identifier,
@@ -421,12 +344,14 @@ public final class SwiftAppleSpeechTranscriber: TelegramVoiceTranscribing {
         timeoutSeconds: TimeInterval = 45,
         speechAuthorizationStatus: @escaping @Sendable () -> SFSpeechRecognizerAuthorizationStatus = {
             SFSpeechRecognizer.authorizationStatus()
-        }
+        },
+        contextualStrings: @escaping @Sendable () -> [String] = { [] }
     ) {
         self.localeIdentifier = localeIdentifier
         self.preferOnDevice = preferOnDevice
         self.timeoutNanoseconds = UInt64(max(1, timeoutSeconds) * 1_000_000_000)
         self.speechAuthorizationStatus = speechAuthorizationStatus
+        self.contextualStrings = contextualStrings
     }
 
     public func transcribe(_ attachment: TelegramMediaAttachment) async throws -> TelegramVoiceTranscription {
@@ -497,6 +422,7 @@ public final class SwiftAppleSpeechTranscriber: TelegramVoiceTranscribing {
 
         let request = SFSpeechURLRecognitionRequest(url: url)
         request.shouldReportPartialResults = false
+        request.contextualStrings = contextualStrings()
         if forceOnDevice, recognizer.supportsOnDeviceRecognition {
             request.requiresOnDeviceRecognition = true
         }
@@ -554,166 +480,5 @@ public final class SwiftAppleSpeechTranscriber: TelegramVoiceTranscribing {
         case .notDetermined: return "not determined"
         @unknown default: return "unknown"
         }
-    }
-}
-
-/// Swift-native Telegram voice-note transcriber. It calls OpenAI's
-/// `/v1/audio/transcriptions` endpoint directly, with no external runtime and no
-/// local Whisper CLI. The default model favors speed for short Telegram notes;
-/// set `voice_transcription_model` to `whisper-1` for literal Whisper.
-public final class SwiftOpenAIWhisperTranscriber: TelegramVoiceTranscribing {
-    public static let endpoint = URL(string: "https://api.openai.com/v1/audio/transcriptions")!
-    public static let userAgent = "NativeAgent/0.2.0"
-    public static let supportedExtensions: Set<String> = ["mp3", "mp4", "mpeg", "mpga", "m4a", "wav", "webm"]
-
-    private let session: URLSession
-    private let endpoint: URL
-    private let model: String
-    private let apiKeyOverride: String?
-    private let dataRoot: URL
-
-    public init(
-        session: URLSession = .shared,
-        endpoint: URL = SwiftOpenAIWhisperTranscriber.endpoint,
-        model: String = TelegramVoiceTranscriptionBackends.openAIModel,
-        apiKeyOverride: String? = nil,
-        dataRoot: URL = PersistenceCore.defaultDataRoot()
-    ) {
-        self.session = session
-        self.endpoint = endpoint
-        self.model = model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            ? TelegramVoiceTranscriptionBackends.openAIModel
-            : model.trimmingCharacters(in: .whitespacesAndNewlines)
-        self.apiKeyOverride = apiKeyOverride
-        self.dataRoot = dataRoot
-    }
-
-    public func transcribe(_ attachment: TelegramMediaAttachment) async throws -> TelegramVoiceTranscription {
-        guard let key = apiKeyOverride
-                ?? LLMCredentialResolver.resolveAPIKey(
-                    envVar: "OPENAI_API_KEY",
-                    providerConfigFile: "openai.json",
-                    dataRoot: dataRoot
-                ),
-              !key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            throw TelegramVoiceTranscriptionError.notConfigured
-        }
-        guard let originalBytes = attachment.bytes, !originalBytes.isEmpty else {
-            throw TelegramVoiceTranscriptionError.missingAudioBytes
-        }
-
-        let prepared = try await prepareForOpenAI(attachment)
-        guard let audioBytes = prepared.bytes, !audioBytes.isEmpty else {
-            throw TelegramVoiceTranscriptionError.missingAudioBytes
-        }
-
-        let started = Date()
-        let body = Self.multipartBody(
-            fileField: "file",
-            filename: prepared.captureFilename ?? "telegram_voice.m4a",
-            mimeType: prepared.mimeType ?? TelegramVoiceAudioPreparer.mimeType(for: prepared.captureFilename),
-            fileBytes: audioBytes,
-            fields: [
-                "model": model,
-                "response_format": "json",
-            ]
-        )
-        var req = URLRequest(url: endpoint)
-        req.httpMethod = "POST"
-        req.timeoutInterval = 45
-        req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
-        req.setValue(Self.userAgent, forHTTPHeaderField: "User-Agent")
-        req.setValue("multipart/form-data; boundary=\(body.boundary)", forHTTPHeaderField: "Content-Type")
-        req.httpBody = body.data
-
-        let data: Data
-        let response: URLResponse
-        do {
-            (data, response) = try await session.data(for: req)
-        } catch {
-            if error is CancellationError { throw CancellationError() }
-            let ns = error as NSError
-            if ns.domain == NSURLErrorDomain && ns.code == NSURLErrorCancelled {
-                throw CancellationError()
-            }
-            throw TelegramVoiceTranscriptionError.transport(ns.localizedDescription)
-        }
-        guard let http = response as? HTTPURLResponse else {
-            throw TelegramVoiceTranscriptionError.transport("non-HTTP response")
-        }
-        if http.statusCode == 401 {
-            throw TelegramVoiceTranscriptionError.authRejected
-        }
-        guard (200..<300).contains(http.statusCode) else {
-            throw TelegramVoiceTranscriptionError.apiError(
-                status: http.statusCode,
-                message: Self.errorMessage(from: data)
-            )
-        }
-        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let text = obj["text"] as? String else {
-            throw TelegramVoiceTranscriptionError.malformedResponse
-        }
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        let elapsed = max(0, Int(Date().timeIntervalSince(started) * 1000))
-        return TelegramVoiceTranscription(
-            text: trimmed,
-            backend: "openai",
-            model: model,
-            latencyMilliseconds: elapsed
-        )
-    }
-
-    private func prepareForOpenAI(_ attachment: TelegramMediaAttachment) async throws -> TelegramMediaAttachment {
-        let ext = TelegramVoiceAudioPreparer.fileExtension(for: attachment.captureFilename)
-        if let ext, Self.supportedExtensions.contains(ext) {
-            return attachment
-        }
-        do {
-            return try await TelegramVoiceAudioPreparer.transcodeToM4AAttachment(attachment)
-        } catch {
-            // Some providers accept more than the public format list. If native
-            // conversion cannot read the source, fall back to the original file
-            // instead of throwing before the transcription service gets a chance.
-            return attachment
-        }
-    }
-
-    private static func multipartBody(
-        fileField: String,
-        filename: String,
-        mimeType: String,
-        fileBytes: Data,
-        fields: [String: String]
-    ) -> (boundary: String, data: Data) {
-        let boundary = "NativeAgentBoundary-\(UUID().uuidString)"
-        var data = Data()
-        func append(_ string: String) {
-            data.append(Data(string.utf8))
-        }
-        for (key, value) in fields {
-            append("--\(boundary)\r\n")
-            append("Content-Disposition: form-data; name=\"\(key)\"\r\n\r\n")
-            append("\(value)\r\n")
-        }
-        append("--\(boundary)\r\n")
-        append("Content-Disposition: form-data; name=\"\(fileField)\"; filename=\"\(filename)\"\r\n")
-        append("Content-Type: \(mimeType)\r\n\r\n")
-        data.append(fileBytes)
-        append("\r\n--\(boundary)--\r\n")
-        return (boundary, data)
-    }
-
-    private static func errorMessage(from data: Data) -> String? {
-        guard !data.isEmpty,
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return nil
-        }
-        if let message = obj["message"] as? String { return message }
-        if let error = obj["error"] as? [String: Any],
-           let message = error["message"] as? String {
-            return message
-        }
-        return nil
     }
 }

@@ -78,8 +78,6 @@ import ApprovalInbox
 }
 
 @Test func telegramDelegateProgressUsesUserFacingWords() {
-    #expect(TelegramPollLoop.voiceTranscriptionNotice(for: TelegramBotError.notConfigured)
-        == "Voice transcription needs an OpenAI API key.")
     for (kind, text) in [("invoke_started", "Invoking Claude"),
                          ("invoke_heartbeat", "Claude still working"),
                          ("invoke_timeout", "Codex invoke timed out")] {

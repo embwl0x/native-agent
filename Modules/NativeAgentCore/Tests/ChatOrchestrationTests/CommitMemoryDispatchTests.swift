@@ -35,7 +35,7 @@ struct CommitMemoryDispatchTests {
         // must appear here (daemon always_on + AUTO), NOT gated behind Full Mac.
         let schemas = dispatcher.builtInToolSchemas(includeFullMacFileTools: false)
         let commit = try #require(schemas.first { $0.name == "commit_memory" })
-        #expect(commit.description.contains("Durably record"))
+        #expect(commit.description.contains("Save a fact"))
 
         // Schema declares `text` required and the four optional params.
         let parsed = try JSONValue.parse(commit.parametersJSON)

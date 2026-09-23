@@ -21,7 +21,6 @@ import UserNotifications
 struct ContentView: View {
     @Environment(\.colorScheme) private var colorScheme
     @EnvironmentObject private var pairingStore: PairingStore
-    @EnvironmentObject private var bridgeClient: MacBridgeClient
     @ObservedObject private var sync = iCloudSyncEngine.shared
 
     // Shared stores so the tab badges stay in sync with the views' stores
@@ -187,13 +186,6 @@ struct ContentView: View {
             } else {
                 await refreshActivityBadgesIfAllowed()
             }
-            // CloudKit/KVS snapshot groups are owner-driven. Retain the sampled
-            // fallback only for the legacy direct bridge, which has no complete
-            // snapshot publication owner.
-            while !Task.isCancelled, !pairingStore.usesICloudTransport {
-                try? await Task.sleep(nanoseconds: 5_000_000_000)
-                await refreshActivityBadgesIfAllowed()
-            }
         }
         .onDisappear {
             notificationOpenRefreshTask?.cancel()
@@ -277,9 +269,6 @@ struct ContentView: View {
                 animated: animated,
                 notifyNewArrivals: notifyNewActivity
             )
-        } else {
-            await approvalsStore.refresh(client: bridgeClient, pairingStore: pairingStore)
-            await inboxStore.refresh(client: bridgeClient, pairingStore: pairingStore)
         }
         if pruneNotifications {
             await NativeAgentActivityNotificationCleaner.pruneDeliveredNotifications(activeInboxItems: inboxStore.items)

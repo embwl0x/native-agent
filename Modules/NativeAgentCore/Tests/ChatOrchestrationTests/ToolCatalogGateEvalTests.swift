@@ -113,18 +113,63 @@ private func writeTrustPolicy(_ object: [String: JSONValue], dataRoot: URL) asyn
 
 // MARK: - chat.tools.fullMacSystemToolNames
 
+@Test func fullMacActivityAccessUsesCurrentAuthorityWithoutChangingCapturePolicy() async throws {
+    let root = try catalogEvalRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    try writeActivityPolicy(captureEnabled: true, allowModelAccess: false, dataRoot: root)
+    try await writeTrustPolicy(["permissionLevel": .string("full_mac_os")], dataRoot: root)
+    let dispatcher = SwiftToolDispatcher(dataRoot: root)
+    #expect(try await dispatcher.listAvailableTools().contains("activity_query"))
+    _ = try await dispatcher.impl_activity_query_tool(
+        tool: "activity_query", input: ["range": .string("today")], surface: "chat"
+    )
+    #expect(try ActivityPolicyStore(dataRoot: root).loadChecked().allowModelAccess == false)
+    // A surface name alone cannot manufacture authenticated remote authority.
+    await #expect(throws: AutonomyGateError.self) {
+        try await dispatcher.impl_activity_query_tool(
+            tool: "activity_query", input: ["range": .string("today")], surface: "telegram"
+        )
+    }
+    try await SwiftNativePersistenceCore().writeJSON(
+        .object(["allowed_chat_ids": .array([.string("operator-chat")])]),
+        to: root.appendingPathComponent("telegram/config.json")
+    )
+    _ = try await ChatToolSessionContext.$verifiedChatId.withValue("operator-chat") {
+        try await dispatcher.impl_activity_query_tool(
+            tool: "activity_query", input: ["range": .string("today")], surface: "telegram"
+        )
+    }
+    try await writeTrustPolicy(["permissionLevel": .string("safe")], dataRoot: root)
+    #expect(try await !dispatcher.listAvailableTools().contains("activity_query"))
+    await #expect(throws: AutonomyGateError.self) {
+        try await dispatcher.impl_activity_query_tool(
+            tool: "activity_query", input: ["range": .string("today")], surface: "chat"
+        )
+    }
+    try await writeTrustPolicy(["permissionLevel": .string("full_mac_os")], dataRoot: root)
+    try writeActivityPolicy(captureEnabled: false, allowModelAccess: false, dataRoot: root)
+    #expect(try await !dispatcher.listAvailableTools().contains("activity_query"))
+    await #expect(throws: AutonomyGateError.self) {
+        try await dispatcher.impl_activity_query_tool(
+            tool: "activity_query", input: ["range": .string("today")], surface: "chat"
+        )
+    }
+    try Data("malformed".utf8).write(to: ActivityWatchPaths.policyURL(dataRoot: root))
+    #expect(try await !dispatcher.listAvailableTools().contains("activity_query"))
+    await #expect(throws: AutonomyGateError.self) {
+        try await dispatcher.impl_activity_query_tool(
+            tool: "activity_query", input: ["range": .string("today")], surface: "chat"
+        )
+    }
+}
+
 /// `system_info` / `remote_node_list` have NEVER appeared in the live trace, so
 /// a gating regression here would be invisible indefinitely — in either
 /// direction. Every layer that has to line up is exercised.
 ///
-/// FOUND WHILE WRITING THIS EVAL, and now pinned: the `system` category is not
-/// just a Full Mac category bit. `normalizedTrustPolicy` FORCES
-/// `system_control_allowed` (and `shell_allowed`) back to false whenever
-/// `developerMode` is off — so a saved policy asking for the system category
-/// without the developer-mode escalation is silently overridden at load. That
-/// floor had no test; scenario 3 below is it. Remove the override and scenario
-/// 3 goes red, which is exactly the widening you would want to hear about.
-@Test func fullMacSystemTools_catalogMembershipFlipsExactlyWithTheSystemCategory() async throws {
+/// Full Mac is the operator's permission choice; stale master/category and
+/// developer-mode settings must not hide tools from that admitted surface.
+@Test func fullMacSystemTools_catalogMembershipHonorsFullMacOverLegacyCategorySwitches() async throws {
     let fullMacBase: [String: JSONValue] = [
         "permissionLevel": .string("full_mac_os"),
         "fullMacNeverExpires": .bool(true),
@@ -148,19 +193,19 @@ private func writeTrustPolicy(_ object: [String: JSONValue], dataRoot: URL) asyn
             true
         ),
         (
-            "system category asked for WITHOUT developer mode (must be forced off at load)",
+            "Full Mac without developer mode",
             policy(master: true, systemCategory: true, developerMode: false),
-            false
+            true
         ),
         (
             "developer mode ON but system category OFF",
             policy(master: true, systemCategory: false, developerMode: true),
-            false
+            true
         ),
         (
             "system category ON but master gate OFF",
             policy(master: false, systemCategory: true, developerMode: true),
-            false
+            true
         ),
     ]
 

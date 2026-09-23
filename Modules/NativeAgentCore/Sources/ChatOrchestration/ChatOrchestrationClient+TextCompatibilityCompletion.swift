@@ -21,7 +21,7 @@ extension SwiftNativeChatOrchestrationClient {
         // final at all, but it is stripped to its visible prefix first, exactly
         // as the Mac UI shows it.
         let replyText = finalResult?.reply ?? ToolCallParser.visiblePrefix(
-            in: ToolCallParser.stripToolUseMarkers(accumulated)
+            in: ToolCallParser.stripToolUseMarkers(accumulated), invoke: true
         ).trimmingCharacters(in: .whitespacesAndNewlines)
         // The row the conversation keeps is not always the reply the transport
         // gets: a turn that ended waiting on a card persists the one-sentence

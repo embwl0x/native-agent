@@ -123,11 +123,10 @@ public struct OrganismBehaviorPosture: Codable, Sendable, Equatable {
         surface: String,
         fileAccess: String
     ) -> String {
+        // 2026-09-22: run/session/surface ids dropped — trace plumbing no
+        // directive reads; [CognitiveSubstrate] keeps them for the trace parser.
         var lines: [String] = [
             "[OrganismBehavior]",
-            "run_id: \(cleanToken(runId))",
-            "session_id: \(cleanToken(sessionId))",
-            "surface: \(cleanToken(surface))",
             "file_access: \(cleanToken(fileAccess))",
             "posture: \(posture)",
             "tool_claims: \(claimDiscipline.rawValue)",

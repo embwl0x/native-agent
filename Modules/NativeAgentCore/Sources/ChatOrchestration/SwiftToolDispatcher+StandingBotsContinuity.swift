@@ -25,7 +25,13 @@ public enum StandingBotContinuity {
             // A text-only account hears the limitation before the brief, so the
             // answer leads with it instead of dressing remembered text as fresh
             // (Agent, 2026-09-10: appending the note did not make the reply honest).
-            var message = message
+            // A first conversation need not be preceded by Run once. Reattach
+            // the current saved brief on every turn so first asks and edited
+            // jobs receive their instructions without replaying a prior run.
+            // This stays in the ordinary session; there is no second memory.
+            var message = "Current standing instructions for \(bot.name):\n\(bot.brief)"
+                + (bot.outputFormat.map { "\nRequested output: " + $0 } ?? "")
+                + "\n\nMessage for this turn:\n" + message
             if let provider = bot.provider, !ProviderToolCapability.supportsTools(providerID: provider) {
                 message = ProviderToolCapability.textOnlyTurnPreface + "\n\n" + message
             }

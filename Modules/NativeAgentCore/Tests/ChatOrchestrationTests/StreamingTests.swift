@@ -8,6 +8,7 @@ import MemoryV2
 import ProviderRouting
 import TrustCenter
 import DreamREMCycle
+import NativeAgentTestSupport
 
 // MARK: - Helpers (duplicated from ChatOrchestrationTurnEngineTests.swift —
 // private there, redeclared fileprivate here so this file compiles standalone).

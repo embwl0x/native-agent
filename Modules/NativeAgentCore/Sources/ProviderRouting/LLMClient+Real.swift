@@ -637,6 +637,50 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
         }
     }
 
+    /// The one provider switch all four dispatch paths share, so a guard added
+    /// here cannot be missing from a sibling copy (the F1-M1 guard below once
+    /// lived only in the streaming path). `label` is the stream-guard label.
+    private func adapter(
+        for resolution: AdapterResolution,
+        tools: [LLMToolSchema]?
+    ) throws -> (adapter: any LLMAdapter, label: String) {
+        switch resolution.choice {
+        case .openRouter:
+            guard let openRouter else { throw LLMError.notConfigured(provider: "openrouter") }
+            return (openRouter, "openrouter")
+        case .anthropic:
+            // F1-M1: the native-tools GATE (usesNativeToolLane) and the
+            // resolver decide the provider independently; with
+            // LLMCallContext.providerId nil the gate can admit the native lane
+            // on the model-id backstop while the resolver keeps an anthropic
+            // surface pin. Sending provider-native tools[] on a Claude
+            // subscription connection is the documented invariant this defends
+            // (NativeToolCapability) — kimi-code is the ONLY anthropic-family
+            // adapter probed for the native tools contract. Scoped HERE, not
+            // pre-dispatch: OpenAI-shaped lanes receive tools[] legitimately
+            // (function calling). FAIL LOUD — never silently strip tools.
+            if tools != nil,
+               !NativeToolCapability.providerSupportsNativeTools(resolution.providerId) {
+                throw LLMError.providerError(message:
+                    "native tools[] bound to non-native Anthropic-family adapter "
+                    + "'\(resolution.providerId)' for model "
+                    + "'\(resolution.model)' — "
+                    + "gate/resolver disagreement (F1-M1)")
+            }
+            return (try anthropicAdapter(for: resolution.providerId), resolution.providerId)
+        case .openAI:
+            return (try openAIAdapter(for: resolution.providerId), resolution.providerId)
+        case .xai:
+            guard let xaiOAuthDirect else { throw LLMError.notConfigured(provider: "xai_oauth_direct") }
+            return (xaiOAuthDirect, "xai")
+        case .moonshot:
+            guard let moonshot else { throw LLMError.notConfigured(provider: "moonshot") }
+            return (moonshot, "moonshot")
+        case .codex:
+            return (codex, "codex")
+        }
+    }
+
     private func adapterChoice(forProviderId rawProviderId: String) -> AdapterChoice? {
         switch SwiftNativeProviderRouting.normalizeProviderId(rawProviderId) {
         case "anthropic": return .anthropic
@@ -760,6 +804,7 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
     /// with no error (observed 2026-09-05: an OAuth-direct request open >11 min).
     private func withCompletionWall<T: Sendable>(
         _ label: String,
+        providerId: String,
         _ work: @escaping @Sendable () async throws -> T
     ) async throws -> T {
         // User, 2026-09-06: bound the per-call wall by what the whole turn has
@@ -767,8 +812,12 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
         // (600s) equalled the interactive/Telegram turn window (600s), so the
         // first hung call spent the entire budget and the reconnect ladder
         // exited on the budget instead of retrying.
+        // 2026-09-22 WHY: 300s, not the stream's 600s, on the OAuth-direct routes
+        // only. Slowest real non-streaming call there in 14 days was 245s; hung
+        // ones sat the full 600s then passed on retry.
         let wall = ProviderRecoveryPolicy.callWallSeconds(
-            configured: streamGuardConfig.wallTimeout,
+            configured: providerId.hasSuffix("_oauth_direct")
+                ? min(streamGuardConfig.wallTimeout, 300) : streamGuardConfig.wallTimeout,
             remainingTurnSeconds: LLMCallContext.remainingTurnSeconds
         )
         guard wall > 0 else { return try await work() }
@@ -911,42 +960,12 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
         // U1 step 1: bind the calling surface task-locally so the adapters'
         // llm.call telemetry rows can carry it (no signature changes).
         do {
-            let result = try await ProviderRecoveryPolicy.retryOverload { try await withCompletionWall("\(resolution.choice)") { [self] in try await LLMCallContext.$surface.withValue(surface) {
+            let result = try await ProviderRecoveryPolicy.retryOverload { try await withCompletionWall("\(resolution.choice)", providerId: resolution.providerId) { [self] in try await LLMCallContext.$surface.withValue(surface) {
                 try await LLMCallContext.$reasoningEffort.withValue(controls.effort) {
                     try await LLMCallContext.$serviceTier.withValue(controls.serviceTier) {
-                switch resolution.choice {
-                case .openRouter:
-                    guard let or = openRouter else {
-                        throw LLMError.notConfigured(provider: "openrouter")
-                    }
-                    return try await or.complete(
-                        prompt: prompt, system: system, model: effectiveModel, tools: tools
-                    )
-                case .anthropic:
-                    return try await anthropicAdapter(for: resolution.providerId).complete(
-                        prompt: prompt, system: system, model: effectiveModel, tools: tools
-                    )
-                case .openAI:
-                    return try await openAIAdapter(for: resolution.providerId).complete(
-                        prompt: prompt, system: system, model: effectiveModel, tools: tools
-                    )
-                case .xai:
-                    guard let xai = xaiOAuthDirect else {
-                        throw LLMError.notConfigured(provider: "xai_oauth_direct")
-                    }
-                    return try await xai.complete(
-                        prompt: prompt, system: system, model: effectiveModel, tools: tools
-                    )
-                case .moonshot:
-                    guard let moonshot else { throw LLMError.notConfigured(provider: "moonshot") }
-                    return try await moonshot.complete(
-                        prompt: prompt, system: system, model: effectiveModel, tools: tools
-                    )
-                case .codex:
-                    return try await codex.complete(
-                        prompt: prompt, system: system, model: effectiveModel, tools: tools
-                    )
-                }
+                return try await adapter(for: resolution, tools: tools).adapter.complete(
+                    prompt: prompt, system: system, model: effectiveModel, tools: tools
+                )
                     }
                 }
             } } }
@@ -1010,59 +1029,12 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
         )
         // U1 step 1: bind the calling surface task-locally for telemetry.
         do {
-            let result = try await ProviderRecoveryPolicy.retryOverload { try await withCompletionWall("\(resolution.choice)") { [self] in try await LLMCallContext.$surface.withValue(surface) {
+            let result = try await ProviderRecoveryPolicy.retryOverload { try await withCompletionWall("\(resolution.choice)", providerId: resolution.providerId) { [self] in try await LLMCallContext.$surface.withValue(surface) {
                 try await LLMCallContext.$reasoningEffort.withValue(controls.effort) {
                     try await LLMCallContext.$serviceTier.withValue(controls.serviceTier) {
-                switch resolution.choice {
-                case .openRouter:
-                    guard let or = openRouter else {
-                        throw LLMError.notConfigured(provider: "openrouter")
-                    }
-                    return try await or.completeMessages(
-                        messages: messages, system: system, model: effectiveModel, tools: tools
-                    )
-                case .anthropic:
-                    // User, 2026-09-06: the STREAMING branch has carried this
-                    // guard since F1-M1; the non-streaming one did not, and
-                    // `runEphemeralToolTurn` (Workshop, Studio, swarm workers,
-                    // scheduler jobs) drives the structured loop through THIS
-                    // call with schemas attached. On an Anthropic OAuth surface
-                    // that reached the OAuth builder, which writes body["tools"]
-                    // — the one request shape NativeToolCapability exists to
-                    // keep off the Claude subscription connection. FAIL LOUD,
-                    // never silently strip: same message, same invariant.
-                    if tools != nil,
-                       !NativeToolCapability.providerSupportsNativeTools(resolution.providerId) {
-                        throw LLMError.providerError(message:
-                            "native tools[] bound to non-native Anthropic-family adapter "
-                            + "'\(resolution.providerId)' for model "
-                            + "'\(resolution.model)' — "
-                            + "gate/resolver disagreement (F1-M1)")
-                    }
-                    return try await anthropicAdapter(for: resolution.providerId).completeMessages(
-                        messages: messages, system: system, model: effectiveModel, tools: tools
-                    )
-                case .openAI:
-                    return try await openAIAdapter(for: resolution.providerId).completeMessages(
-                        messages: messages, system: system, model: effectiveModel, tools: tools
-                    )
-                case .xai:
-                    guard let xai = xaiOAuthDirect else {
-                        throw LLMError.notConfigured(provider: "xai_oauth_direct")
-                    }
-                    return try await xai.completeMessages(
-                        messages: messages, system: system, model: effectiveModel, tools: tools
-                    )
-                case .moonshot:
-                    guard let moonshot else { throw LLMError.notConfigured(provider: "moonshot") }
-                    return try await moonshot.completeMessages(
-                        messages: messages, system: system, model: effectiveModel, tools: tools
-                    )
-                case .codex:
-                    return try await codex.completeMessages(
-                        messages: messages, system: system, model: effectiveModel, tools: tools
-                    )
-                }
+                return try await adapter(for: resolution, tools: tools).adapter.completeMessages(
+                    messages: messages, system: system, model: effectiveModel, tools: tools
+                )
                     }
                 }
             } } }
@@ -1158,8 +1130,8 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
                     try self.validateCatalogAvailability(resolution)
                     ProviderToolCapability.recordOfferedTools(providerID: resolution.providerId, tools: tools)
                     // F1-M1 NOTE: the guard for "tools[] must never reach a
-                    // Claude OAuth adapter" lives inside the `.anthropic`
-                    // dispatch case below — NOT here. `tools != nil` is NOT
+                    // Claude OAuth adapter" lives inside `adapter(for:tools:)`'s
+                    // `.anthropic` case — NOT here. `tools != nil` is NOT
                     // native-lane-exclusive: the structured tool loop
                     // (ChatOrchestration+ToolLoop) passes provider tool schemas
                     // to EVERY provider for function calling, so a blanket
@@ -1180,64 +1152,10 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
                     lifecycle = started
                     try await LLMCallContext.$reasoningEffort.withValue(controls.effort) {
                     try await LLMCallContext.$serviceTier.withValue(controls.serviceTier) {
-                    switch resolution.choice {
-                    case .openRouter:
-                        guard let or = openRouter else {
-                            throw LLMError.notConfigured(provider: "openrouter")
-                        }
-                        try await forward(or.streamMessages(
-                            messages: messages, system: system, model: effectiveModel, tools: tools
-                        ), providerLabel: "openrouter")
-                    case .anthropic:
-                        // F1-M1: the native-tools GATE (usesNativeToolLane) and
-                        // this resolver decide the provider independently; with
-                        // LLMCallContext.providerId nil the gate can admit the
-                        // native lane on the model-id backstop while the
-                        // resolver keeps an anthropic surface pin. Sending
-                        // provider-native tools[] on a Claude subscription
-                        // connection is the documented invariant this defends
-                        // (NativeToolCapability) — kimi-code is the ONLY
-                        // anthropic-family adapter probed for the native tools
-                        // contract. Scoped HERE, not pre-dispatch: OpenAI-shaped
-                        // lanes receive tools[] legitimately (function calling).
-                        // FAIL LOUD — never silently strip tools (house rule:
-                        // no silent fallbacks).
-                        if tools != nil,
-                           !NativeToolCapability.providerSupportsNativeTools(resolution.providerId) {
-                            throw LLMError.providerError(message:
-                                "native tools[] bound to non-native Anthropic-family adapter "
-                                + "'\(resolution.providerId)' for model "
-                                + "'\(resolution.model)' — "
-                                + "gate/resolver disagreement (F1-M1)")
-                        }
-                        let adapter = try self.anthropicAdapter(for: resolution.providerId)
-                        try await forward(adapter.streamMessages(
-                            messages: messages, system: system, model: effectiveModel, tools: tools
-                        ), providerLabel: resolution.providerId)
-                    case .openAI:
-                        let adapter = try self.openAIAdapter(for: resolution.providerId)
-                        try await forward(adapter.streamMessages(
-                            messages: messages, system: system, model: effectiveModel, tools: tools
-                        ), providerLabel: resolution.providerId)
-                    case .xai:
-                        guard let xai = self.xaiOAuthDirect else {
-                            throw LLMError.notConfigured(provider: "xai_oauth_direct")
-                        }
-                        try await forward(xai.streamMessages(
-                            messages: messages, system: system, model: effectiveModel, tools: tools
-                        ), providerLabel: "xai")
-                    case .moonshot:
-                        guard let moonshot = self.moonshot else {
-                            throw LLMError.notConfigured(provider: "moonshot")
-                        }
-                        try await forward(moonshot.streamMessages(
-                            messages: messages, system: system, model: effectiveModel, tools: tools
-                        ), providerLabel: "moonshot")
-                    case .codex:
-                        try await forward(codex.streamMessages(
-                            messages: messages, system: system, model: effectiveModel, tools: tools
-                        ), providerLabel: "codex")
-                    }
+                    let (adapter, providerLabel) = try self.adapter(for: resolution, tools: tools)
+                    try await forward(adapter.streamMessages(
+                        messages: messages, system: system, model: effectiveModel, tools: tools
+                    ), providerLabel: providerLabel)
                     }
                     }
                     // User, 2026-09-06: cancellation can resume the iteration's
@@ -1302,7 +1220,6 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
         // withValue overload (was a sync binding around construction — the
         // G4-5 release-crash LIFO shape; see ChatOrchestration+ToolLoop).
         AsyncThrowingStream { continuation in
-            let codex = self.codex
             // Same per-call wall bound as `withCompletionWall`.
             var streamGuardConfig = self.streamGuardConfig
             streamGuardConfig.wallTimeout = ProviderRecoveryPolicy.callWallSeconds(
@@ -1361,54 +1278,14 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
                 await LLMCallContext.$serviceTier.withValue(controls.serviceTier) {
                 let stream: AsyncThrowingStream<String, Error>
                 let providerLabel: String
-                switch resolution.choice {
-                case .openRouter:
-                    guard let or = self.openRouter else {
-                        await self.providerLifecycleFinish(started, phase: .failed)
-                        continuation.finish(throwing: LLMError.notConfigured(provider: "openrouter"))
-                        return
-                    }
-                    stream = or.stream(prompt: prompt, system: system, model: effectiveModel)
-                    providerLabel = "openrouter"
-                case .anthropic:
-                    do {
-                        let adapter = try self.anthropicAdapter(for: resolution.providerId)
-                        stream = adapter.stream(prompt: prompt, system: system, model: effectiveModel)
-                        providerLabel = resolution.providerId
-                    } catch {
-                        await self.providerLifecycleFinish(started, phase: .failed)
-                        continuation.finish(throwing: ProviderFailure.normalize(error))
-                        return
-                    }
-                case .openAI:
-                    do {
-                        let adapter = try self.openAIAdapter(for: resolution.providerId)
-                        stream = adapter.stream(prompt: prompt, system: system, model: effectiveModel)
-                        providerLabel = resolution.providerId
-                    } catch {
-                        await self.providerLifecycleFinish(started, phase: .failed)
-                        continuation.finish(throwing: ProviderFailure.normalize(error))
-                        return
-                    }
-                case .xai:
-                    guard let xai = self.xaiOAuthDirect else {
-                        await self.providerLifecycleFinish(started, phase: .failed)
-                        continuation.finish(throwing: LLMError.notConfigured(provider: "xai_oauth_direct"))
-                        return
-                    }
-                    stream = xai.stream(prompt: prompt, system: system, model: effectiveModel)
-                    providerLabel = "xai"
-                case .moonshot:
-                    guard let moonshot = self.moonshot else {
-                        await self.providerLifecycleFinish(started, phase: .failed)
-                        continuation.finish(throwing: LLMError.notConfigured(provider: "moonshot"))
-                        return
-                    }
-                    stream = moonshot.stream(prompt: prompt, system: system, model: effectiveModel)
-                    providerLabel = "moonshot"
-                case .codex:
-                    stream = codex.stream(prompt: prompt, system: system, model: effectiveModel)
-                    providerLabel = "codex"
+                do {
+                    let resolved = try self.adapter(for: resolution, tools: nil)
+                    stream = resolved.adapter.stream(prompt: prompt, system: system, model: effectiveModel)
+                    providerLabel = resolved.label
+                } catch {
+                    await self.providerLifecycleFinish(started, phase: .failed)
+                    continuation.finish(throwing: ProviderFailure.normalize(error))
+                    return
                 }
                 let guardedStream = ProviderStreamGuard.wrap(
                     stream,

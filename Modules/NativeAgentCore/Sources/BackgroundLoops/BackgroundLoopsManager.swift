@@ -472,6 +472,7 @@ public actor BackgroundLoopsManager {
     private let clock: @Sendable () -> Date
     private var started = false
     private var starting = false
+    private var stopped = false
     private var startedAt: Date?
     private var lifecycleGeneration: UInt64 = 0
     private var startWaiters: [CheckedContinuation<Void, Never>] = []
@@ -534,9 +535,10 @@ public actor BackgroundLoopsManager {
     /// `restartLoop(id:newLoop:)` so unrelated loop tasks and counters survive.
     @discardableResult
     public func start(loops: [any LoopRunner] = []) async -> Bool {
+        guard !stopped else { return false }
         if starting {
             await waitForStartTransition()
-            guard started else { return false }
+            guard started, !stopped else { return false }
         }
         if started {
             for loop in loops where registrations[loop.loopId] == nil {
@@ -552,10 +554,10 @@ public actor BackgroundLoopsManager {
         for loop in loops where registrations[loop.loopId] == nil {
             await register(loop)
         }
-        guard starting, lifecycleGeneration == generation else { return false }
+        guard starting, !stopped, lifecycleGeneration == generation else { return false }
 
         await scheduler.start()
-        guard starting, lifecycleGeneration == generation else {
+        guard starting, !stopped, lifecycleGeneration == generation else {
             await scheduler.stop()
             return false
         }
@@ -564,6 +566,13 @@ public actor BackgroundLoopsManager {
         activateAllPhysiology()
         finishStartTransition()
         return true
+    }
+
+    /// Terminal stop for app quit: the manager never starts again. Plain
+    /// `stop()` stays restartable and keeps registrations.
+    public func shutdown() async {
+        stopped = true
+        await stop()
     }
 
     public func stop() async {

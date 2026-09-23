@@ -151,6 +151,46 @@ enum TelegramRichMessageRenderer {
         return value
     }
 
+    /// 2026-09-22: rich blocks and ordinary sends carry plain text (no
+    /// parse_mode, no entities), so markdown showed raw. Outside code fences:
+    /// drop `**bold**` and `*italic*` markers, turn `[text](url)` into
+    /// "text (url)", and drop the backticks around inline code (its contents
+    /// stay untouched). Bullets ("* ") and math (2*3*4) are left alone.
+    static func stripBoldMarkers(_ text: String) -> String {
+        guard text.contains("*") || text.contains("`") || text.contains("]("),
+              let bold = try? NSRegularExpression(pattern: #"\*\*(?=\S)(.+?)(?<=\S)\*\*"#),
+              // Opens at start/after space or an opening bracket/quote; closes before
+              // space, punctuation or end. A / or . beside a star never counts (globs).
+              let italic = try? NSRegularExpression(
+                  pattern: #"(?<![^\s(\[{"'“‘])\*(?=[^\s*/.])(.+?)(?<=[^\s*/.])\*(?![^\s,;:!?)\]}"'”’])"#
+              ),
+              let link = try? NSRegularExpression(pattern: #"\[([^\]\n]+)\]\(([^)\s]+)\)"#)
+        else { return text }
+        var inFence = false
+        return text.split(separator: "\n", omittingEmptySubsequences: false).map { line -> String in
+            let line = String(line)
+            if line.hasPrefix("```") { inFence.toggle(); return line }
+            guard !inFence else { return line }
+            let parts = line.split(separator: "`", omittingEmptySubsequences: false)
+            let cleaned = parts
+                .enumerated()
+                .map { index, part -> String in
+                    var part = String(part)
+                    guard index.isMultiple(of: 2) else { return part }
+                    for (regex, template) in [(bold, "$1"), (italic, "$1"), (link, "$1 ($2)")] {
+                        part = regex.stringByReplacingMatches(
+                            in: part,
+                            range: NSRange(part.startIndex..., in: part),
+                            withTemplate: template
+                        )
+                    }
+                    return part
+                }
+            // Paired backticks (odd part count) are inline code: drop them.
+            return cleaned.joined(separator: parts.count.isMultiple(of: 2) ? "`" : "")
+        }.joined(separator: "\n")
+    }
+
     private static func parseBlocks(_ source: [Substring]) -> [TelegramInputRichBlock] {
         let lines = source.map(String.init)
         var blocks: [TelegramInputRichBlock] = []

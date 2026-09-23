@@ -217,6 +217,11 @@ extension MemoryStorage {
                 );
             """)
         }
+        // The embedding rollback lane had no caller; its retained-vector copy
+        // table is dropped rather than kept filling on every activation.
+        m.registerMigration("v9_drop_embedding_previous") { db in
+            try db.execute(sql: "DROP TABLE IF EXISTS memory_embedding_previous")
+        }
         return m
     }
 

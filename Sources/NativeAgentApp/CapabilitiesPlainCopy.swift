@@ -156,7 +156,7 @@ enum CapabilitiesPlainCopy {
         case "search_chat_history", "session_search": return "Find an earlier conversation."
         case "request_interaction": return "Ask you for a choice or an answer."
         case "list_skills", "read_skill", "save_skill": return "Find or save instructions for a task."
-        case "second_opinion", "agent_swarm": return "Ask other assistants for help."
+        case "agent_swarm": return "Ask other assistants for help."
         case "claude_message", "invoke_claude", "codex_message", "invoke_codex", "omp_message": return "Exchange messages with another assistant."
         default: break
         }

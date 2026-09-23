@@ -48,7 +48,6 @@ extension MemoryStorage {
             ("memories", "id", "embedding"),
             ("proposals", "id", "embedding"),
             ("tombstones", "content_hash", "embedding"),
-            ("memory_embedding_previous", "kind || ':' || row_id", "embedding"),
         ]
         for field in blobColumns {
             let sql = """
@@ -81,10 +80,6 @@ extension MemoryStorage {
                 UNION ALL
                 SELECT embedding_epoch AS epoch, length(embedding) AS bytes
                 FROM tombstones WHERE embedding IS NOT NULL AND embedding_epoch IS NOT NULL
-                UNION ALL
-                SELECT embedding_epoch AS epoch, length(embedding) AS bytes
-                FROM memory_embedding_previous
-                WHERE embedding IS NOT NULL AND embedding_epoch IS NOT NULL
             )
             GROUP BY epoch
             HAVING MIN(bytes) != MAX(bytes)

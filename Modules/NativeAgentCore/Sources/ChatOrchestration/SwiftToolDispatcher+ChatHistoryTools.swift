@@ -21,6 +21,8 @@ private struct ChatHistorySessionMetadata: Sendable {
 
 private struct ChatHistorySearchHit: Sendable {
     var score: Double
+    var runId: String?
+    var workContextRank = 1
     var sessionId: String
     var sessionTitle: String?
     var sessionCreatedAt: String?
@@ -38,7 +40,11 @@ private struct ChatHistorySearchHit: Sendable {
 extension SwiftToolDispatcher {
     static let chatHistoryCurrentSessionFloor = 0.3
 
-    func impl_search_chat_history(input: [String: JSONValue], invokedAs: String) async throws -> JSONValue {
+    func impl_search_chat_history(
+        input: [String: JSONValue], invokedAs: String,
+        workContextQuery: WorkContextQuery? = nil,
+        excludingRunID: String? = nil
+    ) async throws -> JSONValue {
         let input = input.filter { $0.value != .string("") }
         let requestedScope = (jsonString(input["scope"]) ?? "auto")
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -158,6 +164,8 @@ extension SwiftToolDispatcher {
                     continue
                 }
                 let meta = sessionMeta[sessionId]
+                let firstHit = hits.count
+                var runTools: [String: Set<String>] = [:]
                 var messageIndex = 0
                 let lines = text.split(separator: "\n", omittingEmptySubsequences: true)
                 for rawLine in lines {
@@ -171,6 +179,19 @@ extension SwiftToolDispatcher {
                         continue
                     }
                     let role = (jsonString(obj["role"]) ?? "unknown").lowercased()
+                    if let excludingRunID, jsonString(obj["runId"]) == excludingRunID { continue }
+                    if workContextQuery != nil, role == "tool",
+                       let runID = jsonString(obj["runId"]), !runID.isEmpty {
+                        let metadata: [String: JSONValue]
+                        if case .object(let value)? = obj["metadata"] { metadata = value }
+                        else if case .string(let text)? = obj["metadata"],
+                                let parsed = try? JSONValue.parse(Data(text.utf8)),
+                                case .object(let value) = parsed { metadata = value }
+                        else { metadata = [:] }
+                        if let name = jsonString(metadata["toolName"] ?? obj["toolName"]), !name.isEmpty {
+                            runTools[runID, default: []].insert(name)
+                        }
+                    }
                     if let roleFilter, !roleFilter.isEmpty, role != roleFilter {
                         continue
                     }
@@ -201,7 +222,12 @@ extension SwiftToolDispatcher {
                             rowMetadata: obj["metadata"]
                         )
                     )
-                    let score = chatHistoryScore(
+                    // Optional composition-level relevance policy. Work recall
+                    // must not match unrelated rows merely because their broad
+                    // session title happens to name the same project.
+                    let workScore = workContextQuery.map { $0.score(searchable) }
+                    if let workScore, workScore == 0 { continue }
+                    let score = workScore.map(Double.init) ?? chatHistoryScore(
                         content: searchable,
                         sessionTitle: meta?.title.map(ChatTranscriptBoilerplate.stripBridgePrefix),
                         query: query,
@@ -221,6 +247,7 @@ extension SwiftToolDispatcher {
                     }
                     hits.append(ChatHistorySearchHit(
                         score: score,
+                        runId: jsonString(obj["runId"]),
                         sessionId: sessionId,
                         sessionTitle: meta?.title,
                         sessionCreatedAt: meta?.createdAt,
@@ -237,9 +264,16 @@ extension SwiftToolDispatcher {
                             role: role, row: obj
                         ).prefix(368)),
                         continuity: continuityMode ? Self.continuityNeighbors(
-                            lines: lines, index: messageIndex, roleFilter: roleFilter
+                            lines: lines, index: messageIndex, roleFilter: roleFilter, sessionId: sessionId,
+                            excludingRunID: excludingRunID
                         ) : []
                     ))
+                }
+                if workContextQuery != nil {
+                    for index in firstHit..<hits.count {
+                        let tools = hits[index].runId.flatMap { runTools[$0] } ?? []
+                        hits[index].workContextRank = Self.workContextActivityRank(tools)
+                    }
                 }
             }
             return (hits, searchedSessions)
@@ -317,9 +351,9 @@ extension SwiftToolDispatcher {
 
         var hits = selected.hits
         let searchedSessions = selected.sessions
-        hits.sort {
-            if sort == "relevance", $0.score != $1.score { return $0.score > $1.score }
-            switch ($0.timestampInstant, $1.timestampInstant) {
+        func hitsOrder(_ lhs: ChatHistorySearchHit, _ rhs: ChatHistorySearchHit) -> Bool {
+            if sort == "relevance", lhs.score != rhs.score { return lhs.score > rhs.score }
+            switch (lhs.timestampInstant, rhs.timestampInstant) {
             case let (left?, right?) where left != right: return sort == "oldest" ? left < right : left > right
             case (_?, nil): return true
             case (nil, _?): return false
@@ -328,10 +362,39 @@ extension SwiftToolDispatcher {
             // Equal instants (or absent dates) still need repeatable paging.
             // Within a transcript, canonical row order is the final recency
             // evidence; different sessions get a stable identity tie-break.
-            if $0.sessionId != $1.sessionId { return $0.sessionId < $1.sessionId }
-            return sort == "oldest" ? $0.messageIndex < $1.messageIndex : $0.messageIndex > $1.messageIndex
+            if lhs.sessionId != rhs.sessionId { return lhs.sessionId < rhs.sessionId }
+            return sort == "oldest" ? lhs.messageIndex < rhs.messageIndex : lhs.messageIndex > rhs.messageIndex
         }
-        let page = hits.dropFirst(min(offset, hits.count)).prefix(limit)
+        hits.sort(by: hitsOrder)
+        let page: [ChatHistorySearchHit]
+        let selectableCount: Int
+        if workContextQuery != nil {
+            // Keep the newest match alongside source-oriented turns so a
+            // later correction is not buried by older recorded activity.
+            // One representative per persisted run prevents its request and
+            // answer consuming the entire small page. Legacy rows retain
+            // their own identity; do not guess their run membership.
+            let newest = hits.first
+            var ranked = hits.sorted {
+                if $0.workContextRank != $1.workContextRank { return $0.workContextRank < $1.workContextRank }
+                return hitsOrder($0, $1)
+            }
+            var chosen: [ChatHistorySearchHit] = []
+            var represented: Set<String> = []
+            func append(_ hit: ChatHistorySearchHit) {
+                let identity = hit.sessionId + ":" + (hit.runId.flatMap { $0.isEmpty ? nil : $0 }
+                    ?? "row:\(hit.messageIndex)")
+                if represented.insert(identity).inserted { chosen.append(hit) }
+            }
+            if !ranked.isEmpty { append(ranked.removeFirst()) }
+            if limit > 1, let newest { append(newest) }
+            for hit in ranked { append(hit) }
+            selectableCount = chosen.count
+            page = Array(chosen.dropFirst(min(offset, chosen.count)).prefix(limit))
+        } else {
+            selectableCount = hits.count
+            page = Array(hits.dropFirst(min(offset, hits.count)).prefix(limit))
+        }
         let out = page.map { hit -> JSONValue in
             var obj: [String: JSONValue] = [
                 "session_id": .string(hit.sessionId),
@@ -342,6 +405,13 @@ extension SwiftToolDispatcher {
                 "score": .double(hit.score),
             ]
             if hit.role == "tool" { obj["evidence_type"] = .string("persisted_tool_receipt") }
+            if workContextQuery != nil {
+                obj["ranking_basis"] = .string([
+                    "same_turn_tool_activity_without_history_lookup",
+                    "no_classifiable_turn_activity",
+                    "turn_includes_history_lookup"
+                ][hit.workContextRank])
+            }
             if let title = hit.sessionTitle, !title.isEmpty { obj["session_title"] = .string(title) }
             if let created = hit.sessionCreatedAt, !created.isEmpty { obj["session_created_at"] = .string(created) }
             obj["source_path"] = .string("chat/messages/\(hit.sessionId).jsonl")
@@ -377,12 +447,15 @@ extension SwiftToolDispatcher {
             "hit_count": .int(Int64(hits.count)),
             "returned_count": .int(Int64(out.count)),
             "offset": .int(Int64(offset)),
-            "has_more": .bool(offset + out.count < hits.count),
+            "has_more": .bool(offset + out.count < selectableCount),
             "hits": .array(Array(out)),
         ]
         if roleFilter == "tool" {
             response["evidence_type"] = .string("persisted_tool_receipt")
             response["receipt_coverage"] = .string(Self.toolReceiptCoverage)
+        }
+        if workContextQuery != nil {
+            response["selection_policy"] = .string("Prefer matching turns with recorded activity outside history lookup, newest within each tier; retain the newest matching context and one excerpt per known run. Tool activity is a retrieval hint, not proof of success. Ordinary history search remains available for every matching row.")
         }
         if before != nil { response["before"] = input["before"] }
         if after != nil { response["after"] = input["after"] }
@@ -405,6 +478,21 @@ extension SwiftToolDispatcher {
             response["previous_session_id"] = .string(resolvedPreviousSessionId)
         }
         return .object(response)
+    }
+
+    /// Evidence about how a turn was produced, never a text classifier for
+    /// "test" or "done" and never a success/authority judgment. A turn that
+    /// reads history can repeat older work verbatim; don't let that echo
+    /// displace the original simply by being newer. Other activity in that
+    /// turn does not erase its history-lookup provenance.
+    private static func workContextActivityRank(_ tools: Set<String>) -> Int {
+        let historyTools: Set<String> = [
+            "workspace", "work_context", "artifact_find", "search_chat_history", "session_search",
+            "read_chat_message", "recall_memory", "recall_search", "context_lookup", "studio_recall"
+        ]
+        if !tools.isDisjoint(with: historyTools) { return 2 }
+        let discoveryTools: Set<String> = ["tool_catalog", "tool_load", "list_tools", "tool_result_page"]
+        return tools.subtracting(discoveryTools).isEmpty ? 1 : 0
     }
 
     private static let toolReceiptCoverage = "Historical persisted receipt, potentially redacted or truncated; not the full original result or a fresh source read. Paging expands only the retained receipt."
@@ -485,7 +573,8 @@ extension SwiftToolDispatcher {
     /// Only the explicitly invoked history tool asks for this material. No
     /// background digest, cross-session scan, or work reminder is injected.
     private static func continuityNeighbors(
-        lines: [Substring], index: Int, roleFilter: String?
+        lines: [Substring], index: Int, roleFilter: String?, sessionId: String,
+        excludingRunID: String?
     ) -> [JSONValue] {
         guard lines.indices.contains(index) else { return [] }
         return (max(0, index - 2)...min(lines.count - 1, index + 2)).compactMap { offset in
@@ -497,11 +586,21 @@ extension SwiftToolDispatcher {
                   roleFilter == nil || roleFilter == role,
                   case .string(let content)? = row["content"] ?? row["text"] else { return nil }
             let display = chatHistoryDisplayEvidence(String(content.prefix(480)), role: role, row: row)
-            return .object([
+            var result: [String: JSONValue] = [
                 "role": .string(role), "message_index": .int(Int64(offset)),
                 "excerpt": .string(String(display.prefix(480))),
                 "truncated": .bool(content.count > 480 || display.count > 480),
-            ])
+            ]
+            if let excludingRunID, row["runId"] == .string(excludingRunID) { return nil }
+            result["timestamp"] = row["createdAt"] ?? row["timestamp"]
+            if case .string(let messageId)? = row["id"], !messageId.isEmpty {
+                result["message_id"] = .string(messageId)
+                result["read_locator"] = .object([
+                    "tool": .string("read_chat_message"),
+                    "arguments": .object(["session_id": .string(sessionId), "message_id": .string(messageId)])
+                ])
+            }
+            return .object(result)
         }
     }
 

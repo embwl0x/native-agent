@@ -261,10 +261,28 @@ public enum ConversationPrefixTelemetry {
     /// and replaces the borrowed shape with `requestShape: "unmeasured"` — said
     /// out loud, because plain absence is indistinguishable from a chat row
     /// recorded before the prefix was known.
+    ///
+    /// 2026-09-22: it also sheds the turn's admitted provider/model/effort/tier
+    /// and token budget — once chat moved to Opus, 24 memory calls rode the
+    /// chat route instead of the Memory row's own provider and model.
     public static func withUnmeasuredRequestShape<T: Sendable>(
         _ body: () async throws -> T
     ) async rethrows -> T {
-        try await $sink.withValue(.unmeasuredRequestShape) { try await body() }
+        try await $sink.withValue(.unmeasuredRequestShape) {
+            try await LLMCallContext.$providerId.withValue(nil) {
+                try await LLMCallContext.$admittedModel.withValue(nil) {
+                    try await LLMCallContext.$reasoningEffort.withValue(nil) {
+                        try await LLMCallContext.$serviceTier.withValue(nil) {
+                            try await LLMCallContext.$turnTokenBudget.withValue(nil) {
+                                try await LLMCallContext.$botOutputTokenLimit.withValue(nil) {
+                                    try await body()
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -618,7 +636,9 @@ public final class LLMCallTraceRecorder: @unchecked Sendable {
         /// token counts: a missing or mis-TTL'd breakpoint shows up here
         /// directly. Absent for callers that do not pass it, so those rows
         /// decode exactly as before.
-        cacheMarkers: [LLMCacheMarker]? = nil
+        cacheMarkers: [LLMCacheMarker]? = nil,
+        /// Provider stop reason (end_turn, max_tokens, tool_use…). Additive.
+        stopReason: String? = nil
     ) async {
         let surface = LLMCallContext.surface ?? "unknown"
         // Turn Inspector W1: tag with the per-turn trace id so the Inspector
@@ -670,6 +690,7 @@ public final class LLMCallTraceRecorder: @unchecked Sendable {
         if let requestBody, let prefix = ConversationPrefixTelemetry.current {
             payload.merge(RequestPrefixReceipt.payload(requestBody, prefix: prefix)) { _, actual in actual }
         }
+        if let stopReason { payload["stopReason"] = .string(stopReason) }
         if let usage {
             if let v = usage.inputTokens { payload["inputTokens"] = .int(Int64(v)) }
             if let v = usage.outputTokens { payload["outputTokens"] = .int(Int64(v)) }

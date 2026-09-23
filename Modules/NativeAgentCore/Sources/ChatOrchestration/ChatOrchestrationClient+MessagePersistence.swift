@@ -225,15 +225,19 @@ public struct ChatMessageOrigin: Sendable, Equatable, Codable {
     /// Set ONLY by a lane that knows it is transcribing its own agent's output.
     /// A future forwarding lane must leave it nil.
     public let authored: ChatMessageAuthorship?
+    /// The Claude inbox message this row answers, when the sender named one.
+    public var replyTo: String? = nil
 
     public init(
         surface: String,
         agent: String? = nil,
-        authored: ChatMessageAuthorship? = nil
+        authored: ChatMessageAuthorship? = nil,
+        replyTo: String? = nil
     ) {
         self.surface = surface
         self.agent = agent
         self.authored = authored
+        self.replyTo = replyTo
     }
 }
 
@@ -423,7 +427,7 @@ extension SwiftNativeChatOrchestrationClient {
         outcomeInterventionAssignment: CausalInterventionAssignment? = nil,
         onNotice: @escaping @Sendable (String, String) async -> Void
     ) async {
-        guard !text.isEmpty else { return }
+        guard !text.isEmpty, !EphemeralTextLane.owns(sessionId) else { return }
         guard let safeSessionId = NativeAgentChatSessionID.normalizedPathComponent(sessionId) else { return }
         let messageSource = Self.messageSource(for: source)
         let path = dataRoot
@@ -502,6 +506,7 @@ extension SwiftNativeChatOrchestrationClient {
         cognitiveResult: ChatToolOutcome.CognitiveResult? = nil,
         source: String = "app"
     ) async throws {
+        if EphemeralTextLane.owns(sessionId) { return }
         guard let safeSessionId = NativeAgentChatSessionID.normalizedPathComponent(sessionId) else {
             throw ChatOrchestrationError.underlying("invalid chat session id")
         }
@@ -937,12 +942,15 @@ extension SwiftNativeChatOrchestrationClient {
         outcomeTurnID: String? = nil,
         responseOutcomeStatus: String? = nil,
         outcomeInterventionAssignment: CausalInterventionAssignment? = nil,
+        expectedLastMessageID: String? = nil,
         // PROVENANCE, not prose: the templated writer that produced this row
         // names ITSELF (`CognitiveMechanicalRowKind`). The felt organ keeps such
         // a row out of lived state; it must never be inferred from the text of
         // the row itself. Nil is the ordinary case — a turn somebody meant.
         mechanicalRow: CognitiveMechanicalRowKind? = nil
     ) async throws {
+        // 2026-09-22: a background turn on the text tool lane keeps no transcript.
+        if EphemeralTextLane.owns(sessionId) { return }
         guard let safeSessionId = NativeAgentChatSessionID.normalizedPathComponent(sessionId) else {
             throw ChatOrchestrationError.underlying("invalid chat session id")
         }
@@ -1038,6 +1046,7 @@ extension SwiftNativeChatOrchestrationClient {
                !agent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 originObject["agent"] = .string(agent)
             }
+            if let replyTo = origin.replyTo { originObject["replyTo"] = .string(replyTo) }
             metadata["origin"] = .object(originObject)
         }
         // `metadata.envelope` — the turn's surface identity and return route,
@@ -1152,6 +1161,16 @@ extension SwiftNativeChatOrchestrationClient {
         // trustworthy: no other lock-respecting writer, in this process or
         // another, can slip a row in between the read and the record.
         let replacedTurnTraceID: String? = try await persistence.withFileLock(path) {
+            if let expectedLastMessageID {
+                let bytes = try Data(contentsOf: path)
+                guard bytes.count <= 8 * 1024 * 1024,
+                      let text = String(data: bytes, encoding: .utf8),
+                      let tail = text.split(separator: "\n", omittingEmptySubsequences: true).last,
+                      let last = try? JSONValue.parse(Data(tail.utf8)),
+                      Self.messageID(in: last) == expectedLastMessageID else {
+                    throw ChatOrchestrationError.underlying("The conversation changed before the reply could be saved. Reopen it before replying.")
+                }
+            }
             if canonicalAssistantCompletion,
                role == "assistant",
                let replacementID = ChatPersistenceContext.replacementAssistantMessageID?
@@ -1337,8 +1356,8 @@ extension SwiftNativeChatOrchestrationClient {
         outcomeTurnID: String? = nil,
         outcomeInterventionAssignment: CausalInterventionAssignment? = nil
     ) async throws {
-        let content = failure.flatMap { ProviderFailure.report($0)?.errorDescription }
-            ?? "The reply could not be completed. Work: outcome unknown."
+        let content = failure.flatMap { ProviderFailure.report($0)?.personDescription }
+            ?? "The reply could not be completed."
         guard let safeSessionId = NativeAgentChatSessionID.normalizedPathComponent(sessionId) else {
             return
         }
@@ -1533,6 +1552,7 @@ extension SwiftNativeChatOrchestrationClient {
                         backupPath: backupPath,
                         messagesReplaced: messagesReplaced,
                         turnModel: model,
+                        providerID: providerID,
                         surface: surface,
                         runId: runId
                     )
@@ -1543,7 +1563,8 @@ extension SwiftNativeChatOrchestrationClient {
     }
 
     static func shouldPersistFailureMessage(surface: String) -> Bool {
-        !["telegram", "bot"].contains(surface.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
+        // 2026-09-22: telegram removed — a failed phone turn left no row.
+        !["bot"].contains(surface.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
     }
 
     /// The one public boundary that admits an identity to durable chat state.
@@ -2282,7 +2303,8 @@ extension SwiftNativeChatOrchestrationClient {
                 updated = row
             }
 
-            if let updated {
+            if var updated {
+                ChatSessionIndexFile.recordConversationChange(in: &updated, role: normalizedRole)
                 remaining.insert(updated, at: 0)
             }
             let out = try ChatSessionIndexFile.serializedData(for: remaining)

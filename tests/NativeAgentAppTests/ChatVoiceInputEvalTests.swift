@@ -26,7 +26,6 @@ struct ChatVoiceInputEvalTests {
         let launch = try AppSourceScraping.appSource("AppDelegate+Launch.swift")
         #expect(!launch.contains("requestSpeechRecognitionIfNotDetermined"))
         #expect(!launch.contains("SFSpeechRecognizer.requestAuthorization"))
-        #expect(launch.contains("NativeAgentNotifications.requestAuthorization()"))
         let telegram = try AppSourceScraping.appSource("TelegramView.swift")
         #expect(telegram.contains("Button(\"Set up Telegram voice\")"))
         #expect(telegram.contains("SystemPermissionPreflight.requestSpeechRecognitionIfNotDetermined()"))

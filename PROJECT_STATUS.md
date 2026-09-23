@@ -1,6 +1,6 @@
 # NativeAgent Project Status
 
-Last updated: 2026-09-16
+Last updated: 2026-09-22
 
 Navigation: [documentation and repository guide](docs/README.md),
 [capability snapshot](#capability-snapshot),
@@ -17,21 +17,141 @@ certify a new source build or publish an artifact.
 
 ## Summary
 
-Version 0.4.16 is the current release (`VERSION` = 0.4.16, cut 2026-09-20). The
+Everyday desktop windows (2026-09-22): Workspace now supplies direct area
+launchers and up to 18 exact resident windows, including persistent app identity,
+Today, individual helpers and bounded selected Messages history. Document links
+open directly; browser titles and sessions follow actual owner observations.
+Helper settings show current values separately and reopen the exact helper after
+save. Supported archived Messages text is decoded under strict read bounds.
+Correspondence stays separate from focused document sources unless explicitly
+kept. Installed Agent journeys covered Today, Mail, Messages, helper settings,
+Calculator, browser and return to the unchanged brief, with six original sources
+and zero drafts. Final navigation follow-through preserves controls beside large
+page output and distinguishes same-titled windows. Detailed build/source and
+installed evidence: `docs/workspace-desktop-windows-2026-09-22.md`. No permission
+expansion, extra background collector, model setup or separate tests.
+
+Agent session desktop (2026-09-22): named external conversations now have
+on-demand recent scrollback, earlier-message navigation and exact exchange
+opening beside Reply. The existing owner retains a bounded display cache;
+the peer keeps its original session and model context. Selected files offer
+already-attached discussions directly. Historical reading gives the selected
+moment its own space. Per-place dated outcomes preserve file save/readback
+evidence across peer conversations and saved-workspace recovery. Actual Hermes
+discussion exposed and verified the outcome-displacement fix; the final build
+is `0c3e12a9b`. See `docs/workspace-session-desktop-2026-09-22.md` for installed
+journeys, storage bounds and precise coverage. No separate tests or extra model
+turns construct these views; no permissions or local-model setup changed.
+
+Joined Workspace work continuity (2026-09-22): This work carries the authored
+purpose/requirements and exact sources/discussions across saved workspaces.
+Focused work removes unrelated old places and automatically keeps successful
+opened detail sources. Revise this file carries the destination/current text,
+checks the original content before replacement, and returns actual readback.
+The app retains a dated last-action outcome and compares complete replacement
+readback in Swift, without declaring the whole task complete. Find opens exact
+installed skill names directly. Agent's installed joined work reduced 24 old
+places to four relevant references, attached a fifth source automatically,
+and revised/read back the 420-word brief with zero drafts. Detailed source,
+build and recovery evidence: `docs/workspace-work-continuity-2026-09-22.md`.
+No new background work, model downloads or permission changes.
+
+Workspace environment follow-through (2026-09-22): unfinished work and return
+points lead recognizable open places, with matching Home counts and direct
+continuation actions. Topic ranking avoids incidental path matches, exact action
+names open their form from Find, and saved helper replies browse newest first
+with accurate comparison and bounded pagination. Installed work exposed and
+fixed Workspace-relative saves landing in the checkout, opaque research errors,
+old generic source labels, and misleading readiness descriptions. Agent completed
+a sourced design note, received Plainspoken's review, revised it and read it back.
+Bounded Mail/Messages, Calendar/Reminders, Skills, Helpers, Saved replies and
+Computer reads are recorded in `docs/workspace-environment-2026-09-22.md`.
+LM Studio/local-model work is explicitly excluded; human Full Mac and the
+Contacts/Mail/Messages write-off choices remain unchanged. External setup
+prerequisites remain separate from these installed observations.
+
+Workspace refinement (2026-09-22): one Find combines bounded work, recorded-file,
+memory and conversation readers, preserving exact opening and Back navigation.
+Ordinary views use compact controls with the full workspace controls available
+on demand. Agent conversations show retained original answers and Reply first;
+delivery diagnostics remain in Details. Arrivals carry attributed, bounded
+previews and return to the latest unfinished draft. Invalid inputs offer direct
+correction actions, exact action names rank before description matches, and
+recovery never automatically repeats an effect. Existing owners, permissions,
+storage budgets and the 22-tool default floor remain unchanged. Installed
+acceptance is recorded in the newest handoff.
+The existing delegation event snapshot now advances exact waiting conversation
+bookmarks, making completed replies discoverable in Arrivals before a manual
+conversation read, without new polling or provider work.
+
+Everyday AX integration (2026-09-21): work rows, parts, dependencies and evidence
+are selectable; current/history results continue without rebuilding searches.
+Browser actions lead to an exact current-page view. Forms retain partial input
+through detours and correction, with direct field/choice controls. Open places
+carry recognition cues and supported reading positions; versioned reads detect
+changed sources. Selected files, memories, skills, web sources and historical
+messages can carry rechecked evidence into agent/helper discussions. Mail now
+offers exact-message body reads and replies; Messages exposes real thread
+identity and bound replies, with an explicit app-view path for history that its
+scripting API does not expose. Existing permissions, full-session agent/helper
+owners, arrivals and the 22-tool default floor remain authoritative. See the
+latest handoff for installed acceptance and actual platform limits.
+
+Development AX batch (2026-09-21): a native workspace now carries work,
+documents, agent discussions and return navigation through offered actions.
+Its environment now exposes memory, research, skills, apps/browser, files and
+creation, helpers, ongoing work, communication, calendar/reminders and state.
+Further available capabilities open forms from their live owner schemas; bound
+targets stay attached and effects are never replayed by navigation. Availability
+does not imply connector authentication or permission, and sources are read only
+when their destination is opened. Whole-catalog access is not a claim that every
+external service has been exercised.
+Open places and named arrangements now survive app restarts within the verified
+chat, retaining current selection and owner references rather than loaded
+content or execution handles. Common browser opening/scrolling and file append
+have direct controls. Missing references and persistence failures stay visible.
+Conversations now bind named discussions and distinguish changed replies from
+recorded progress. Successful-view hashes support source comparisons across
+restart without storing content. Human conversations expose exact current reads
+and supported replies through canonical transcript/delivery owners; the active
+chat replies normally. Event-driven arrivals now surface scoped agent replies
+and opened helper/work/human changes during normal context or structured tool
+responses, without opening workspace first. Notices offer exact Open and Return
+controls, preserve the current place, and keep decisions/failures distinct from
+quiet progress. Owner file events replace unrelated reads on every navigation;
+no polling, automatic send, provider wakeup or new default tool was introduced.
+Swift retains exact references and verifies explicitly shared document text.
+Saved helper replies also keep Follow up beside the full answer, carrying a
+rechecked, labeled excerpt into the helper's continuous conversation. The send
+result retains a direct return to the exact saved reply. Unfiltered reply lists
+now show each available helper's name. Saved replies browses history even after
+an answer was read, without consuming unread state. No send is repeated by
+refresh or return.
+Saved-answer places use compact helper/date labels. Two owner notices for the
+same exact helper result coalesce without hiding distinct decisions or failures.
+The model supplies selection, judgment and message content. The same normal
+gates and canonical owners remain in charge. The 22-name default tool set is
+unchanged in size. This extends work-context and lazy
+artifact-evidence retrieval, per-chat Chrome tab continuity, explicit find-and-load discovery,
+and retained long-result continuation. These compose existing owners and
+preserve current/history, approval/version and execution/delivery distinctions.
+See the latest handoff for installed validation; this is not a public release.
+
+Version 0.4.17 is the current release (`VERSION` = 0.4.17, cut 2026-09-23). The
 [public Releases page](https://github.com/embwl0x/native-agent/releases)
 is authoritative for available installers; a version in this checkout is not
 publication proof. Published artifacts carry their exact-source test receipt
 and release attestation; this status document is not a release receipt.
 Source and live behavior remain authoritative over older release prose below.
 
-### Current shipped state (0.4.16)
+### Current shipped state (0.4.17)
 
 - **Composer.** Model, thinking and Trust open anchored cards; the context ring shows usage and hover token counts.
 - **Inline cards.** The first conversation's saved role has a visible receipt; peer approval cards name the requester.
 - **Memory and growth.** History search supports date bounds and chronological order; peer memory notes retain source attribution.
-- **Agent conversations.** Lazy message/read tools cover coding agents, bots, A2A, NativeAgent peers and saved desktop contacts; inbound A2A/MCP use persistent peer sessions.
+- **Agent conversations.** Lazy message/read tools open and continue conversations by unique contact name, retaining scoped routing identities and optional human discussion labels. Supported pending replies are collected underneath; inbound A2A/MCP retain full persistent peer sessions.
 - **Onboarding.** Setup collects both names; a fresh public install opens with one role question, then hands the conversation back.
-- **Trust.** Per-peer credentials and elevation are explicit; unelevated peer effects require approval even under Full Mac.
+- **Trust.** Per-peer credentials and elevation are explicit. Routine peer conversations no longer re-prompt after replies; destructive capabilities and unclassified execution still ask. Human Full Mac permissions are unchanged.
 - **Fixes.** Composer clearance and interaction, retired provider defaults, greeting retries, native schema refresh and file-access symlink checks are corrected.
 
 ### Standing capabilities
@@ -58,6 +178,11 @@ Release-by-release detail lives in `docs/release-notes/` and the
   the agent's tools under the current Trust policy, and gets Fluid Context and
   memory recall like any other turn. Scheduled runs sit behind the master
   Autonomy switch; **Run once** is the user asking, so it still runs.
+  Agent can use plain schedule phrases and discover configured model/Think
+  choices directly while choosing a model explicitly;
+  bot conversations carry the current saved brief and open full latest replies.
+  Requested Run once results return automatically to the initiating Agent
+  conversation through the existing delivery lifecycle.
 - **Trust.** Four preset cards — Safe, Work mode, Builder, Full Mac. Full Mac has
   no timer: it stays in force until another preset is chosen. See
   `docs/USER_GUIDE.md` and `docs/CAPABILITIES.md` for how Full Mac, Developer
@@ -81,7 +206,10 @@ Release-by-release detail lives in `docs/release-notes/` and the
   persistent bots, discovered A2A services, NativeAgent bridge peers and saved
   desktop contacts. Inbound A2A and MCP plus the bundled nativeagent-link helper
   enter full persistent Agent sessions, preserving
-  conversation/request/task identity and existing Trust. Supported versions and
+  conversation/request/task identity and existing Trust. Agent supplies a name
+  and words; the app retains the current conversation per initiating session,
+  supports named separate discussions, and opens replies without copied IDs.
+  Send-only and standalone adapters retain their honest limitations. Supported versions and
   honest recovery limits are in `docs/agent-communication.md`.
 - **Look.** A charcoal slate page ground in the same family as the cards, with a
   smaller, softer warm glow; cards in dark rooms are a soft silver-grey.

@@ -2,6 +2,7 @@ import Testing
 import Foundation
 @testable import DreamREMCycle
 import NativeAgentCore
+import NativeAgentTestSupport
 
 // Spec called for XCTest; this package uses swift-testing throughout
 // (see NativeAgentCoreTests.swift). Matching repo convention.

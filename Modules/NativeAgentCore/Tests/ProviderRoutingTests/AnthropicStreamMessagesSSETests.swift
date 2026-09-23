@@ -17,23 +17,18 @@ import PersistenceCore
 //       transport can never drift from the item-8 wire shape.
 //   (3) Breakpoint budget on the text-compat shape (tools nil +
 //       MessagesCacheHint.withinTurnReuse): identity + stable-end +
-//       current message = 3 on the first request, then previous+current = 4;
-//       with tools (structured streaming loop): identity + stable-end +
-//       last-tool + current message = 4.
+//       current message = 3 on the first request, then previous+current = 4.
 //   (4) The ONE rollback lever (NATIVE_AGENT_GROWN_PROMPT_COMPAT) restores
 //       the legacy layout on this transport too: no message breakpoint.
-//   (5) Structured tool_use SSE blocks (content_block_start →
-//       input_json_delta → content_block_stop) assemble into .toolCall
-//       events with the provider id + full JSON input.
+//   (5) A non-empty native tools array is refused before any request: the
+//       subscription route carries tools only as prompt text.
 //   (6) .notConfigured propagates BEFORE any yield (api-key fallback chain
 //       contract in SwiftNativeLLMClient stays intact).
 // Fix-round pins (gpt-5.5 review 2026-06-11):
 //   (7) Breakpoint-contract matrix — trailing message breakpoint iff
-//       (tool-capable OR withinTurnReuse-hinted) AND eligible AND not
-//       compat; budget ≤ 4 across all 16 hint × tools × segmented × compat
-//       combinations (never a 5th).
-//   (8) Tool-call-first TTFT stamps at content_block_start (OpenAI
-//       structured-parser parity), strictly before content_block_stop.
+//       (v2 prefix OR withinTurnReuse-hinted) AND eligible AND not
+//       compat; budget ≤ 4 across every hint × segmented × compat
+//       combination (never a 5th).
 //   (9) Mid-stream bytes.lines transport errors classify .transient via
 //       transientNetworkError; consumer cancellation tears down the
 //       URLSession task (stub stopLoading observed).
@@ -302,58 +297,29 @@ private func sseTextStream(deltas: [String]) -> String {
         #expect(payload["outputTokens"] as? Int == 9)
     }
 
-    // (5) Structured tool_use SSE: start → input_json_delta x2 → stop
-    // assembles ONE .toolCall with id + full JSON.
-    @Test func streamMessages_toolUseBlocks_yieldToolCallEvents() async throws {
+    // (5) The subscription route never carries native tools: a non-empty
+    // tools array is refused before any request is sent.
+    @Test func streamMessages_nonEmptyTools_refusedBeforeRequest() async throws {
         Item9StubURLProtocol.reset()
         defer { Item9StubURLProtocol.reset() }
-        let sse = [
-            "event: content_block_delta",
-            #"data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"calling"}}"#,
-            "",
-            "event: content_block_start",
-            #"data: {"type":"content_block_start","content_block":{"type":"tool_use","id":"toolu_9","name":"tool_a"}}"#,
-            "",
-            "event: content_block_delta",
-            #"data: {"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":"{\"q\":"}}"#,
-            "",
-            "event: content_block_delta",
-            #"data: {"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":"\"x\"}"}}"#,
-            "",
-            "event: content_block_stop",
-            #"data: {"type":"content_block_stop"}"#,
-            "",
-            "event: message_stop",
-            #"data: {"type":"message_stop"}"#,
-            "",
-        ].joined(separator: "\n")
-        Item9StubURLProtocol.responder = { _ in .init(status: 200, body: Data(sse.utf8)) }
+        Item9StubURLProtocol.responder = { _ in
+            .init(status: 200, body: Data(sseTextStream(deltas: ["ok"]).utf8))
+        }
         let adapter = makeAdapter(telemetryRoot: makeTmpRoot())
-        var events: [LLMMessageStreamEvent] = []
-        for try await event in adapter.streamMessages(
-            messages: [.user("hi")], system: "sys",
-            model: "claude-opus-4-8", tools: makeTools()
-        ) {
-            events.append(event)
+        var thrown: Error?
+        do {
+            for try await _ in adapter.streamMessages(
+                messages: [.user("hi")], system: "sys",
+                model: "claude-opus-4-8", tools: makeTools()
+            ) {}
+        } catch {
+            thrown = error
         }
-        // input_json_delta frames emit `.keepAlive` (liveness, no content) —
-        // filter them; the CONTENT events are the text delta + the tool call.
-        let content = events.filter { $0 != .keepAlive }
-        #expect(content.count == 2)
-        #expect(content.first == .textDelta("calling"))
-        if case .toolCall(let call)? = content.last {
-            #expect(call.id == "toolu_9")
-            #expect(call.name == "tool_a")
-            #expect(String(data: call.inputJSON, encoding: .utf8) == #"{"q":"x"}"#)
-        } else {
-            Issue.record("expected a .toolCall event")
+        guard case .providerError? = thrown as? LLMError else {
+            Issue.record("expected providerError, got \(String(describing: thrown))")
+            return
         }
-        // No empty content delta ever leaks (the bug this guards): keepalives
-        // are `.keepAlive`, never `.textDelta("")`.
-        #expect(!events.contains(.textDelta("")))
-        // Liveness IS emitted (audit #4): the 2 input_json_delta frames each
-        // produce a keepalive so ProviderStreamGuard's idle clock survives.
-        #expect(events.filter { $0 == .keepAlive }.count == 2)
+        #expect(Item9StubURLProtocol.lastBody == nil)
     }
 
     // keepAlive liveness (audit #4 + empty-delta-leak fix, 2026-06-15): a
@@ -412,7 +378,7 @@ private func sseTextStream(deltas: [String]) -> String {
         do {
             for try await _ in adapter.streamMessages(
                 messages: [.user("build it")], system: "sys",
-                model: "claude-opus-5", tools: makeTools()
+                model: "claude-opus-5", tools: nil
             ) {}
         } catch {
             thrown = error
@@ -487,7 +453,7 @@ private func sseTextStream(deltas: [String]) -> String {
         _ = try await LLMCallContext.$systemSegments.withValue(segments) {
             try await adapter.completeMessages(
                 messages: convo, system: Self.segCombined,
-                model: "claude-opus-4-8", tools: makeTools()
+                model: "claude-opus-4-8", tools: nil
             )
         }
         let completeBody = try lastRequestBody()
@@ -498,7 +464,7 @@ private func sseTextStream(deltas: [String]) -> String {
         let stream = LLMCallContext.$systemSegments.withValue(segments) {
             adapter.streamMessages(
                 messages: convo, system: Self.segCombined,
-                model: "claude-opus-4-8", tools: makeTools()
+                model: "claude-opus-4-8", tools: nil
             )
         }
         for try await _ in stream {}
@@ -563,7 +529,6 @@ private func sseTextStream(deltas: [String]) -> String {
                     system: Self.segCombined,
                     coercedModel: "claude-opus-5",
                     maxTokens: 32,
-                    tools: nil,
                     stream: true
                 )
             }
@@ -580,35 +545,6 @@ private func sseTextStream(deltas: [String]) -> String {
         #expect(counts.system == 2)
         #expect(counts.tools == 0)
         #expect(counts.messages == 2)
-        #expect(counts.system + counts.tools + counts.messages == 4)
-    }
-
-    // (3b) Structured shape via SSE: tools + segments → same item-8 layout,
-    // 4 ≤ 4 (identity + stable-end + last-tool + current message).
-    @Test func streamMessages_withTools_trailingBreakpoint_fourTotal() async throws {
-        Item9StubURLProtocol.reset()
-        defer { Item9StubURLProtocol.reset() }
-        Item9StubURLProtocol.responder = { _ in
-            .init(status: 200, body: Data(sseTextStream(deltas: ["ok"]).utf8))
-        }
-        let adapter = makeAdapter(telemetryRoot: makeTmpRoot())
-        let segments = SystemPromptSegments(stable: Self.segStable, dynamic: Self.segDynamic)
-        // LEGACY ARM PIN — v2 drops the identity breakpoint (see the v2
-        // sibling test below).
-        let stream = ConversationPrefixShape.$override.withValue(.v1Legacy) {
-            LLMCallContext.$systemSegments.withValue(segments) {
-                adapter.streamMessages(
-                    messages: [.user("hi")], system: Self.segCombined,
-                    model: "claude-opus-4-8", tools: makeTools()
-                )
-            }
-        }
-        for try await _ in stream {}
-        let body = try lastRequestBody()
-        let counts = breakpointCounts(body)
-        #expect(counts.system == 2)   // identity + stable-end (dynamic: none)
-        #expect(counts.tools == 1)    // last tool def
-        #expect(counts.messages == 1) // current message
         #expect(counts.system + counts.tools + counts.messages == 4)
     }
 
@@ -896,7 +832,7 @@ private func sseTextStream(deltas: [String]) -> String {
     // streamMessages at once.
     /// EXTENDED (v2, 2026-09-01) with the prefix-shape AND conversation-shape
     /// dimensions: the budget must hold across
-    /// convo × shape × hint × tools × segmented × compat. v2 spends its freed
+    /// convo × shape × hint × segmented × compat. v2 spends its freed
     /// identity slot on the previous-turn boundary, so the ceiling is
     /// unchanged at 4 — including on the SEEDED order
     /// (… assistant(N-1), user(N), system LAST) and on a within-turn round
@@ -935,7 +871,7 @@ private func sseTextStream(deltas: [String]) -> String {
         for (convoName, convo, v2MessageMarkers, v1RetainMarks, boundUserIndex) in convos {
         for shape in ConversationPrefixShape.allCases {
         for hint in [false, true] {
-            for withTools in [false, true] {
+            do {
                 for segmented in [false, true] {
                     for compat in [false, true] {
                         let body = ConversationPrefixBoundary.$currentUserIndex.withValue(boundUserIndex) {
@@ -948,7 +884,6 @@ private func sseTextStream(deltas: [String]) -> String {
                                         system: segmented ? Self.segCombined : "sys",
                                         coercedModel: "claude-opus-4-8",
                                         maxTokens: 1024,
-                                        tools: withTools ? makeTools() : nil,
                                         stream: true
                                     )
                                 }
@@ -957,9 +892,9 @@ private func sseTextStream(deltas: [String]) -> String {
                             }
                         }
                         let counts = breakpointCounts(body)
-                        let total = counts.system + counts.tools + counts.messages
+                        let total = counts.system + counts.messages
                         let cell: Testing.Comment =
-                            "convo=\(convoName) shape=\(shape) hint=\(hint) tools=\(withTools) segmented=\(segmented) compat=\(compat) counts=\(counts)"
+                            "convo=\(convoName) shape=\(shape) hint=\(hint) segmented=\(segmented) compat=\(compat) counts=\(counts)"
 
                         // The v2 SYSTEM shape needs valid segments AND the
                         // compat lever off; otherwise the legacy arm ships.
@@ -969,11 +904,11 @@ private func sseTextStream(deltas: [String]) -> String {
                         // above, plus v2's unconditional prefix-reuse grant.
                         // (The last message here always carries a non-empty
                         // text block, so it is trailing-eligible.)
-                        let expectTrailing = (usesPrefix || withTools || hint) && !compat
+                        let expectTrailing = (usesPrefix || hint) && !compat
                         // v1 marks only the last message (plus its `count - 3`
                         // retain, which this fixture set never triggers);
                         // v2 marks current + previous-turn where one exists.
-                        let v1Retain = !withTools && hint && v1RetainMarks
+                        let v1Retain = hint && v1RetainMarks
                         let expectedMessages = expectTrailing
                             ? (usesPrefix ? v2MessageMarkers : (v1Retain ? 2 : 1))
                             : 0
@@ -995,17 +930,13 @@ private func sseTextStream(deltas: [String]) -> String {
                                         .contains { $0["cache_control"] != nil }
                             }
                         #expect(!systemMarked, cell)
-                        // Tools block: last-definition breakpoint iff sent.
-                        #expect(counts.tools == (withTools ? 1 : 0), cell)
+                        // No tools block ever ships on this route.
+                        #expect(counts.tools == 0, cell)
                         // System: v2 → the single stable-end breakpoint
                         // (identity is a strict prefix, dynamic uncached).
-                        // v1 → identity + (segmented: stable-end, plus
-                        // dynamic-end ONLY under compat+tools — when the
-                        // trailing breakpoint ships it subsumes lane (a);
+                        // v1 → identity + (segmented: stable-end;
                         // unsegmented: the combined sys block).
-                        let expectedSystem = usesPrefix
-                            ? 1
-                            : (segmented ? 2 + ((withTools && compat) ? 1 : 0) : 2)
+                        let expectedSystem = usesPrefix ? 1 : 2
                         #expect(counts.system == expectedSystem, cell)
                         // No combination — old or new shape — reaches 5.
                         #expect(total <= 4, cell)
@@ -1013,94 +944,18 @@ private func sseTextStream(deltas: [String]) -> String {
                         // no-tools + hint → identity + stable-end +
                         // trailing = 3 ≤ 4.
                         if convoName == "oneShot",
-                           shape == .v1Legacy, hint, !withTools, segmented, !compat {
+                           shape == .v1Legacy, hint, segmented, !compat {
                             #expect(total == 3, cell)
                         }
-                        // v2: stable-end + message markers (+ last tool).
+                        // v2: stable-end + message markers.
                         if usesPrefix {
-                            #expect(
-                                total == 1 + v2MessageMarkers + (withTools ? 1 : 0),
-                                cell
-                            )
+                            #expect(total == 1 + v2MessageMarkers, cell)
                         }
                     }
                 }
             }
         }
         }
-        }
-    }
-
-    // (gpt-5.5 review 2026-06-11, finding 2) Tool-call-FIRST stream: TTFT
-    // stamps at the tool_use content_block_start — parity with the OpenAI
-    // structured parser's output_item.added stamp — NOT at
-    // content_block_stop after the whole input_json_delta stream. Chunk
-    // layout: block_start arrives in chunk 1; two 250ms gaps separate it
-    // from the argument delta and the block stop, so a stop-stamped TTFT
-    // could never read under 250ms.
-    @Test func streamMessages_toolCallFirst_ttftStampedBeforeBlockStop() async throws {
-        Item9StubURLProtocol.reset()
-        defer { Item9StubURLProtocol.reset() }
-        let chunk1 = [
-            "event: message_start",
-            #"data: {"type":"message_start","message":{"usage":{"input_tokens":50}}}"#,
-            "",
-            "event: content_block_start",
-            #"data: {"type":"content_block_start","content_block":{"type":"tool_use","id":"toolu_1","name":"tool_a"}}"#,
-            "",
-        ].joined(separator: "\n") + "\n"
-        let chunk2 = [
-            "event: content_block_delta",
-            #"data: {"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":"{\"q\":\"x\"}"}}"#,
-            "",
-        ].joined(separator: "\n") + "\n"
-        let chunk3 = [
-            "event: content_block_stop",
-            #"data: {"type":"content_block_stop"}"#,
-            "",
-            "event: message_stop",
-            #"data: {"type":"message_stop"}"#,
-            "",
-        ].joined(separator: "\n") + "\n"
-        Item9StubURLProtocol.responder = { _ in
-            // Non-final chunks carry flush padding (see sseFlushPadding) so
-            // block_start and the argument delta genuinely arrive before
-            // their 250ms gaps instead of coalescing into one burst.
-            .init(status: 200, body: Data(),
-                  chunks: [Data(chunk1.utf8) + sseFlushPadding,
-                           Data(chunk2.utf8) + sseFlushPadding,
-                           Data(chunk3.utf8)],
-                  interChunkDelayMs: 250)
-        }
-        let root = makeTmpRoot()
-        let adapter = makeAdapter(telemetryRoot: root)
-        var sawToolCall = false
-        for try await event in adapter.streamMessages(
-            messages: [.user("hi")], system: "sys",
-            model: "claude-opus-4-8", tools: makeTools()
-        ) {
-            if case .toolCall(let call) = event {
-                sawToolCall = true
-                #expect(call.name == "tool_a")
-                #expect(String(data: call.inputJSON, encoding: .utf8) == #"{"q":"x"}"#)
-            }
-        }
-        #expect(sawToolCall)
-        let rows = readLLMCallRows(dataRoot: root)
-        #expect(rows.count == 1)
-        let payload = rows.first?["payload"] as? [String: Any] ?? [:]
-        let ttft = payload["ttftMs"] as? Int
-        let duration = payload["durationMs"] as? Int
-        #expect(ttft != nil)
-        #expect(duration != nil)
-        if let ttft, let duration {
-            // Under a full-package parallel run the first chunk can be delayed
-            // by scheduler contention. The stable contract is ordering: TTFT
-            // must still land well before block_stop/message_stop, not at the
-            // terminal frame after both inter-chunk gaps.
-            #expect(duration >= 500)
-            #expect(ttft < duration)
-            #expect(duration - ttft >= 250)
         }
     }
 

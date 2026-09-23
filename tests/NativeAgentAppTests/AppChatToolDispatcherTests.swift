@@ -59,7 +59,7 @@ private final class StubInnerToolDispatcher: ToolDispatchClient, @unchecked Send
     }
 
     func listAvailableTools() async throws -> [String] {
-        ["read_file", "tool_catalog", "tool_load", "x_search"]
+        ["mac_notify", "mobile_notify", "read_file", "tool_catalog", "tool_load", "x_search"]
     }
 
     func listAvailableToolSchemas() async throws -> [LLMToolSchema] {
@@ -73,6 +73,16 @@ private final class StubInnerToolDispatcher: ToolDispatchClient, @unchecked Send
                 name: "x_search",
                 description: "Search recent public X posts.",
                 parametersJSON: Data(#"{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}"#.utf8)
+            ),
+            LLMToolSchema(
+                name: "mac_notify",
+                description: "Post a macOS notification.",
+                parametersJSON: Data(#"{"type":"object","properties":{"message":{"type":"string"}},"required":["message"]}"#.utf8)
+            ),
+            LLMToolSchema(
+                name: "mobile_notify",
+                description: "Push a notification to the paired iPhone.",
+                parametersJSON: Data(#"{"type":"object","properties":{"message":{"type":"string"}},"required":["message"]}"#.utf8)
             ),
         ]
     }
@@ -934,46 +944,6 @@ func appChatToolDispatcher_prewarmHintsAreAPureFunctionOfTheSettledCall() {
 }
 
 @Test
-func appChatToolDispatcher_addsOrganismPostureToObjectResults() async throws {
-    let posture = OrganismBehaviorPosture(
-        generatedAt: Date(timeIntervalSince1970: 7_000),
-        enabled: true,
-        posture: "careful",
-        claimDiscipline: .verifyBeforeCompletion,
-        toolStrategy: .verifyBeforeRetry,
-        directives: ["After provider or tool brittleness, verify before saying the work is done."],
-        reviewSignals: ["9 reflex candidate(s) require review"],
-        approvedReflexBiases: ["Soft preference: use the bounded path."],
-        reviewRequiredReflexCount: 9,
-        approvedLowRiskReflexTotalCount: 5
-    )
-    let dispatcher = AppChatToolDispatcher(
-        inner: StubInnerToolDispatcher(),
-        organismPostureProvider: { posture }
-    )
-
-    let result = try await dispatcher.dispatch(tool: "x_search", input: [:], surface: "telegram")
-    guard case .object(let object) = result,
-          case .object(let organismPosture)? = object["organism_posture"] else {
-        Issue.record("organism_posture missing from object-shaped tool result")
-        return
-    }
-
-    #expect(organismPosture["posture"] == .string("careful"))
-    #expect(organismPosture["tool_claims"] == .string("verifyBeforeCompletion"))
-    #expect(organismPosture["tool_strategy"] == .string("verifyBeforeRetry"))
-    #expect(organismPosture["surface"] == .string("telegram"))
-    #expect(organismPosture["directive_count"] == .int(1))
-    #expect(organismPosture["review_required_reflex_count"] == .int(9))
-    #expect(organismPosture["approved_low_risk_reflex_total_count"] == .int(5))
-    #expect(organismPosture["approved_reflex_bias_sample_count"] == .int(1))
-    #expect(organismPosture["approved_reflex_biases_are_sampled"] == .bool(true))
-    #expect(organismPosture["directives"] == nil)
-    #expect(organismPosture["review_signals"] == nil)
-    #expect(organismPosture["approved_reflex_biases"] == nil)
-}
-
-@Test
 func appChatToolDispatcher_exposesNotificationToolsAndDispatchesMobileNotify() async throws {
     let capture = NotificationCapture()
     let dispatcher = AppChatToolDispatcher(
@@ -1005,12 +975,13 @@ func appChatToolDispatcher_exposesNotificationToolsAndDispatchesMobileNotify() a
     )
 
     let names = try await dispatcher.listAvailableTools()
-    #expect(names.contains("mobile.notify"))
-    #expect(names.contains("mac.notify"))
+    #expect(names.contains("mobile_notify"))
+    #expect(names.contains("mac_notify"))
+    #expect(!names.contains("mobile.notify"))
+    #expect(!names.contains("mac.notify"))
 
     let schemas = try await dispatcher.listAvailableToolSchemas()
-    #expect(schemas.map(\.name).contains("mobile.notify"))
-    #expect(schemas.map(\.name).contains("mac.notify"))
+    #expect(schemas.filter { $0.name.hasSuffix("notify") }.map(\.name).sorted() == ["mac_notify", "mobile_notify"])
 
     let load = try await dispatcher.dispatch(
         tool: "tool_load",
@@ -1020,8 +991,8 @@ func appChatToolDispatcher_exposesNotificationToolsAndDispatchesMobileNotify() a
     #expect(jsonString(load, key: "status") == "preview")
     #expect(jsonStringArray(load, key: "loaded").isEmpty)
     let loaded = jsonStringArray(load, key: "available")
-    #expect(loaded.contains("mobile.notify"))
-    #expect(loaded.contains("mac.notify"))
+    #expect(loaded.contains("mobile_notify"))
+    #expect(loaded.contains("mac_notify"))
 
     let catalog = try await dispatcher.dispatch(
         tool: "tool_catalog",
@@ -1029,8 +1000,8 @@ func appChatToolDispatcher_exposesNotificationToolsAndDispatchesMobileNotify() a
         surface: "telegram"
     )
     #expect(jsonBool(catalog, key: "delegated") == true)
-    #expect(jsonStringArray(catalog, key: "available_tools").contains("mobile.notify"))
-    #expect(jsonStringArray(catalog, key: "notification_tools").contains("mac.notify"))
+    #expect(jsonStringArray(catalog, key: "available_tools").contains("mobile_notify"))
+    #expect(jsonStringArray(catalog, key: "notification_tools").contains("mac_notify"))
 
     let result = try await dispatcher.dispatch(
         tool: "mobile.notify",
@@ -1165,6 +1136,19 @@ func appChatToolDispatcher_notifyPermissionGateAllowsWriteAndSuppressesBothDenie
             "mobile permission denial must not invoke the injected sender")
     #expect(await capture.mac.count == 1,
             "Mac permission denial must not invoke the injected notifier")
+
+    // Admitted Full Mac replaces the separate toggles without rewriting them.
+    let trust = root.appendingPathComponent("trust")
+    try FileManager.default.createDirectory(at: trust, withIntermediateDirectories: true)
+    try Data(#"{"permissionLevel":"full_mac_os","developerMode":true,"fullMacNeverExpires":true}"#.utf8)
+        .write(to: trust.appendingPathComponent("policy.json"))
+    for tool in ["mac_notify", "mobile_notify"] {
+        _ = try await dispatcher.dispatch(tool: tool, input: ["message": .string("Full Mac delivery")], surface: "chat")
+    }
+    #expect(await capture.mac.count == 2)
+    #expect(await capture.mobile.count == 2)
+    #expect(await permissions.allows(MacIntegrationID.notifyMac, mode: .write) == false)
+    #expect(await permissions.allows(MacIntegrationID.notifyMobile, mode: .write) == false)
 }
 
 @Test
@@ -1402,11 +1386,14 @@ func appChatToolDispatcher_exposesVisibleBrowserToolsAndDispatchesStatusAlias() 
 
     let names = try await dispatcher.listAvailableTools()
     #expect(names.contains("browser.status"))
-    #expect(names.contains("browser.navigate"))
+    #expect(!names.contains("browser.navigate"))
+    #expect(names.contains("browser.open_url"))
     #expect(names.contains("browser.read_text"))
     #expect(names.contains("browser.read_links"))
     #expect(names.contains("browser.screenshot"))
     #expect(names.contains("browser.chrome_acquire"))
+    #expect(names.contains("browser.chrome_setup"))
+    #expect(names.contains("browser.chrome_status"))
     #expect(names.contains("browser.chrome_renew"))
     #expect(names.contains("browser.chrome_navigate"))
     #expect(names.contains("browser.chrome_snapshot"))
@@ -1424,7 +1411,7 @@ func appChatToolDispatcher_exposesVisibleBrowserToolsAndDispatchesStatusAlias() 
 
     let schemas = try await dispatcher.listAvailableToolSchemas()
     #expect(schemas.map(\.name).contains("browser.status"))
-    #expect(schemas.map(\.name).contains("browser.navigate"))
+    #expect(!schemas.map(\.name).contains("browser.navigate"))
     #expect(schemas.map(\.name).contains("browser.chrome_snapshot"))
     #expect(schemas.map(\.name).contains("browser.chrome_click"))
     #expect(schemas.map(\.name).contains("browser.chrome_fill"))
@@ -1465,9 +1452,20 @@ func appChatToolDispatcher_exposesVisibleBrowserToolsAndDispatchesStatusAlias() 
 
 @Test
 func everyRegisteredBrowserToolMapsValidInputToTheAppRunner() async throws {
+    // Setup writes the visible extension folder outside app data. Exercise
+    // routing under explicit fixture authority, never the machine's live policy.
+    let root = try makeDispatcherTestRoot("browser-routing")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let persistence = SwiftNativePersistenceCore()
+    try await persistence.writeJSON(.object([
+        "permissionLevel": .string("full_mac_os"),
+        "fullMacNeverExpires": .bool(true),
+        "securityPolicy": .object(["toolSigningRequired": .bool(false)]),
+    ]), to: root.appendingPathComponent("trust/policy.json"))
     let capture = BrowserToolCapture()
     let dispatcher = AppChatToolDispatcher(
         inner: StubInnerToolDispatcher(),
+        securityCenter: SwiftNativeSecurityCenter(dataRoot: root, persistence: persistence),
         enforceAutonomySecurity: false,
         browserActionRunner: { actionId, dryRun, input in
             await capture.record(actionId: actionId, dryRun: dryRun, input: input)
@@ -1486,6 +1484,8 @@ func everyRegisteredBrowserToolMapsValidInputToTheAppRunner() async throws {
     ]
     let cases: [(String, [String: JSONValue])] = [
         ("browser.status", [:]),
+        ("browser.chrome_setup", ["dry_run": .bool(true)]),
+        ("browser.chrome_status", [:]),
         ("browser.open_url", ["url": .string("https://example.com/"), "dry_run": .bool(true)]),
         ("browser.navigate", ["url": .string("https://example.com/next"), "dry_run": .bool(true)]),
         ("browser.read_text", ["dry_run": .bool(true)]),
@@ -1521,14 +1521,16 @@ func everyRegisteredBrowserToolMapsValidInputToTheAppRunner() async throws {
     #expect(Set(cases.map(\.0)) == Set(
         AppChatToolDispatcher.catalogRegisteredToolNames.filter { $0.hasPrefix("browser.") }
     ))
+    // browser.navigate is an alias of browser.open_url (same handler).
+    func routed(_ tool: String) -> String { tool == "browser.navigate" ? "browser.open_url" : tool }
     for (tool, input) in cases {
         let result = try await dispatcher.dispatch(tool: tool, input: input, surface: "chat")
-        #expect(jsonString(result, key: "tool") == tool)
-        #expect(jsonString(result, key: "runner_action") == tool)
+        #expect(jsonString(result, key: "tool") == routed(tool))
+        #expect(jsonString(result, key: "runner_action") == routed(tool))
         #expect(jsonString(result, key: "surface") == "chat")
     }
     let calls = await capture.calls
-    #expect(calls.map(\.actionId) == cases.map(\.0))
+    #expect(calls.map(\.actionId) == cases.map { routed($0.0) })
     #expect(calls.map(\.input) == cases.map(\.1))
 }
 
@@ -1630,15 +1632,16 @@ func appChatToolDispatcher_toolLoadBrowserCategoryPersistsSessionActiveTools() a
     #expect(jsonString(result, key: "category") == "browser")
     let activeTools = jsonStringArray(result, key: "active_tools")
     #expect(activeTools.contains("browser.status"))
-    #expect(activeTools.contains("browser.navigate"))
+    #expect(activeTools.contains("browser.open_url"))
+    #expect(!activeTools.contains("browser.navigate"))
     #expect(activeTools.contains("browser.screenshot"))
     let schemas = jsonObjectArray(result, key: "schemas_added")
     #expect(schemas.contains { jsonString(.object($0), key: "name") == "browser.status" })
-    #expect(schemas.contains { jsonString(.object($0), key: "name") == "browser.navigate" })
+    #expect(schemas.contains { jsonString(.object($0), key: "name") == "browser.open_url" })
 
     let state = await store.load(sessionId: sessionId)
     #expect(state.activeTools.contains("browser.status"))
-    #expect(state.activeTools.contains("browser.navigate"))
+    #expect(state.activeTools.contains("browser.open_url"))
     #expect(state.activeTools.contains("browser.read_links"))
 
     let catalog = try await dispatcher.dispatch(
@@ -1650,7 +1653,7 @@ func appChatToolDispatcher_toolLoadBrowserCategoryPersistsSessionActiveTools() a
         surface: "chat"
     )
     #expect(jsonStringArray(catalog, key: "currently_loaded").contains("browser.status"))
-    #expect(jsonStringArray(catalog, key: "currently_loaded").contains("browser.navigate"))
+    #expect(jsonStringArray(catalog, key: "currently_loaded").contains("browser.open_url"))
     #expect(!jsonStringArray(catalog, key: "discovery_only_tools").contains("browser.status"))
     let rows = jsonObjectArray(catalog, key: "tools")
     #expect(rows.contains { row in
@@ -1722,9 +1725,9 @@ func appChatToolDispatcher_toolLoadBrowserCategorySkipsPersistingTurnActiveTools
 
     #expect(jsonString(result, key: "status") == "loaded")
     #expect(jsonStringArray(result, key: "loaded_now").isEmpty)
-    #expect(jsonStringArray(result, key: "already_active").contains("browser.navigate"))
-    #expect(jsonStringArray(result, key: "turn_active").contains("browser.navigate"))
-    #expect(jsonStringArray(result, key: "active_tools").contains("browser.navigate"))
+    #expect(jsonStringArray(result, key: "already_active").contains("browser.open_url"))
+    #expect(jsonStringArray(result, key: "turn_active").contains("browser.open_url"))
+    #expect(jsonStringArray(result, key: "active_tools").contains("browser.open_url"))
     #expect(jsonObjectArray(result, key: "schemas_added").isEmpty)
     #expect(jsonString(result, key: "next_turn_note")?.contains("no session loadout changed") == true)
     #expect(jsonString(result, key: "mode") == "persisted_session_load")
@@ -1742,7 +1745,7 @@ func appChatToolDispatcher_toolLoadBrowserCategorySkipsPersistingTurnActiveTools
             surface: "chat"
         )
     }
-    #expect(jsonStringArray(catalog, key: "currently_loaded").contains("browser.navigate"))
+    #expect(jsonStringArray(catalog, key: "currently_loaded").contains("browser.open_url"))
     #expect(jsonStringArray(catalog, key: "turn_active_tools").contains("browser.navigate"))
     #expect(!jsonStringArray(catalog, key: "discovery_only_tools").contains("browser.navigate"))
 }
@@ -1957,16 +1960,21 @@ func appChatToolDispatcher_toolLoadNotificationsPersistsSessionActiveTools() asy
     #expect(jsonString(result, key: "status") == "loaded")
     #expect(jsonString(result, key: "mode") == "persisted_session_load")
     let activeTools = jsonStringArray(result, key: "active_tools")
-    #expect(activeTools.contains("mac.notify"))
-    #expect(activeTools.contains("mobile.notify"))
+    #expect(activeTools.contains("mac_notify"))
+    #expect(activeTools.contains("mobile_notify"))
     #expect(!activeTools.contains("read_file"))
     let schemas = jsonObjectArray(result, key: "schemas_added")
-    #expect(schemas.contains { jsonString(.object($0), key: "name") == "mac.notify" })
-    #expect(schemas.contains { jsonString(.object($0), key: "name") == "mobile.notify" })
+    #expect(schemas.contains { jsonString(.object($0), key: "name") == "mac_notify" })
+    #expect(schemas.contains { jsonString(.object($0), key: "name") == "mobile_notify" })
 
+    // Every loaded name is backed by a pinned schema; no dotted duplicate.
     let state = await store.load(sessionId: sessionId)
-    #expect(state.activeTools.contains("mac.notify"))
-    #expect(state.activeTools.contains("mobile.notify"))
+    for name in ["mac_notify", "mobile_notify"] {
+        #expect(state.activeTools.contains(name))
+        #expect(state.pinnedSchemas[name] != nil)
+    }
+    #expect(!state.activeTools.contains("mac.notify"))
+    #expect(!state.activeTools.contains("mobile.notify"))
 }
 
 @Test
@@ -2020,11 +2028,11 @@ func appChatToolDispatcher_mixedToolLoadForwardsNonNotificationToInner() async t
     // notification tool AND the forwarded read_file — core tool_load doesn't
     // echo active_tools, so the merge must re-read the store.
     let active = jsonStringArray(result, key: "active_tools")
-    #expect(active.contains("mobile.notify"))
+    #expect(active.contains("mobile_notify"))
     #expect(active.contains("read_file"))
     // Both subsets persisted to the session store.
     let state = await store.load(sessionId: sessionId)
-    #expect(state.activeTools.contains("mobile.notify"))
+    #expect(state.activeTools.contains("mobile_notify"))
     #expect(state.activeTools.contains("read_file"))
 }
 
@@ -2071,7 +2079,7 @@ func appChatToolDispatcher_mixedToolLoadHandlesSingularNameField() async throws 
     )
     #expect(jsonString(result, key: "category") == "mixed")
     let state = await store.load(sessionId: sessionId)
-    #expect(state.activeTools.contains("mobile.notify"))
+    #expect(state.activeTools.contains("mobile_notify"))
     #expect(state.activeTools.contains("read_file"))
 }
 
@@ -2106,8 +2114,8 @@ func appChatToolDispatcher_pureSingularNotificationNameLoadsOnlyThatTool() async
         surface: "chat"
     )
     let loaded = jsonStringArray(result, key: "loaded")
-    #expect(loaded.contains("mobile.notify"))
-    #expect(!loaded.contains("mac.notify"))
+    #expect(loaded.contains("mobile_notify"))
+    #expect(!loaded.contains("mac_notify"))
 }
 
 @Test
@@ -2371,7 +2379,7 @@ func appChatToolDispatcher_categoryAndExplicitNamesAreAdditive(category: String)
     )
     #expect(jsonString(result, key: "status") == "loaded")
     let state = await store.load(sessionId: sessionId)
-    #expect(state.activeTools.contains("mobile.notify"))
+    #expect(state.activeTools.contains("mobile_notify"))
     #expect(state.activeTools.contains("read_file"))
     if category == "memory" {
         let group = try #require(ToolPreloadHeuristics.loadGroup(forCategory: category))

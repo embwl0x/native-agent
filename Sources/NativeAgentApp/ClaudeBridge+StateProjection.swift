@@ -448,7 +448,9 @@ extension ClaudeBridge {
         // Same WorkLatch + asyncAfter bound as handleMessage/handleTool: exactly
         // one of the work Task and the deadline writes the response.
         let workLatch = WorkLatch()
-        let workTask = Task.detached(priority: .utility) { [weak self] in
+        // 2026-09-23: .userInitiated; at .utility the first /codex/state reply
+        // nearly missed the installer's 2s liveness check.
+        let workTask = Task.detached(priority: .userInitiated) { [weak self] in
             guard let self else { return }
             let payload = await self.statePayload()
             guard workLatch.claim() else { return }

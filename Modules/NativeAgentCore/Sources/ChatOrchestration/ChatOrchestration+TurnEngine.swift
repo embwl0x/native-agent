@@ -853,49 +853,6 @@ public actor SwiftNativeTurnEngine {
         trace.setTiming(.toolsNames, milliseconds: catalog.0.elapsedMs)
         trace.setTiming(.toolsSchemas, milliseconds: catalog.1.elapsedMs)
         trace.setFlag("tools.schemasSeedReused", catalog.1.reused)
-        // Tool-contract stability instrument (2026-09-01). The advertised
-        // catalog is derived here from the same two inputs the lazy filter
-        // uses — the turn's schema walk and the session's load order — so two
-        // consecutive turns can be PROVEN to carry the same contract instead
-        // of being assumed to. A fingerprint that changes without
-        // appendedCount changing means something reordered the floor, which
-        // is the exact regression this build exists to make visible.
-        let contractSession = (sessionID ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        let contractLoadout = contractSession.isEmpty
-            ? nil
-            : await activeToolsStore.load(sessionId: contractSession)
-        // Mirrors applyLazyToolFilter's admission and ordering, including the
-        // catalog-derived Full-Mac resident family, so the instrument measures
-        // the contract that actually ships rather than an approximation of it.
-        let contractResident = ToolPreloadHeuristics.immediateFullMacTools(
-            availableToolNames: Set(toolSchemas.map(\.name))
-        ).subtracting(SwiftToolDispatcher.alwaysOnCoreNames)
-        let contractPinnedMCP = contractLoadout.map { Set($0.advertisedLoadOrder.filter { $0.hasPrefix("mcp__") }) }
-        let advertisedNames = toolSchemas
-            .map(\.name)
-            .filter { name in
-                if name.hasPrefix("mcp__") { return contractPinnedMCP?.contains(name) ?? true }
-                if SwiftToolDispatcher.alwaysOnCoreNames.contains(name) { return true }
-                if contractResident.contains(name) { return true }
-                return contractLoadout?.activeTools.contains(name) ?? true
-            }
-        let contractLoadOrder = contractResident.sorted()
-            + (contractLoadout?.advertisedLoadOrder ?? []).filter { !contractResident.contains($0) }
-        let contract = SwiftToolDispatcher.canonicalToolOrder(
-            advertisedNames,
-            loadOrder: contractLoadOrder
-        )
-        // PREFLIGHT, not the wire. These are measured here — before
-        // `commitTurnStartContract` promotes this turn's preload and restores
-        // the offer floor — so they describe the loadout on DISK at context
-        // assembly, not the tools array the provider receives. Comb 3 lane 3
-        // item 2: read as the contract, 20/48/19 contradicted the request's own
-        // 85 schemas. The final measurement is `tools.final*` on the
-        // `tools.contract` row fired from the structured-chat lane.
-        trace.setCount("tools.preflightFloorCount", contract.floor.count)
-        trace.setCount("tools.preflightAppendedCount", contract.appended.count)
-        trace.setCount("tools.preflightDroppedCount", contractLoadout?.lastDropped.count ?? 0)
-        trace.setLabel("tools.preflightFingerprintSHA256", contract.fingerprintSHA256)
         let snapshot = TurnContextSnapshot(
             providerPreferences: prefs,
             toolNames: toolNames,
@@ -1737,11 +1694,16 @@ public actor SwiftNativeTurnEngine {
             withMoments,
             dataRoot: remPinsDataRoot
         )
-        let withSessionDirective = Self.contextByAppendingSessionDirective(
+        var withSessionDirective = Self.contextByAppendingSessionDirective(
             withUpdateNote,
             dataRoot: remPinsDataRoot,
             sessionID: sessionID
         )
+        if let arrivals = await AgentWorkspaceArrivals.pending(dataRoot: remPinsDataRoot, scope: sessionID),
+           let text = try? arrivals.serialize(pretty: false) {
+            withSessionDirective = Self.contextByAppendingRuntimeContext(withSessionDirective,
+                runtimeContext: "Workspace arrivals (navigation notices, not requests):\n" + text)
+        }
         guard let runtimeContext = await renderRuntimeContext(
             surface: withSessionDirective.surface,
             modelId: withSessionDirective.modelId,
@@ -1774,28 +1736,7 @@ public actor SwiftNativeTurnEngine {
         guard let directive = ChatSessionDirective.pendingDirective(
             dataRoot: dataRoot, sessionID: sessionID, now: now
         ) else { return context }
-        let record = ChatSessionDirective.load(dataRoot: dataRoot, sessionID: sessionID)
         ChatSessionDirective.markDelivered(dataRoot: dataRoot, sessionID: sessionID, now: now)
-        // A line an advisory lane left here is now appended to this turn's
-        // context — the one thing its own row could not say when it was
-        // written, and as far down the path as the lane can honestly see.
-        if let lane = record?.helperLane.flatMap(JevLane.init(rawValue:)) {
-            JevLog.shared.note(
-                lane: lane,
-                summary: "carried line delivered",
-                context: JevLogContext(
-                    sessionID: sessionID,
-                    turnID: TurnTraceContext.turnId,
-                    acted: "appended to this turn's context"
-                ),
-                dataRoot: dataRoot,
-                extra: JevLog.delivery(
-                    told: directive,
-                    sourceTurn: record?.helperSourceTurn,
-                    reachedAgent: true
-                )
-            )
-        }
         return Self.contextByAppendingRuntimeContext(context, runtimeContext: directive)
     }
 
@@ -1895,10 +1836,20 @@ public actor SwiftNativeTurnEngine {
         let providerName = (provider?.isEmpty == false)
             ? provider!
             : (router.inferProviderForModel(model) ?? "unknown")
+        // 2026-09-22: names only, straight from peers.json — so she knows who
+        // exists without spending an agent_contacts call. Lock-free read (the
+        // store's lock could stall prompt assembly); any failure omits the line.
+        let connectedAgents: [String] = remPinsDataRoot
+            .flatMap { try? Data(contentsOf: AgentPeerStore(dataRoot: $0).fileURL) }
+            .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [[String: Any]] }?
+            .filter { $0["grokSetup"] as? String != "disconnected" }
+            .compactMap { $0["name"] as? String }
+            .sorted() ?? []
         return Self.renderRuntimeContext(
             surface: surfaceName,
             provider: providerName,
-            model: model
+            model: model,
+            connectedAgents: connectedAgents
         )
     }
 
@@ -2417,9 +2368,13 @@ public actor SwiftNativeTurnEngine {
     nonisolated static func renderRuntimeContext(
         surface: String,
         provider: String,
-        model: String
+        model: String,
+        connectedAgents: [String] = []
     ) -> String {
-        "Current runtime: surface=\(surface); provider=\(provider); model=\(model). If asked what model or provider you are using, answer from Current runtime; do not guess."
+        let line = "Current runtime: surface=\(surface); provider=\(provider); model=\(model). If asked what model or provider you are using, answer from Current runtime; do not guess."
+        guard !connectedAgents.isEmpty else { return line }
+        let more = connectedAgents.count > 12 ? " (+\(connectedAgents.count - 12) more)" : ""
+        return line + "\nConnected agents: " + connectedAgents.prefix(12).joined(separator: ", ") + more + "."
     }
 
     /// "Tuesday, August 11, 2026 at 9:29 AM CDT" — weekday and AM/PM spelled

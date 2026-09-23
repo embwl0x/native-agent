@@ -6,7 +6,8 @@ import PersistenceCore
 import Testing
 @testable import ChatOrchestration
 
-@Suite struct AgentACPClientTests {
+// Subprocess startup must not consume another fixture's phase-specific deadline.
+@Suite(.serialized) struct AgentACPClientTests {
     private struct Fixture {
         let root: URL
         let script: URL
@@ -18,14 +19,17 @@ import Testing
         }
         func clean() { try? FileManager.default.removeItem(at: root) }
         func run(_ mode: String, client: AgentACPClient = AgentACPClient(),
-                 mcpServers: [JSONValue] = [],
+                 conversationID: String? = nil,
+                 keepAlive: Bool = false, requireVerifiedRestore: Bool = false,
+                 mcpServers: [JSONValue] = [], timeout: Duration = .seconds(10),
                  permission: @escaping AgentACPClient.Permission = { _ in false },
                  update: @escaping AgentACPClient.Update = { _ in }) async throws -> AgentACPClient.Reply {
             try await client.turn(executable: "/usr/bin/ruby", arguments: [script.path, mode],
                 directory: root, environment: ["HOME": root.path, "PATH": "/usr/bin:/bin"],
                 message: "--message $(must_not_run)\nsecond line", mcpServers: mcpServers, permissionMode: "ask",
+                conversationID: conversationID,
                 approvedExecutable: try AgentACPExecutable.capture(path: "/usr/bin/ruby"),
-                timeout: .seconds(10),
+                keepAlive: keepAlive, requireVerifiedRestore: requireVerifiedRestore, timeout: timeout,
                 permission: permission, update: update)
         }
         static let source = #"""
@@ -44,18 +48,39 @@ import Testing
         prompt_id = nil
         permission_pending = false
         mode_set = false
+        turns = 0
         STDIN.each_line do |line|
           m = JSON.parse(line)
+          File.open('prompt-attempted', 'w') { |f| f.puts('prompt') } if m['method'] == 'session/prompt'
+          if mode == 'stall-' + m['method'].to_s
+            File.write('stalled-method', m['method'])
+            sleep 60
+          end
           case m['method']
           when 'initialize'
             raise 'version' unless m['params']['protocolVersion'] == 1
             raise 'capabilities' unless m['params']['clientCapabilities'] == {}
-            result(m['id'], {'protocolVersion'=> mode == 'version' ? 2 : 1, 'agentCapabilities'=>{}})
+            caps = mode.start_with?('session-') ? {'loadSession'=>true} : {}
+            caps['sessionCapabilities'] = {'resume'=>{}} if mode == 'session-resume'
+            result(m['id'], {'protocolVersion'=> mode == 'version' ? 2 : 1, 'agentCapabilities'=>caps})
             sleep 10 if mode == 'blocked-input'
           when 'session/new'
+            File.open('requests', 'a') { |f| f.puts('new') }
             raise 'cwd' unless m['params']['cwd'] == ENV['HOME']
             raise 'servers' unless m['params']['mcpServers'] == []
             result(m['id'], {'sessionId'=>'session-one','modes'=>{'currentModeId'=>'auto','availableModes'=>[{'id'=>'ask','name'=>'Ask'}]}})
+          when 'session/load', 'session/resume'
+            raise 'wrong method' unless m['method'] == (mode == 'session-resume' ? 'session/resume' : 'session/load')
+            raise 'cwd' unless m['params']['cwd'] == ENV['HOME'] && File.realpath(Dir.pwd) == File.realpath(ENV['HOME'])
+            raise 'servers' unless m['params']['mcpServers'] == []
+            raise 'session' unless m['params']['sessionId'] == 'session-one'
+            File.open('requests', 'a') { |f| f.puts(m['method']) }
+            update('old answer must not appear') unless mode == 'session-empty'
+            if mode == 'session-failed'
+              send_json({'jsonrpc'=>'2.0', 'id'=>m['id'], 'error'=>{'code'=>-32000,'message'=>'Session expired'}})
+            else
+              result(m['id'], {})
+            end
           when 'session/set_mode'
             raise 'unsafe mode' unless m['params']['modeId'] == 'ask'
             mode_set = true
@@ -69,6 +94,12 @@ import Testing
               permission_pending = true
               send_json({'jsonrpc'=>'2.0','id'=>'permission-one','method'=>'session/request_permission','params'=>{'sessionId'=>'session-one','toolCall'=>{'toolCallId'=>'tool-one','title'=>'Write a note','rawInput'=>{'path'=>'note.txt'}},'options'=>[{'optionId'=>'once','name'=>'Allow once','kind'=>'allow_once'},{'optionId'=>'never','name'=>'Deny','kind'=>'reject_once'},{'optionId'=>'always','name'=>'Always','kind'=>'allow_always'}]}})
             else
+              turns += 1
+              if mode == 'retained'
+                update(turns == 1 ? 'model selected' : 'selected model retained')
+                result(prompt_id, {'stopReason'=>'end_turn'})
+                next
+              end
               update('first ')
               exit 7 if mode == 'crash'
               next if mode == 'cancel'
@@ -122,6 +153,73 @@ import Testing
         #expect(FileManager.default.fileExists(atPath: fixture.root.appendingPathComponent("closed").path))
     }
 
+    @Test(arguments: ["session-load", "session-resume"])
+    func secondMessageContinuesWithoutHistory(_ mode: String) async throws {
+        let fixture = try Fixture(); defer { fixture.clean() }
+        let first = try await fixture.run(mode)
+        let updates = Updates()
+        let second = try await fixture.run(mode, conversationID: first.sessionID, update: { await updates.add($0) })
+        #expect(first.sessionID == second.sessionID)
+        #expect(!first.continued && second.continued)
+        #expect(second.detail == nil)
+        #expect(second.text == "first answer")
+        #expect(await updates.count == 2)
+        let requests = try String(contentsOf: fixture.root.appendingPathComponent("requests"), encoding: .utf8)
+        #expect(requests == "new\n" + (mode == "session-resume" ? "session/resume\n" : "session/load\n"))
+    }
+
+    @Test(arguments: ["session-failed", "normal"])
+    func unavailableSessionNeverSilentlyStartsFresh(_ mode: String) async throws {
+        let fixture = try Fixture(); defer { fixture.clean() }
+        let first = try await fixture.run(mode)
+        try FileManager.default.removeItem(at: fixture.root.appendingPathComponent("prompt-attempted"))
+        do {
+            _ = try await fixture.run(mode, conversationID: first.sessionID)
+            Issue.record("An unsupported or rejected restore must never start another conversation")
+        } catch { #expect(error as? AgentACPClient.Failure == .sessionUnavailable) }
+        #expect(!FileManager.default.fileExists(atPath: fixture.root.appendingPathComponent("prompt-attempted").path))
+        let requests = try String(contentsOf: fixture.root.appendingPathComponent("requests"), encoding: .utf8)
+        #expect(requests == (mode == "session-failed" ? "new\nsession/load\n" : "new\n"))
+    }
+
+    @Test func commandOnlyConversationStaysInTheSameProcess() async throws {
+        let fixture = try Fixture(); defer { fixture.clean() }
+        let client = AgentACPClient()
+        let first = try await fixture.run("retained", client: client, keepAlive: true)
+        let second = try await fixture.run("retained", client: client, conversationID: first.sessionID, keepAlive: true)
+        #expect(first.text == "model selected")
+        #expect(second.text == "selected model retained")
+        #expect(second.continued && second.sessionID == first.sessionID)
+        #expect(try String(contentsOf: fixture.root.appendingPathComponent("requests"), encoding: .utf8) == "new\n")
+        await client.close()
+        #expect(FileManager.default.fileExists(atPath: fixture.root.appendingPathComponent("closed").path))
+    }
+
+    @Test func ambiguousColdResumeNeverPromptsOrStartsFresh() async throws {
+        let fixture = try Fixture(); defer { fixture.clean() }
+        do {
+            _ = try await fixture.run("session-empty", conversationID: "session-one", requireVerifiedRestore: true)
+            Issue.record("An empty restore response cannot prove the old session exists")
+        } catch { #expect(error as? AgentACPClient.Failure == .sessionUnavailable) }
+        #expect(try String(contentsOf: fixture.root.appendingPathComponent("requests"), encoding: .utf8) == "session/load\n")
+    }
+
+    @Test func poolRejectsOverlappingTurnsAndRevokesOwnedChild() async throws {
+        let fixture = try Fixture(); defer { fixture.clean() }
+        let pool = AgentACPConnections()
+        let lease = try await pool.acquire(peer: "fixture", conversation: nil, configuration: "approved")
+        let reply = try await fixture.run("retained", client: lease.client, keepAlive: true)
+        await pool.finish(lease, peer: "fixture", conversation: reply.sessionID)
+        let resumed = try await pool.acquire(peer: "fixture", conversation: reply.sessionID, configuration: "approved")
+        do {
+            _ = try await pool.acquire(peer: "fixture", conversation: reply.sessionID, configuration: "approved")
+            Issue.record("Overlapping conversation must not run twice")
+        } catch { #expect(error as? AgentACPClient.Failure == .busy) }
+        await pool.finish(resumed, peer: "fixture", conversation: reply.sessionID)
+        await pool.revoke(peer: "fixture")
+        #expect(FileManager.default.fileExists(atPath: fixture.root.appendingPathComponent("closed").path))
+    }
+
     @Test func stoppedReaderCannotBlockTheTurnDeadline() async throws {
         let fixture = try Fixture(); defer { fixture.clean() }
         let start = ContinuousClock.now
@@ -129,9 +227,40 @@ import Testing
             _ = try await fixture.run("blocked-input", mcpServers: [.string(String(repeating: "x", count: 512 * 1024))])
             Issue.record("A peer that stops reading must fail")
         } catch {
-            #expect(error as? AgentACPClient.Failure == .timedOut)
+            #expect(error as? AgentACPClient.Failure == .sessionStartupTimedOut)
         }
         #expect(start.duration(to: .now) < .seconds(5))
+    }
+
+    @Test(arguments: ["initialize", "session/new", "session/set_mode", "session/prompt"])
+    func timeoutIdentifiesStartupWithoutClaimingPromptWasUnsent(_ method: String) async throws {
+        let fixture = try Fixture(); defer { fixture.clean() }
+        let expected: AgentACPClient.Failure
+        let phase: String?
+        switch method {
+        case "initialize": expected = .initializationTimedOut; phase = "initialization"
+        case "session/new": expected = .sessionStartupTimedOut; phase = "session_startup"
+        case "session/set_mode": expected = .modeSetupTimedOut; phase = "mode_setup"
+        default: expected = .timedOut; phase = nil
+        }
+        do {
+            _ = try await fixture.run("stall-" + method, timeout: .seconds(10))
+            Issue.record("The stalled peer must time out")
+        } catch {
+            #expect(error as? AgentACPClient.Failure == expected)
+            let receipt = AgentACPClient.startupTimeoutReceipt(error)
+            if let phase {
+                #expect(receipt?["phase"] == .string(phase))
+                #expect(receipt?["sent"] == .bool(false))
+                #expect(receipt?["completed"] == .bool(false))
+                #expect(receipt?["status"] == .string("unavailable"))
+            } else {
+                #expect(receipt == nil)
+            }
+        }
+        // Prove the fixture reached the intended stall before checking its receipt.
+        #expect(try String(contentsOf: fixture.root.appendingPathComponent("stalled-method"), encoding: .utf8) == method)
+        #expect(FileManager.default.fileExists(atPath: fixture.root.appendingPathComponent("prompt-attempted").path) == (method == "session/prompt"))
     }
 
     @Test(arguments: [ApprovalDecision.approved, .denied])
@@ -252,7 +381,9 @@ import Testing
         #expect(AgentHostDirectory.row(named: "Cursor CLI")?.acp?.arguments == ["acp", "--mode=ask", "--sandbox=enabled"])
         #expect(AgentHostDirectory.row(named: "Cursor")?.acp == nil)
         #expect(Set(AgentHostDirectory.rows.map(\.id)).count == AgentHostDirectory.rows.count)
-        #expect(AgentHostDirectory.row(named: "gemini")?.id == "gemini-cli")
+        #expect(AgentHostDirectory.row(named: "gemini")?.id == "antigravity-cli")
+        #expect(AgentHostDirectory.row(named: "Gemini CLI")?.id == "gemini-cli")
+        #expect(AgentHostDirectory.row(named: "gemini-cli")?.displayName == "Gemini CLI (Legacy)")
         #expect(AgentHostDirectory.row(named: "cursor-agent")?.id == "cursor-cli")
         for (id, version) in [("gemini-cli", "0.60.0"), ("goose", "1.51.0"), ("cursor-cli", "2026.09.15")] {
             let route = try #require(AgentHostACP.byHostID[id])

@@ -22,18 +22,14 @@ extension BackgroundLoopsAssembly {
         sessionID: String,
         operation: () async throws -> T
     ) async rethrows -> T {
-        do {
-            let value = try await operation()
-            await MainActor.run {
+        // 2026-09-22: fire-and-forget — the reply must not wait on a busy
+        // main thread just to tell the Mac UI to reload.
+        defer {
+            Task { @MainActor in
                 NotificationCenter.default.post(name: .chatTurnCompleted, object: sessionID)
             }
-            return value
-        } catch {
-            await MainActor.run {
-                NotificationCenter.default.post(name: .chatTurnCompleted, object: sessionID)
-            }
-            throw error
         }
+        return try await operation()
     }
 
     static func makeSlackSocketModeLoopIfConfigured(
@@ -279,7 +275,11 @@ extension BackgroundLoopsAssembly {
                     }
                 }
             }
-            return response.output
+            // The streamed draft showed her working; the settled message is the answer.
+            return ChatOrchestration.ChatResponse.answerOnly(
+                response.output,
+                workingCommentaryCharacters: response.workingCommentaryCharacters
+            )
         }
         return TelegramPollLoop(
             interval: 0.25,
@@ -296,13 +296,12 @@ extension BackgroundLoopsAssembly {
             sendRichMessage: TelegramPollLoop.defaultSendRichMessage,
             sendMessageWithReplyMarkupReturningId: TelegramPollLoop.defaultSendMessageWithReplyMarkupReturningId,
             editMessageTextWithReplyMarkup: TelegramPollLoop.defaultEditMessageTextWithReplyMarkup,
+            deleteMessage: TelegramPollLoop.defaultDeleteMessage,
             syncCommandMenu: TelegramPollLoop.defaultSyncCommandMenu,
             approvalHandler: approvalFiler,
             attachmentChatHandler: handler,
-            // Astra comb 3, lane2 finding 3 (2026-09-12): the turn starts its
-            // memory promotion after the assistant append and returns; this
-            // drains it once Telegram has actually delivered the reply.
-            afterReplyDelivered: { await client.drainDeferredMemoryPromotion() },
+            // Memory promotion already runs under the turn engine's ownership.
+            // Telegram completion must not wait for this optional background work.
             voiceTranscriber: makeTelegramVoiceTranscriber(cfg: cfg, dataRoot: dataRoot),
             onCapabilityDenied: { capability in
                 await fileSystemPermissionNotice(capability: capability, dataRoot: dataRoot)
@@ -539,17 +538,7 @@ extension BackgroundLoopsAssembly {
         dataRoot: URL
     ) -> (any TelegramVoiceTranscribing)? {
         guard cfg.voiceTranscriptionEnabled else { return nil }
-        let backend = TelegramVoiceTranscriptionBackends.canonical(cfg.voiceTranscriptionBackend)
-        if TelegramVoiceTranscriptionBackends.isAppleSpeech(backend) {
-            return SwiftAppleSpeechTranscriber()
-        }
-        if TelegramVoiceTranscriptionBackends.isOpenAI(backend) {
-            return SwiftOpenAIWhisperTranscriber(
-                model: cfg.voiceTranscriptionModel,
-                dataRoot: dataRoot
-            )
-        }
-        return nil
+        return SwiftAppleSpeechTranscriber(contextualStrings: { [AgentVoice.live.name] })
     }
 
 }

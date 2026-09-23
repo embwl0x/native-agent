@@ -9,7 +9,7 @@ public struct ChatSessionAutocompactionConfig: Sendable, Equatable {
     public static let agingEnabledKey = "nativeagent.compactionAgingEnabled"
     public static let defaultThresholdTokens = 200_000
     public static let defaultKeepCount = 20
-    public static let maximumContextWindowFraction = 0.40
+    public static let maximumContextWindowFraction = 0.60 // User 2026-09-23: 300K or 60% of the window
     /// Fraction of the threshold at which older turns start aging into
     /// recollection — the continuous lane (NORTHSTAR clause 4, sweep item 45).
     /// A quarter is deliberately far below the backstop: by the time a session
@@ -294,7 +294,10 @@ struct ChatSessionAutocompactor: Sendable {
             }
 
             let candidateReplaceCount = keepTailFixed
-                ? Self.fixedKeepTailReplacementCount(rows: rows, keepCount: config.keepCount)
+                ? Self.keepingLastUserRow(
+                    rows: rows,
+                    replaceCount: Self.fixedKeepTailReplacementCount(rows: rows, keepCount: config.keepCount)
+                )
                 : Self.replacementCount(
                     rows: rows,
                     keepCount: config.keepCount,
@@ -308,10 +311,13 @@ struct ChatSessionAutocompactor: Sendable {
             // row exists the split is impossible (the raw turns are gone), so
             // the fix belongs here: fold only what the dream has already passed
             // and leave the post-mark turns raw for the next pass.
-            let replaceCount = Self.markSafeReplacementCount(
+            let replaceCount = Self.keepingLastUserRow(
                 rows: rows,
-                replaceCount: candidateReplaceCount,
-                mark: ChatSessionRecollections.dreamConsolidationMark(dataRoot: dataRoot)
+                replaceCount: Self.markSafeReplacementCount(
+                    rows: rows,
+                    replaceCount: candidateReplaceCount,
+                    mark: ChatSessionRecollections.dreamConsolidationMark(dataRoot: dataRoot)
+                )
             )
             // Clamped to a prefix with no raw turn left in it → this pass would
             // only rewrite an existing recollection into an identical-coverage
@@ -389,7 +395,9 @@ struct ChatSessionAutocompactor: Sendable {
             let summary = Self.compactionSummary(
                 for: removableRows,
                 preservedCardCount: preservedCards.count,
-                foldedCards: foldedCards
+                foldedCards: foldedCards,
+                // 2026-09-23: 40K on a verified 1M route, 12K otherwise.
+                maxChars: ChatCompactionDistiller.maxSummaryChars(model: model, providerID: providerID)
             )
             let nowISO = ISO8601DateFormatter().string(from: now())
             let summaryId = "compact-\(UUID().uuidString.lowercased())"
@@ -737,7 +745,9 @@ struct ChatSessionAutocompactor: Sendable {
         var tailCount = preferredTailCount
         let cardCap = preservedCardCharacterCap(thresholdTokens: thresholdTokens, divisor: divisor)
         while tailCount > 1 {
-            let replaceCount = messageCount - tailCount
+            // 2026-09-23: the tail reaches back to its run's user row when that
+            // still fits; otherwise the loop shrinks on as before.
+            let replaceCount = keepingLastUserRow(rows: rows, replaceCount: messageCount - tailCount)
             // Preserved cards are REINSERTED after the summary, so their bytes
             // stay in the session. Leaving them out of this sum made the search
             // believe a pass would get under threshold when it could not, and a
@@ -751,7 +761,7 @@ struct ChatSessionAutocompactor: Sendable {
                 preservedCardCount: preserved.count,
                 foldedCards: folded
             )
-            let tail = Array(rows.suffix(tailCount))
+            let tail = Array(rows.suffix(messageCount - replaceCount))
             let postCompactionChars = summary.count
                 + transcriptCharacterCount(preserved)
                 + transcriptCharacterCount(tail)
@@ -764,7 +774,7 @@ struct ChatSessionAutocompactor: Sendable {
 
         // If even the preferred tail would stay over threshold, compact as much
         // as possible while preserving the newest raw message for continuity.
-        return messageCount - 1
+        return keepingLastUserRow(rows: rows, replaceCount: messageCount - 1)
     }
 
     /// The aging lane's replacement count: everything older than the keep-tail,
@@ -956,6 +966,22 @@ struct ChatSessionAutocompactor: Sendable {
         max(0, Int((Double(thresholdTokens) * divisor / 2).rounded()))
     }
 
+    /// 2026-09-23: the tail counts ROWS, so it could keep tool rows plus her
+    /// reply and fold away the user message that started that run — she then
+    /// replayed an answer to nothing. Pull the cut back to that user row;
+    /// skip when doing so would fold no raw turn.
+    static func keepingLastUserRow(rows: [JSONValue], replaceCount: Int) -> Int {
+        func role(_ row: JSONValue) -> String? {
+            guard case .object(let obj) = row, case .string(let value)? = obj["role"] else { return nil }
+            return value
+        }
+        guard replaceCount > 0, replaceCount < rows.count,
+              ["assistant", "tool"].contains(role(rows[replaceCount]))
+        else { return replaceCount }
+        guard let lastUser = rows[..<replaceCount].lastIndex(where: { role($0) == "user" }) else { return 0 }
+        return lastUser > 0 && containsRawTurn(Array(rows.prefix(lastUser))) ? lastUser : 0
+    }
+
     private static func preferredTailCount(messageCount: Int, keepCount: Int) -> Int {
         if messageCount > keepCount {
             return keepCount
@@ -996,7 +1022,8 @@ struct ChatSessionAutocompactor: Sendable {
     private static func compactionSummary(
         for rows: [JSONValue],
         preservedCardCount: Int = 0,
-        foldedCards: [JSONValue] = []
+        foldedCards: [JSONValue] = [],
+        maxChars: Int = ChatCompactionDistiller.maxSummaryChars
     ) -> String {
         let header = "[NativeAgent compacted \(rows.count + foldedCards.count) earlier message(s)."
             + InlineInteractionCompactionRetention.summaryClause(preservedCount: preservedCardCount)
@@ -1047,7 +1074,7 @@ struct ChatSessionAutocompactor: Sendable {
         // reliably longer than the `prefix(maxSummaryChars)` the next pass
         // reads it back with — the overflow was silently dropped on re-read.
         let fixedPrefixChars = lines.joined(separator: "\n").count
-        let cap = max(0, ChatCompactionDistiller.maxSummaryChars - fixedPrefixChars - 1)
+        let cap = max(0, maxChars - fixedPrefixChars - 1)
         let prior = pinnedLines.joined(separator: "\n")
         let rest = restLines.joined(separator: "\n")
         // The prior note may claim at most two thirds; whatever it does not use
@@ -1090,10 +1117,15 @@ enum ChatCompactionRowRendering {
     }
 
     /// The transcript line body for a row, or nil when the row carries nothing
-    /// worth preserving. Falls back to a compact `toolName + resultSummary`
-    /// when `content` is empty so post-compaction continuity keeps a record of
+    /// worth preserving. A tool row (empty `content`, a `toolName` in metadata)
+    /// renders exactly as prompt history renders it — same status, projection,
+    /// and secret redaction — so post-compaction continuity keeps a record of
     /// the tool activity.
-    static func summaryBody(_ obj: [String: JSONValue], collapseNewlines: Bool) -> String? {
+    static func summaryBody(
+        _ obj: [String: JSONValue],
+        collapseNewlines: Bool,
+        toolSummaryCap: Int? = nil
+    ) -> String? {
         let content: String = {
             if case .string(let text)? = obj["content"] { return text }
             if let value = obj["content"] { return (try? value.serialize(pretty: false)) ?? "" }
@@ -1102,9 +1134,13 @@ enum ChatCompactionRowRendering {
         let normalized = normalize(content, collapseNewlines: collapseNewlines)
         let metadata: [String: JSONValue]?
         if case .object(let value)? = obj["metadata"] { metadata = value } else { metadata = nil }
+        var line = normalized
+        if line.isEmpty, case .string(let toolName)? = metadata?["toolName"],
+           !toolName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            line = SessionHistoryPromptRenderer.toolSummary(content: "", metadata: metadata, resultCap: toolSummaryCap)
+        }
         let body = ChatTranscriptEvidenceRendering.contentIncludingAttachments(
-            normalized.isEmpty ? toolFallbackLine(obj) ?? "" : normalized,
-            attachments: metadata?["attachments"])
+            line, attachments: metadata?["attachments"])
         guard !body.isEmpty else { return nil }
         let role: String
         if case .string(let value)? = obj["role"] {
@@ -1131,33 +1167,17 @@ enum ChatCompactionRowRendering {
         return kind == ChatSessionRecollections.rowKind
     }
 
-    /// `toolName (ok): result summary` — nil when the row has no tool metadata.
-    static func toolFallbackLine(_ obj: [String: JSONValue]) -> String? {
-        guard case .object(let metadata)? = obj["metadata"] else { return nil }
-        guard case .string(let toolName)? = metadata["toolName"],
-              !toolName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
-        let recordedStatus = ChatTranscriptEvidenceRendering.recordedToolStatus(metadata)
-        var line = recordedStatus.map { "\($0): \(toolName)" } ?? toolName
-        if recordedStatus == nil, case .bool(let ok)? = metadata["ok"] {
-            line += ok ? " (ok)" : " (failed)"
-        }
-        if case .string(let summary)? = metadata["resultSummary"] {
-            let normalized = normalize(summary, collapseNewlines: true)
-            if !normalized.isEmpty {
-                line += ": \(String(normalized.prefix(toolResultSummaryMaximumCharacters)))"
-            }
-        }
-        return line
-    }
-
-    /// A tool receipt is context, not content — keep it short enough that a
-    /// long run of tool calls cannot crowd the conversation out of the summary.
-    static let toolResultSummaryMaximumCharacters = 200
+    /// 2026-09-23: the distiller writes her recollection from these rows; the
+    /// 160-char prompt projection left it guessing what each tool returned.
+    static let distillerToolResultSummaryMaximumCharacters = 1_000
 
     private static func normalize(_ text: String, collapseNewlines: Bool) -> String {
+        // Same redactor prompt history applies, so a compaction summary can
+        // never carry a secret the live prompt would have masked.
+        let redacted = ChatSecretRedactor.redactText(text)
         let flattened = collapseNewlines
-            ? text.replacingOccurrences(of: "\n", with: " ")
-            : text
+            ? redacted.replacingOccurrences(of: "\n", with: " ")
+            : redacted
         return flattened.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }

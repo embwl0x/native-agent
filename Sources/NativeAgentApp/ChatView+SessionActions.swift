@@ -66,6 +66,19 @@ extension ChatView {
         }
     }
 
+    /// 2026-09-22 WHY: a reconnect waits up to 30s (the backoff cap); 6s left
+    /// most of the wait silent. Each try replaces the last.
+    func pushChatTopNotice(_ text: String, kind: String) {
+        guard kind == "provider_retry" else {
+            turnNoticeToasts.push(info: text, autoDismissAfter: 6)
+            return
+        }
+        // One fixed id: each try replaces the last without clearing other notices.
+        turnNoticeToasts.push(SystemToast(kind: .info, text: text, autoDismissAfter: 30, id: Self.providerRetryNoticeID))
+    }
+
+    static let providerRetryNoticeID = UUID()
+
     func primeAutoReadForCurrentSessionIfNeeded() {
         let sessionID = appModel.activeChatSessionId.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !sessionID.isEmpty, !autoReadPrimedSessionIds.contains(sessionID) else { return }
@@ -119,7 +132,10 @@ extension ChatView {
             appModel.systemToasts.push(error: "Export failed: \(error.localizedDescription)")
         }
     }
+}
 
+// 2026-09-22: read only by ChatTurnCardInset, never by ChatView.body.
+extension ChatTurnCardInset {
     // chat-smoothness phase 4: one visibility truth for the floating live-turn
     // card — the overlay, its animation, and the "Latest" button lift all key
     // off this so they can never disagree.
@@ -139,21 +155,9 @@ extension ChatView {
             approvals: appModel.approvals
         )
     }
+}
 
-    /// What one publication of the streaming tail does to the viewport.
-    /// User, 2026-09-14: the streamed reply ran under the working card and the
-    /// composer and the list never followed it — native size-change anchoring
-    /// alone did not hold on this branch. An explicit follow per publication:
-    /// non-animated, coalesced by the coordinator (160 ms), off while the
-    /// reader has scrolled away.
-    func followStreamedTail(_ proxy: ScrollViewProxy) {
-        if showTranscriptSearch {
-            refreshTranscriptSearchTailIfPresented()
-        } else {
-            scrollToBottom(proxy, animated: false, delay: 0)
-        }
-    }
-
+extension ChatView {
     func scrollToBottom(_ proxy: ScrollViewProxy, animated: Bool, delay: TimeInterval, force: Bool = false) {
         scrollCoordinator.scrollToBottom(
             proxy,

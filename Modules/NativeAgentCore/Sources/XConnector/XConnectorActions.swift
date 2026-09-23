@@ -47,7 +47,7 @@ public enum XConnectorActions {
 
     public static func searchRecent(input: [String: JSONValue]) async throws -> JSONValue {
         await run(actionId: "x.search_recent") {
-            let query = try recentSearchQuery(input["query"])
+            let window = try recentSearchWindow(try recentSearchQuery(input["query"]))
             // /2/tweets/search/recent rejects max_results below 10 with a 400.
             // Clamp to the provider's real floor instead of forwarding a value
             // it will refuse; the advertised schema states the same bound.
@@ -57,11 +57,17 @@ public enum XConnectorActions {
             let requestedMax = inputInt(input["max"])
             let bearer = try await currentBearer()
             let url = apiURL("/2/tweets/search/recent")
-            let (status, data) = try await httpGET(url, bearer: bearer, query: [
-                ("query", query),
+            var query: [(String, String)] = [
+                ("query", window.query),
                 ("max_results", String(maxResults)),
                 ("tweet.fields", "id,text,author_id,created_at,public_metrics")
-            ])
+            ] + window.params
+            // 2026-09-23: meta.next_token was returned but could not be sent back.
+            // Search pages with next_token (timelines use pagination_token).
+            if let next = inputString(input["next_token"])?.trimmingCharacters(in: .whitespacesAndNewlines), !next.isEmpty {
+                query.append(("next_token", next))
+            }
+            let (status, data) = try await httpGET(url, bearer: bearer, query: query)
             guard (200..<300).contains(status) else {
                 return httpFailureEnvelope(actionId: "x.search_recent", statusCode: status, data: data)
             }
@@ -70,8 +76,53 @@ public enum XConnectorActions {
             if let requestedMax, requestedMax != maxResults {
                 fields["clamped"] = .string("\(requestedMax)→\(maxResults)")
             }
+            if let note = window.note { fields["window_clamped"] = .string(note) }
             return completedEnvelope(actionId: "x.search_recent", fields: fields)
         }
+    }
+
+    // 2026-09-23: since:/until: are web-search syntax; X v2 answers 400. Move
+    // them to start_time/end_time. Recent search reaches back 7 days only, so an
+    // older since: is clamped and the result says so.
+    static func recentSearchWindow(_ query: String, now: Date = Date())
+        throws -> (query: String, params: [(String, String)], note: String?) {
+        // Quoted phrases match first so operator-looking literal text is skipped.
+        let pattern = #""(?:\\.|[^"\\])*"|(?<![^\s()])(since|until):(\d{4}-\d{2}-\d{2})(?=$|[\s()])"#
+        let regex = try NSRegularExpression(pattern: pattern, options: .caseInsensitive)
+        let day = Date.ISO8601FormatStyle().year().month().day()
+        var stripped = query
+        var start: Date?
+        var end: Date?
+        for match in regex.matches(in: query, range: NSRange(query.startIndex..., in: query)).reversed() {
+            guard match.range(at: 1).location != NSNotFound,
+                  let whole = Range(match.range, in: stripped),
+                  let operatorRange = Range(match.range(at: 1), in: query),
+                  let dateRange = Range(match.range(at: 2), in: query),
+                  let date = try? day.parse(String(query[dateRange])) else { continue }
+            if query[operatorRange].lowercased() == "since" { start = date } else { end = date }
+            stripped.removeSubrange(whole)
+        }
+        guard start != nil || end != nil else { return (query, [], nil) }
+        stripped = stripped.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !stripped.isEmpty else {
+            throw XActionError("invalid_input",
+                detail: "query needs a keyword, phrase or account besides since:/until:. Example: from:XDevelopers since:2026-09-20")
+        }
+        var params: [(String, String)] = []
+        var note: String?
+        if let start {
+            let floor = now.addingTimeInterval(-7 * 86_400 + 60)
+            let clamped = max(start, floor)
+            if clamped > start {
+                note = "since:\(start.formatted(day)) moved to \(clamped.formatted(.iso8601)); recent search covers the last 7 days only"
+            }
+            params.append(("start_time", clamped.formatted(.iso8601)))
+        }
+        // X wants end_time at least 10s in the past; a today/future until: means now.
+        if let end, end < now.addingTimeInterval(-10) {
+            params.append(("end_time", end.formatted(.iso8601)))
+        }
+        return (stripped, params, note)
     }
 
     // Validate before credential lookup as well as before the HTTP request.

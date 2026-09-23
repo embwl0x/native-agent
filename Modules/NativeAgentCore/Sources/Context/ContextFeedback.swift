@@ -292,10 +292,10 @@ private extension ContextFeedbackReducer {
             try advance(to: event.timeBucket, configuration: configuration)
             switch event.signal {
             case .selection:
+                // 2026-09-22: count only. Being picked raised the score that
+                // picked it, so the same 8 memories held 75% of slots on every
+                // topic. Expansion and outcomes still move the score.
                 selectionCount += 1
-                retrievalUtility += configuration.selectionUtilityDelta
-                temporaryActivation += 0.06
-                decay += 0.015
             case .expansion:
                 expansionCount += 1
                 retrievalUtility += configuration.expansionUtilityDelta

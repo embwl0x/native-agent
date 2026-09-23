@@ -345,7 +345,9 @@ func _tgParseDate(_ value: String?) -> Date? {
 
 func _tgPreview(_ text: String?, limit: Int = 240) -> String? {
     guard let text else { return nil }
-    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    // 2026-09-22: previews land in receipts.jsonl; scrub before the cut so a
+    // pasted token can't survive by being truncated out of its pattern.
+    let trimmed = TurnTraceRedactor.redactText(text.trimmingCharacters(in: .whitespacesAndNewlines))
     guard !trimmed.isEmpty else { return nil }
     if trimmed.count <= limit { return trimmed }
     return String(trimmed.prefix(limit)) + "..."

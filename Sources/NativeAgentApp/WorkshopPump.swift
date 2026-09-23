@@ -288,6 +288,15 @@ public struct WorkshopPump: Sendable {
                     attemptId: reservationId,
                     receipt: receiptLine
                 )
+                // 2026-09-22: a blocked owner cadence re-ran on schedule with the
+                // same "blocked" (Desk 618, 4x). Park it only when its own clean
+                // workshop_progress report said blocked (.completed); timeouts,
+                // failures and missing reports keep retrying. setBlockedOn takes
+                // item handles only, so the prose goes in blockedReason.
+                if receipt.disposition == .blocked, receipt.status == .completed {
+                    _ = try? await store.setStatus(candidate.handle, status: .blocked,
+                                                   blockedReason: String(receipt.summary.prefix(600)))
+                }
             }
             deskSettled = true
         } catch {
@@ -473,8 +482,13 @@ public struct WorkshopPump: Sendable {
         }
 
         // Else User items with a beating cadence that is due.
+        // Effective blockers only, as DeskSequencing derives them: a stored
+        // handle that has closed or left live state no longer blocks.
+        let liveBlockers = Set(state.items.filter { !$0.status.isTerminal }.map(\.handle))
         let userDue = globalCapHit ? [] : state.items.filter { item in
-            guard !item.isPursuit, !item.status.isTerminal else { return false }
+            guard !item.isPursuit, !item.status.isTerminal, item.status != .blocked,
+                  !item.blockedOn.contains(where: { $0 != item.handle && liveBlockers.contains($0) })
+            else { return false }
             switch item.cadence.mode {
             case .tick, .daily, .weekly: break
             default: return false

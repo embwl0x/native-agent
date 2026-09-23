@@ -293,20 +293,14 @@ extension SwiftNativeChatOrchestrationClient {
             || normalized == "cancellationerror()"
     }
 
-    nonisolated static func shouldUseAnthropicTextStreamingCompatibility(
-        model: String,
-        surface: String
-    ) -> Bool {
-        let normalizedSurface = surface.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard isAnthropicTextCompatibilitySurface(normalizedSurface) else { return false }
+    /// Model-id backstop, used only when no provider id resolved for the turn.
+    /// A Claude id alone cannot say which Claude transport serves it, and the
+    /// text lane is safe on both (native tools engage inside it when allowed).
+    nonisolated static func shouldUseAnthropicTextStreamingCompatibility(model: String) -> Bool {
         let normalizedModel = model.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !normalizedModel.isEmpty else { return false }
         if normalizedModel.hasPrefix("anthropic/") { return true }
         if normalizedModel.hasPrefix("claude-") { return true }
-        // Kimi Code subscription models speak the Anthropic wire protocol and
-        // MUST ride this text-compat path: the API-key AnthropicAdapter never
-        // sends native tools[], so text-compat's system-block tool contract is
-        // what makes them tool-capable (gpt-5.5 review HIGH, 2026-07-18).
         if FirstPartyModelCatalog.kimiCodeModelIDSet.contains(normalizedModel) { return true }
         return normalizedModel.hasPrefix("opus")
             || normalizedModel.hasPrefix("sonnet")
@@ -318,36 +312,35 @@ extension SwiftNativeChatOrchestrationClient {
         surface: String
     ) async throws -> Bool {
         let normalizedSurface = surface.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard Self.isAnthropicTextCompatibilitySurface(normalizedSurface) else { return false }
-        if let admittedProvider = LLMCallContext.providerId {
-            return Self.isAnthropicProviderId(admittedProvider)
+        var provider = LLMCallContext.providerId
+        if provider == nil { provider = try await engine.checkedActiveProviderID(for: normalizedSurface) }
+        guard let provider else {
+            return Self.shouldUseAnthropicTextStreamingCompatibility(model: model)
         }
-        if Self.shouldUseAnthropicTextStreamingCompatibility(model: model, surface: surface) {
-            return true
-        }
-        guard let activeProvider = try await engine.checkedActiveProviderID(for: normalizedSurface) else {
-            return false
-        }
-        return Self.isAnthropicProviderId(activeProvider)
+        // 2026-09-22: one rule on every surface (the old surface allowlist sent
+        // subscription turns on workshop/bridge surfaces into native tools).
+        // Kimi Code and the Anthropic API key keep the lane they have always
+        // ridden; their native tools engage inside it (usesNativeToolLane).
+        return Self.providerNeedsTextToolLane(provider) || Self.keepsTextLaneWithNativeTools(provider)
     }
 
-    private nonisolated static func isAnthropicTextCompatibilitySurface(_ surface: String) -> Bool {
-        let compatibleSurfaces: Set<String> = [
-            "chat", "telegram", "slack", "ios", "icloud", "iphone", "ipad", "mobile",
-            // A bot's turn is an ordinary chat turn on its own session (2026-09-09).
-            "bot",
-        ]
-        return compatibleSurfaces.contains(surface.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
+    /// THE lane rule: an Anthropic-wire provider that cannot take a native
+    /// tools[] array (the Claude subscription) speaks tool markers in text.
+    nonisolated static func providerNeedsTextToolLane(_ providerId: String?) -> Bool {
+        guard let providerId else { return false }
+        let normalized = normalizedProviderId(providerId)
+        let anthropicWire = normalized == "anthropic" || normalized.hasPrefix("anthropic_")
+        return anthropicWire && !NativeToolCapability.providerSupportsNativeTools(providerId)
     }
 
-    private nonisolated static func isAnthropicProviderId(_ providerId: String) -> Bool {
-        let normalized = providerId
+    private nonisolated static func keepsTextLaneWithNativeTools(_ providerId: String) -> Bool {
+        ["kimi_code", "anthropic"].contains(normalizedProviderId(providerId))
+    }
+
+    private nonisolated static func normalizedProviderId(_ providerId: String) -> String {
+        providerId
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
             .replacingOccurrences(of: "-", with: "_")
-        // kimi-code is an Anthropic-WIRE provider (Kimi Code subscription
-        // endpoint) — its turns take the same text-compat contract.
-        return normalized == "anthropic" || normalized.hasPrefix("anthropic_")
-            || normalized == "kimi_code"
     }
 }

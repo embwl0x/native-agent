@@ -93,7 +93,8 @@ extension NativeCognitionRuntime {
     func runReflectionIfDue(
         llm: any LLMClient,
         reason: String,
-        demand: CognitiveReflectionDemand = .requested
+        demand: CognitiveReflectionDemand = .requested,
+        sameSourceCooldown: TimeInterval? = nil
     ) async -> CognitiveBackgroundRunOutcome {
         await bootstrap()
         if let bootstrapFailure { return .failed(bootstrapFailure) }
@@ -108,6 +109,14 @@ extension NativeCognitionRuntime {
         let dreamMaterial = reason.hasSuffix(":dreamCompleted")
             ? await latestDreamMaterial()
             : nil
+        // Take the lease BEFORE planning: planning sets the in-flight
+        // reservation, and a lease refusal after it would strand that
+        // reservation and refuse every reflection until it expires.
+        let lease = BackgroundWorkLease(dataRoot: dataRoot)
+        let window = WorkshopPump.windowKey(Date())
+        guard await lease.tryAcquire(holder: "reflection", window: window) else {
+            return .skipped("background work lease held")
+        }
         switch await substrate.planReflectionChecked(
             reason: reason,
             demand: demand,
@@ -118,25 +127,24 @@ extension NativeCognitionRuntime {
             materialExcerpt: dreamMaterial?.excerpt,
             // …and the takeaway keeps WHICH night it was: the diary entry's own
             // identity travels with the request (Astra audit 2026-09-11, 7).
-            materialProvenance: dreamMaterial?.provenance
+            materialProvenance: dreamMaterial?.provenance,
+            sameSourceCooldown: sameSourceCooldown
         ) {
         case .admitted(let planned):
             request = planned
         case .refused(let admission):
             // Honest skip: which fence stopped it, and the load reading behind it.
+            _ = await lease.releaseUnused(holder: "reflection", window: window)
             return .skipped(admission.detail)
         }
         let reflectionOutcome = await executeReflection(request: request, llm: llm)
+        if case .skipped(let why) = reflectionOutcome, why != "reflection cancelled" {
+            // Routing refused before any provider work; return the unused slot.
+            // A cancellation came after the provider call began: the slot is spent.
+            _ = await lease.releaseUnused(holder: "reflection", window: window)
+        }
         publishRuntimeChange(reason: "reflection:finished")
         guard case .completed = reflectionOutcome else { return reflectionOutcome }
-        // C2 lease PRIORITY (gpt-5.5 LOW): reflection did real expensive-LLM
-        // work THIS window → mark the shared green-window lease so a later
-        // workshop tick yields to her cognition. Marked here (not in the loop
-        // tick) so a not-due reflection never consumes a window for nothing.
-        // Result ignored — reflection never gates on the lease. Same dataRoot
-        // and window key the pump uses.
-        _ = await BackgroundWorkLease(dataRoot: dataRoot)
-            .tryAcquire(holder: "reflection", window: WorkshopPump.windowKey(Date()))
         // C2b — volition ignition: after the reflection's normal work, Agent MAY
         // propose ONE new self-pursuit, but ONLY from resolved, un-launderable
         // evidence (a User-approved ACTIVE standing view). No new unattended-LLM

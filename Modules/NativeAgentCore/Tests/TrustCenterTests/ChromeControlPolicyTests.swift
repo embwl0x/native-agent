@@ -24,6 +24,29 @@ struct ChromeControlPolicyTests {
         #expect(await trust.chromeControlEnabledChecked() == true)
     }
 
+    @Test("Full Mac admits Chrome effects only for the checked caller and current grant")
+    func fullMacCallerAndRevocation() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ChromeFullMac-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let trust = SwiftNativeTrustCenter(dataRoot: root)
+        _ = try await trust.updateTrust(.object([
+            "permissionLevel": .string("full_mac_os"),
+            "filePolicy": .object(["outsideWorkspaceDefault": .string("allow")]),
+            "chromeControlPolicy": .object(["enabled": .bool(false)])
+        ]))
+        let local = SecurityOriginContext(surface: "chat", source: "test", isRemote: false)
+        let remote = SecurityOriginContext(surface: "telegram", source: "test", isRemote: true)
+        #expect(await trust.chromeControlEnabledChecked(tool: "browser.chrome_snapshot", origin: local))
+        #expect(await trust.chromeControlEnabledChecked(tool: "browser.chrome_snapshot", origin: remote) == false)
+        #expect(await trust.chromeControlEnabledChecked() == false)
+        _ = try await trust.updateTrust(.object([
+            "permissionLevel": .string("balanced"),
+            "filePolicy": .object(["outsideWorkspaceDefault": .string("deny")])
+        ]))
+        #expect(await trust.chromeControlEnabledChecked(tool: "browser.chrome_snapshot", origin: local) == false)
+    }
+
     @Test("Malformed saved authority fails closed")
     func malformedPolicyFailsClosed() async throws {
         let root = FileManager.default.temporaryDirectory

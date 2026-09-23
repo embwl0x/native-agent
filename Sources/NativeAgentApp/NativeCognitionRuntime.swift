@@ -229,6 +229,8 @@ actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureProvidin
     var organismPersistenceDrainTask: Task<Void, Never>?  // internal for actor extensions (move-only Wave C)
     var organismPersistenceWaiters: [UInt64: [CheckedContinuation<Bool, Never>]] = [:]  // internal for actor extensions (move-only Wave C)
     var organismPersistenceLastResult = true  // internal for actor extensions (move-only Wave C)
+    var organismPersistenceLastWriteAt: ContinuousClock.Instant?  // internal for actor extensions
+    var organismPersistenceDebounceTask: Task<Void, Never>?  // internal for actor extensions
     let organismPersistenceWriterOverride:  // internal for actor extensions (move-only Wave C)
         (@Sendable (OrganismPersistentState, URL) async throws -> Void)?
     /// Test seam for the required cognition-side half of a reflex review.
@@ -752,6 +754,7 @@ actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureProvidin
         await recoverPendingOrganismReflexReviewIfNeeded()
         await restoreProviderLifecycleEvidence()
         await reconcileProviderVitalsNotices()
+        await TriggerNotifierBinding.archiveSupersededMorningBriefs(dataRoot: dataRoot)
         // The only awaited Desk replay is launch/bootstrap work, performed in
         // a detached task so its synchronous JSONL parse never occupies this
         // actor. All later turns consume the resident projection.

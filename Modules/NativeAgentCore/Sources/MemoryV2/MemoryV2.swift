@@ -887,13 +887,6 @@ public actor SwiftNativeMemoryV2: MemoryV2Protocol {
         }
     }
 
-    public func rollbackMemoryEmbeddingEpochActivation() async throws -> MemoryEmbeddingEpochState {
-        guard let bridge = storage as? MemoryStorageBridge else {
-            throw MemoryV2Error.storageUnavailable
-        }
-        return try await bridge.underlyingStorage().rollbackEmbeddingEpochActivation()
-    }
-
     // MARK: - internal helpers used by extension methods
 
     internal func embedOneWithEpoch(

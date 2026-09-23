@@ -261,7 +261,7 @@ extension AppModel {
                 input: MacChatTurnLifecycleInput(
                     identity: state.identity,
                     kind: .outcomeUnknown(
-                        reason: "The turn ended without a provable terminal outcome."
+                        reason: "I'm not sure that finished \u{2014} if my answer isn't here, say it again and I'll pick it up."
                     ),
                     occurredAt: instant
                 )

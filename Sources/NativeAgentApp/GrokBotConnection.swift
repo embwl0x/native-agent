@@ -1,4 +1,5 @@
 import AppKit
+import os
 import ApplicationServices
 import ChatOrchestration
 import NativeAgentCore
@@ -20,7 +21,9 @@ import PersistenceCore
     static func ensureRunning() async -> Bool {
         if running { return true }
         guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: GrokBotRoute.bundleID) else { return false }
-        _ = try? await NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration())
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.activates = false
+        _ = try? await NSWorkspace.shared.openApplication(at: url, configuration: configuration)
         for _ in 0..<40 where !running { try? await Task.sleep(nanoseconds: 500_000_000) }
         if running { try? await Task.sleep(nanoseconds: 4_000_000_000) }
         return running
@@ -69,42 +72,62 @@ import PersistenceCore
         return name.isEmpty ? "Grok Bot" : name
     }
     /// Seen on the installed app (09-20): the box has no placeholder attribute;
-    /// an empty box reports "Message <chat name>" as its value, and a chat named
-    /// after its first message makes that long.
-    static func isEmptyBox(_ value: String) -> Bool {
+    /// an empty box reports "Message <chat name>" as its value. Match only the
+    /// verified destination's exact placeholder, never a generic prose prefix.
+    static func isEmptyBox(_ value: String, conversation: String = "grok") -> Bool {
         let text = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        return text.isEmpty || text.hasPrefix("Message ") || text.hasPrefix("Ask anything")
+        return text.isEmpty || (!conversation.isEmpty && text == "Message " + conversation)
+            || ["Ask anything", "Ask anything…", "Ask anything..."].contains(text)
     }
     /// Grok Bot builds its accessibility tree only while it is in front and has
     /// been told a reader is present. Every read of its window starts here.
+    static let log = Logger(subsystem: "NativeAgent", category: "GrokBot")
+    /// Which check stopped setup: the one message the person sees covers six.
+    static func step(_ name: String) { log.error("grok setup stopped at \(name, privacy: .public)") }
     static func awake() async throws -> NSRunningApplication {
         guard await ensureRunning(),
               let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: GrokBotRoute.bundleID) else { throw Blocker.offline }
         let configuration = NSWorkspace.OpenConfiguration()
         configuration.activates = true
         let app = try await NSWorkspace.shared.openApplication(at: url, configuration: configuration)
-        try await waitUntil { NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier }
+        do { try await waitUntil { NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier } }
+        catch { step("awake: Grok Bot never became frontmost"); throw error }
         _ = AXUIElementSetAttributeValue(AXUIElementCreateApplication(app.processIdentifier), "AXManualAccessibility" as CFString, kCFBooleanTrue)
         for _ in 0..<3 {
             if (try? await waitUntil { try nodes(window()).contains { string($0, kAXRoleAttribute) == "AXWebArea" } }) != nil { return app }
         }
+        step("awake: no web area in the window (AX tree not readable)")
         throw Blocker.conversation
     }
     /// No model-driven screen access while a secret-bearing panel is open.
     static func requireChatOnly() throws {
-        let tree = nodes(try window())
+        // The secret-bearing panel shows its values in text fields; a chat
+        // message that merely says "key" or carries a link is not that panel.
+        let tree = nodes(try window()).filter { string($0, kAXRoleAttribute) == kAXTextFieldRole }
         guard !tree.contains(where: { node in
             let labels = [kAXValueAttribute, kAXTitleAttribute, kAXDescriptionAttribute].map { string(node, $0).lowercased() }
             return labels.contains { $0 == "post to" || $0 == "key" || $0 == "webhook key" || $0.hasPrefix("https://") }
         }) else { throw Blocker.secrets }
     }
-    static func prepareConversation() throws -> AXUIElement {
+    static func isCurrentBotChat(_ bot: String) throws -> Bool {
+        try nodes(window()).contains { string($0, kAXRoleAttribute) == "AXHeading"
+            && (string($0, kAXTitleAttribute) == bot || string($0, kAXDescriptionAttribute) == bot) }
+    }
+    static func prepareConversation(bot: String) throws -> AXUIElement {
         try requireChatOnly()
+        guard try isCurrentBotChat(bot) else { throw Blocker.conversation }
         let tree = nodes(try window())
         let boxes = tree.filter { string($0, kAXRoleAttribute) == kAXTextAreaRole
             && string($0, kAXDescriptionAttribute).lowercased() == "prompt" }
-        guard boxes.count == 1, let value = attribute(boxes[0], kAXValueAttribute) as? String,
-              isEmptyBox(value) else { throw Blocker.conversation }
+        guard boxes.count == 1 else {
+            step("prepare: prompt box count \(boxes.count)"); throw Blocker.conversation
+        }
+        guard let value = attribute(boxes[0], kAXValueAttribute) as? String else {
+            step("prepare: prompt value unavailable, box count \(boxes.count)"); throw Blocker.conversation
+        }
+        guard isEmptyBox(value, conversation: bot) else {
+            step("prepare: prompt not empty, box count \(boxes.count)"); throw Blocker.conversation
+        }
         return boxes[0]
     }
     static func centre(_ node: AXUIElement) throws -> CGPoint {
@@ -155,8 +178,7 @@ import PersistenceCore
     /// or "<name>, Unread activity"; once open, the heading is the name.
     static func openBotChat(_ bot: String) async throws {
         func heading() throws -> Bool {
-            try nodes(window()).contains { string($0, kAXRoleAttribute) == "AXHeading"
-                && (string($0, kAXTitleAttribute) == bot || string($0, kAXDescriptionAttribute) == bot) }
+            try isCurrentBotChat(bot)
         }
         if try heading() { return }
         let chats = nodes(try window()).filter {
@@ -169,25 +191,59 @@ import PersistenceCore
     }
     static func send(_ text: String, bot: String) async throws {
         guard !text.isEmpty else { throw Blocker.submission }
+        try await restoringForeground { try await sendInForeground(text, bot: bot) }
+    }
+    /// Workspace activation works from a background app where activate() can be
+    /// ignored. Await cleanup on success and failure; never steal focus back
+    /// after the person has switched to another application during setup.
+    static func restoringForeground(_ operation: () async throws -> Void) async throws {
         let previous = NSWorkspace.shared.frontmostApplication
-        defer { previous?.activate() }
+        do {
+            try await operation()
+        } catch {
+            await restoreForeground(previous)
+            throw error
+        }
+        await restoreForeground(previous)
+    }
+    static func shouldRestoreForeground(previousPID: pid_t?, previousTerminated: Bool,
+                                        currentPID: pid_t?, currentBundleID: String?) -> Bool {
+        previousPID != nil && !previousTerminated && previousPID != currentPID
+            && currentBundleID == GrokBotRoute.bundleID
+    }
+    private static func restoreForeground(_ previous: NSRunningApplication?) async {
+        let current = NSWorkspace.shared.frontmostApplication
+        guard shouldRestoreForeground(previousPID: previous?.processIdentifier,
+                                      previousTerminated: previous?.isTerminated ?? true,
+                                      currentPID: current?.processIdentifier,
+                                      currentBundleID: current?.bundleIdentifier),
+              let url = previous?.bundleURL else { return }
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.activates = true
+        _ = try? await NSWorkspace.shared.openApplication(at: url, configuration: configuration)
+    }
+    private static func sendInForeground(_ text: String, bot: String) async throws {
         let app = try await awake()
         func requireFrontmost() throws {
-            guard NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier else { throw Blocker.submission }
+            guard NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier else {
+                step("frontmost lost to \(NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "?")"); throw Blocker.submission
+            }
         }
         try await openBotChat(bot)
-        let box = try prepareConversation()
+        let box = try prepareConversation(bot: bot)
         let click = try clickEvents(at: centre(box))
         let paste = try keyEvents(9, flags: .maskCommand)
         let submit = try keyEvents(36)
         try requireFrontmost()
         click.forEach { $0.post(tap: .cghidEventTap) }
-        try await waitUntil {
-            try requireFrontmost()
-            return (attribute(box, kAXFocusedAttribute) as? Bool) == true
-        }
+        do {
+            try await waitUntil {
+                try requireFrontmost()
+                return (attribute(box, kAXFocusedAttribute) as? Bool) == true
+            }
+        } catch { step("message box never took focus after click"); throw error }
         // Recheck after focus: never replace a draft or paste into a changed chat.
-        guard CFEqual(box, try prepareConversation()) else { throw Blocker.conversation }
+        guard CFEqual(box, try prepareConversation(bot: bot)) else { step("box changed after focus"); throw Blocker.conversation }
         let pasteboard = NSPasteboard.general
         let saved = try copyPasteboard(pasteboard)
         pasteboard.clearContents()
@@ -198,35 +254,37 @@ import PersistenceCore
         guard pasteboard.setString(text, forType: .string) else { throw Blocker.submission }
         try requireFrontmost()
         paste.forEach { $0.post(tap: .cghidEventTap) }
-        try await waitUntil {
+        do { try await waitUntil {
             try requireFrontmost()
             // The box reports the pasted text with its own trailing newline.
             let value = (attribute(box, kAXValueAttribute) as? String) ?? ""
             func flat(_ t: String) -> String { t.split(whereSeparator: \.isWhitespace).joined(separator: " ") }
-            return !isEmptyBox(value) && flat(value).contains(String(flat(text).prefix(40)))
-        }
+            return !isEmptyBox(value, conversation: bot) && flat(value).contains(String(flat(text).prefix(40)))
+        } } catch { step("pasted text never appeared in the box"); throw error }
         try requireFrontmost()
         submit.forEach { $0.post(tap: .cghidEventTap) }
-        do { try await verifySubmission(text) }
-        catch { throw Blocker.submission }
+        do { try await verifySubmission(text, bot: bot) }
+        catch { step("sent, but the message was not seen in the chat (\(error))"); throw Blocker.submission }
     }
-    static func verifySubmission(_ message: String) async throws {
+    static func verifySubmission(_ message: String, bot: String) async throws {
         func normalized(_ text: String) -> String { text.split(whereSeparator: \.isWhitespace).joined(separator: " ") }
         for _ in 0..<20 {
+            guard try isCurrentBotChat(bot) else { throw Blocker.conversation }
             let tree = nodes(try window())
             let boxes = tree.filter { string($0, kAXRoleAttribute) == kAXTextAreaRole
                 && string($0, kAXDescriptionAttribute).lowercased() == "prompt" }
             let visible = tree.filter { string($0, kAXRoleAttribute) == kAXStaticTextRole }
                 .map { string($0, kAXValueAttribute) }
             if boxes.count == 1, let value = attribute(boxes[0], kAXValueAttribute) as? String,
-               isEmptyBox(value), visible.contains(where: { normalized($0).contains(normalized(String(message.prefix(40)))) }) { return }
+               isEmptyBox(value, conversation: bot), visible.contains(where: { normalized($0).contains(normalized(String(message.prefix(40)))) }) { return }
             try await Task.sleep(for: .milliseconds(500))
         }
         throw Blocker.submission
     }
     static func importRoutine(peer: String, dataRoot: URL) async throws {
-        let previous = NSWorkspace.shared.frontmostApplication
-        defer { previous?.activate() }
+        try await restoringForeground { try await importRoutineInForeground(peer: peer, dataRoot: dataRoot) }
+    }
+    private static func importRoutineInForeground(peer: String, dataRoot: URL) async throws {
         _ = try await awake()
         let contact = try? AgentPeerStore(dataRoot: dataRoot).list().first { $0.id == peer }
         try await openBotChat(contact?.grokConversation ?? "grok")
@@ -319,14 +377,17 @@ enum GrokBotConnection {
                 if contact.grokSetup == "set up" { return result("set up", "Set up. Send a message to check the reply path.") }
                 guard contact.grokSetup != "disconnected" else { return result("disconnected", "Finish disconnecting before creating a new connection.") }
                 var saved = contact
-                if contact.grokConversation == nil {
+                // An unconfirmed request is asked again: the request itself
+                // tells the Bot not to create a second routine, so a repeat
+                // can only finish the first one, never duplicate it.
+                if contact.grokConversation == nil || contact.grokBootstrapConfirmed != true {
                     let conversation: String
                     // The Bot's own 1:1 chat; Grok Bot's built-in Bot is "grok".
-                    if let chosen = contact.conversationLabel, !chosen.isEmpty { conversation = chosen } else { conversation = "grok" }
+                    if let chosen = contact.grokConversation ?? contact.conversationLabel, !chosen.isEmpty { conversation = chosen } else { conversation = "grok" }
                     saved = try store.updateGrok(peerID) {
-                        guard $0.grokConversation == nil else { throw GrokLinkCredential.Failure.invalid }
+                        guard $0.grokConversation == nil || $0.grokConversation == conversation else { throw GrokLinkCredential.Failure.invalid }
                         $0.grokConversation = conversation
-                    } // attempted once, including ambiguous submission
+                    }
                     guard let command = contact.approvedExecutablePath else { throw GrokLinkCredential.Failure.invalid }
                     let message = "Create one Active webhook routine named \(GrokBotRoute.routineName(peerID)) for NativeAgent. Use the exact instruction below. If it already exists, do not create another. Never print the webhook URL or key in chat or command output; NativeAgent reads them from the Routines panel itself. Do not change local execution policy or any other routine.\n\n" + GrokBotRoute.instruction(peer: peerID, command: command)
                     try await DesktopAgentConversationRoute.shared.grokBootstrap(message, bot: conversation)

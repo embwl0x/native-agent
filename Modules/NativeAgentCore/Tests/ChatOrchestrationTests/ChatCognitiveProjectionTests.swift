@@ -560,6 +560,9 @@ func chatClient_usesOneCombinedCognitiveProjectionAndCommitsAfterInjection() asy
 func chatClient_overlapsResidentProjectionWithContextWithoutChangingProviderInputs() async throws {
     let root = try makeTempRoot("resident-preparation-overlap")
     defer { try? FileManager.default.removeItem(at: root) }
+    try FileManager.default.createDirectory(at: root.appendingPathComponent("mcp"), withIntermediateDirectories: true)
+    try Data(#"[{"id":"preparation_probe","status":"ready"}]"#.utf8)
+        .write(to: root.appendingPathComponent("mcp/servers.json"))
     let probe = TurnPreparationOverlapProbe()
     let llm = MessageCapturingLLM(reply: "overlapped")
     let schema = LLMToolSchema(
@@ -575,7 +578,19 @@ func chatClient_overlapsResidentProjectionWithContextWithoutChangingProviderInpu
         }
     )
     let cognition = CombinedCognitiveTurnProjectionCapture(preparationProbe: probe)
-    let engine = makeEngine(root: root, llm: llm, tools: tools)
+    let activeTools = ActiveToolsStore(dataRoot: root)
+    _ = try await activeTools.addLoaded(
+        sessionId: "s-resident-preparation-overlap", names: [schema.name],
+        descriptors: [schema.name: PinnedToolSchema(schema)]
+    )
+    let engine = SwiftNativeTurnEngine(
+        persona: hermeticPersona(root: root), memory: nil,
+        router: StubRoutingForClient(prefs: [
+            "chat": SurfacePreference(surface: "chat", model: "client-model", reasoningEffort: "high"),
+        ]),
+        trust: hermeticTrust(), llm: llm, tools: tools,
+        remPinsDataRoot: root, activeToolsStore: activeTools
+    )
     let client = SwiftNativeChatOrchestrationClient(
         engine: engine,
         tools: tools,

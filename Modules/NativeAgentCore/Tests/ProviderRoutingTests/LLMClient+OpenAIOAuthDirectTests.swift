@@ -162,7 +162,7 @@ private func stubSession() -> URLSession {
         let cfg = session.configuration
         #expect(cfg.timeoutIntervalForRequest == 240)
         #expect(cfg.timeoutIntervalForResource == 600)
-        #expect(cfg.waitsForConnectivity == true)
+        #expect(cfg.waitsForConnectivity == false)
     }
 
     @Test func jwt_payload_decodes_base64url_with_padding_variants() throws {

@@ -77,7 +77,7 @@ extension SwiftNativeSecurityCenter {
         // through the built-in path — "read"/"message" would otherwise land it
         // on the keyword classifier rather than the plain-local-read shape
         // search_chat_history already has.
-        "read_chat_message",
+        "read_chat_message", "workspace", "work_context", "artifact_find",
         // workshop_submit / workshop_status (2026-06-11, U5 W-I): Agent's execution
         // chat lane. workshop_submit is a medium-risk write (a thin shim into
         // the execution queue; the executor's own gates apply downstream),
@@ -102,11 +102,6 @@ extension SwiftNativeSecurityCenter {
         // generic safe_read keyword catcher via the unsigned path, so register
         // it explicitly and pin the shape in the dedicated branch below.
         "delegation_status",
-        // second_opinion (0.4.15): one outbound call to the decision service
-        // carrying only the state and questions the call named, and no local
-        // store is touched. "opinion" trips no keyword catcher, so register it
-        // explicitly and pin the shape in the dedicated branch below.
-        "second_opinion",
         // agent-desk chat lane: desk_read is a low-risk read; the nine
         // mutations are medium ledger-class writes into <dataRoot>/desk/ — NOT
         // a Mac filesystem op and NOT a process spawn. Register explicitly so
@@ -275,6 +270,8 @@ extension SwiftNativeSecurityCenter {
         "browser.read_text",
         "browser.read_links",
         "browser.screenshot",
+        "browser.chrome_setup",
+        "browser.chrome_status",
         "browser.chrome_acquire",
         "browser.chrome_renew",
         "browser.chrome_navigate",
@@ -303,7 +300,7 @@ extension SwiftNativeSecurityCenter {
         // as filesystem work, which is a lie — none of these touches a file
         // the user owns, spawns a process, or reaches another app.
         "app_page_read", "app_page_screenshot", "app_settings_list",
-        "app_setting_set", "interaction_act", "voice_render",
+        "app_setting_set", "interaction_act",
     ]
     static let builtinToolPrefixes: [String] = [
         "browser.",
@@ -484,6 +481,7 @@ extension SwiftNativeSecurityCenter {
             return ToolProfile(capabilities: capabilities, risk: risk)
         }
         let browserReadTools: Set<String> = [
+            "browser.chrome_status",
             "browser.status",
             "browser.read_text",
             "browser.read_links",
@@ -519,7 +517,7 @@ extension SwiftNativeSecurityCenter {
             add("safe_read", .low)
             return ToolProfile(capabilities: capabilities, risk: risk)
         }
-        if ["app_setting_set", "interaction_act", "voice_render"].contains(tool) {
+        if ["app_setting_set", "interaction_act"].contains(tool) {
             add("app_data_write", .medium)
             return ToolProfile(capabilities: capabilities, risk: risk)
         }
@@ -576,6 +574,11 @@ extension SwiftNativeSecurityCenter {
             return ToolProfile(capabilities: capabilities, risk: risk)
         }
         if tool == "menu_press" || tool == "mac.menu_press" {
+            add("ax_injection", .high)
+            return ToolProfile(capabilities: capabilities, risk: risk)
+        }
+        if tool == "browser.chrome_setup" {
+            add("outside_app_data_write", .high)
             add("ax_injection", .high)
             return ToolProfile(capabilities: capabilities, risk: risk)
         }
@@ -674,7 +677,9 @@ extension SwiftNativeSecurityCenter {
         }
         // One already-persisted transcript row, read back verbatim. Same shape
         // as the search that hands out its id (Agent, 2026-09-06).
-        if tool == "read_chat_message" {
+        // workspace admits only preparation here. Its canonical facade sends
+        // each actual read/message through this same gate under its own name.
+        if tool == "workspace" || tool == "read_chat_message" || tool == "work_context" || tool == "artifact_find" {
             add("safe_read", .low)
             return ToolProfile(capabilities: capabilities, risk: risk)
         }
@@ -718,16 +723,6 @@ extension SwiftNativeSecurityCenter {
         // machine, so the external_send carve-out must not apply to it.
         if tool == "delegation_status" {
             add("safe_read", .low)
-            return ToolProfile(capabilities: capabilities, risk: risk)
-        }
-        // second_opinion (0.4.15): an outbound question-and-answer against the
-        // decision service. `network_read` because data leaves the machine and
-        // an answer comes back, and nothing else: no local store is written,
-        // no permission changes, nothing is scheduled. Deliberately NOT
-        // external_send — the payload is the agent's own state and questions,
-        // never a message delivered to a person.
-        if tool == "second_opinion" {
-            add("network_read", .medium)
             return ToolProfile(capabilities: capabilities, risk: risk)
         }
         // agent-desk (agent-desk): desk_read is a pure read; the nine desk
@@ -985,6 +980,10 @@ extension SwiftNativeSecurityCenter {
             return "agentmail.send"
         case "browser_status":
             return "browser.status"
+        case "browser_chrome_setup":
+            return "browser.chrome_setup"
+        case "browser_chrome_status":
+            return "browser.chrome_status"
         case "browser_open_url":
             return "browser.open_url"
         case "browser_navigate":

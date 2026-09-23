@@ -10,7 +10,7 @@ import PersistenceCore
 // subprocess surface in this module"* — that second clause was factually wrong.
 // `SelfImprovement+Git.swift` already ships `SelfImprovementGitOps`, a real
 // `Foundation.Process`-backed `git -C <dir>` subprocess surface in THIS module
-// (it powers `applyDiffAndCommit` / `revertCommit` / `stashSnapshot`). The diff
+// (it powers `applyDiffAndCommit` / `revertCommit`). The diff
 // route is therefore portable exactly like the wave-32 W09 gauntlet read: a
 // run-record lookup over `improvements/runs.json` (the file this actor already
 // reads) plus a read-only `git` invocation against the run's worktree.

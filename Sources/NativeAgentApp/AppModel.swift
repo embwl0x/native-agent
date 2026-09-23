@@ -414,7 +414,6 @@ final class AppModel {
     /// Small always-visible readers have lifecycles independent of the full
     /// Chat/Activity panels. Keep their freshness separate so one successful
     /// badge poll cannot erase a stale full-panel warning (or vice versa).
-    var whatsRunningRefreshStatus: PanelRefreshStatus?
     var sidebarActivityRefreshStatus: PanelRefreshStatus?
     var detachedChatRefreshStatus: [String: PanelRefreshStatus] = [:]
     var detachedChatContextReceiptRefreshStatus: [String: PanelRefreshStatus] = [:]
@@ -892,9 +891,7 @@ final class AppModel {
 
     // PATCH-2026-05-08: wave3 Feature A/B state
     var healthCard: HealthCard?
-    var whatsRunning: WhatsRunning?
     @ObservationIgnored var healthCardRefreshGate = LatestSnapshotRefreshGate()
-    @ObservationIgnored var whatsRunningRefreshGate = LatestSnapshotRefreshGate()
 
     @MainActor
     var chatDrafts: [String: String] = [:]

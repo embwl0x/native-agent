@@ -23,6 +23,8 @@ extension SwiftToolDispatcher {
     /// historical uncertainty separate from evidence produced by this build.
     static func stampDelegationProducer(on payload: inout [String: JSONValue]) {
         payload["producerSchemaVersion"] = .int(1)
+        // 2026-09-22: a peer's words shaped this turn; the woken agent must know the ask is not the person's.
+        if let taint = PeerDataTaint.current, taint.isTainted { payload["peerTainted"] = .string(taint.sourceDescription) }
         guard let raw = Bundle.main.object(forInfoDictionaryKey: "NativeAgentSourceRevision") as? String else {
             return
         }
@@ -430,7 +432,10 @@ extension SwiftToolDispatcher {
             }
             try await appendJSONLCapped(
                 .object(entry), to: inboxURL, using: persistence,
-                maxLines: maxLines, logLabel: logLabel, takeLock: false
+                maxLines: maxLines, logLabel: logLabel, takeLock: false,
+                // 2026-09-22: without a trigger the line cap re-read the whole
+                // inbox on every append.
+                trimWhenBytesExceed: 4 << 20
             )
             return ("appended", false, queuedAt)
         }

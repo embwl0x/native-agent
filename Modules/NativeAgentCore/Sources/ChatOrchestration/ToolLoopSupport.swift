@@ -596,6 +596,20 @@ enum ProviderToolResultProjection {
         fields["original_characters"] = .int(Int64(content.count))
         fields["original_bytes"] = .int(Int64(content.utf8.count))
         fields["full_result_retained"] = .bool(recovery != nil)
+        // Workspace controls must remain usable even when a page's reading
+        // evidence is paged. Preserve the exact live controls, never reconstruct
+        // or replay them from retained content. The full result remains paged.
+        if toolName == "workspace", let data = content.data(using: .utf8),
+           let value = try? JSONDecoder().decode(JSONValue.self, from: data),
+           case .object(let frame) = value {
+            let keys: Set<String> = ["status", "workspace", "path", "actions", "windows", "places", "desktop"]
+            let navigation = JSONValue.object(frame.filter { keys.contains($0.key) })
+            var candidate = fields
+            candidate["workspace_navigation"] = navigation
+            if let encoded = try? JSONValue.object(candidate).serialize(pretty: false), encoded.utf8.count <= limit {
+                fields = candidate
+            }
+        }
         return (try? JSONValue.object(fields).serialize(pretty: false)) ?? "{}"
     }
 }

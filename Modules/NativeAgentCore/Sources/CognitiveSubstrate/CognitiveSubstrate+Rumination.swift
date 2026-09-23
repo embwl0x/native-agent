@@ -474,43 +474,6 @@ extension CognitiveSubstrate {
         )
     }
 
-    // MARK: - The `- Thread:` candidate (the seam the capsule builder consumes)
-
-    /// THE SEAM. The seeds the `- Thread:` line may speak, heaviest first.
-    ///
-    /// CONTRACT FOR `+Capsule` (another fence — this side only publishes):
-    /// these are ordinary `CognitiveThoughtSeed` values of a NON-takeaway kind,
-    /// so `innerThoughtSeedLine(for:)` already renders them with the `- Thread:`
-    /// prefix and the existing 180-char capsule bound. Append them to
-    /// `innerCandidates` AFTER the standing-view and takeaway candidates and let
-    /// the existing cadence ledger pick — the Inner/Thread line stays at most one
-    /// per turn, and a nag never outranks a durable view.
-    ///
-    /// Empty whenever nothing is at stake, which is the common case.
-    public func ruminationThreadSeeds(
-        at now: Date,
-        seeds: [CognitiveThoughtSeed]? = nil
-    ) -> [CognitiveThoughtSeed] {
-        let population = seeds ?? projectedThoughtSeeds(at: now)
-        let byID = Dictionary(population.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
-        return ruminationCandidates(at: now, seeds: population).compactMap { candidate in
-            if let seed = byID[candidate.seedId] { return seed }
-            // An external candidate has no seed row. Synthesize the value the
-            // capsule's existing renderer expects — it is never stored, never
-            // persisted, and never enters the seed family; it exists so the
-            // published seam stays one type and `+Capsule` needs no change.
-            guard candidate.externalId != nil else { return nil }
-            return CognitiveThoughtSeed(
-                id: candidate.seedId,
-                kind: candidate.kind,
-                text: candidate.text,
-                priority: candidate.weight,
-                createdAt: now.addingTimeInterval(-candidate.ageHours * 3_600),
-                lastUpdatedAt: now
-            )
-        }
-    }
-
     // MARK: - Heal
 
     /// Release every itching seed the given text ANSWERS, clearing its weight.
@@ -721,10 +684,5 @@ extension CognitiveSubstrate {
             ruminationReleasedAt[seedId] = releasedAt
             thoughtSeeds.removeValue(forKey: seedId)
         }
-    }
-
-    /// Diagnostic/Observatory read: what is itching, at the live instant.
-    public func ruminationSnapshot() async -> [CognitiveRuminationRead] {
-        ruminationCandidates(at: dependencies.now())
     }
 }

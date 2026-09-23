@@ -84,15 +84,24 @@ public actor BotRunnerScheduler {
         try StandingBotsDisk.nextOccurrence(bot, after: date)
     }
 
-    private func completed(_ id: UUID, at date: Date) throws {
+    /// `reschedule` false is a person's Run once: it clears a block but leaves
+    /// the schedule where it was, so "daily at 09:00" still means 09:00.
+    private func completed(_ id: UUID, at date: Date, reschedule: Bool = true) throws {
         let bot = try definitions.get(id)
         try disk.locked {
             var jobs = try disk.read([String: Job].self, at: path) ?? [:]
             // A run that completed disproves a block; an occurrence that never
             // ran is still a fact about that occurrence.
             let missed = jobs[id.uuidString]?.missed
+            let cleared = missed?.reason == .blocked ? nil : missed
+            if !reschedule {
+                guard var job = jobs[id.uuidString], job.missed != cleared else { return }
+                job.missed = cleared
+                jobs[id.uuidString] = job
+                return try disk.write(jobs, at: path)
+            }
             jobs[id.uuidString] = Job(revision: bot.updatedAt, next: try next(bot, after: date), scheduledFrom: date,
-                                      missed: missed?.reason == .blocked ? nil : missed)
+                                      missed: cleared)
             try disk.write(jobs, at: path)
         }
     }
@@ -240,6 +249,7 @@ public actor BotRunnerScheduler {
     }
 
     public func runDue() async -> [String] {
+        guard await BotRunGate.isReady() else { return [] }
         failure = nil
         var completed: [String] = []
         do {
@@ -283,7 +293,7 @@ public actor BotRunnerScheduler {
                 do {
                     if let entry = try await runner.run(bot: id, requestID: requestID,
                                                         holdUnattended: holdUnattended) {
-                        try self.completed(id, at: Date())
+                        try self.completed(id, at: Date(), reschedule: isEvent)
                         completed.append("bot:\(entry.botId.uuidString)")
                     }
                 } catch let error as BotRunAdmissionError {

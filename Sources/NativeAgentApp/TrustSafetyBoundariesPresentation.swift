@@ -37,7 +37,7 @@ enum TrustSafetyBoundariesPresentation {
             rows: [
                 fileAccessRow(accessMode: accessMode),
                 toolsRow(policy.toolPolicy),
-                externalSendRow(policy.connectorPolicy),
+                externalSendRow(policy.connectorPolicy, fullMacActive: AppModel.fullMacGrantIsActive(policy)),
                 macControlRow(policy.macControlPolicy),
                 receiptsRow(policy.workshopPolicy),
             ],
@@ -114,7 +114,14 @@ enum TrustSafetyBoundariesPresentation {
         }
     }
 
-    private static func externalSendRow(_ connectors: TrustConnectorPolicy?) -> TrustSafetyBoundaryRow {
+    private static func externalSendRow(_ connectors: TrustConnectorPolicy?, fullMacActive: Bool) -> TrustSafetyBoundaryRow {
+        if fullMacActive {
+            return TrustSafetyBoundaryRow(
+                id: "external_send", title: "External messages",
+                detail: "Admitted Full Mac actions can send messages without an additional app approval. Connected accounts and external-agent safeguards still apply.",
+                systemImage: "paperplane.fill", tone: .caution
+            )
+        }
         guard let requiresApproval = connectors?.sendExternalMessagesRequiresApproval else {
             return TrustSafetyBoundaryRow(
                 id: "external_send", title: "External messages", detail: "External-send approval policy is unavailable.",

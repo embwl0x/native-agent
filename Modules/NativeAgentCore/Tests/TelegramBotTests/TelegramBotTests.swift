@@ -493,7 +493,7 @@ struct SwiftNativeTelegramBotPhaseBTests {
         }
     }
 
-    @Test func longPoll_transport_error_throws_unavailable() async throws {
+    @Test func longPoll_transport_error_keeps_cause() async throws {
         let session = mockSession { _ in
             throw URLError(.notConnectedToInternet)
         }
@@ -501,8 +501,8 @@ struct SwiftNativeTelegramBotPhaseBTests {
         do {
             _ = try await bot.longPoll(token: tokenStr, offset: 0, session: session)
             Issue.record("expected throw")
-        } catch TelegramBotError.unavailable {
-            // ok
+        } catch let TelegramBotError.underlying(msg) {
+            #expect(msg.contains("Code=-1009"))
         } catch {
             Issue.record("wrong error: \(error)")
         }
@@ -3179,7 +3179,7 @@ struct SwiftNativeTelegramBotPhaseBTests {
         #expect(captured.handlerCalls == 2)
         #expect(captured.sent.map { $0.1 } == ["The connection was interrupted; check your internet connection and try again."])
         #expect(captured.cardSends.count == 1)
-        #expect(captured.cardEdits.contains { $0.hasPrefix("That hiccuped, trying again") })
+        #expect(captured.cardEdits.contains { $0.hasPrefix("Still can't reach the model") })
         #expect(captured.cardEdits.last?.hasPrefix("That didn't work") == true)
 
         let receipts = try readTelegramJSONL(root, "receipts.jsonl")

@@ -1,6 +1,7 @@
 import SwiftUI
 import Foundation
 import os
+import PersistenceCore
 
 /// Per-row layout cost for the chat transcript.
 ///
@@ -150,16 +151,7 @@ final class TranscriptLayoutLedger: @unchecked Sendable {
         let url = NativeAgentPaths.dataRoot
             .appendingPathComponent("traces", isDirectory: true)
             .appendingPathComponent("transcript_layout.jsonl")
-        let directory = url.deletingLastPathComponent()
-        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        guard let bytes = line.data(using: .utf8) else { return }
-        if let handle = try? FileHandle(forWritingTo: url) {
-            defer { try? handle.close() }
-            _ = try? handle.seekToEnd()
-            try? handle.write(contentsOf: bytes)
-        } else {
-            try? bytes.write(to: url, options: .atomic)
-        }
+        try? SwiftNativePersistenceCore.appendLines(Data(line.utf8), to: url)
     }
 }
 

@@ -784,7 +784,7 @@ enum MacChatTurnLifecycleTerminalResolver {
             break
         case .unavailable:
             return .outcomeUnknown(
-                reason: "Canonical turn evidence could not be read safely."
+                reason: "I'm not sure that finished \u{2014} if my answer isn't here, say it again and I'll pick it up."
             )
         }
 
@@ -795,11 +795,11 @@ enum MacChatTurnLifecycleTerminalResolver {
             return .failed(reason: reason)
         case .ambiguousTermination:
             return .outcomeUnknown(
-                reason: "The turn stopped without a provable cancellation receipt."
+                reason: "I'm not sure that finished \u{2014} if my answer isn't here, say it again and I'll pick it up."
             )
         case .finalResponse, .none:
             return .outcomeUnknown(
-                reason: "The turn ended without a provable terminal outcome."
+                reason: "I'm not sure that finished \u{2014} if my answer isn't here, say it again and I'll pick it up."
             )
         }
     }
@@ -818,13 +818,10 @@ enum MacChatTurnLifecycleRestartRepair {
         case .completed: kind = .completed
         case .failed: kind = .failed(reason: nil)
         case .canceled: kind = .cancellationConfirmed
-        case .absent:
+        case .absent, .unavailable:
+            // 2026-09-22 WHY: same plain line Telegram and Slack use after a restart.
             kind = .outcomeUnknown(
-                reason: "The prior process ended before the turn outcome could be confirmed."
-            )
-        case .unavailable:
-            kind = .outcomeUnknown(
-                reason: "Canonical turn evidence could not be read safely after restart."
+                reason: "I lost my answer to your last message when I restarted \u{2014} say it again and I'll pick it up."
             )
         }
         return MacChatTurnLifecycleReducer.reduce(

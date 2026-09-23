@@ -18,15 +18,17 @@ import MacIntegration
 extension SwiftToolDispatcher {
     // MARK: - Mac integration dispatch helper
     //
-    // Shared shape for all 5 Mac integration tools:
-    //   1. Ask MacIntegrationPermissionStore — returns a structured `denied`
-    //      envelope (NOT an exception) so the LLM sees a clean refusal with a
-    //      "fix" hint it can relay to the user.
+    // Shared shape for Mac integration tools:
+    //   1. Check saved authority and actual-origin Full Mac admission. Admitted
+    //      Full Mac covers supported integrations without changing preferences;
+    //      lower modes retain the ordinary per-integration permission request.
     //   2. If the bridge isn't wired (headless / app forgot to inject),
     //      return a `bridge_not_wired` envelope — same rationale: don't tear
     //      down the turn, let the LLM explain it.
     //   3. Otherwise forward to the bridge.
     func dispatchMacIntegrationTool(
+        tool: String,
+        surface: String,
         integration: String,
         mode: MacIntegrationPermissionMode,
         fixHint: String,
@@ -37,7 +39,8 @@ extension SwiftToolDispatcher {
         input: [String: JSONValue],
         run: (any MacIntegrationToolBridge, [String: JSONValue]) async throws -> JSONValue
     ) async throws -> JSONValue {
-        let allowed = await macIntegrationPermissionStore.allows(integration, mode: mode)
+        let admitted = await fullMacYoloAdmitted(tool: tool, surface: surface)
+        let allowed = await macIntegrationPermissionStore.allows(integration, mode: mode, fullMacAdmitted: admitted)
         guard allowed else {
             // The permission is not granted. That is not a refusal to be
             // relayed as prose with a "fix" hint — it is the person's

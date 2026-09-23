@@ -409,15 +409,6 @@ extension TrustMacControlPolicy {
     }
 }
 
-// PATCH-2026-05-07: mac-control-ui-1 Mac Control audit entry (iOS display)
-struct MacControlAuditEntry: Identifiable, Codable {
-    var id: String { "\(ts)-\(action)" }
-    var ts: String
-    var action: String
-    var detail: String?
-    var allowed: Bool?
-}
-
 // ApprovalRequest moved to NativeAgentShared.
 
 
@@ -430,19 +421,6 @@ struct ConnectorRecord: Identifiable, Codable, Hashable, Sendable {
     var healthStatus: String?
     var lastUsedAt: String?
     var updatedAt: String?
-}
-
-struct DoctorReport: Codable, Hashable {
-    var status: String
-    var checks: [DoctorCheck]?
-    var createdAt: String?
-}
-
-struct DoctorCheck: Identifiable, Codable, Hashable {
-    var id: String
-    var title: String
-    var status: String
-    var detail: String?
 }
 
 struct MemoryProposalRecord: Decodable, Identifiable, Hashable, Sendable {
@@ -600,34 +578,6 @@ struct PromotionCandidateSummary: Decodable, Identifiable, Sendable {
         createdAt = (try? container.decode(String.self, forKey: .createdAt))
             ?? (try? container.decode(String.self, forKey: .createdAtSnake))
     }
-}
-
-struct SkillManifest: Codable, Identifiable {
-    var id: String { name }
-    var name: String
-    var version: String?
-    var description: String?
-    var status: String?
-    var kind: String?
-    var triggers: [String]?
-}
-
-struct EvalRun: Identifiable, Codable, Hashable {
-    var id: String
-    var status: String
-    var passCount: Int?
-    var failCount: Int?
-    var score: Double?
-    var createdAt: String?
-}
-
-struct SchedulerJob: Identifiable, Codable, Hashable {
-    var id: String
-    var name: String?
-    var kind: String?
-    var status: String?
-    var nextRunAt: String?
-    var lastRunAt: String?
 }
 
 // PATCH-2026-05-07: leftover-1 iOS provider models — mirror of Mac ProviderInfo types

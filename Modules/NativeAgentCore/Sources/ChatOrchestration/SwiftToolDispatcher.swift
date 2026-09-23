@@ -268,7 +268,7 @@ public final class SwiftToolDispatcher: ToolDispatchClient, ActiveToolsStoreProv
             includeFullMacAppTools: access.appControlAllowed,
             includeFullMacAccessibilityReadTools: access.accessibilityReadAllowed,
             includeFullMacAccessibilityInjectionTools: access.accessibilityInjectionAllowed,
-            includeActivityQueryTool: activityCaptureEnabled()
+            includeActivityQueryTool: await activityCaptureEnabled()
         )
         // R9: registry custom-tool schemas ride the eager catalog. Built-in
         // names win on collision — provider APIs reject duplicate tool names,
@@ -297,7 +297,7 @@ public final class SwiftToolDispatcher: ToolDispatchClient, ActiveToolsStoreProv
             includeFullMacAppTools: access.appControlAllowed,
             includeFullMacAccessibilityReadTools: access.accessibilityReadAllowed,
             includeFullMacAccessibilityInjectionTools: access.accessibilityInjectionAllowed,
-            includeActivityQueryTool: activityCaptureEnabled(),
+            includeActivityQueryTool: await activityCaptureEnabled(),
             requestedNames: allowed
         )
         // R9: registry custom tools are lazy — schemas appear only once the
@@ -401,7 +401,7 @@ public final class SwiftToolDispatcher: ToolDispatchClient, ActiveToolsStoreProv
         // whose every call refuses teaches the model to keep trying it, and
         // advertising it at all when capture is off would tell the model this
         // Mac records activity when it does not.
-        if activityCaptureEnabled() {
+        if await activityCaptureEnabled() {
             let existing = Set(names)
             names.append(contentsOf: Self.activityQueryToolNames.filter { !existing.contains($0) })
         }

@@ -5,6 +5,7 @@ import PersistenceCore
 import ProviderRouting
 import Testing
 @testable import ChatOrchestration
+import NativeAgentTestSupport
 
 // Coverage-ledger fence `core.chat.persistence`:
 //   * chat.persistence.turnTraceIdStamp (silent zero in two places at once)

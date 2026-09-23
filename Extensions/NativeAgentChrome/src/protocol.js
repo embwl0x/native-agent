@@ -124,6 +124,9 @@ function validatePayload(action, payload) {
       optionalString(payload.clientVersion, "clientVersion", 64);
       return;
     case "lease.acquire": {
+      if (payload.renderingMode !== undefined && (!["visible_work_window", "grouped_background"].includes(payload.renderingMode) || payload.mode !== "create")) {
+        throw new ProtocolError("invalid_payload", "renderingMode supports visible_work_window or grouped_background for created tabs only.");
+      }
       if (payload.mode !== "create" && payload.mode !== "claim") {
         throw new ProtocolError("invalid_payload", "lease.acquire mode must be 'create' or 'claim'.");
       }
@@ -133,7 +136,10 @@ function validatePayload(action, payload) {
         requireInteger(payload.tabId, "tabId", 0);
         const expected = requireObject(payload.expectedTab, "expectedTab");
         requireString(expected.url, "expectedTab.url", 8192);
-        requireString(expected.title, "expectedTab.title", 1024);
+        // 2026-09-22: a loading tab has an empty title; claims must still match it.
+        if (typeof expected.title !== "string" || expected.title.length > 1024) {
+          throw new ProtocolError("invalid_payload", "expectedTab.title must be a bounded string.");
+        }
       }
       optionalInteger(payload.leaseDurationMs, "leaseDurationMs", 30000, 300000);
       return;
@@ -157,6 +163,9 @@ function validatePayload(action, payload) {
       requireId(payload.leaseId, "leaseId");
       optionalInteger(payload.maxNodes, "maxNodes", 1, 500);
       optionalInteger(payload.maxTextChars, "maxTextChars", 1, 50000);
+      if (payload.scope !== undefined && !["page", "main_content"].includes(payload.scope)) {
+        throw new ProtocolError("invalid_payload", "Snapshot scope must be page or main_content.");
+      }
       return;
     case "page.element.click":
       requireLeaseAndSequence(payload);

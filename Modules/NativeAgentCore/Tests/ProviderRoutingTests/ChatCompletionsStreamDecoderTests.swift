@@ -19,10 +19,10 @@ func chatCompletionErrorEnvelopesKeepTheirCause(payload: String) throws {
     var decoder = ChatCompletionsStreamDecoder(providerLabel: "Model")
     _ = try decoder.consume(payload: #"{"choices":[{"delta":{"content":"partial"}}]}"#)
     let root = try #require(JSONSerialization.jsonObject(with: Data(payload.utf8)) as? [String: Any])
-    #expect(throws: LLMError.failure(.rateLimited(retryAfter: nil))) {
+    #expect(throws: LLMError.failure(.rateLimited(retryAfter: 3600))) {
         _ = try decoder.consume(payload: payload)
     }
-    #expect(throws: LLMError.failure(.rateLimited(retryAfter: nil))) {
+    #expect(throws: LLMError.failure(.rateLimited(retryAfter: 3600))) {
         _ = try chatCompletionsMessage(root, status: 200)
     }
 }
@@ -278,7 +278,7 @@ struct ChatCompletionsAdapterErrorAndUsageTests {
         do {
             for try await _ in adapter.stream(prompt: "p", system: nil, model: "gpt-5.6-sol") {}
         } catch { caught = error }
-        #expect(ProviderFailure.classify(try #require(caught)) == .rateLimited(retryAfter: nil))
+        #expect(ProviderFailure.classify(try #require(caught)) == .rateLimited(retryAfter: 3600))
     }
 
     /// B2: same for OpenRouter (most exposed — it aggregates upstreams).

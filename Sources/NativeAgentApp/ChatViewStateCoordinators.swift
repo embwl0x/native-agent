@@ -3,6 +3,13 @@ import Foundation
 import Observation
 import SwiftUI
 
+/// Scroll offsets are deliberately excluded: following the bottom must not
+/// trigger another layout-follow request merely because the viewport moved.
+struct ChatScrollLayoutExtent: Equatable {
+    let contentHeight: CGFloat
+    let viewportHeight: CGFloat
+}
+
 @Observable
 @MainActor
 final class ChatToastQueue {

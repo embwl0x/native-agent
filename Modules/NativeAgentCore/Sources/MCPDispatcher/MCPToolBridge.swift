@@ -137,6 +137,36 @@ public enum MCPToolBridge {
             }
             for t in tools {
                 let bridged = "mcp__\(serverId)__\(t.name)"
+                // The built-in server's own words ("Search SearXNG") never say
+                // "web", so a "web search" query scored it zero.
+                var description = t.description
+                if serverId == "searxng-local" {
+                    switch t.name {
+                    case "search": description = "Search the web and news (SearXNG); use categories=news and time_range=day|week|month for recent results. Returns titles, URLs and snippets."
+                    case "fetch": description = "Fetch and read a web page by URL and return its extracted text."
+                    default: break
+                    }
+                }
+                var inputSchema = t.inputSchema
+                if serverId == "searxng-local", t.name == "search",
+                   case .object(var schema)? = inputSchema {
+                    if case .object(var properties)? = schema["properties"] {
+                        properties["categories"] = .object(["type": .string("string"),
+                            "description": .string("Optional SearXNG category, such as news, general, it or science.")])
+                        properties["time_range"] = .object(["type": .string("string"),
+                            "enum": .array([.string("day"), .string("week"), .string("month"), .string("year")]),
+                            "description": .string("Optional SearXNG time range for recent results.")])
+                        schema["properties"] = .object(properties)
+                        inputSchema = .object(schema)
+                    }
+                } else if serverId == "searxng-local", t.name == "search", inputSchema == nil {
+                    inputSchema = .object(["type": .string("object"), "properties": .object([
+                        "query": .object(["type": .string("string")]),
+                        "categories": .object(["type": .string("string")]),
+                        "time_range": .object(["type": .string("string"),
+                            "enum": .array([.string("day"), .string("week"), .string("month"), .string("year")])])
+                    ]), "required": .array([.string("query")])])
+                }
                 out.append(
                     MCPToolDescriptor(
                         bridgedName: bridged,
@@ -144,8 +174,8 @@ public enum MCPToolBridge {
                         toolName: t.name,
                         serverRiskClass: serverRisk,
                         toolRiskClass: t.riskClass,
-                        description: t.description,
-                        inputSchema: t.inputSchema
+                        description: description,
+                        inputSchema: inputSchema
                     )
                 )
             }

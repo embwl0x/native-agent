@@ -69,7 +69,7 @@ public actor SwiftNativeChatOrchestrationClient: ChatOrchestrationClient {
         trust: SwiftNativeTrustCenter? = nil,
         approvalFiler: (any ApprovalFiler)? = nil,
         approvalTimeoutSeconds: Double = 30,
-        historyLimit: Int = 40,
+        historyLimit: Int = 400,
         toolLoopMaxIterations: Int? = nil,
         turnWallClockSeconds: TimeInterval? = nil,
         promoter: (any MemoryPromoting)? = nil,

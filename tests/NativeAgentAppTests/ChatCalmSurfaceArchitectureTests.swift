@@ -9,7 +9,6 @@ struct ChatCalmSurfaceArchitectureTests {
         let sidebar = try sessionSidebar(in: source)
 
         #expect(!sidebar.contains("LivingStatusPanel()"))
-        #expect(!sidebar.contains("WhatsRunningPanel()"))
         #expect(occurrences(of: "HealthCardPill()", in: sidebar) == 1)
 
         // Pin the visible Chats vocabulary while retaining the placement checks.
@@ -26,8 +25,6 @@ struct ChatCalmSurfaceArchitectureTests {
     @Test func globalActivityOwnershipAndPanelModelsRemainIntact() throws {
         let content = try AppSourceScraping.appSource("ContentView.swift")
         let activity = try AppSourceScraping.appSource("ActivityView.swift")
-        let running = try AppSourceScraping.appSource("ChatRuntimeStatusChrome.swift")
-        let runningOwner = try AppSourceScraping.appSource("AppModel+HealthEmbeddings.swift")
         let living = try AppSourceScraping.appSource("LivingStatusPanel.swift")
         let today = try AppSourceScraping.appSource("TodayView.swift")
 
@@ -40,8 +37,6 @@ struct ChatCalmSurfaceArchitectureTests {
         #expect(activity.contains("struct ActivityView: View"))
         #expect(today.contains("struct TodayView: View"))
         #expect(activity.contains("Text(\"Needs your eyes\")"))
-        #expect(running.contains("struct WhatsRunningPanel: View"))
-        #expect(runningOwner.contains("func loadWhatsRunning()"))
         #expect(living.contains("struct LivingStatusPanel: View"))
     }
 

@@ -1,6 +1,8 @@
 import SwiftUI
 import StandingBots
 import ProviderRouting
+import ChatOrchestration
+import PersistenceCore
 
 struct BotsEditorSheet: View {
     @Environment(AppModel.self) private var appModel
@@ -13,8 +15,14 @@ struct BotsEditorSheet: View {
     @State private var model = ""
     @State private var think = ""
     @State private var fast: Bool?
-    @State private var when = ""
+    @State private var when = "Manual only"
     @State private var hours = ""
+    /// The clock time for Daily, Weekdays and Weekly; only its hour and minute count.
+    @State private var time = Calendar.current.date(bySettingHour: 9, minute: 0, second: 0, of: Date()) ?? Date()
+    /// Cron day-of-week, 0 is Sunday.
+    @State private var weekday = 1
+    /// The When section as it opened; saved untouched, the bot keeps its exact timing.
+    @State private var loadedTiming: [String]?
     @State private var cron = ""
     @State private var zone = ""
     @State private var tokens = ""
@@ -156,9 +164,20 @@ struct BotsEditorSheet: View {
                         }
                         Divider().padding(.vertical, 4)
                             Picker("When", selection: $when) {
-                                Text("Manual only").tag("")
-                                ForEach(["Twice daily", "Daily", "Every N hours", "Custom", "On an event", "Manual only"], id: \.self) { Text($0).tag($0) }
+                                ForEach(["Manual only", "Daily", "Weekdays", "Weekly", "Every N hours", "On an event"], id: \.self) { Text($0).tag($0) }
+                                // A cron saved elsewhere still opens and saves as it was.
+                                if when == "Custom" { Text("Custom (cron)").tag("Custom") }
                             }
+                        if ["Daily", "Weekdays", "Weekly"].contains(when) {
+                            HStack(spacing: 12) {
+                                if when == "Weekly" {
+                                    Picker("On", selection: $weekday) {
+                                        ForEach(0..<7, id: \.self) { Text(Calendar.current.weekdaySymbols[$0]).tag($0) }
+                                    }.fixedSize()
+                                }
+                                DatePicker("At", selection: $time, displayedComponents: .hourAndMinute).fixedSize()
+                            }
+                        }
                         if when == "Every N hours" { field("Hours between runs", text: $hours) }
                         if when == "Custom" {
                             field("Schedule (cron)", text: $cron)
@@ -226,11 +245,32 @@ struct BotsEditorSheet: View {
         switch bot.cadence {
         case .manual: when = bot.eventTrigger == nil ? "Manual only" : "On an event"
         case .interval(let value):
-            when = value == 43200 ? "Twice daily" : value == 86400 ? "Daily" : "Every N hours"
+            // A rolling day or week from before clock times opens as one, at
+            // its next run's time and day (09:00 when it has none).
+            when = value == 86400 ? "Daily" : value == 604800 ? "Weekly" : "Every N hours"
             hours = String(value / 3600)
-        case .cron(let expression, let timeZone): when = "Custom"; cron = expression; zone = timeZone
+            if when != "Every N hours",
+               let next = try? BotRunnerScheduler.scheduledDates(dataRoot: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot())[bot.id] {
+                time = next; weekday = Calendar.current.component(.weekday, from: next) - 1
+            }
+        case .cron(let expression, let timeZone):
+            when = "Custom"; cron = expression; zone = timeZone
+            let parts = expression.split(separator: " ").map(String.init)
+            if parts.count == 5, parts[2] == "*", parts[3] == "*",
+               let minute = Int(parts[0]), let hour = Int(parts[1]), (0...59).contains(minute), (0...23).contains(hour),
+               let clock = Calendar.current.date(bySettingHour: hour, minute: minute, second: 0, of: Date()) {
+                if parts[4] == "*" { when = "Daily" } else if parts[4] == "1-5" { when = "Weekdays" }
+                else if let day = Int(parts[4]), (0...6).contains(day) { when = "Weekly"; weekday = day }
+                if when != "Custom" { time = clock }
+            }
         }
+        loadedTiming = timingKey
     }
+    private var clockText: String {
+        let clock = Calendar.current.dateComponents([.hour, .minute], from: time)
+        return String(format: "%02d:%02d", clock.hour ?? 9, clock.minute ?? 0)
+    }
+    private var timingKey: [String] { [when, hours, cron, zone, String(weekday), clockText] }
     private func makeDefinition() throws -> BotDefinition {
         // User, 2026-09-13: "Bots has no default model; Agent is supposed to pick
         // the model when she makes one." There is no blank-means-Chat any more:
@@ -246,17 +286,23 @@ struct BotsEditorSheet: View {
             throw EditorError.message("Limits must be positive numbers, or blank for the defaults.")
         }
         let timing: BotCadence
-        switch when {
-        case "Manual only": timing = .manual
-        case "Twice daily": timing = .interval(seconds: 43200)
-        case "Daily": timing = .interval(seconds: 86400)
-        case "Every N hours":
-            guard let value = Double(hours), value.isFinite, value > 0 else { throw EditorError.message("Enter the number of hours.") }
-            timing = .interval(seconds: value * 3600)
-        case "Custom": timing = .cron(expression: cron, timeZone: zone)
-        // An event-woken bot keeps no schedule: the event is the occurrence.
-        case "On an event": timing = .manual
-        default: timing = .manual
+        if let definition, timingKey == loadedTiming {
+            timing = definition.cadence
+        } else {
+            switch when {
+            case "Manual only": timing = .manual
+            case "Daily", "Weekdays", "Weekly":
+                timing = try StandingBotSchedule.parse(when == "Weekly"
+                    ? "weekly on \(StandingBotSchedule.weekdays[weekday]) at \(clockText)" : "\(when) at \(clockText)",
+                    timezone: zone.isEmpty ? nil : zone)
+            case "Every N hours":
+                guard let value = Double(hours), value.isFinite, value > 0 else { throw EditorError.message("Enter the number of hours.") }
+                timing = .interval(seconds: value * 3600)
+            case "Custom": timing = .cron(expression: cron, timeZone: zone)
+            // An event-woken bot keeps no schedule: the event is the occurrence.
+            case "On an event": timing = .manual
+            default: timing = .manual
+            }
         }
         var trigger: BotEventTrigger?
         if when == "On an event" {

@@ -6,16 +6,6 @@ import NativeAgentCore
 import PersistenceCore
 
 extension CognitiveSubstrate {
-    @discardableResult
-    public func updateAffect(from event: CognitiveEvent) async -> CognitiveAffectState {
-        await waitForMaintenanceTransition()
-        return await updateAffectFromEvent(event)
-    }
-
-    public func affectSnapshot() async -> CognitiveAffectState {
-        projectedAffect(at: dependencies.now())
-    }
-
     /// One fixed-time affect projection for sibling organs. Warmth and pressure
     /// must cross together so the organism cannot observe two decay epochs.
     /// (This IS the affect-convergence hook: d0bcd775 superseded the old
@@ -27,36 +17,11 @@ extension CognitiveSubstrate {
     }
 
     @discardableResult
-    public func decayAffect() async -> CognitiveAffectState {
-        await waitForMaintenanceTransition()
-        guard configuration.enabled, configuration.affectEnabled else { return affect }
-        decayAffectInMemory(to: dependencies.now())
-        return affect
-    }
-
-    @discardableResult
     func decayAffectInMemory(to now: Date) -> Bool {
         guard configuration.enabled, configuration.affectEnabled,
               now.timeIntervalSince(affect.updatedAt) > 0 else { return false }
         affect = projectedAffect(at: now)
         return true
-    }
-
-    func updateAffectFromEvent(_ event: CognitiveEvent) async -> CognitiveAffectState {
-        guard event.turnKind.contributesToLivedState else { return affect }
-        let next = applyAffectFromEvent(event)
-        guard configuration.enabled, configuration.affectEnabled else { return next }
-        await persistArtifact(
-            kind: "affect",
-            id: stableArtifactID("affect"),
-            status: "current",
-            score: next.arousal,
-            payload: next.toJSON(
-                lastUserPresenceAt: lastUserPresenceAt,
-                lastWarmPresenceAt: lastWarmPresenceAt
-            )
-        )
-        return next
     }
 
     /// Synchronous affect apply: decays to `now`, folds in this event's deltas, commits

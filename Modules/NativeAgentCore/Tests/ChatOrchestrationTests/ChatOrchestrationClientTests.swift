@@ -12,6 +12,7 @@ import DreamREMCycle
 import ApprovalInbox
 import MacIntegration
 import CognitiveSubstrate
+import NativeAgentTestSupport
 
 private let makeTempRoot: @Sendable (String) throws -> URL = makeChatOrchestrationTempRoot
 

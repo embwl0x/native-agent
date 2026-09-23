@@ -104,6 +104,8 @@ public struct DelegationJobSnapshot: Sendable, Equatable {
     /// ChatOrchestration.
     public var stallBasis: String?
     public var lastLiveness: String?
+    /// The agent's own reply words, distinct from the completion/delivery text.
+    public var agentReplyTextHead: String?
 
     public init(
         id: String,
@@ -122,7 +124,8 @@ public struct DelegationJobSnapshot: Sendable, Equatable {
         deskHandle: String? = nil,
         stalled: Bool = false,
         stallBasis: String? = nil,
-        lastLiveness: String? = nil
+        lastLiveness: String? = nil,
+        agentReplyTextHead: String? = nil
     ) {
         self.id = id
         self.motorOwnerID = motorOwnerID
@@ -141,6 +144,14 @@ public struct DelegationJobSnapshot: Sendable, Equatable {
         self.stalled = stalled
         self.stallBasis = stallBasis
         self.lastLiveness = lastLiveness
+        self.agentReplyTextHead = agentReplyTextHead
+    }
+
+    /// 2026-09-22: an aborted run with reply words on record said something
+    /// before it stopped. The words may be interim narration, so the outcome
+    /// stays non-success; only the card stops calling it a failure.
+    var abortedAfterReply: Bool {
+        statusWord == "aborted" && !(agentReplyTextHead ?? "").isEmpty
     }
 
     /// Status words that mean the RUN produced an outcome. Deliberately does
@@ -430,6 +441,11 @@ public struct DelegationOutcomeCard: Sendable, Equatable {
         case .succeeded:
             title = "\(name) finished"
             summary = "\(name) finished\(topicPhrase)"
+        case .failed where job.abortedAfterReply:
+            title = "\(name) stopped early — its last reply is in the thread"
+            summary = "\(name) stopped early\(topicPhrase); its last reply is in the thread"
+            reasonLine = "The run was marked aborted after it had written a reply. That reply may be "
+                + "interim, not a final answer."
         case .failed:
             title = "\(name) delegation failed"
             let word = job.statusWord ?? "failed"

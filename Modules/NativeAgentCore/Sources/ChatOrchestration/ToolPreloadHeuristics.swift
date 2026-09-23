@@ -125,6 +125,16 @@ public enum ToolPreloadHeuristics {
         }
     }
 
+    static let chromeReadTools: Set<String> = [
+        "browser.chrome_status", "browser.chrome_acquire", "browser.chrome_navigate",
+        "browser.chrome_snapshot", "browser.chrome_scroll", "browser.chrome_release",
+    ]
+
+    /// The built-in SearXNG server's tools (MCPDispatcher default server).
+    public static let webSearchTools: Set<String> = [
+        "mcp__searxng-local__search", "mcp__searxng-local__fetch",
+    ]
+
     /// Table order is the tie-break priority when match counts are equal.
     /// Member lists mirror impl_tool_load's categories where one exists
     /// (builder/markets/swarm); the Full-Mac lists reference the dispatcher
@@ -162,25 +172,14 @@ public enum ToolPreloadHeuristics {
                 "news", "headline", "headlines", "announcement", "announcements",
             ],
             phrases: ["web search", "search the web", "search online", "latest news"],
-            tools: [
-                "browser.status",
-                "browser.open_url",
-                "browser.navigate",
-                "browser.read_text",
-                "browser.read_links",
-            ],
+            // 2026-09-22: the real-Chrome tools, not the old built-in browser
+            // (272 Chrome calls vs one built-in call in eight days).
+            tools: chromeReadTools.union(webSearchTools),
             // Headless/Core callers historically used `research` for X
             // search. The installed app intercepts this category and loads
             // the visible Browser group. Preserve the Core compatibility
             // member without advertising or preloading it as Browser tissue.
-            loadTools: [
-                "browser.status",
-                "browser.open_url",
-                "browser.navigate",
-                "browser.read_text",
-                "browser.read_links",
-                "x_search",
-            ]
+            loadTools: chromeReadTools.union(webSearchTools).union(["x_search"])
         ),
         GroupEntry(
             group: "browser",
@@ -193,14 +192,7 @@ public enum ToolPreloadHeuristics {
                 "visible browser", "open url", "open website", "open webpage",
                 "read page", "read website", "browser screenshot",
             ],
-            tools: [
-                "browser.status",
-                "browser.open_url",
-                "browser.navigate",
-                "browser.read_text",
-                "browser.read_links",
-                "browser.screenshot",
-            ]
+            tools: chromeReadTools
         ),
         GroupEntry(
             group: "art",
@@ -253,6 +245,7 @@ public enum ToolPreloadHeuristics {
         ),
         GroupEntry(
             group: "mail",
+            aliases: ["email", "emails"],
             tokens: ["email", "emails", "mail", "inbox", "gmail"],
             phrases: [],
             tools: [
@@ -268,6 +261,7 @@ public enum ToolPreloadHeuristics {
         ),
         GroupEntry(
             group: "calendar",
+            aliases: ["reminders", "reminder", "events"],
             tokens: [
                 "calendar", "meeting", "meetings", "appointment", "appointments",
                 "reminder", "reminders", "remind",
@@ -292,8 +286,9 @@ public enum ToolPreloadHeuristics {
         ),
         GroupEntry(
             group: "messages",
+            aliases: ["imessage", "sms", "texts", "text"],
             tokens: ["imessage", "imessages", "sms", "texted"],
-            phrases: ["text message"],
+            phrases: ["text message", "text my", "send a text", "text her", "text him"],
             tools: ["messages_recent_threads", "messages_send"]
         ),
         GroupEntry(
@@ -304,6 +299,7 @@ public enum ToolPreloadHeuristics {
         ),
         GroupEntry(
             group: "contacts",
+            aliases: ["mom", "dad"],
             tokens: ["contact", "contacts"],
             phrases: ["phone number", "address book"],
             tools: ["contacts_search", "contacts_create_or_update", "contacts_delete"]
@@ -374,7 +370,7 @@ public enum ToolPreloadHeuristics {
             group: "swarm",
             aliases: ["swarms", "subagent", "subagents"],
             tokens: ["swarm", "swarms", "subagent", "subagents"],
-            phrases: ["sub-agent"],
+            phrases: ["sub-agent", "sub-agents"],
             tools: ["agent_swarm", "agent_contacts", "agent_message", "agent_read"]
         ),
         GroupEntry(
@@ -433,7 +429,7 @@ public enum ToolPreloadHeuristics {
             aliases: ["trace", "scratch"],
             tokens: [],
             phrases: [],
-            tools: ["context_lookup", "scratchpad_read", "recent_trace_summary"],
+            tools: ["context_lookup", "scratchpad_read", "recent_trace_summary", "work_context", "artifact_find"],
             advertised: false,
             preloadable: false
         ),
@@ -442,7 +438,8 @@ public enum ToolPreloadHeuristics {
             aliases: ["recall", "session"],
             tokens: [],
             phrases: [],
-            tools: ["recall_memory", "recall_search", "search_kg", "search_chat_history", "session_search"],
+            tools: ["recall_memory", "recall_search", "search_kg", "search_chat_history", "session_search", "work_context", "artifact_find",
+                    "list_memories", "forget_memory", "rewrite_memory"],
             advertised: false,
             preloadable: false
         ),
@@ -521,7 +518,7 @@ public enum ToolPreloadHeuristics {
            let names = try? AgentPeerStore(dataRoot: dataRoot).namesMentioned(in: userMessage),
            !names.isEmpty {
             return Prediction(groups: [GroupMatch(group: "agent_message", matchedPatterns: names)],
-                              candidateTools: ["agent_message"])
+                              candidateTools: ["agent_message", "agent_read"])
         }
         var namesAgent = false
         if !connectionVerbs.isEmpty {
@@ -553,7 +550,12 @@ public enum ToolPreloadHeuristics {
                     : tokens.contains(t)
                 if hit { hits.append(t) }
             }
-            for p in entry.phrases where lower.contains(p) { hits.append(p) }
+            // Whole words only: "context here" is not "text her".
+            for p in entry.phrases where lower.contains(p)
+                && lower.range(of: "(?<![\\p{L}\\p{N}_])" + NSRegularExpression.escapedPattern(for: p)
+                    + "(?![\\p{L}\\p{N}_])", options: .regularExpression) != nil {
+                hits.append(p)
+            }
             if entry.group == "delegation", !namesAgent { hits.removeAll() }
             if entry.group == "files" {
                 hits.append(contentsOf: fileSignals(rawTokens: rawTokens))
@@ -669,6 +671,12 @@ public enum ToolPreloadHeuristics {
             "worktree", "project", "fixed", "changed", "created", "updated",
         ]
         return signals.contains { body.contains($0) }
+    }
+
+    /// The `tool_load` category spellings of these groups ("text" for
+    /// messages, "email" for mail, "news" for research).
+    static func aliases(ofGroups groups: [String]) -> [String] {
+        table.filter { groups.contains($0.group) }.flatMap(\.aliases)
     }
 
     /// Compact discovery index shared by the Core and app-owned catalog
@@ -811,8 +819,8 @@ public enum ToolPreloadHeuristics {
     ]
 
     /// Second security gate (2026-06-10 review fix): drop every candidate
-    /// whose Mac Integration policy bit is OFF, using the SAME
-    /// `allows(integration, mode:)` check dispatchMacIntegrationTool runs
+    /// whose effective Mac Integration permission is OFF, using the SAME
+    /// checked preference/Full Mac admission dispatchMacIntegrationTool runs
     /// before executing the tool. Without this, e.g. `mail_send` preloaded
     /// on an "email" match even with Mail write off — dispatch still denied
     /// it, but the "policy-denied tool is never preloaded" invariant was
@@ -820,13 +828,19 @@ public enum ToolPreloadHeuristics {
     /// through untouched.
     static func filterByMacIntegrationPolicy(
         _ names: Set<String>,
-        permissions: MacIntegrationPermissionStore
+        permissions: MacIntegrationPermissionStore,
+        surface: String = "chat",
+        dataRoot: URL? = nil
     ) async -> Set<String> {
         var out: Set<String> = []
         out.reserveCapacity(names.count)
         for name in names {
             if let gate = macIntegrationGates[name] {
-                if await permissions.allows(gate.integration, mode: gate.mode) {
+                let admitted: Bool
+                if let dataRoot {
+                    admitted = await ChatFullMacYoloAdmission.admitted(tool: name, surface: surface, dataRoot: dataRoot, source: "tool_preload")
+                } else { admitted = false }
+                if await permissions.allows(gate.integration, mode: gate.mode, fullMacAdmitted: admitted) {
                     out.insert(name)
                 }
             } else {
@@ -923,7 +937,7 @@ public enum ToolPreloadHeuristics {
         )
         // Dispatch-gate mirror: Mac Integration policy denials drop out here
         // so a policy-denied tool is never preloaded (see header invariant).
-        let names = await filterByMacIntegrationPolicy(catalogGated, permissions: permissions)
+        let names = await filterByMacIntegrationPolicy(catalogGated, permissions: permissions, surface: surface, dataRoot: dataRoot)
         guard !names.isEmpty else {
             return PreloadOutcome(activeTools: effectiveActiveTools, promotable: [])
         }

@@ -54,7 +54,7 @@ enum MacPIMConnectorActions {
             "status": .string("completed"),
             "actionId": .string("mac.calendar_list_upcoming"),
             "source": .string("eventkit"),
-            "authorization": .string(calendarAuthorizationState()),
+            "access": .string(calendarAuthorizationState()),
             "hoursAhead": .int(Int64(window.hoursAhead)),
             "rangeStart": .string(iso(window.start)),
             "rangeEnd": .string(iso(window.end)),
@@ -130,7 +130,7 @@ enum MacPIMConnectorActions {
             "status": .string("completed"),
             "actionId": .string("mac.reminders_list_due_today"),
             "source": .string("eventkit"),
-            "authorization": .string(reminderAuthorizationState()),
+            "access": .string(reminderAuthorizationState()),
             "includeCompleted": .bool(includeCompleted),
             "count": .int(Int64(reminders.count)),
             "reminders": .array(Array(reminders)),
@@ -828,7 +828,7 @@ enum MacPIMConnectorActions {
             "status": .string("needs_permission"),
             "actionId": .string(actionId),
             "source": .string("eventkit"),
-            "authorization": .string(status),
+            "access": .string(status),
             "message": .string(message),
         ])
     }
@@ -923,6 +923,7 @@ enum MacPIMConnectorActions {
 
     nonisolated private static func reminderJSON(_ reminder: EKReminder) -> JSONValue {
         var obj: [String: JSONValue] = [
+            "id": .string(reminder.calendarItemIdentifier),
             "title": .string(NativeAppSecretRedactor.redactText(reminder.title ?? "(Untitled reminder)")),
             "list": .string(reminder.calendar.title),
             "completed": .bool(reminder.isCompleted),

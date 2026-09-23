@@ -17,6 +17,25 @@ private struct NoGrokDesktopTools: ToolDispatchClient {
 }
 
 @Suite struct GrokBotConnectionTests {
+    @Test @MainActor func restoresOnlyTheStillRunningPreviousAppWhileGrokOwnsFocus() {
+        #expect(GrokRoutineAccessibility.shouldRestoreForeground(
+            previousPID: 101, previousTerminated: false, currentPID: 202,
+            currentBundleID: GrokBotRoute.bundleID))
+        // A person switching elsewhere is authoritative, even on setup failure.
+        #expect(!GrokRoutineAccessibility.shouldRestoreForeground(
+            previousPID: 101, previousTerminated: false, currentPID: 303,
+            currentBundleID: "com.apple.Safari"))
+        #expect(!GrokRoutineAccessibility.shouldRestoreForeground(
+            previousPID: 202, previousTerminated: false, currentPID: 202,
+            currentBundleID: GrokBotRoute.bundleID))
+        #expect(!GrokRoutineAccessibility.shouldRestoreForeground(
+            previousPID: 101, previousTerminated: true, currentPID: 202,
+            currentBundleID: GrokBotRoute.bundleID))
+        #expect(!GrokRoutineAccessibility.shouldRestoreForeground(
+            previousPID: nil, previousTerminated: false, currentPID: 202,
+            currentBundleID: GrokBotRoute.bundleID))
+    }
+
     @Test func unconfirmedLegacyDisconnectRemovesContactWithoutDesktopCleanup() async throws {
         let root = root(); defer { try? FileManager.default.removeItem(at: root) }
         var peer = AgentPeerContact(name: "Grok Bot", endpoint: URL(string: "grok://grok-bot")!, transport: .grokBot)
@@ -37,6 +56,10 @@ private struct NoGrokDesktopTools: ToolDispatchClient {
         #expect(GrokRoutineAccessibility.isEmptyBox("Ask anything…"))
         #expect(!GrokRoutineAccessibility.isEmptyBox("Ask Grok to finish…"))
         #expect(!GrokRoutineAccessibility.isEmptyBox("Message User"))
+        #expect(!GrokRoutineAccessibility.isEmptyBox("Message grok about tomorrow"))
+        #expect(!GrokRoutineAccessibility.isEmptyBox("Ask anything about this draft"))
+        #expect(GrokRoutineAccessibility.isEmptyBox("Message Research Bot", conversation: "Research Bot"))
+        #expect(!GrokRoutineAccessibility.isEmptyBox("Message Research Bot", conversation: "grok"))
     }
 
     @Test @MainActor func grokInputEventsCarryClickAndKeyboardIntentWithoutPosting() throws {

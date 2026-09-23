@@ -181,6 +181,10 @@ public enum MacKeySyntaxError: Error, Equatable, LocalizedError {
         case .unknownModifier(let mod, let chord):
             return "invalid_keystroke_syntax: unknown modifier \"\(mod)\" in \"\(chord)\" (use cmd/shift/opt/ctrl/fn)"
         case .unknownKey(let key, let chord):
+            // 2026-09-22: she sent key "shift" alone and read "unknown key" as a dead end.
+            if MacKeySyntax.modifier(key.lowercased()) != nil {
+                return "invalid_keystroke_syntax: \"\(key)\" is a modifier, not a key; put it in `holding` with the key it modifies, or write a chord such as \(key.lowercased())+tab"
+            }
             return "invalid_keystroke_syntax: unknown key \"\(key)\" in \"\(chord)\""
         case .keyCodeOutOfRange(let raw):
             return "invalid_keystroke_syntax: key code \"\(raw)\" is outside 0…127"

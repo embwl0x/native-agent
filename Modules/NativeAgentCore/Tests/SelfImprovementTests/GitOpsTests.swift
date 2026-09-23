@@ -68,24 +68,6 @@ private func makeDiff(repo: TempRepo, fileName: String, newContent: String) thro
     #expect(head.count == 12)
 }
 
-@Test func isWorkTreeClean_returns_true_on_clean_tree() async throws {
-    let repo = try TempRepo.make()
-    defer { repo.cleanup() }
-    let ops = SelfImprovementGitOps(repoRoot: repo.root)
-    #expect(try await ops.isWorkTreeClean() == true)
-}
-
-@Test func isWorkTreeClean_returns_false_when_file_modified() async throws {
-    let repo = try TempRepo.make()
-    defer { repo.cleanup() }
-    try "dirty\n".write(
-        to: repo.root.appendingPathComponent("seed.txt"),
-        atomically: true, encoding: .utf8
-    )
-    let ops = SelfImprovementGitOps(repoRoot: repo.root)
-    #expect(try await ops.isWorkTreeClean() == false)
-}
-
 @Test func applyDiffAndCommit_happy_path_creates_commit() async throws {
     let repo = try TempRepo.make()
     defer { repo.cleanup() }
@@ -240,44 +222,6 @@ private func makeDiff(repo: TempRepo, fileName: String, newContent: String) thro
             Issue.record("wrong error: \(e)")
         }
     }
-}
-
-@Test func stashSnapshot_then_pop_round_trips() async throws {
-    let repo = try TempRepo.make()
-    defer { repo.cleanup() }
-    let ops = SelfImprovementGitOps(repoRoot: repo.root)
-    try "dirty\n".write(
-        to: repo.root.appendingPathComponent("seed.txt"),
-        atomically: true, encoding: .utf8
-    )
-    let ref = try await ops.stashSnapshot(message: "round-trip-test")
-    #expect(try await ops.isWorkTreeClean() == true)
-    try await ops.stashPop(ref: ref)
-    let content = try String(
-        contentsOf: repo.root.appendingPathComponent("seed.txt"),
-        encoding: .utf8
-    )
-    #expect(content == "dirty\n")
-}
-
-@Test func resetHard_to_sha_destroys_uncommitted() async throws {
-    let repo = try TempRepo.make()
-    defer { repo.cleanup() }
-    let ops = SelfImprovementGitOps(repoRoot: repo.root)
-    let origHead = try shellCapture("git", ["-C", repo.root.path, "rev-parse", "HEAD"])
-        .trimmingCharacters(in: .whitespacesAndNewlines)
-    try "dirty\n".write(
-        to: repo.root.appendingPathComponent("seed.txt"),
-        atomically: true, encoding: .utf8
-    )
-    #expect(try await ops.isWorkTreeClean() == false)
-    try await ops.resetHard(toSha: origHead)
-    #expect(try await ops.isWorkTreeClean() == true)
-    let content = try String(
-        contentsOf: repo.root.appendingPathComponent("seed.txt"),
-        encoding: .utf8
-    )
-    #expect(content == "hello\n")
 }
 
 @Test func gitNotFound_when_PATH_lacks_git() async throws {

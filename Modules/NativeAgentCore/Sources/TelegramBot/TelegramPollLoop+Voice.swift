@@ -61,9 +61,6 @@ extension TelegramPollLoop {
         .compactMap { $0 }
         .joined(separator: " ")
         .lowercased()
-        if description.contains("notconfigured") || description.contains("no openai platform key") {
-            return "Voice transcription needs an OpenAI API key."
-        }
         if description.contains("siri and dictation") || description.contains("dictation") {
             return "The voice note arrived, but macOS Siri/Dictation is blocking Apple Speech. Transcription was retried without on-device recognition; if this keeps happening, enable Dictation in System Settings."
         }

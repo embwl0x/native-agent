@@ -5,6 +5,11 @@ import PersistenceCore
 /// Anthropic OAuth wire layout and cache placement. Transport and token
 /// ownership remain in the adapter; these helpers preserve model-visible bytes.
 extension AnthropicOAuthDirectAdapter {
+    /// First line of the text-lane tool protocol in the system prompt; its
+    /// presence is what marks a request as a text-tool-lane chat call.
+    public static let textToolProtocolHeader =
+        "NativeAgent Swift tool protocol (text compatibility):"
+
     /// Anthropic's API gates OAuth-mode on this EXACT string being the first
     /// system block.
     private static let claudeCodeIdentity =
@@ -72,11 +77,10 @@ extension AnthropicOAuthDirectAdapter {
 
     // MARK: - cache_control body helpers (U1 step 3 + 2b/3b, 2026-06-10)
     //
-    // Anthropic prompt caching is a PREFIX match over tools → system →
-    // messages. Three ephemeral breakpoints (max 4 allowed):
-    //   (a) the LAST tool definition  — caches the whole tools block
-    //   (b) the claudeCodeIdentity system block — caches tools + identity
-    //   (c) the END of the STABLE system mass:
+    // Anthropic prompt caching is a PREFIX match over system → messages
+    // (this route sends no tools array). System breakpoints (max 4 in all):
+    //   (a) the claudeCodeIdentity system block
+    //   (b) the END of the STABLE system mass:
     //       - with a stable/dynamic split bound via
     //         LLMCallContext.systemSegments (U1 2b/3b), the breakpoint sits
     //         on the stable block (persona+pins) and the dynamic block
@@ -177,12 +181,10 @@ extension AnthropicOAuthDirectAdapter {
     ///
     /// ORDERING RULE (Anthropic): entries with the longer TTL must appear
     /// BEFORE shorter ones — a 1h entry may not sit behind a 5m entry in the
-    /// tools → system → messages render order. The tools breakpoint is always
-    /// FIRST, so it can never be shorter than the system or message markers;
-    /// deciding the TTL once, here, and handing the same value to
-    /// `makeToolList`, `makeSystemBlocks` and the previous-turn boundary is
-    /// what makes that structural instead of a rule three call sites have to
-    /// remember. The current-turn boundary is always LAST and always 5m, which
+    /// system → messages render order. Deciding the TTL once, here, and
+    /// handing the same value to `makeSystemBlocks` and the previous-turn
+    /// boundary is what makes that structural instead of a rule each call
+    /// site has to remember. The current-turn boundary is always LAST and always 5m, which
     /// the rule permits.
     ///
     /// Returns nil (plain 5m ephemeral, no `ttl` key on the wire) unless the
@@ -280,19 +282,6 @@ extension AnthropicOAuthDirectAdapter {
     /// string (pre-U1 shape was already [identity][sys]), so it carries no
     /// join contract with the blocks that follow it.
     ///
-    /// `toolCapable` (U1 F1 lane (a), step-6 rider, 2026-06-10): on TOOL-
-    /// CAPABLE requests with a stable/dynamic split, the dynamic block ALSO
-    /// gets a breakpoint — within a multi-iteration tool turn the dynamic
-    /// mass (recall+history, built once per turn) is byte-identical across
-    /// iterations, so iteration 2..N read it from cache instead of re-paying
-    /// ~2k input tokens per iteration (F1 live measurement). Breakpoint
-    /// budget: last-tool + identity + stable-end + dynamic-end = 4 ≤ 4.
-    /// On NON-tool turns there is exactly ONE call per turn and the dynamic
-    /// block churns across turns — a breakpoint there would pay the 1.25x
-    /// cache-write premium with ~zero read probability, hence the gate.
-    /// (Unsegmented fallback: the combined sys block already carries the
-    /// end-of-system breakpoint; nothing extra to add.)
-    ///
     /// V2 PREFIX SHAPE (`ConversationPrefixShape.v2Prefix`, production default,
     /// engaged only when the segments are present and reassemble):
     ///   [identity — NO cache_control] [stable] [stableSuffix?] [dynamic?]
@@ -302,8 +291,8 @@ extension AnthropicOAuthDirectAdapter {
     /// slot funds the previous-turn conversation boundary marker. The LAST
     /// stable block (stableSuffix when present, else stable) carries the
     /// single system breakpoint, at the GA 1h TTL when `longTTL` says so —
-    /// see `requestLongTTL`, which also keeps the tools breakpoint at the
-    /// same TTL so the render order never puts 5m ahead of 1h. An empty `dynamic`
+    /// see `requestLongTTL`, so the render order never puts 5m ahead of 1h.
+    /// An empty `dynamic`
     /// emits no dynamic block at all.
     /// Byte faithfulness is unchanged: separators ride as SUFFIXES on the
     /// preceding block, so the emitted non-identity block texts concatenate to
@@ -311,7 +300,6 @@ extension AnthropicOAuthDirectAdapter {
     static func makeSystemBlocks(
         _ system: String?,
         segments: SystemPromptSegments? = LLMCallContext.systemSegments,
-        toolCapable: Bool = false,
         longTTL: String? = nil
     ) -> [[String: Any]] {
         let usesPrefixShape = usesV2PrefixShape(system, segments: segments)
@@ -371,21 +359,11 @@ extension AnthropicOAuthDirectAdapter {
                 "text": seg.stable + "\n\n",
                 "cache_control": ephemeralCacheControl,
             ])
-            // Dynamic tail: cache_control ONLY on tool-capable requests
-            // (within-turn iteration reads; see toolCapable doc above).
-            // Non-tool turns: NO breakpoint — recall+history churn per turn.
-            if toolCapable {
-                blocks.append([
-                    "type": "text",
-                    "text": seg.dynamic,
-                    "cache_control": ephemeralCacheControl,
-                ])
-            } else {
-                blocks.append([
-                    "type": "text",
-                    "text": seg.dynamic,
-                ])
-            }
+            // Dynamic tail: NO breakpoint — recall+history churn per turn.
+            blocks.append([
+                "type": "text",
+                "text": seg.dynamic,
+            ])
         } else {
             blocks.append([
                 "type": "text",
@@ -467,36 +445,18 @@ extension AnthropicOAuthDirectAdapter {
         return true
     }
 
-    /// Anthropic Messages-API tools list with a cache_control breakpoint on
-    /// the LAST definition. Returns nil for nil/empty input so the no-tools
-    /// request body stays byte-identical to the no-tools overload.
-    /// `ttl` MUST match the request's system/message TTL decision — the
-    /// tools block renders FIRST, and a 5m entry there would sit ahead of a
-    /// 1h entry, which Anthropic rejects as an ordering violation. Defaults
-    /// to nil (plain 5m) so every non-v2 caller is byte-identical.
-    static func makeToolList(
-        _ tools: [LLMToolSchema]?,
-        ttl: String? = nil
-    ) -> [[String: Any]]? {
-        guard let tools, !tools.isEmpty else { return nil }
-        var toolList: [[String: Any]] = []
-        for t in tools {
-            var entry: [String: Any] = [
-                "name": t.name,
-                "description": t.description,
-            ]
-            if let schema = try? JSONSerialization.jsonObject(with: t.parametersJSON) {
-                entry["input_schema"] = schema
-            } else {
-                entry["input_schema"] = [
-                    "type": "object",
-                    "properties": [:] as [String: Any],
-                ] as [String: Any]
-            }
-            toolList.append(entry)
+    /// 2026-09-22 WHY: on this text tool lane Claude writes its own
+    /// `<function_calls>` blocks; without the stop the API normally applies,
+    /// Opus 5.5 went on to invent `<function_results>` and ran 421s to the
+    /// 65,536-token cap (turn 37802ab2). Stop where a real call would —
+    /// chat calls carrying the text-lane protocol only, never side calls.
+    /// Every transport (messages and the legacy prompt stream) reads it.
+    /// `</tool_use>` is deliberately NOT a stop: bare `<tool_use>` markers
+    /// have no outer block, so stopping at the first would drop parallel calls.
+    static func applyTextLaneStops(to body: inout [String: Any], system: String?) {
+        if system?.contains(textToolProtocolHeader) == true {
+            body["stop_sequences"] = ["</function_calls>", "<function_results>", "\n<tool_result", "\nNativeAgent tool result #"]
         }
-        toolList[toolList.count - 1]["cache_control"] = ephemeralCacheControl(ttl: ttl)
-        return toolList
     }
 
     // MARK: - Shared messages-request body builder (U1 items 8 + 9)
@@ -517,26 +477,13 @@ extension AnthropicOAuthDirectAdapter {
         system: String?,
         coercedModel: String,
         maxTokens: Int,
-        tools: [LLMToolSchema]?,
         stream: Bool
     ) -> [String: Any] {
-        // U1 items 8 + 9 — conversation-cache INVARIANT: caching ships iff
-        // the call is tool-capable OR withinTurnReuse-
-        // hinted (and trailing-eligible, and not compat). Both grantors are
-        // legitimate reuse signals: tools[] implies a multi-iteration
-        // structured loop (item 8); the hint is the no-tools text-compat
-        // loop's explicit "I re-send this conversation as a prefix next
-        // iteration" signal (item 9 — see MessagesCacheHint). The current
-        // message breakpoint replaces the lane-(a) dynamic-end breakpoint (its prefix
-        // covers every system block, so the dynamic block is cached from
-        // iteration 1's write on — and the 4-breakpoint budget has no room for
-        // both; the `toolCapable && !useConversationCache` arg below is
-        // what closes the budget at ≤ 4 across the whole hint × tools ×
-        // segmented × compat matrix, test-pinned). The grown-prompt compat
-        // lever restores the old layout. Non-tool un-hinted calls keep the
-        // pre-item-8 body byte-identical (no trailing breakpoint, no
-        // dynamic-end — single-shot turns have no within-turn reuse).
-        let toolCapable = !(tools?.isEmpty ?? true)
+        // Conversation-cache INVARIANT: caching ships iff the call is a v2
+        // prefix turn OR withinTurnReuse-hinted (the text-compat loop's
+        // explicit "I re-send this conversation as a prefix next iteration"
+        // signal — see MessagesCacheHint), and trailing-eligible, and not
+        // compat. The grown-prompt compat lever restores the old layout.
         // V2: EVERY turn is a prefix-reuse turn — the transcript is re-sent
         // as a cached prefix across turns, not only inside one tool loop — so
         // the conversation breakpoints are unconditional (still subject to
@@ -561,17 +508,13 @@ extension AnthropicOAuthDirectAdapter {
         let boundaryIndex = Self.currentBoundaryIndex(messages)
         let trailingEligible = boundaryIndex.map { !messages[$0].content.isEmpty } ?? false
         let useConversationCache =
-            (usesPrefixShape || toolCapable || MessagesCacheHint.withinTurnReuse)
+            (usesPrefixShape || MessagesCacheHint.withinTurnReuse)
             && trailingEligible
             && !Self.GrownPromptCompat.effective
         let longTTL = Self.requestLongTTL(
             usesPrefixShape: usesPrefixShape, messages: messages
         )
-        let systemBlocks = Self.makeSystemBlocks(
-            system,
-            toolCapable: toolCapable && !useConversationCache,
-            longTTL: longTTL
-        )
+        let systemBlocks = Self.makeSystemBlocks(system, longTTL: longTTL)
 
         // Encode each LLMMessage as an Anthropic message with structured
         // content blocks. Text-only messages can use the short `content:
@@ -647,12 +590,11 @@ extension AnthropicOAuthDirectAdapter {
                 // the two arrays share indices.
                 previousBoundaryIndex = Self.previousTurnBoundaryIndex(messages)
                 previousBoundaryTTL = longTTL
-                // Budget: stable-end + previous + current + last tool = 4.
+                // Budget: stable-end + previous + current = 3.
                 // Nothing else can ship a marker on v2, so this is closed.
             } else {
-                // The text lane has one free fourth slot. Structured tools
-                // already spend it on the last tool definition.
-                let retain = !toolCapable && MessagesCacheHint.withinTurnReuse
+                // The text lane has one free fourth slot.
+                let retain = MessagesCacheHint.withinTurnReuse
                 previousBoundaryIndex =
                     (retain && anthropicMessages.count >= 3)
                     ? anthropicMessages.count - 3
@@ -675,9 +617,7 @@ extension AnthropicOAuthDirectAdapter {
         if stream {
             body["stream"] = true
         }
-        if let toolList = Self.makeToolList(tools, ttl: longTTL) {
-            body["tools"] = toolList
-        }
+        Self.applyTextLaneStops(to: &body, system: system)
         // Turn Inspector W2 — GATED summarized-thinking lane. The `thinking`
         // param is part of the request BODY, so adding it CHANGES the bytes on
         // the wire (and the U1 cache prefix). It is therefore strictly gated on

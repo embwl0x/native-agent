@@ -250,19 +250,18 @@ extension NativeCognitionRuntime {
         window: TimeInterval
     ) async -> OrganismCaringEventOutcome {
         let outcome = await organismKernel.admitCaringEvent(reading, window: window)
-        // Only a dose changed the chemistry. A coalesced or already-counted moment
-        // moved the encounter window, which is persisted with the next write and is
-        // not worth one of its own.
         // A coalesced moment moved the encounter window without changing the
         // chemistry; the window is persisted state too (review r2: a crash after
         // a coalesced turn restored the older window and let the next turn dose
         // early), so it gets the same persistence, just no publish.
+        // 2026-09-22: both branches awaited, since unawaited saves now sit in a
+        // 30s debounce — a crash inside it would let the next turn dose again.
         if outcome.dosed {
             cachedBodyRead = nil
-            scheduleOrganismContinuityPersistence(reason: "caring:\(reading.kind.rawValue)")
+            await persistOrganismContinuity(reason: "caring:\(reading.kind.rawValue)")
             publishRuntimeChange(reason: "caring:\(reading.kind.rawValue)")
         } else {
-            scheduleOrganismContinuityPersistence(reason: "caring:coalesced")
+            await persistOrganismContinuity(reason: "caring:coalesced")
         }
         // AND THE RECEIPT LEARNS WHAT THE BODY DID. The appraisal owner wrote the
         // model's verdict a moment ago and had no way to know the outcome yet;
@@ -770,12 +769,6 @@ extension NativeCognitionRuntime {
             .appendingPathComponent("organism_state.json")
     }
 
-    private var organismChemistryHistoryURL: URL {
-        dataRoot
-            .appendingPathComponent("cognition", isDirectory: true)
-            .appendingPathComponent("organism_chemistry.jsonl")
-    }
-
     private var organismReflexReviewIntentURL: URL {
         dataRoot
             .appendingPathComponent("cognition", isDirectory: true)
@@ -957,6 +950,8 @@ extension NativeCognitionRuntime {
         }
         return await withCheckedContinuation { continuation in
             organismPersistenceWaiters[generation, default: []].append(continuation)
+            // An awaited save (quit, reflex, proof flush) never waits out the debounce.
+            organismPersistenceDebounceTask?.cancel()
         }
     }
 
@@ -969,9 +964,25 @@ extension NativeCognitionRuntime {
                 organismPersistenceDrainTask = nil
                 return
             }
+            // 2026-09-22: every accepted event rewrote the whole 257KB state
+            // (~3,000x/day). Un-awaited saves now land at most once per 30s,
+            // latest state wins; a waiter cancels the sleep and flushes now.
+            if organismPersistenceWaiters.isEmpty,
+               let last = organismPersistenceLastWriteAt,
+               ContinuousClock.now < last + .seconds(30) {
+                let due = last + .seconds(30)
+                let debounce = Task<Void, Never> {
+                    try? await Task.sleep(until: due, clock: .continuous)
+                }
+                organismPersistenceDebounceTask = debounce
+                await debounce.value
+                organismPersistenceDebounceTask = nil
+                continue
+            }
             let generation = organismPersistenceRequestedGeneration
             let reason = organismPersistenceLatestReason
             let succeeded = await writeOrganismContinuitySnapshot(reason: reason)
+            organismPersistenceLastWriteAt = ContinuousClock.now
             organismPersistenceCompletedGeneration = generation
             organismPersistenceLastResult = succeeded
             resumeOrganismPersistenceWaiters(through: generation, result: succeeded)
@@ -1002,21 +1013,6 @@ extension NativeCognitionRuntime {
             } else {
                 try await Self.writeOrganismPersistentState(state, to: url)
             }
-            // CHEMISTRY HISTORY. The ten axes had no sampler at all: the only
-            // series on disk came from a hand-run script that stopped on
-            // 2026-07-07, so nothing could say whether an axis moves, saturates
-            // or is dead. One JSONL row per persisted save — the same writes the
-            // organism already earns, no timer, no extra read, and inside this
-            // same `do` so a failure reports through the existing receipt. This
-            // RECORDS chemistry; it changes no gate, no decay and no source term.
-            // A test runtime that owns the writer owns the whole write: do not
-            // put a file beside a simulated one.
-            if organismPersistenceWriterOverride == nil {
-                try await Self.appendOrganismChemistrySample(
-                    state,
-                    to: organismChemistryHistoryURL
-                )
-            }
             return true
         } catch {
             await substrate.recordReceipt(
@@ -1045,62 +1041,8 @@ extension NativeCognitionRuntime {
             )
             let encoder = JSONEncoder()
             encoder.dateEncodingStrategy = .iso8601
-            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
             let data = try encoder.encode(state)
             try data.write(to: url, options: .atomic)
-        }.value
-    }
-
-    /// Bounded append-only chemistry series. Trimmed to the newest
-    /// `organismChemistryHistoryMaxRows` rows when it overruns, so an install
-    /// that runs for years cannot grow this file without limit.
-    static let organismChemistryHistoryMaxRows = 20_000
-
-    private nonisolated static func appendOrganismChemistrySample(
-        _ state: OrganismPersistentState,
-        to url: URL
-    ) async throws {
-        let chemistry = state.chemicalState
-        let row: [String: JSONValue] = [
-            "savedAt": .string(ISO8601DateFormatter().string(from: state.savedAt)),
-            "signalCount": .int(Int64(state.signalCount)),
-            "warmth": .double(chemistry.warmth),
-            "vigilance": .double(chemistry.vigilance),
-            "curiosity": .double(chemistry.curiosity),
-            "fatigue": .double(chemistry.fatigue),
-            "coherence": .double(chemistry.coherence),
-            "agency": .double(chemistry.agency),
-            "tenderness": .double(chemistry.tenderness),
-            "confidence": .double(chemistry.confidence),
-            "novelty": .double(chemistry.novelty),
-            "urgency": .double(chemistry.urgency),
-        ]
-        let maxRows = organismChemistryHistoryMaxRows
-        try await Task.detached(priority: .utility) {
-            let encoder = JSONEncoder()
-            encoder.outputFormatting = [.sortedKeys]
-            var line = try encoder.encode(JSONValue.object(row))
-            line.append(0x0A)
-            let fm = FileManager.default
-            try fm.createDirectory(
-                at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-            if let handle = try? FileHandle(forWritingTo: url) {
-                defer { try? handle.close() }
-                try handle.seekToEnd()
-                try handle.write(contentsOf: line)
-            } else {
-                try line.write(to: url, options: .atomic)
-            }
-            // Trim in place, newest kept. Cheap because it only reads the file
-            // when it has actually grown past the cap.
-            let size = (try? fm.attributesOfItem(atPath: url.path)[.size] as? NSNumber)??.intValue ?? 0
-            guard size > maxRows * 64 else { return }
-            guard let text = try? String(contentsOf: url, encoding: .utf8) else { return }
-            var rows = text.split(separator: "\n", omittingEmptySubsequences: true)
-            guard rows.count > maxRows else { return }
-            rows = Array(rows.suffix(maxRows))
-            try (rows.joined(separator: "\n") + "\n").data(using: .utf8)?
-                .write(to: url, options: .atomic)
         }.value
     }
 

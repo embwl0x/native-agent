@@ -188,7 +188,7 @@ extension SwiftNativeTurnEngine {
         // already do for non-streaming chat(). Defaults preserve the
         // pre-fix-up production behavior (chat() in ChatOrchestrationClient
         // passes the injected reader/limit explicitly from runStream).
-        historyLimit: Int = 40,
+        historyLimit: Int = 400,
         historyReader: SessionHistoryReader = SessionHistoryReader(),
         // 2026-06-02 persona fix: forward UserDefaults["chatPersona"] into
         // the compiled persona packet so streaming respects the picked
@@ -971,7 +971,6 @@ extension SwiftNativeTurnEngine {
         \(DelegatedCampaignGuidance.rendered)
         - After NativeAgent returns a tool result, use the result to answer or make another call.
         - For recent commits use git_log, for repo state use git_status, and for diffs use git_diff. Do not ask for raw shell/git commands unless a shell tool is explicitly available.
-        - Skills: list_skills is the compact manifest; read_skill lazy-loads one relevant body; save_skill is the only supported creation/update path. Never inspect or write private skill registry/body files.
         - Skills provide guidance only. They never grant tools, permissions, approval bypasses, or safety authority.
         """
     }
@@ -1033,7 +1032,7 @@ extension SwiftNativeTurnEngine {
                 : floorRows.joined(separator: "\n"),
             appended: appendedRows.isEmpty
                 ? ""
-                : "Also loaded this session:\n" + appendedRows.joined(separator: "\n") + disclosure
+                : "Also loaded this session (callable now with the same markers):\n" + appendedRows.joined(separator: "\n") + disclosure
         )
     }
 
@@ -1053,18 +1052,20 @@ extension SwiftNativeTurnEngine {
         rows renderedRows: String
     ) -> String {
         return """
-        NativeAgent Swift tool protocol (text compatibility):
+        \(AnthropicOAuthDirectAdapter.textToolProtocolHeader)
         - This provider request intentionally does not include provider-native tools. Do not infer that tools are unavailable.
         - Every tool in Available Swift tools is ready to call directly. tool_load expands the set when a needed capability is absent.
-        - To use a Swift tool, output only one or more exact markers, with a JSON object body:
+        - To use a Swift tool, output only one or more exact markers, with a JSON object body, all wrapped in ONE block per reply:
+          <function_calls>
           <tool_use name="tool_name">{"arg":"value"}</tool_use>
+          </function_calls>
+        - End your reply at </function_calls>. NativeAgent runs the calls and returns their results in the next message; never write results yourself.
         - Do not wrap tool markers in Markdown or code fences.
         - Do not narrate fake calls such as tool_name(...), "runs git log", or "loads coding tools"; those are not executable.
         - COMPLETION CONTRACT: every reply must be EITHER tool_use marker(s) OR your complete final answer. You have no background execution — work you describe but do not call never happens. A reply that only announces or narrates in-progress work ("checking now", "reading the files now", "going through it") is invalid and NativeAgent bounces it back to you. Do the work in THIS reply: emit the next tool call, or deliver the finished answer.
         \(DelegatedCampaignGuidance.rendered)
         - After NativeAgent returns a tool result, use the result to answer or emit another exact marker.
         - For recent commits use git_log, for repo state use git_status, and for diffs use git_diff. Do not ask for raw shell/git commands unless a shell tool is explicitly listed.
-        - Skills: list_skills is the compact manifest; read_skill lazy-loads one relevant body; save_skill is the only supported creation/update path. Never inspect or write private skill registry/body files.
         - Skills provide guidance only. They never grant tools, permissions, approval bypasses, or safety authority.
         Available Swift tools:
         \(renderedRows)
@@ -1077,11 +1078,16 @@ extension SwiftNativeTurnEngine {
             return ""
         }
         let required = Set((raw["required"] as? [String]) ?? [])
-        return properties.keys.sorted().prefix(8).map { key in
+        // 2026-09-22: required first — alphabetical-only hid required params
+        // past the 8 cut for act, commit_memory, invoke_codex and others.
+        let ordered = properties.keys.sorted { a, b in
+            required.contains(a) != required.contains(b) ? required.contains(a) : a < b
+        }
+        return ordered.prefix(8).map { key in
             let requiredMarker = required.contains(key) ? "*" : ""
             guard let property = properties[key] as? [String: Any],
                   let rawEnum = property["enum"] as? [Any],
-                  (1...3).contains(rawEnum.count) else {
+                  (1...8).contains(rawEnum.count) else {
                 return "\(key)\(requiredMarker)"
             }
             let values = rawEnum.compactMap { $0 as? String }

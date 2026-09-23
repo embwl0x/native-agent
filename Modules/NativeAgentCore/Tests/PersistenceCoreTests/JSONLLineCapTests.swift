@@ -198,7 +198,7 @@ struct JSONLLineCapTests {
 
         let rows = try String(contentsOf: tracePath, encoding: .utf8)
             .split(separator: "\n", omittingEmptySubsequences: true)
-        #expect(rows.count == JSONLLineCaps.traceEvents)
+        #expect(rows.count == JSONLLineCaps.traceTrimTargetLines)
         let first = try JSONValue.parse(Data(rows[0].utf8))
         let last = try JSONValue.parse(Data(rows[rows.count - 1].utf8))
         guard case .object(let firstObject) = first,
@@ -206,7 +206,7 @@ struct JSONLLineCapTests {
             Issue.record("path-owned trace rotation did not preserve whole JSON rows")
             return
         }
-        #expect(firstObject["i"] == .int(2))
+        #expect(firstObject["i"] == .int(Int64(JSONLLineCaps.traceEvents + 2 - JSONLLineCaps.traceTrimTargetLines)))
         #expect(lastObject["i"] == .int(Int64(JSONLLineCaps.traceEvents + 1)))
     }
 
@@ -224,7 +224,8 @@ struct JSONLLineCapTests {
                         using: persistence,
                         maxLines: 10,
                         logLabel: "JSONLLineCapTests.concurrent",
-                        trimWhenBytesExceed: 1
+                        trimWhenBytesExceed: 1,
+                        capCheckStride: 1
                     )
                 }
             }

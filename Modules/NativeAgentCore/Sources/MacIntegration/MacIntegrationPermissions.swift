@@ -10,7 +10,8 @@ import PersistenceCore
 // chat tool dispatcher BEFORE executing any side effect against the host OS.
 //
 // Defaults bias to READ ON for sensitive surfaces, WRITE OFF — Agent can SEE
-// what's on the user's machine but can't write/send/play without an explicit flip.
+// what's on the user's machine. Writes need a grant or admitted Full Mac;
+// an explicit operator OFF always takes precedence over Full Mac.
 // Notifications and the scheduler default ON because they're already trusted
 // outbound channels (no PII read concept).
 //
@@ -34,6 +35,13 @@ public struct MacIntegrationPermission: Sendable, Codable, Equatable {
         self.read = read
         self.write = write
     }
+}
+
+/// Read-only readiness evidence. Explicit revocations are distinct from the
+/// untouched defaults that an admitted Full Mac conversation may cover.
+public struct MacIntegrationPermissionReadiness: Sendable {
+    public let operatorReadOff: Set<String>
+    public let operatorWriteOff: Set<String>
 }
 
 public struct MacIntegrationPermissionMutationProvenance: Sendable, Equatable {
@@ -229,6 +237,16 @@ public actor MacIntegrationPermissionStore {
 
     // MARK: - Read
 
+    /// One checked read for environment presentation; no migration write,
+    /// permission request, OS probe, or authority change is performed here.
+    public func readinessChecked() async throws -> MacIntegrationPermissionReadiness {
+        let raw = try Self.loadRawStoreChecked(at: storePath)
+        let overrides = Self.operatorOverrides(in: raw)
+        return MacIntegrationPermissionReadiness(
+            operatorReadOff: Set(overrides.compactMap { $0.value["read"] == false ? $0.key : nil }),
+            operatorWriteOff: Set(overrides.compactMap { $0.value["write"] == false ? $0.key : nil }))
+    }
+
     /// Returns the current effective permission map: stored values merged on
     /// top of defaults for any unset key. Every entry in
     /// `MacIntegrationID.all` is present in the returned dict.
@@ -264,10 +282,11 @@ public actor MacIntegrationPermissionStore {
         }
     }
 
-    /// Hot-path gate. Returns true iff the integration permits the requested
-    /// mode. Unsupported axes (e.g. `read` on `notify_mac`) ALWAYS return
+    /// Hot-path gate. An explicit operator OFF wins over Full Mac; otherwise a
+    /// valid saved preference or checked Full Mac admission permits the mode.
+    /// Unsupported axes (e.g. `read` on `notify_mac`) ALWAYS return
     /// false — there is no concept to grant.
-    public func allows(_ integrationId: String, mode: MacIntegrationPermissionMode) async -> Bool {
+    public func allows(_ integrationId: String, mode: MacIntegrationPermissionMode, fullMacAdmitted: Bool = false) async -> Bool {
         // Unknown integration → deny. (Stops a typo'd id from accidentally
         // matching the "default to ON" branch.)
         guard MacIntegrationID.all.contains(integrationId) else { return false }
@@ -279,10 +298,18 @@ public actor MacIntegrationPermissionStore {
         }
         let stored: [String: MacIntegrationPermission]
         do {
-            stored = try loadStoredChecked()
+            let raw = try Self.loadRawStoreChecked(at: storePath)
+            if Self.operatorOverrides(in: raw)[integrationId]?[mode.rawValue] == false {
+                return false
+            }
+            stored = Self.permissions(in: raw)
         } catch {
             return false
         }
+        // Admission is evaluated by TrustCenter for the actual tool origin.
+        // Full Mac covers untouched defaults, never an operator revocation,
+        // unreadable authority or an unsupported operation.
+        if fullMacAdmitted { return true }
         let perm = stored[integrationId] ?? MacIntegrationID.defaultPermission(for: integrationId)
         switch mode {
         case .read:  return perm.read
@@ -422,6 +449,31 @@ public actor MacIntegrationPermissionStore {
                 // retried action may not revert a newer local choice.
                 return effectiveBefore
             }
+            // Explicit human choices live with the canonical permission axes,
+            // independently of the bounded receipt journal. Permission cards
+            // only touch the axis they actually request. An agent may add an
+            // untouched default, but cannot undo a person's explicit OFF.
+            var overrides = Self.operatorOverrides(in: dict)
+            var integrationOverrides = overrides[integrationId] ?? [:]
+            if provenance.kind == "agent" {
+                guard !(requestedRead && integrationOverrides["read"] == false),
+                      !(requestedWrite && integrationOverrides["write"] == false) else {
+                    throw NSError(domain: "MacIntegrationPermissionStore", code: -4,
+                        userInfo: [NSLocalizedDescriptionKey:
+                            "The operator turned this permission off. Only an explicit operator choice can turn it back on."])
+                }
+            } else {
+                if MacIntegrationID.supportsRead(integrationId), !onlyAddingAxes || requestedRead {
+                    integrationOverrides["read"] = requestedRead
+                }
+                if MacIntegrationID.supportsWrite(integrationId), !onlyAddingAxes || requestedWrite {
+                    integrationOverrides["write"] = requestedWrite
+                }
+            }
+            if !integrationOverrides.isEmpty { overrides[integrationId] = integrationOverrides }
+            dict["_operatorOverrides"] = .object(overrides.mapValues { axes in
+                .object(axes.mapValues(JSONValue.bool))
+            })
             // Persist only the supported axes for this id (matches the
             // contract: the file does not store an entry for an axis the
             // integration doesn't have).
@@ -485,6 +537,25 @@ public actor MacIntegrationPermissionStore {
         }
         guard case .object(let dict) = raw else {
             throw MacIntegrationPermissionStoreError.invalidRoot
+        }
+
+        // Authority metadata has an exact, supported per-axis Boolean shape.
+        // Malformed metadata cannot quietly fall back to Full Mac admission.
+        if let metadata = dict["_operatorOverrides"] {
+            guard case .object(let integrations) = metadata else {
+                throw MacIntegrationPermissionStoreError.malformedStore
+            }
+            for (id, value) in integrations {
+                guard MacIntegrationID.all.contains(id), case .object(let axes) = value,
+                      !axes.isEmpty else { throw MacIntegrationPermissionStoreError.malformedStore }
+                for (axis, value) in axes {
+                    guard case .bool = value,
+                          (axis == "read" && MacIntegrationID.supportsRead(id))
+                            || (axis == "write" && MacIntegrationID.supportsWrite(id)) else {
+                        throw MacIntegrationPermissionStoreError.malformedStore
+                    }
+                }
+            }
         }
 
         if let receiptValue = dict["_mutationReceipts"] {
@@ -585,7 +656,11 @@ public actor MacIntegrationPermissionStore {
     }
 
     private func loadStoredChecked() throws -> [String: MacIntegrationPermission] {
-        let dict = try Self.loadRawStoreChecked(at: storePath)
+        Self.permissions(in: try Self.loadRawStoreChecked(at: storePath))
+    }
+
+    private nonisolated static func permissions(in dict: [String: JSONValue]) -> [String: MacIntegrationPermission] {
+        let overrides = operatorOverrides(in: dict)
         var out: [String: MacIntegrationPermission] = [:]
         out.reserveCapacity(dict.count)
         for (id, val) in dict {
@@ -596,9 +671,54 @@ public actor MacIntegrationPermissionStore {
             var w = false
             if case .bool(let b) = entry["read"] ?? .null { r = b }
             if case .bool(let b) = entry["write"] ?? .null { w = b }
+            if overrides[id]?["read"] == false { r = false }
+            if overrides[id]?["write"] == false { w = false }
             out[id] = MacIntegrationPermission(read: r, write: w)
         }
+        // A revocation remains authoritative even if an older client omitted
+        // the ordinary axis entry while preserving this metadata.
+        for (id, axes) in overrides where out[id] == nil {
+            var permission = MacIntegrationID.defaultPermission(for: id)
+            if axes["read"] == false { permission.read = false }
+            if axes["write"] == false { permission.write = false }
+            out[id] = permission
+        }
         return out
+    }
+
+    /// Called only after strict document/receipt validation. Legacy stores did
+    /// not record additive-vs-replacement intent, so only a changed human axis
+    /// establishes an override. A default false left untouched by a read card
+    /// must not be mistaken for an explicit revocation. On the next normal
+    /// mutation this migration is persisted before receipts can rotate away.
+    private nonisolated static func operatorOverrides(in dict: [String: JSONValue]) -> [String: [String: Bool]] {
+        if case .object(let rows)? = dict["_operatorOverrides"] {
+            return rows.reduce(into: [String: [String: Bool]]()) { result, row in
+                guard case .object(let axes) = row.value else { return }
+                result[row.key] = axes.compactMapValues { value -> Bool? in
+                    guard case .bool(let bit) = value else { return nil }
+                    return bit
+                }
+            }
+        }
+        var result: [String: [String: Bool]] = [:]
+        guard case .array(let receipts)? = dict["_mutationReceipts"] else { return result }
+        for receipt in receipts {
+            guard case .object(let row) = receipt,
+                  case .object(let provenance)? = row["provenance"],
+                  provenance["kind"] == .string("local") || provenance["kind"] == .string("signed_ios"),
+                  case .string(let id)? = row["integrationId"],
+                  case .object(let before)? = row["before"],
+                  case .object(let after)? = row["after"] else { continue }
+            var axes = result[id] ?? [:]
+            for axis in ["read", "write"] {
+                if case .bool(let old)? = before[axis], case .bool(let new)? = after[axis], old != new {
+                    axes[axis] = new
+                }
+            }
+            if !axes.isEmpty { result[id] = axes }
+        }
+        return result
     }
 
     private nonisolated static func denyAllPermissions() -> [String: MacIntegrationPermission] {

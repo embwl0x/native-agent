@@ -8,6 +8,7 @@ import MemoryV2
 import ProviderRouting
 import TrustCenter
 import DreamREMCycle
+import NativeAgentTestSupport
 
 // MARK: - Test helpers
 

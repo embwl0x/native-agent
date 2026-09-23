@@ -2,6 +2,7 @@ import Testing
 import Foundation
 @testable import DreamREMCycle
 import NativeAgentCore
+import NativeAgentTestSupport
 
 // Ledger fence core.substrate.organism — rem.weeklyMarker
 //

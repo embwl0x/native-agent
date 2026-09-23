@@ -39,6 +39,13 @@ public enum ChatSessionIndexFileError: Error, LocalizedError, Sendable, Equatabl
 /// prevents read failures and malformed rows from being collapsed into an
 /// empty index and overwritten by the next surface that creates a session.
 public enum ChatSessionIndexFile {
+    /// The last transcript generation containing conversational speech. Tool
+    /// receipts still advance transcriptGeneration, but do not announce a new
+    /// exchange to another open workspace.
+    public static func recordConversationChange(in row: inout [String: JSONValue], role: String) {
+        guard ["user", "assistant"].contains(role), let generation = transcriptGeneration(in: row) else { return }
+        row["lastConversationGeneration"] = .int(generation)
+    }
     public static func loadObjectRowsForMutation(
         at path: URL,
         fileManager: FileManager = .default

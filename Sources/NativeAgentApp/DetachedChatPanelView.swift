@@ -132,33 +132,15 @@ struct DetachedChatPanelView: View {
     // observing it (the main window's session list among them). Committed back
     // at the points where it must survive this panel: send-clear and window
     // close. The panel's session is immutable, so there's no switch case.
-    @State private var panelDraft = ""
-    /// 2026-09-06: the text this panel ADOPTED. A panel that was never typed
-    /// into has nothing to say about the stored draft; committing its empty
-    /// string on close used to delete text typed in the main window after the
-    /// panel opened.
-    @State private var panelDraftAdopted = ""
-    /// 2026-09-06: when this panel's text was last changed HERE. Adopting the
-    /// stored draft is not an edit. The commit path uses it so a panel edit
-    /// made before the main window's typing cannot land on top of it.
-    @State private var panelDraftEditedAt = Date.distantPast
+    // 2026-09-22: an @Observable read only by `DetachedChatComposer`, so a
+    // keystroke no longer re-runs this body and its transcript (the main
+    // window's 2026-09-13 fix; see ChatComposerDraft.swift). `adoptedText` and
+    // `editedAt` keep the 2026-09-06 adopt/commit rules.
+    @State private var panelDraft = ChatComposerDraft()
 
     private var draft: String {
-        get { panelDraft }
-        nonmutating set {
-            panelDraft = newValue
-            panelDraftEditedAt = Date()
-        }
-    }
-
-    private var draftBinding: Binding<String> {
-        Binding(
-            get: { panelDraft },
-            set: {
-                panelDraft = $0
-                panelDraftEditedAt = Date()
-            }
-        )
+        get { panelDraft.text }
+        nonmutating set { panelDraft.edit(newValue) }
     }
 
     private var pendingAttachments: [MultimodalAttachment] {
@@ -277,9 +259,9 @@ struct DetachedChatPanelView: View {
             // text in @State too, so ask it to commit before reading — else
             // this panel opens showing the last commit, not the typing.
             appModel.flushLiveChatDrafts()
-            panelDraft = appModel.chatDraft(for: sessionId)
-            panelDraftAdopted = panelDraft
-            panelDraftEditedAt = .distantPast
+            panelDraft.text = appModel.chatDraft(for: sessionId)
+            panelDraft.adoptedText = panelDraft.text
+            panelDraft.editedAt = .distantPast
             await appModel.loadDetachedSessionMessages(sessionId)
             await inlineCards.refresh(sessionID: sessionId)
             inputFocused = true
@@ -559,6 +541,7 @@ struct DetachedChatPanelView: View {
             // the transcript, so the open search bar is fed from there.
             .followsStreamingTail(
                 messageID: messages.last?.id,
+                enabled: showTranscriptSearch,
                 onChanged: { refreshTranscriptSearchTailIfPresented() }
             )
             .onChange(of: messages.last?.id) {
@@ -769,35 +752,24 @@ struct DetachedChatPanelView: View {
                     .transition(NativeAgentMotion.fade)
             }
 
-            MacChatComposerControlStrip(
-                isListening: voiceInput.isListening,
+            DetachedChatComposer(
+                draft: panelDraft,
+                placeholder: "Message \(personaName)…",
+                voiceInput: voiceInput,
                 screenCaptureAllowed: screenCaptureAllowed,
                 screenCaptureDisabled: !sessionIsAvailable || isBusy || isCapturing || !screenCaptureAllowed,
                 pendingAttachmentCount: pendingAttachments.count,
                 isRunning: isBusy,
                 hasQueuedTurns: !appModel.queuedChatTurns(for: sessionId).isEmpty,
                 isQueuePaused: appModel.isChatQueuePaused(sessionId),
-                canSend: canSend,
+                sendAllowed: sessionIsAvailable && !isCapturing && !appModel.isSavingChatBrain,
+                inputFocused: $inputFocused,
                 onToggleVoice: toggleVoice,
                 onCaptureScreen: captureScreen,
                 onAttach: attachFromClipboardOrPickFile,
                 onStop: { appModel.stopChatStream(sessionId: sessionId) },
                 onSend: send,
-                onFocusRequest: { inputFocused = true }
-            ) {
-                TextField(
-                    voiceInput.isListening ? "" : "Message \(personaName)…",
-                    text: draftBinding,
-                    axis: .vertical
-                )
-                .textFieldStyle(.plain)
-                .lineLimit(1...5)
-                .fixedSize(horizontal: false, vertical: true)
-                .focused($inputFocused)
-                .foregroundStyle(voiceInput.isListening ? .secondary : .primary)
-                .italic(voiceInput.isListening)
-                .onSubmit(send)
-                .onChange(of: voiceInput.transcript) { _, newVal in
+                onTranscript: { newVal in
                     // 2026-09-06: only a live dictation may write here. The
                     // recognizer's transcript is cumulative, so after a send
                     // cleared the box the next update used to put the whole
@@ -807,26 +779,15 @@ struct DetachedChatPanelView: View {
                         draft = composeVoiceDraft(newVal)
                     }
                 }
-            }
+            )
 
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
         .animation(
             NativeAgentMotion.respecting(NativeAgentMotion.quick, reduceMotion: reduceMotion),
-            value: draft
-        )
-        .animation(
-            NativeAgentMotion.respecting(NativeAgentMotion.quick, reduceMotion: reduceMotion),
             value: pendingAttachments.count
         )
-    }
-
-    private var canSend: Bool {
-        sessionIsAvailable
-            && !isCapturing
-            && !appModel.isSavingChatBrain
-            && (ChatTranscriptPresentation.hasVisibleText(draft) || !pendingAttachments.isEmpty)
     }
 
     private func send() {
@@ -836,8 +797,8 @@ struct DetachedChatPanelView: View {
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         // 2026-09-06: the stored draft and its edit time, captured before the
         // box is cleared, so the send-clear speaks only for what it sent.
-        let sentDraft = panelDraft
-        let sentDraftEditedAt = panelDraftEditedAt
+        let sentDraft = panelDraft.text
+        let sentDraftEditedAt = panelDraft.editedAt
         let attachments = pendingAttachments
         guard !isCapturing, (!text.isEmpty || !attachments.isEmpty) else { return }
         // D2 (2026-08-28): this panel has no slash-command dispatcher, so a
@@ -875,7 +836,7 @@ struct DetachedChatPanelView: View {
                     sessionId: sessionId,
                     editedAt: sentDraftEditedAt
                 )
-                panelDraftAdopted = ""
+                panelDraft.adoptedText = ""
                 pendingAttachments = []
                 // 2026-09-06: sending from scrollback used to leave the new
                 // exchange offscreen — nothing here re-armed follow, so the
@@ -969,7 +930,7 @@ struct DetachedChatPanelView: View {
         }
         let capturedDraft = draft
         // 2026-09-06: the snapshot's own edit time, for the send-clear below.
-        let capturedDraftEditedAt = panelDraftEditedAt
+        let capturedDraftEditedAt = panelDraft.editedAt
         let capturedAttachments = pendingAttachments
         let capturedAttachmentIds = Set(capturedAttachments.map(\.id))
         let prompt = capturedDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -1014,7 +975,7 @@ struct DetachedChatPanelView: View {
                         sessionId: sessionId,
                         editedAt: capturedDraftEditedAt
                     )
-                    panelDraftAdopted = ""
+                    panelDraft.adoptedText = ""
                     pendingAttachments = []
                     // 2026-09-06: a screenshot send is a send — re-arm follow
                     // so the new exchange is not left offscreen, and end the
@@ -1038,15 +999,15 @@ struct DetachedChatPanelView: View {
     /// its draft since adopting stays out of the way: another surface may have
     /// written a newer one for the same session (2026-09-06).
     private func commitPanelDraft() {
-        guard panelDraft != panelDraftAdopted else { return }
+        guard panelDraft.text != panelDraft.adoptedText else { return }
         // 2026-09-06: a rejected commit is not a commit. Marking it adopted
         // anyway is how closing this panel used to eat the text in it.
         guard appModel.commitChatDraft(
-            panelDraft,
+            panelDraft.text,
             sessionId: sessionId,
-            editedAt: panelDraftEditedAt
+            editedAt: panelDraft.editedAt
         ) else { return }
-        panelDraftAdopted = panelDraft
+        panelDraft.adoptedText = panelDraft.text
     }
 
     private func composeVoiceDraft(_ transcript: String) -> String {
@@ -1176,5 +1137,66 @@ private func detachedChatAttachmentTypeAndMime(forExtension ext: String) -> (typ
     case "docx": return ("file", "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
     case "txt", "md": return ("file", "text/plain")
     default: return nil
+    }
+}
+
+/// The panel's text field and send strip: the only view that reads the draft,
+/// so a keystroke re-runs this and not the panel's transcript (2026-09-22).
+private struct DetachedChatComposer: View {
+    let draft: ChatComposerDraft
+    let placeholder: String
+    let voiceInput: VoiceInputController
+    let screenCaptureAllowed: Bool
+    let screenCaptureDisabled: Bool
+    let pendingAttachmentCount: Int
+    let isRunning: Bool
+    let hasQueuedTurns: Bool
+    let isQueuePaused: Bool
+    let sendAllowed: Bool
+    @FocusState.Binding var inputFocused: Bool
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    let onToggleVoice: () -> Void
+    let onCaptureScreen: () -> Void
+    let onAttach: () -> Void
+    let onStop: () -> Void
+    let onSend: () -> Void
+    let onTranscript: (String) -> Void
+
+    var body: some View {
+        MacChatComposerControlStrip(
+            isListening: voiceInput.isListening,
+            screenCaptureAllowed: screenCaptureAllowed,
+            screenCaptureDisabled: screenCaptureDisabled,
+            pendingAttachmentCount: pendingAttachmentCount,
+            isRunning: isRunning,
+            hasQueuedTurns: hasQueuedTurns,
+            isQueuePaused: isQueuePaused,
+            canSend: sendAllowed
+                && (ChatTranscriptPresentation.hasVisibleText(draft.text) || pendingAttachmentCount > 0),
+            onToggleVoice: onToggleVoice,
+            onCaptureScreen: onCaptureScreen,
+            onAttach: onAttach,
+            onStop: onStop,
+            onSend: onSend,
+            onFocusRequest: { inputFocused = true }
+        ) {
+            TextField(
+                voiceInput.isListening ? "" : placeholder,
+                text: draft.textBinding,
+                axis: .vertical
+            )
+            .textFieldStyle(.plain)
+            .lineLimit(1...5)
+            .fixedSize(horizontal: false, vertical: true)
+            .focused($inputFocused)
+            .foregroundStyle(voiceInput.isListening ? .secondary : .primary)
+            .italic(voiceInput.isListening)
+            .onSubmit(onSend)
+            .onChange(of: voiceInput.transcript) { _, newVal in onTranscript(newVal) }
+        }
+        .animation(
+            NativeAgentMotion.respecting(NativeAgentMotion.quick, reduceMotion: reduceMotion),
+            value: draft.text
+        )
     }
 }

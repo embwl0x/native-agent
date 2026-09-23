@@ -727,7 +727,8 @@ public final class AnthropicAdapter: LLMAdapter {
                                 streaming: true,
                                 usage: usage.isEmpty ? nil : usage,
                                 ttftMs: ttftMs,
-                                durationMs: durationMs
+                                durationMs: durationMs,
+                                stopReason: lastStopReason
                             )
                             if !yieldedAnyText {
                                 throw FirstPartyExecutionControls.anthropicEmptyStreamError(

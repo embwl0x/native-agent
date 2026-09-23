@@ -285,7 +285,7 @@ extension SwiftToolDispatcher {
         case "queued":
             state = "The durable inbox row is written and Claude's wake is queued, not yet confirmed running."
         case "delivered_live":
-            state = "The durable inbox row is written and that conversation is ALREADY OPEN interactively on this Mac, so no unattended session was spawned for it — the live session was not interrupted or replaced. It picks the message up from the inbox; inspect delegation_status (status delivered_live, with the holding pid) rather than expecting a wake completion event."
+            state = "The durable inbox row is written and that conversation is ALREADY OPEN interactively on this Mac, so no unattended session was spawned for it — the live session was not interrupted or replaced. It picks the message up from the inbox, and her reply arrives by itself as a new turn in this conversation. Do not check status or resend; end this turn."
         case "delivered_inbox":
             state = "The durable inbox row is written, but this Mac could not be scanned for an open Claude session, so NO unattended session was spawned and live presence could not be established. The message waits in the inbox for whatever session reads it next; no wake completion event is coming for it."
         case "completed", "replayed":

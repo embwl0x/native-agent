@@ -7,6 +7,7 @@ import PersonaEngine
 import ProviderRouting
 import TrustCenter
 import DreamREMCycle
+import NativeAgentTestSupport
 
 // MARK: - evals-total-coverage · fence core.chat.engine
 //

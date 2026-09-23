@@ -7,7 +7,7 @@ import ApprovalInbox
 @testable import NativeAgentApp
 
 @Suite(.serialized) @MainActor struct AgentsTabAccessibilityTests {
-    @Test(arguments: ["AXPress", "click"], ["Connect Codex", "Disconnect Fixture", "Send a test message to Fixture"])
+    @Test(arguments: ["AXPress", "click"], ["Connect Codex", "Disconnect Fixture agent contact", "Send a test message to Fixture"])
     func tabExposesAndPressesConnectionButtons(activation: String, target: String) async throws {
         let application = NSApplication.shared
         application.accessibilitySetValue(true, forAttribute: NSAccessibility.Attribute(rawValue: "AXEnhancedUserInterface"))
@@ -62,7 +62,7 @@ import ApprovalInbox
             #expect(spoken.contains(detail), "Missing accessible ACP detail: \(detail)")
         }
         let buttons = tree.filter { (read($0, "accessibilityRole") as? String) == NSAccessibility.Role.button.rawValue }
-        for label in ["Agents", "Connect Codex", "Disconnect Fixture",
+        for label in ["Agents", "Connect Codex", "Disconnect Fixture agent contact",
                       "Send a test message to Fixture"] {
             let button = try #require(buttons.first {
                 (read($0, "accessibilityLabel") as? String) == label

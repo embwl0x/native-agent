@@ -88,6 +88,13 @@ extension MCPServer {
         try executionBinding().identity
     }
 
+    /// The same resolved binding used by stored consent, for per-call Full Mac
+    /// admission which must not create a new standing high-risk grant.
+    public func pinnedExecutionIdentity() throws -> String? {
+        let binding = try executionBinding()
+        return binding.unpinned ? nil : binding.identity
+    }
+
     func executionBinding() throws -> (identity: String, unpinned: Bool) {
         var unpinned = false
         var identity: [String: JSONValue] = [

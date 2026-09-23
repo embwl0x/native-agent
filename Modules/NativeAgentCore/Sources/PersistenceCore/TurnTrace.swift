@@ -362,11 +362,9 @@ public struct TurnTraceEvent: Sendable, Equatable {
         destinationId: String? = nil,
         threadId: String? = nil
     ) -> Int? {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         var row: [String: JSONValue] = [
             "turnId": .string(turnId),
-            "ts": .string(formatter.string(from: ts)),
+            "ts": .string(ts.formatted(fractionalISO8601)),
             "kind": .string(kind),
             "payload": payload,
         ]
@@ -447,9 +445,6 @@ public struct TurnTraceEvent: Sendable, Equatable {
               case .string(let turnId)? = obj["turnId"],
               case .string(let kind)? = obj["kind"],
               case .string(let tsString)? = obj["ts"],
-              // Per-call formatter: ISO8601DateFormatter is NOT thread-safe, and
-              // replay rows decode off concurrent tasks. Constructing one per
-              // call is cheap relative to the bounded (≤20k-line) file.
               // Fractional first (current write format), plain second (rows
               // persisted before the sub-second fix).
               let ts = Self.parseISO8601(tsString)
@@ -552,11 +547,13 @@ public struct TurnTraceEvent: Sendable, Equatable {
     /// sub-second fix. Per-call formatters — ISO8601DateFormatter is not
     /// thread-safe.
     static func parseISO8601(_ s: String) -> Date? {
-        let fractional = ISO8601DateFormatter()
-        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let d = fractional.date(from: s) { return d }
-        return ISO8601DateFormatter().date(from: s)
+        if let d = try? fractionalISO8601.parse(s) { return d }
+        return try? Date.ISO8601FormatStyle().parse(s)
     }
+
+    /// 2026-09-23: one shared Sendable style, not a new ISO8601DateFormatter per
+    /// row. Summaries re-parse every row at launch and after each iPhone/iCloud sync.
+    static let fractionalISO8601 = Date.ISO8601FormatStyle(includingFractionalSeconds: true)
 
     /// The persisted JSONL row shape. Matches the {turnId, ts, kind,
     /// sessionId?, surface?, payload} schema in the W1 brief. `ts` is ISO8601
@@ -566,14 +563,9 @@ public struct TurnTraceEvent: Sendable, Equatable {
     /// its end, observed live 2026-06-12). Sub-second ts restores an honest
     /// chronological replay sort without relying on file order.
     public var jsonRow: JSONValue {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         var obj: [String: JSONValue] = [
             "turnId": .string(turnId),
-            // Inline formatter (per-call) — same pattern as the other trace
-            // writers; ISO8601DateFormatter is not Sendable so it can't be a
-            // shared static.
-            "ts": .string(formatter.string(from: ts)),
+            "ts": .string(ts.formatted(Self.fractionalISO8601)),
             "kind": .string(kind),
             "payload": payload,
         ]
@@ -1226,6 +1218,9 @@ public struct TurnTracePersistLane: Sendable {
                 trimWhenBytesExceed: JSONLLineCaps.turnTraceTrimTriggerBytes,
                 maxBytes: Self.maxBytes,
                 trimToBytes: Self.trimToBytes,
+                // 2026-09-22: the byte ceiling is checked every append; the full
+                // re-read for the line cap only needs to run rarely.
+                capCheckStride: 4096,
                 // A TERMINAL ROW IS A RECORD, not telemetry: `.turnTraceTerminalPersisted`
                 // is posted below and the Doctor's one-shot refresh fires on it, so the
                 // row has to be on the platter before the signal goes out (GPT-5.6 round
@@ -1313,6 +1308,7 @@ public struct TurnTracePersistLane: Sendable {
                     trimWhenBytesExceed: JSONLLineCaps.turnTraceTrimTriggerBytes,
                     maxBytes: Self.maxBytes,
                     trimToBytes: Self.trimToBytes,
+                    capCheckStride: 4096,
                     durable: true
                 )
                 await onPersist?(event)

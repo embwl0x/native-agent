@@ -88,3 +88,14 @@ func event(
         metadata: metadata
     )
 }
+
+// MARK: - Test-only seams (no production caller, so they live here)
+
+extension CognitiveSubstrate {
+    func affectSnapshot() -> CognitiveAffectState { projectedAffect(at: dependencies.now()) }
+
+    @discardableResult
+    func updateAffect(from event: CognitiveEvent) -> CognitiveAffectState { applyAffectFromEvent(event) }
+
+    func ruminationSnapshot() -> [CognitiveRuminationRead] { ruminationCandidates(at: dependencies.now()) }
+}

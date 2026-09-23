@@ -1193,59 +1193,6 @@ extension NativeClient {
     // The EmbeddingsInstallState type is KEPT — it still decodes the installState/
     // reindexState fields embedded in EmbeddingsStatus. See CUTOVER_PLAN.md §6.55.
 
-    func getWhatsRunning() async throws -> WhatsRunning {
-        async let loopStatusesTask = BackgroundLoopsManager.shared.status()
-        async let pendingImprovementsTask = SelfImprovementOrchestrator.shared.list_pending()
-        let (loopStatuses, pendingImprovements) = await (loopStatusesTask, pendingImprovementsTask)
-
-        var items: [WhatsRunningItem] = []
-        for loop in loopStatuses where loop.running {
-            items.append(WhatsRunningItem(
-                id: loop.loopId,
-                kind: "scheduler",
-                label: Self.whatsRunningLabel(forLoopId: loop.loopId),
-                startedAt: nil,
-                startsAt: nil,
-                cancellable: false,
-                cancelHint: nil
-            ))
-        }
-        for run in pendingImprovements {
-            items.append(WhatsRunningItem(
-                id: run.id,
-                kind: "improvement",
-                label: run.objective.isEmpty ? "Self-improvement run" : run.objective,
-                startedAt: nil,
-                startsAt: nil,
-                cancellable: true,
-                cancelHint: "Discard pending self-improvement run"
-            ))
-        }
-        items.sort { lhs, rhs in
-            if lhs.kind == rhs.kind { return lhs.label < rhs.label }
-            return lhs.kind < rhs.kind
-        }
-        return WhatsRunning(items: items, count: items.count)
-    }
-
-    private static func whatsRunningLabel(forLoopId loopId: String) -> String {
-        switch loopId {
-        case "doctor_auto_run": return "Doctor auto-run loop"
-        case "harness_learning": return "Harness learning loop"
-        case "memory_consolidation": return "Memory consolidation loop"
-        case "self_improvement_sweep": return "Self-improvement sweep loop"
-        case "dream_cycle": return "Dream cycle loop"
-        case "rem_cycle": return "REM reflection loop"
-        case "telegram_poll": return "Telegram long-poll loop"
-        default:
-            return loopId
-                .replacingOccurrences(of: "_", with: " ")
-                .split(separator: " ")
-                .map { $0.prefix(1).uppercased() + $0.dropFirst() }
-                .joined(separator: " ")
-        }
-    }
-
 }
 
 // MARK: - Plain-English semantic search copy

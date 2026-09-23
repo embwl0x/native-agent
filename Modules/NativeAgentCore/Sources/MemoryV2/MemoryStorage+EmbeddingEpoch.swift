@@ -74,18 +74,6 @@ extension MemoryStorage {
             }
 
             let prior = try Self.embeddingEpochState(in: db)
-            try db.execute(sql: "DELETE FROM memory_embedding_previous")
-            for row in live {
-                let existing = try Self.embeddingPayload(in: db, kind: row.kind, id: row.id)
-                try db.execute(sql: """
-                    INSERT INTO memory_embedding_previous
-                      (kind, row_id, content_hash, embedding, embedding_epoch)
-                    VALUES (?, ?, ?, ?, ?)
-                """, arguments: [
-                    row.kind.rawValue, row.id, row.contentHash,
-                    existing.embedding, existing.epoch,
-                ])
-            }
             for item in staged {
                 try Self.updateEmbedding(
                     in: db,
@@ -97,7 +85,7 @@ extension MemoryStorage {
             }
             try db.execute(sql: """
                 UPDATE memory_embedding_state
-                SET active_epoch = ?, previous_epoch = ?, activated_at = ?, rollback_available = 1
+                SET active_epoch = ?, previous_epoch = ?, activated_at = ?, rollback_available = 0
                 WHERE id = 1
             """, arguments: [epoch.rawValue, prior.activeEpoch, activatedAt])
 
@@ -123,63 +111,6 @@ extension MemoryStorage {
         ))
         await DerivedStateInvalidationCenter.shared.flush()
         return report
-    }
-
-    /// Immediate rollback lane retained for post-activation verification. It
-    /// refuses if any canonical row was added, removed, or edited after the
-    /// switch; a backup/repair workflow is required once reality has moved on.
-    public func rollbackEmbeddingEpochActivation() async throws -> MemoryEmbeddingEpochState {
-        let state = try await dbPool.write { db -> MemoryEmbeddingEpochState in
-            let currentState = try Self.embeddingEpochState(in: db)
-            guard currentState.rollbackAvailable else {
-                throw MemoryStorageError.embeddingActivationInvalid(.unusableCandidate, "no retained prior epoch")
-            }
-            let live = try Self.embeddingCorpus(in: db)
-            let previous = try Row.fetchAll(db, sql: """
-                SELECT kind, row_id, content_hash, embedding, embedding_epoch
-                FROM memory_embedding_previous
-            """)
-            let liveKeys = Set(live.map { Self.corpusKey($0.kind, $0.id) })
-            let previousKeys = Set(try previous.map { row in
-                guard let kind = MemoryEmbeddingCorpusKind(rawValue: row["kind"] as String) else {
-                    throw MemoryStorageError.embeddingActivationInvalid(.unusableCandidate, "unknown retained row kind")
-                }
-                return Self.corpusKey(kind, row["row_id"] as String)
-            })
-            guard liveKeys == previousKeys else {
-                throw MemoryStorageError.embeddingActivationInvalid(.corpusDrift, "canonical row set changed after activation")
-            }
-            let liveByKey = Dictionary(uniqueKeysWithValues: live.map { (Self.corpusKey($0.kind, $0.id), $0) })
-            for row in previous {
-                guard let kind = MemoryEmbeddingCorpusKind(rawValue: row["kind"] as String) else {
-                    throw MemoryStorageError.embeddingActivationInvalid(.unusableCandidate, "unknown retained row kind")
-                }
-                let id: String = row["row_id"]
-                let key = Self.corpusKey(kind, id)
-                guard liveByKey[key]?.contentHash == (row["content_hash"] as String) else {
-                    throw MemoryStorageError.embeddingActivationInvalid(.corpusDrift, "canonical content changed for \(key)")
-                }
-                try Self.updateEmbedding(
-                    in: db,
-                    kind: kind,
-                    id: id,
-                    embedding: row["embedding"],
-                    epoch: row["embedding_epoch"]
-                )
-            }
-            try db.execute(sql: """
-                UPDATE memory_embedding_state
-                SET active_epoch = previous_epoch,
-                    previous_epoch = NULL,
-                    activated_at = ?,
-                    rollback_available = 0
-                WHERE id = 1
-            """, arguments: [Self.nowISO8601()])
-            try db.execute(sql: "DELETE FROM memory_embedding_previous")
-            return try Self.embeddingEpochState(in: db)
-        }
-        invalidateRecallCache()
-        return state
     }
 
     private static func embeddingCorpus(in db: Database) throws -> [MemoryEmbeddingCorpusRow] {
@@ -208,28 +139,6 @@ extension MemoryStorage {
 
     private static func corpusKey(_ kind: MemoryEmbeddingCorpusKind, _ id: String) -> String {
         "\(kind.rawValue):\(id)"
-    }
-
-    private static func embeddingPayload(
-        in db: Database,
-        kind: MemoryEmbeddingCorpusKind,
-        id: String
-    ) throws -> (embedding: Data?, epoch: String?) {
-        let table: String
-        let key: String
-        switch kind {
-        case .memory: table = "memories"; key = "id"
-        case .proposal: table = "proposals"; key = "id"
-        case .tombstone: table = "tombstones"; key = "content_hash"
-        }
-        guard let row = try Row.fetchOne(
-            db,
-            sql: "SELECT embedding, embedding_epoch FROM \(table) WHERE \(key) = ?",
-            arguments: [id]
-        ) else {
-            throw MemoryStorageError.embeddingActivationInvalid(.unusableCandidate, "missing canonical row \(corpusKey(kind, id))")
-        }
-        return (row["embedding"], row["embedding_epoch"])
     }
 
     private static func updateEmbedding(

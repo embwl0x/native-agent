@@ -31,6 +31,14 @@ public struct AgentHostCommandLine: Sendable, Equatable {
     /// that file inside the run's own working directory. Otherwise stdout is
     /// the reply.
     public let replyFileName: String?
+    /// The CLI, rather than this app, assigns the session in protocol output.
+    /// Never substitute a locally invented identity.
+    public let capturesThreadID: Bool
+    /// A complete JSON result envelope supplies response and conversation_id.
+    public let jsonResultReply: Bool
+    /// Some headless hosts cannot ask for permission to call an MCP tool.
+    /// Their command conversation is independent of that optional return path.
+    public let automaticMCPProbe: Bool
     /// The wall-clock limit for one run.
     public let timeoutSeconds: Int
     /// The documentation these flags were checked against.
@@ -39,13 +47,55 @@ public struct AgentHostCommandLine: Sendable, Equatable {
     public var continuesConversations: Bool { !continuation.isEmpty }
 
     public init(executable: String, arguments: [String], continuation: [String] = [],
-                replyFileName: String? = nil, timeoutSeconds: Int, documentation: String) {
+                replyFileName: String? = nil, capturesThreadID: Bool = false, jsonResultReply: Bool = false,
+                automaticMCPProbe: Bool = true,
+                timeoutSeconds: Int, documentation: String) {
         self.executable = executable
         self.arguments = arguments
         self.continuation = continuation
         self.replyFileName = replyFileName
+        self.capturesThreadID = capturesThreadID
+        self.jsonResultReply = jsonResultReply
+        self.automaticMCPProbe = automaticMCPProbe
         self.timeoutSeconds = timeoutSeconds
         self.documentation = documentation
+    }
+
+    /// Only the protocol event supplies identity; prose/tool output cannot.
+    /// Multiple different identities are ambiguous and must not be resumed.
+    public func capturedThreadID(stdout: String, expected: String? = nil) -> String? {
+        guard capturesThreadID else { return nil }
+        if jsonResultReply {
+            guard let object = resultObject(stdout), let raw = object["conversation_id"] as? String,
+                  let uuid = UUID(uuidString: raw) else { return nil }
+            let value = uuid.uuidString.lowercased()
+            guard expected == nil || value == expected?.lowercased() else { return nil }
+            return value
+        }
+        var found: String?
+        for line in stdout.split(separator: "\n") {
+            guard let data = String(line).data(using: .utf8),
+                  let event = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  event["type"] as? String == "thread.started" else { continue }
+            guard let raw = event["thread_id"] as? String,
+                  let uuid = UUID(uuidString: raw) else { return nil }
+            let value = uuid.uuidString.lowercased()
+            if let found, found != value { return nil }
+            if let expected, value != expected.lowercased() { return nil }
+            found = value
+        }
+        return found
+    }
+
+    public func resultReply(stdout: String) -> String? {
+        guard jsonResultReply, let object = resultObject(stdout),
+              object["status"] as? String == "SUCCESS" else { return nil }
+        return object["response"] as? String
+    }
+
+    private func resultObject(_ stdout: String) -> [String: Any]? {
+        guard let data = stdout.data(using: .utf8), data.count <= 16 * 1024 * 1024 else { return nil }
+        return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
     }
 
     /// One argv, with every placeholder replaced as a WHOLE argument. A first
@@ -76,6 +126,15 @@ public struct AgentHostCommandLine: Sendable, Equatable {
 /// be ONE table to read rather than a second copy of the same facts.
 public enum AgentHostCommandLines {
     public static let byHostID: [String: AgentHostCommandLine] = [
+        "antigravity-cli": AgentHostCommandLine(
+            executable: "agy",
+            arguments: ["--mode", "plan", "--sandbox", "--disable-slash-commands", "--output-format", "json",
+                        "--print=" + AgentHostCommandLine.messagePlaceholder],
+            continuation: ["--mode", "plan", "--sandbox", "--disable-slash-commands", "--output-format", "json",
+                           "--conversation", AgentHostCommandLine.sessionPlaceholder,
+                           "--print=" + AgentHostCommandLine.messagePlaceholder],
+            capturesThreadID: true, jsonResultReply: true, automaticMCPProbe: false, timeoutSeconds: 300,
+            documentation: "https://www.antigravity.google/docs/cli/headless/"),
         // Verified on this Mac: `claude -p --session-id <uuid> -- "<text>"`
         // printed the reply on stdout, `claude -p --resume <uuid>` answered
         // from the same conversation, and a message beginning with `--` stayed
@@ -88,19 +147,19 @@ public enum AgentHostCommandLines {
                            "--", AgentHostCommandLine.messagePlaceholder],
             timeoutSeconds: 300,
             documentation: "https://code.claude.com/docs/en/cli-reference"),
-        // Verified on this Mac: `codex exec --skip-git-repo-check -o reply.txt
-        // -- "<text>"` wrote the final message to that file, and a message
-        // beginning with `--` stayed the prompt. Its resume takes a session id
-        // the CLI MINTS, which would have to be scraped back out of its
-        // transcript, so this entry claims no continuation and every message is
-        // standalone.
+        // JSONL thread.started carries the CLI-minted identity. Resume uses
+        // that exact UUID, never --last or a guessed private rollout path.
         "codex": AgentHostCommandLine(
             executable: "codex",
-            arguments: ["exec", "--skip-git-repo-check", "-o", AgentHostCommandLine.replyFilePlaceholder,
+            arguments: ["exec", "--json", "--skip-git-repo-check", "-o", AgentHostCommandLine.replyFilePlaceholder,
                         "--", AgentHostCommandLine.messagePlaceholder],
+            continuation: ["exec", "resume", "--json", "--skip-git-repo-check",
+                           "-o", AgentHostCommandLine.replyFilePlaceholder,
+                           "--", AgentHostCommandLine.sessionPlaceholder, AgentHostCommandLine.messagePlaceholder],
             replyFileName: "reply.txt",
+            capturesThreadID: true,
             timeoutSeconds: 300,
-            documentation: "https://learn.chatgpt.com/docs/developer-commands?surface=cli"),
+            documentation: "https://learn.chatgpt.com/docs/non-interactive-mode"),
     ]
 
     /// Fixed, ordered installation locations. Discovery never reads shell PATH or runs code.

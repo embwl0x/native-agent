@@ -146,8 +146,11 @@
           );
           return true;
         case "nativeagent.page.scroll":
-          sendResponse({ ok: true, result: scrollPage(message) });
-          break;
+          void scrollPage(message).then(
+            (result) => sendResponse({ ok: true, result }),
+            (error) => sendPageError(sendResponse, error),
+          );
+          return true;
         default:
           sendResponse({ ok: false, error: { code: "unknown_page_action", message: "Unknown page action." } });
       }
@@ -158,8 +161,10 @@
   });
 
   function createSnapshot(message) {
-    const maxNodes = clampInteger(message.maxNodes, 1, 500, 500);
-    const maxTextChars = clampInteger(message.maxTextChars, 1, 50_000, 50_000);
+    const maxNodes = clampInteger(message.maxNodes, 1, 500, 120);
+    const maxTextChars = clampInteger(message.maxTextChars, 1, 50_000, 12_000);
+    const readingScope = message.scope ?? "page";
+    if (!["page", "main_content"].includes(readingScope)) throw pageError("invalid_snapshot_scope", "Read the page or its semantic main content.");
     const snapshotId = crypto.randomUUID();
     const elementByNodeId = new Map();
     const actionNodeIds = new Map();
@@ -169,12 +174,24 @@
     const nodeIdByElement = new Map();
     const nodes = [];
     const truncationReasons = [];
-    const walk = composedElementWalk(document.body);
+    const walk = composedElementWalk(document.body, 5_000, true);
     pruneObservedShadowRoots();
     observeShadowRoots(walk.shadowRoots);
-    const candidates = walk.elements;
-    const modals = candidates.filter((element) => isVisible(element) && isModal(element));
+    const modals = walk.elements.filter((element) => isVisible(element) && isModal(element));
+    const mainRegions = walk.elements.filter((element) => isVisible(element)
+      && (element.tagName?.toLowerCase() === "main" || element.getAttribute?.("role") === "main"));
+    const contentRegions = mainRegions.length ? mainRegions : walk.elements.filter((element) => isVisible(element)
+      && (element.tagName?.toLowerCase() === "article" || element.getAttribute?.("role") === "article"));
+    // Scope before spending the node/text budget. A long visible sidebar must
+    // not consume all available evidence before the adjacent article. The
+    // viewport, shadow walk cap, redaction, and modal action checks still apply.
+    const candidates = readingScope === "page" ? walk.elements : walk.elements.filter((element) =>
+      modals.some((modal) => withinElement(element, modal))
+      || (contentRegions.some((region) => withinElement(element, region)) && !insideNavigation(element)));
     let aggregateNodeText = 0;
+    // 2026-09-23: node text honors max_text_chars too; only the summary was
+    // bounded, so a 1k-char ask still shipped up to 200k chars of nodes.
+    const nodeTextBudget = Math.min(MAX_AGGREGATE_NODE_TEXT, maxTextChars);
     if (walk.truncated) truncationReasons.push("walk_limit");
 
     for (const element of candidates) {
@@ -182,9 +199,9 @@
         truncationReasons.push("node_limit");
         break;
       }
-      if (!isVisible(element)) continue;
+      if (!isVisible(element) || !intersectsViewport(element)) continue;
       const kind = elementKind(element);
-      const text = bounded(normalizedText(element.innerText ?? element.textContent ?? ""), 1_000);
+      let text = snapshotText(element);
       const name = bounded(accessibleName(element, text), 500);
       // Layout wrappers repeat the entire feed at every nesting level. Keep
       // semantic containers and controls, and preserve direct/leaf text instead.
@@ -192,11 +209,17 @@
       if (!name && !text && kind === "other") continue;
       const selectInfo = element.tagName.toLowerCase() === "select" ? selectDescription(element) : null;
       const nodeTextCost = text.length + name.length + (selectInfo ? JSON.stringify(selectInfo).length : 0);
-      if (aggregateNodeText + nodeTextCost > MAX_AGGREGATE_NODE_TEXT) {
-        truncationReasons.push("encoded_size_limit");
-        break;
+      if (aggregateNodeText + nodeTextCost > nodeTextBudget) {
+        truncationReasons.push(nodeTextBudget < MAX_AGGREGATE_NODE_TEXT ? "text_limit" : "encoded_size_limit");
+        // 2026-09-23: past the text budget, drop prose but never a control; a
+        // long article or a spent top frame must not hide later buttons/links.
+        const budgetRole = element.getAttribute("role") ?? implicitRole(element);
+        if (!isClickable(element, budgetRole) && !isEditable(element) && !isSelectable(element)
+          && !isCheckable(element, budgetRole)) continue;
+        text = ""; // name stays: action identity checks compare it.
+      } else {
+        aggregateNodeText += nodeTextCost;
       }
-      aggregateNodeText += nodeTextCost;
 
       const nodeId = `n${nodes.length + 1}`;
       nodeIdByElement.set(element, nodeId);
@@ -269,7 +292,13 @@
       }
     }
 
-    const rawSummary = normalizedText(document.body?.innerText ?? document.body?.textContent ?? "");
+    // A body prefix keeps returning old feed items after scrolling and can
+    // consume the budget before replies. Summarize the same viewport evidence
+    // as the nodes. Keep container prose too: an article can have direct text
+    // followed by buttons, without a separate text leaf for that prose.
+    const rawSummary = nodes.length ? [...new Set(nodes
+      .map((node) => node.text || node.name).filter(Boolean))].join("\n")
+      : (!document.body?.children?.length ? normalizedText(document.body?.innerText ?? "") : "");
     const summaryText = bounded(rawSummary, maxTextChars);
     if (summaryText.length < rawSummary.length) truncationReasons.push("text_limit");
     const snapshot = {
@@ -281,6 +310,12 @@
       url: location.href,
       title: bounded(document.title ?? "", 1_024),
       language: bounded(document.documentElement?.lang ?? navigator.language ?? "", 64),
+      rendering: {
+        visibility: ["visible", "hidden"].includes(document.visibilityState) ? document.visibilityState : "unknown",
+        readyState: ["loading", "interactive", "complete"].includes(document.readyState) ? document.readyState : "unknown",
+        scope: "rendered_dom_only",
+      },
+      reading: { scope: readingScope, mainContentAvailable: contentRegions.length > 0 },
       viewport: {
         width: finite(window.innerWidth),
         height: finite(window.innerHeight),
@@ -307,6 +342,15 @@
       navigationProofs, selectProofs, capturedAt: Date.now(), pageURL: location.href,
     });
     return snapshot;
+  }
+
+  function insideNavigation(element) {
+    for (let current = element; current; current = composedParent(current)) {
+      const tag = current.tagName?.toLowerCase();
+      const role = current.getAttribute?.("role");
+      if (["nav", "aside"].includes(tag) || ["navigation", "complementary"].includes(role)) return true;
+    }
+    return false;
   }
 
   function clickNode(message) {
@@ -680,7 +724,7 @@
       dropDispatched, dropAcknowledged, reason, inputMechanism: "synthetic_html_drag", verificationRequired: "fresh_snapshot" };
   }
 
-  function scrollPage(message) {
+  async function scrollPage(message) {
     let target = window;
     if (!message.targetNodeId && composedElementWalk(document.body).elements.some((element) => isVisible(element) && isModal(element))) {
       throw pageError("modal_target_required", "A modal is open; use a fresh scrollable node inside it rather than scrolling the page behind it.");
@@ -718,6 +762,11 @@
       eventTarget.dispatchEvent(new Event("scroll", { bubbles: target === window }));
       scrollNotification = "supplemental_untrusted_hidden";
     }
+    // Let ordinary scroll handlers and virtualized feeds render before the
+    // caller's next read. No activation, fabricated intersection events, or
+    // promise that the site's network request completed.
+    const generation = domGeneration;
+    if (movedX !== 0 || movedY !== 0) await new Promise((resolve) => setTimeout(resolve, 750));
     return {
       snapshotId: message.snapshotId ?? null,
       targetNodeId: message.targetNodeId ?? null,
@@ -733,6 +782,7 @@
       atTop: after.y <= 1,
       atBottom: after.y >= maximumY - 1,
       observationScope: "immediate_position_not_feed_completion",
+      contentChangedAfterScroll: domGeneration !== generation,
     };
   }
 
@@ -749,8 +799,20 @@
   }
 
   function currentNodeIdentity(element) {
-    const text = bounded(normalizedText(element.innerText ?? element.textContent ?? ""), 1_000);
+    const text = snapshotText(element);
     return nodeIdentity(element, bounded(accessibleName(element, text), 500));
+  }
+
+  function snapshotText(element) {
+    // Containers may span the whole retained feed even when only their bottom
+    // intersects the viewport. Their descendants carry their own text; copying
+    // innerText here would smuggle offscreen posts back into every new read.
+    const kind = elementKind(element);
+    const control = ["button", "link", "tab", "menuitem", "heading", "option", "select", "input"].includes(kind);
+    const raw = !control && element.children?.length && element.childNodes
+      ? Array.from(element.childNodes).filter((node) => node.nodeType === 3).map((node) => node.textContent ?? "").join(" ")
+      : (element.innerText ?? element.textContent ?? "");
+    return bounded(normalizedText(raw), 1_000);
   }
 
   function requireActionableSnapshotNode(snapshotId, nodeId, action) {
@@ -783,19 +845,24 @@
   }
 
   function captureNavigationProof(element) {
-    if (element.tagName.toLowerCase() !== "a" || element.getAttribute("download") !== null
+    const isTab = element.getAttribute("role") === "tab";
+    if ((!isTab && element.tagName.toLowerCase() !== "a") || element.getAttribute("download") !== null
       || (element.getAttribute("target") && element.getAttribute("target") !== "_self")) return null;
-    let url;
-    try { url = new URL(element.href); } catch { return null; }
-    if (!/^https?:$/.test(url.protocol) || url.origin !== new URL(location.href).origin) return null;
+    if (!isTab || element.href) {
+      let url;
+      try { url = new URL(element.href); } catch { return null; }
+      if (!/^https?:$/.test(url.protocol) || url.origin !== new URL(location.href).origin) return null;
+    }
     const ancestors = [];
     let scope = null;
     for (let parent = composedParent(element); parent; parent = composedParent(parent)) {
       ancestors.push(parent);
-      if (!scope && (parent.tagName?.toLowerCase() === "nav" || parent.getAttribute?.("role") === "navigation")) scope = parent;
+      if (!scope && (parent.tagName?.toLowerCase() === "nav" || parent.getAttribute?.("role") === "navigation"
+        || (isTab && parent.getAttribute?.("role") === "tablist"))) scope = parent;
     }
     if (!scope) return null;
-    return { element, scope, ancestors, href: element.href, identity: currentNodeIdentity(element) };
+    return { element, scope, ancestors, href: element.href, identity: currentNodeIdentity(element),
+      controls: element.getAttribute("aria-controls"), selected: element.getAttribute("aria-selected") };
   }
 
   function navigationProofMatches(proof, snapshot) {
@@ -803,6 +870,7 @@
       || !proof.element.isConnected) return false;
     const current = captureNavigationProof(proof.element);
     return current && current.href === proof.href && current.identity === proof.identity
+      && current.controls === proof.controls && current.selected === proof.selected
       && current.scope === proof.scope && current.ancestors.length === proof.ancestors.length
       && current.ancestors.every((element, index) => element === proof.ancestors[index]);
   }
@@ -913,6 +981,12 @@
     if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0) return false;
     const rect = element.getBoundingClientRect();
     return rect.width > 0 && rect.height > 0;
+  }
+
+  function intersectsViewport(element) {
+    const rect = element.getBoundingClientRect();
+    return rect.x + rect.width > 0 && rect.y + rect.height > 0
+      && rect.x < window.innerWidth && rect.y < window.innerHeight;
   }
 
   function isModal(element) {
@@ -1148,13 +1222,18 @@
     if (typeof element.setSelectionRange === "function") element.setSelectionRange(caret, caret);
   }
 
-  function composedElementWalk(root, maximum = 5_000) {
+  function composedElementWalk(root, maximum = 5_000, viewportOnly = false) {
     if (!root) return { elements: [], truncated: false, shadowRoots: [] };
     const result = [];
     const shadowRoots = [];
     const stack = Array.from(root.children ?? []).reverse();
     while (stack.length > 0 && result.length < maximum) {
       const element = stack.pop();
+      // Retained offscreen feed articles must not exhaust the walk budget
+      // before the newly visible replies. Other ancestors may contain fixed
+      // or overflowing children, so they are still traversed.
+      if (viewportOnly && (element.tagName?.toLowerCase() === "article"
+        || element.getAttribute?.("role") === "article") && !intersectsViewport(element)) continue;
       result.push(element);
       if (element.shadowRoot) shadowRoots.push(element.shadowRoot);
       const descendants = [

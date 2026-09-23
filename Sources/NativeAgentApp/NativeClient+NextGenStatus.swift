@@ -520,8 +520,8 @@ extension NativeClient {
         // direct-consolidate entry point, and both of its callers carry an
         // explicit approval — the MemoryView "Run hygiene" button (manual
         // human action) and applyApprovedSelfImprovement's approved
-        // run_memory_hygiene op. The weekly background tick does NOT call
-        // this; it stages an approval card (MemoryConsolidationHygieneRunner).
+        // run_memory_hygiene op. The weekly tick calls runOnce itself
+        // (MemoryConsolidationHygieneRunner, 2026-09-22).
         return try await MemoryConsolidationHygiene.runOnce(
             dataRoot: root, approvedDirectRun: true)
     }

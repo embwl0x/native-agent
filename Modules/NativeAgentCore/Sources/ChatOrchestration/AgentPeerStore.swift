@@ -14,6 +14,10 @@ public enum AgentPeerTransport: String, Codable, Sendable {
     case mcpHost
     case acp
     case grokBot
+    /// A chat app on this Mac driven through its window (`app://<bundle id>`):
+    /// the message is typed into the agent's own thread there and its answer
+    /// read back in the same call. The thread's title is the conversation_id.
+    case desktopChat
 }
 
 /// Historical evidence, not a promise that the route is currently available.
@@ -105,6 +109,7 @@ public struct AgentPeerContact: Codable, Sendable, Equatable {
     /// transport is. A handshake, an entry, a saved endpoint: all of them are
     /// `setUp`. Only a reply that actually arrived makes a contact `connected`.
     public var state: AgentPeerContactState {
+        if transport == .mcpHost && !canStartTurn { return .setUp }
         // Inbound credentials prove a contact's return path. Local command
         // and ACP routes still need their own completed round-trip proof.
         let inboundContact = transport != .acp && transport != .desktop
@@ -398,6 +403,9 @@ public struct AgentPeerStore: Sendable {
     /// The known-agent row id behind an `mcp://<id>` endpoint, or nil. A row
     /// this build does not have is not an identity this store will accept.
     public static func hostRowID(_ endpoint: URL) -> String? {
+        if let bundle = desktopBundleID(endpoint) {
+            return AgentHostDirectory.rows.first { $0.route == .desktopChat && $0.bundleIDs.contains(bundle) }?.id
+        }
         guard let host = endpoint.host, ["mcp://" + host, "acp://" + host, "grok://" + host].contains(endpoint.absoluteString) else { return nil }
         // Preserve saved ACP identities from before the shared directory landed,
         // while resolving them to its one canonical row.
@@ -436,7 +444,7 @@ public struct AgentPeerStore: Sendable {
               contact.name == contact.name.trimmingCharacters(in: .whitespacesAndNewlines),
               !contact.name.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) })
         else { throw AgentPeerStoreError.invalidContact }
-        if contact.transport == .desktop {
+        if contact.transport == .desktop || contact.transport == .desktopChat {
             guard desktopBundleID(contact.endpoint) != nil else { throw AgentPeerStoreError.invalidEndpoint }
             guard contact.credentialKey == nil else { throw AgentPeerStoreError.invalidCredentialReference }
             if let label = contact.conversationLabel {

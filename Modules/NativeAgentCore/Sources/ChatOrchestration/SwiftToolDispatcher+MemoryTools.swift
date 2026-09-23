@@ -187,8 +187,11 @@ extension SwiftToolDispatcher {
     ) async throws -> JSONValue {
         // Strict structured bindings may populate unused optionals with null
         // or empty strings. Those are absence, not a second requested mode.
-        let supplied = input.filter { _, value in
+        let supplied = input.filter { key, value in
             if value == .null { return false }
+            // 2026-09-22: a model fills offset: 0 by default; that is "from
+            // the start", not a paging request.
+            if key == "offset", value == .int(0) || value == .double(0) || value == .string("0") { return false }
             if case .string(let text) = value {
                 return !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             }
@@ -256,17 +259,6 @@ extension SwiftToolDispatcher {
             // Review blocker (2026-06-10): per-result-set content budget —
             // see recallHitsJSON / recallContentBudgetChars.
             arr = Self.recallHitsJSON(hits)
-        }
-        // Jev lane 5, in shadow: rank the passages and write the ranking next
-        // to the order actually returned. Nothing here is reordered, dropped
-        // or added — the log is the whole product, so the recall does not wait
-        // for it. Fire-and-forget, AFTER the result below is already decided.
-        let rankSessionID = Self.extractSessionId(from: input)
-        let rankRoot = dataRoot
-        Task.detached(priority: .utility) {
-            try? await JevShadow.rankRecall(
-                query: query, hits: hits, sessionID: rankSessionID, dataRoot: rankRoot
-            )
         }
         return .object([
             "status": .string("ok"),
@@ -575,23 +567,6 @@ extension SwiftToolDispatcher {
             }
         }
 
-        // Jev lane 4 (advisory), before the save. It may SUGGEST that this
-        // looks like a duplicate of an existing memory; it cannot prevent,
-        // merge, rewrite or delete anything, and the save below runs exactly
-        // as it would have either way.
-        //
-        // The one advisory call still awaited on a live path, because its
-        // suggestion belongs in the result that reports the save. Capped at
-        // `JevMemoryDedup.budget`, and `try` not `try?`: cancellation must
-        // reach `store` below, so a Stop here stops the save instead of
-        // running on into a write nobody is waiting for.
-        let jevDuplicate = try await JevMemoryDedup.suggestion(
-            candidate: text,
-            memory: memoryV2,
-            sessionID: Self.extractSessionId(from: input),
-            dataRoot: dataRoot
-        )
-
         let record: MemoryRecord
         do {
             record = try await memoryV2.store(
@@ -676,22 +651,6 @@ extension SwiftToolDispatcher {
         ]
         if case .double(let valence)? = meta["valence"] { payload["valence"] = .double(valence) }
         if case .object = correctionField { payload["correction"] = correctionField }
-        if let jevDuplicate {
-            payload["possible_duplicate"] = .object([
-                // `id` stays the strongest match, for anything already reading
-                // it; `ids` carries the rest when more than one existing
-                // memory records the same fact.
-                "id": .string(jevDuplicate.id),
-                "ids": .array(jevDuplicate.ids.map(JSONValue.string)),
-                "note": .string(jevDuplicate.note),
-            ])
-            await JevMemoryDedup.noteSaved(
-                jevDuplicate,
-                savedID: record.id,
-                sessionID: Self.extractSessionId(from: input),
-                dataRoot: dataRoot
-            )
-        }
         return .object(payload)
     }
 

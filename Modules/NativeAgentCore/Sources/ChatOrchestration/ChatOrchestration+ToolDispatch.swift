@@ -557,7 +557,7 @@ extension SwiftNativeTurnEngine {
                 // suspends on the card; the model is not told a tool failed.
                 return (InlineInteractionNeed.envelope(need), false)
             }
-            return (ChatToolOutcome.failure(error: error), true)
+            return (ChatToolOutcome.failure(error: error, tool: prepared.internalName), true)
         }
     }
 

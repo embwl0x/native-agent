@@ -1,35 +1,320 @@
 # NativeAgent Architecture Blueprint
 
-## Second-opinion triage lanes (2026-09-16)
+## Everyday AX context projection (2026-09-21)
 
-| File | Ownership |
-| --- | --- |
-| `JevClient.swift` | Owns endpoint/model, 2 s timeout, redacted requests and validated typed answers/distributions. Missing/malformed values remain unavailable; cancellation propagates. |
-| `JevLog.swift` | Owns `data/jev/log.jsonl`, its field names and the 10 MB rotation. Owns `JevLane`: the five advisory lane ids plus `second_opinion`. |
-| `JevSettings.swift` | Owns the key file `jev/credential.json` (deliberately NOT under `providers/`, whose membership synthesizes a pickable provider row), the master read, and the six `UserDefaults` keys the settings registry rows write. |
-| `JevToolCatalog.swift` | Owns the twenty tool families as data: purpose, negative clause, member names. No routing code branches on a family id. |
-| `JevTurnMemo.swift` | Owns the per-turn ask, the eight-call tool-check budget and the warning-once rule. |
-| `JevPreTurn.swift` | Owns lane 1: the question set, the confidence bars, the shadow (log-only) tool-family scores, and the at-most-three lines. |
-| `JevToolCallCheck.swift` | Owns lane 2: specific-schema context and independent supporting-step/scope/effect judgments composed beside an already-allowed dispatch; one advisory field only. |
-| `JevPostTurn.swift` | Owns lane 3: bounded recent context, canonical tool outcome projection, five post-turn questions and the single advisory carry-forward line. |
-| `JevMemoryDedup.swift` | Owns lane 4: the near-match probe, the 0.90 bar and the suggestion text. |
-| `JevShadow.swift` | Owns lane 5: recall ranking in shadow, peer-message classification, and `CarryForward`, the one serialized writer of an advisory session directive — turn-stamped, so a line whose turn is no longer the session's latest is logged instead of written. |
-| `JevSecondOpinion.swift` | Owns the `second_opinion` tool: the parameter rules, the minimum-disclosure body (exactly the given state and questions, redacted, refused over 24 KB rather than trimmed), the 4 s raced budget, the six outcomes and the `insufficient_context` bar. Returns the native typed answers untouched; writes nothing but its log row. |
-| `JevEvidenceReader.swift` | Owns the read-only `agent_introspect(detail:"jev")` projection: bounded tails of the session transcript and the Jev logs, joined on exact session/turn, allowlisted redacted fields only and honest unknowns. Reads nothing else and calls no service. |
-| `JevProviderRow.swift` | Owns the single Providers row: the paste-key field, its one-line description and the save/remove buttons. |
+- Workspace's bounded 18-window strip derives entirely from resident references;
+  direct area launchers avoid Home trips without owner I/O. The strip
+  opens an exact source/draft directly; explicit app-window selection uses the
+  canonical `go` gate and fresh screen read. Back, refresh and restoration do
+  not activate apps. Structured Computer views bind the observed app identity,
+  retain it through persistence, and hide motor actions while it is behind
+  another app. Browser controls remain lease-bound; no handle is persisted.
+  Document text offers at most six ordinary HTTP(S) hyperlinks from its bounded
+  returned window; only explicit selection opens a source or background tab.
+  Browser headings bind to the observed page title and exact lease; an expired
+  live view offers explicit reopening of its saved URL, never effect replay.
+  New saved browser windows retain the observed tab ID, full title and URL as
+  references, not a lease. Explicit window selection reacquires only that exact
+  tab through the normal browser owner and reads fresh controls; changed or
+  missing targets fail without a substitute. Old address-only bookmarks remain
+  readable and can explicitly open a new tab. Back/refresh never reacquire.
+  Same-titled resident windows receive distinct numbered labels stable across
+  recency changes. Oversized Workspace results preserve exact navigation beside
+  retained reading pages when it fits the existing 48,000-byte provider ceiling;
+  this neither invents action IDs nor increases the response cap.
+  Calendar day/calendar/lookahead selections survive a saved return. Today
+  composes two bounded, gated readers only when selected (eight events and
+  eight reminders); it owns no task, schedule, completion or permissions.
+- Exact helper windows use `bot_list(id)` and preserve UUID identity. New
+  `bot_update` forms expose individual settings and pack the nested owner object
+  only at submission; current schemas and route rules remain authoritative.
+  Each opened settings view reads and labels current owner values separately
+  from the agent's entered changes. Those observations never become defaults
+  to submit or persisted authority. An absent output format is explicitly empty.
+  Legacy object-shaped drafts retain their old shape. Saving/creating/pausing
+  reads the exact resulting helper when its identity is available, without
+  running it. Existing context and shelf results remain with the bot owner.
+- Selected Messages conversations use `MacMessagesHistory`, a utility-priority
+  read-only SQLite view of the Messages-owned database. Exact GUID and indexed
+  joins are required; each request has a two-second execution budget, 150 ms
+  lock wait, at most 30 records and 16 KiB plain text. No body collection runs
+  in list/Home, no database copy/cache is created, and macOS Full Disk Access
+  plus existing Messages read authority still apply. Positive Int64 older-page
+  cursors persist with the exact thread; text-budget exhaustion never skips
+  unread rows. Supported Foundation typedstream string bodies are decoded with
+  a bounded pure-Swift wire reader (64 KiB archive maximum), not archived object
+  instantiation. Unknown archives, attachments and special records stay explicit.
+  Parent cancellation propagates to the utility reader. Writes remain
+  independently gated/off as configured. Inspecting human correspondence keeps
+  its window but attaches it to focused work only on explicit Keep.
 
-Every lane is advisory. Nothing here grants, denies, blocks, merges, rewrites
-or deletes, and nothing here can narrow what the turn would otherwise do. There
-is no mechanical effect: lane 1's tool-family scores are shadow, logged for
-measurement and never added to the turn's tools, so the always-on set, the
-offer floor and the idle-drop rule are untouched. A missing key, a timeout or any error means
-the ordinary turn runs exactly as it does today, and the existing safeguards do
-not fail open with it. Hooks: `ChatOrchestrationClient+StructuredChat.swift`
-(both lanes, turn start and turn end), `ChatOrchestrationClient+DispatchWrappers.swift`
-(`runInner`), `SwiftToolDispatcher+MemoryTools.swift` (commit and recall),
-the peer-agent bridge (inbound messages from other agents), `QuietSelfAdminSettings.swift`
-(the five lane rows), `ProviderSettingsView.swift` (the one row). No new
-targets, no new timers, no change to the turn or memory contracts.
+- `AgentWorkspace` and `AgentWorkspaceProjection` provide the default native
+  workspace: topic → work/source → related document → agent discussion → Back.
+  Swift binds offered actions to exact owner targets and the verified chat.
+  The bounded, disposable navigation actor stores references and document
+  fingerprints and bounded labeled effect receipts, never facts or permissions. Each action re-enters
+  the canonical dispatcher's normal gates under the actual tool name. Sends
+  consume their action before dispatch; navigation only revisits reads.
+  Explicit Discuss rereads the opened text window, refuses changed evidence,
+  and submits the complete composed message through the normal send gate.
+  Contact pages stay bounded; document/source readers retain continuation.
+  Compact contact cards omit transport recipes, and a direct return action
+  reopens the selected work without walking each intermediate location.
+  `workspace` replaces `work_context` on the unchanged 22-name tool floor;
+  detailed readers and existing conversation owners remain authoritative.
+- `AgentConversationStore` retains an optional bounded exchange cache beside
+  each existing conversation bookmark. Begin records the submitted message only
+  after admission; owner updates and terminal callbacks replace the matching
+  operation's answer/status without appending duplicate exchanges. Legacy
+  history is not synthesized. `AgentConversationHistoryView` presents four
+  chronological recent exchanges or an exact retained exchange; opaque earlier
+  boundaries stay scoped to that conversation and still enter its read gate.
+  Workspace exposes Earlier messages, Read exchange and Recent messages beside
+  Reply. History views omit the competing latest answer while retaining current
+  session readiness; exact exchanges can open their preceding page. Selected
+  source views offer up to three already-kept discussions directly, carrying
+  exact agent/conversation/source bindings without another contact inventory.
+  The cache is at most 32 exchanges / 64 KiB, each message at most 8 KiB
+  with disclosed clipping; whole conversation storage remains capped at 50 MiB.
+  It is neither provider context nor a replay queue. The peer owns its original
+  continuing session, bots keep their existing continuous-session/shelf readers,
+  and remote history retains the same untrusted-data boundary.
+- `AgentWorkspaceFind` composes an explicit query from the existing gated
+  work/history, artifact and memory readers, sequentially with at most 6+3+3
+  selectable results. Source failures remain visible alongside successful lanes.
+  It adds no index, filesystem crawl, model routing or background work. Find
+  references persist with Back history; opening a result retains its exact owner.
+  Workspace normally shows essential navigation; Show workspace controls reveals
+  specialized searches, conversations and saved arrangements. Only presentation
+  expands: current targets, drafts, permissions and owner outcomes stay intact.
+  Compact desktop metadata retains storage failures and unfinished-draft counts.
+- `AgentWorkspaceEnvironment` extends that surface across memory, research,
+  skills, computer/browser, files/creation, helpers, saved replies, ongoing work,
+  calendar, reminders, mail, messages, connections and current state. Home reads
+  capability metadata, one checked permission snapshot and one local browser status;
+  each destination reads its canonical owner on demand. `AgentWorkspaceReadiness`
+  labels explicit read-only choices and unverified access, hiding revoked actions
+  without changing the canonical execution gates.
+  Knowledge, Apps and Activity projections bind actions from exact structured
+  owner fields, never instructions embedded in prose. The live capability
+  catalog supplies further actions without enlarging the 22-name default floor.
+  `AgentWorkspaceForm` derives fields from the current owner schema, keeps
+  selected targets immutable, rechecks the schema before submit and dispatches
+  through the same real tool gates. Effects consume their action before dispatch
+  and retain a bounded receipt; refreshing it never repeats the operation.
+  Successful file/skill/memory/Desk writes lead to a separately gated current
+  read with the original action receipt attached; ambiguous effects are not
+  retried. Browser actions read their exact still-owned lease after bounded
+  load observation; loading/refusal stays explicit. Generic pages retain all
+  offered items and the original work anchor survives bounded navigation.
+  Folder creation binds an absolute destination before collecting content;
+  Open places holds 24 recent owner locators plus the original work anchor,
+  plus bounded unfinished resident forms, never a replayable effect. Forms keep
+  partial entries through detours and validation, offer direct field/choice
+  selection. Four drafts are retained independently of arrangements; completed owner
+  outcomes remove them, while failures preserve editable recovery. Uncertain effects
+  require explicit review before another attempt. The guarded recovery draft is saved
+  before dispatch. Optional fields unfold on demand; allowlisted input-only drafts
+  can be saved, while credentials, connection authority and live handles cannot.
+  Invalid fields expose direct Correct actions and a needs-correction state;
+  unavailable forms offer a schema refresh without submission. Unknown effects
+  keep outcome review separate from editing. Previous-result reads bind only
+  immutable selected targets, never subsequently edited form values.
+  This is a disposable presentation layer, not an intent router or new backend.
+- `AgentWorkspaceDesktopNavigation` and `AgentWorkspaceDesktopStore` retain
+  scoped owner references for 24 open places, 12 named arrangements, eight Back
+  positions and four allowlisted drafts. Each chat file is capped at 512 KiB; each
+  form at 64 KiB entered values and 131 KiB schema. There are 64 resident chats;
+  capacity refuses new admission instead of evicting unsaved/temporary drafts.
+  Live action handles, loaded evidence, effects, browser leases and approvals
+  remain ephemeral. Transient storage retries only on later actions (five-second
+  minimum spacing), unchanged snapshots do not rewrite, and corrupt bytes remain.
+  The private versioned store rejects corrupt/nonregular/oversized state without
+  replacement; atomic saves and current-gate rereads preserve owner authority.
+  Saved browser URLs expose explicit background opening rather than restoring
+  obsolete control handles. Missing references remain navigable and storage
+  errors do not rewrite the underlying action outcome. Common website opening,
+  page scrolling and file append controls bind owner arguments in Swift.
+  Supported reading offsets and source-version checks now survive restart;
+  query/source/position cues help recognize a place. Versioned readers refuse
+  changed sources rather than silently merging windows. Separate live browser
+  leases retain separate URL-only bookmarks. Switching a named workspace clears
+  stale interruption return state. Selected file, memory, skill, web and historical
+  message evidence can be explicitly discussed with an agent/helper: full returned
+  windows are fingerprinted and reread before sharing a labeled bounded excerpt.
+- `AgentWorkspaceWorkOverview` adds a 4 KiB authored continuation note and up to
+  twelve kept exact references to the existing saved desktop. This work exposes
+  the full context; ordinary views carry a short note preview. Named workspaces
+  save/switch those associations independently of the rolling recent places.
+  Explicit source discussions attach the source and resolved conversation,
+  including an uncertain send with a recoverable canonical route. Exact protocol
+  reply selectors are never downgraded to latest. Notes are agent-authored
+  navigation context, not canonical completion, evidence or a second task ledger.
+  Focus on these places trims unrelated recent references and then automatically
+  keeps successful opened detail sources, within twelve slots; lists, searches
+  and unavailable reads do not become attachments. Drafts remain reachable.
+  One dated last-action receipt retains the owner outcome before follow-up and
+  updates with its current readback, including a byte comparison for complete
+  file replacements. Failed/unknown outcomes replace the previous success;
+  requirements are never automatically declared complete.
+  Up to 24 last-action observations also follow exact durable places inside
+  each saved arrangement. Kept references are protected when old observations
+  age out. File evidence is no longer displaced by an unrelated conversation;
+  selected views, Open places and This work show the dated observation for
+  that place. Fresh browser readbacks bind their current URL, not the lease's
+  former bookmark. These are historical observations, not current verification
+  or an action history; the existing 512 KiB/chat store cap remains enforced.
+  `AgentWorkspaceFileRevision` prepares complete bounded UTF-8 text in the
+  ordinary write form with immutable path/content hash; the file owner refuses
+  changed sources immediately before replacement and normal readback reopens
+  the result. The guard persists with the draft, but is not atomic CAS against
+  independent writers. No background owner reads or new permission route.
+- `AgentWorkspaceOverview` recognizes resident places without reading owners:
+  attention and unfinished drafts precede return points and recent places.
+  Home offers at most three continuation actions; completed/discarded drafts
+  cannot reappear through an old return reference. Saved arrangements summarize
+  their selection and three recent places. Conversation counts describe only
+  the current bounded page and never acknowledge replies.
+  `WorkContextQuery` measures whole-word topic coverage in a bounded passage,
+  avoiding incidental repository-path matches. Artifacts disclose partial
+  matches; Find prioritizes local topic support among six canonical memory
+  candidates and displays three, preserving original recall rank as a tie-break.
+  These projections add no index, background scan, provider turn or effect.
+  Workspace file forms resolve unbound relative paths against the canonical
+  workspace before saving/submission, with symlink-aware confinement. Explicit
+  absolute/selected paths retain their existing owner semantics. This avoids
+  Full Mac's legacy connector cwd redirecting a Workspace-created file.
+  Exact advertised action names in Find offer their ordinary form directly.
+  Short exact installed skill names/IDs also offer direct opening actions ahead
+  of historical mentions, using the existing metadata inventory and at most
+  three matches. Skill bodies remain lazy; unavailable inventory is explicit.
+  Old generic memory labels refresh after an exact-ID read; generic web-source
+  labels use host/path without credentials or query. Saved helper history opts
+  into newest-first order, with query-bound cursors and a descending endpoint;
+  the shelf API's ascending default and unread acknowledgement rules stay intact.
+  Its comparison describes disclosed history, including failed jobs and short
+  headlines, rather than mistaking those recorded outcomes for read failures.
+- `AgentWorkspaceWork` and `SwiftToolDispatcher+WorkspaceDesk` expose selectable
+  canonical work, parts, dependencies and evidence. The existing `desk_read`
+  default stays textual; the workspace requests its typed bounded view. Full
+  records have versioned text windows, and work-context current/history lanes
+  carry independent continuation offsets with their original query and scope.
+- Computer uses public `screen(structured: true)` and `act` with the canonical
+  observed frame/handle binding; stale selections never retry by label. Menu items
+  retain the observed app/path. One bounded fresh screen follows each action/refusal.
+  Calendar/Reminder mutations return the owner list with the original receipt and
+  explicit list scope; absent completed/out-of-window items do not imply failure.
+- `AgentWorkspaceMail` opens and pages inbox bodies using paired native/RFC
+  message identifiers. The Mail owner rechecks both on reply and refuses an
+  ambiguous legacy subject match. Search inspects at most 50 sender/subject inbox
+  records per page; bodies are loaded only for exact message reads. Operator
+  write-off hides sends/replies. `AgentWorkspaceMessages` shows real names and
+  participants, binds reply to the exact chat, and rechecks its participant set.
+  Apple's Messages scripting dictionary has no transcript reader: the projection
+  says this explicitly and offers the Messages app view. No empty transcript is
+  fabricated and no chat identifier is reinterpreted as a recipient address.
+- `AgentWorkspaceConversations` presents exact scoped agent discussions and
+  canonical helper results. `AgentWorkspaceConversation` supplies latest-reply and
+  details actions bound to the same contact/conversation, including pending/missing
+  result recovery, without automatic polling or resends. `AgentWorkspaceChanges` retains bounded comparison
+  hashes only, separating changed replies from progress. Diagnostic Details
+  receipts report their own availability and are excluded from conversation
+  comparison; switching view cannot manufacture a reply-change notification. Lists never consume
+  the last-opened baseline. `AgentWorkspaceArrivals` uses the existing pooled
+  file watchers to invalidate scoped conversation and opened human/helper/work
+  metadata. Changed owners are read at the next normal context or structured
+  tool-response boundary; unchanged owners are not rescanned. Four compact
+  notices at a time carry stable, scoped Open pointers and at most 240 characters
+  of exact canonical-source preview with sender/status, truncation and provenance.
+  Peer prose remains untrusted and marks current peer-data taint when displayed;
+  baseline collection consumes no text. Up to 24 resident notices retain decisions/failures
+  over ordinary progress. Opening reenters the owner gate, with an explicit
+  return to the interrupted path/form/reading arguments. Clearing a notice
+  never resolves or retries its source. No provider wakeup or timer is added.
+  Initial registration baselines historical state rather than replaying it;
+  resident notices are disposable and canonical results remain with owners.
+  The existing delegation outcome event runner also projects its already-read,
+  complete snapshot into waiting built-in conversation bookmarks. Exact agent
+  and accepted-message ID must identify one terminal owner row. The store lock
+  preserves operation/scope/selection; canonical receipt absorption writes one
+  batch only for phase transitions, including attention to a now-ready reply.
+  This updates the watched conversation index without opening a conversation,
+  adding a reader/watcher, starting a provider or replaying an effect. Missing,
+  ambiguous or incomplete evidence preserves the prior bookmark.
+  Return resolves form references against the latest resident drafts, so it
+  neither overwrites edits nor resurrects completed/discarded drafts.
+  Human index `lastConversationGeneration` excludes tool-only churn; the
+  shelf's lazily upgraded `latestByBot` index avoids historical result scans
+  on subsequent helper events. `chat_conversations`
+  reads the existing human session index/transcript; app-owned `chat_reply`
+  uses canonical assistant persistence, exact last-message validation and the
+  existing completion-delivery lifecycle. A saved route never grants authority.
+- Codex and Claude retain at most 6,000 characters of original executor reply
+  in their existing completion/job record, separately from delivery assessment
+  or replay payload. Exact message-ID status reads expose that text and its
+  truncation flag; bulk listings keep short heads. `AgentConversationView` and
+  scoped conversation reads prefer original answer evidence, never stderr or a
+  delivery assessment. Old missing replies remain missing. Workspace places
+  Reply beside the answer, keeps routing IDs in Details, and returns to the same
+  selected conversation. Waiting/uncertain outcomes do not expose misleading
+  send controls; connection problems open the existing Connections place.
+- `AgentWorkspaceSavedReply` binds Follow up on saved-reply lists and detail to
+  the exact shelf entry and helper. It rereads through `shelf_entry`, validates
+  both identities and, after a detail read, the whole answer/status fingerprint.
+  An explicitly labeled bounded excerpt accompanies the follow-up through
+  ordinary `agent_message` into the helper's continuous session. No reply text
+  or send instruction is persisted in workspace state. The retained send result
+  offers the exact saved-reply readback and current conversation; uncertainty
+  and refresh never replay the send. Unfiltered shelf lists resolve helper names
+  from one canonical definitions read; missing definitions keep their saved IDs.
+  Workspace shelf browsing explicitly uses `shelf_read(include_read: true)`;
+  pagination and durable references retain that mode. It projects canonical
+  history without acknowledging entries. Default shelf callers keep the original
+  unread-only/acknowledgement contract and cursors stay bound to their query.
+  Saved-reply place labels use the helper and recorded UTC date. Arrival
+  projections coalesce agent/shelf views only when exact helper/entry UUIDs and
+  kind match; bounded resident event identities also cover staggered file events.
+  Different decisions/failures and later updates from the original owner remain.
+- `SwiftToolDispatcher+WorkContext.swift` composes one canonical Desk read with
+  bounded continuity history results. Current recorded status, blockers and
+  attempts remain distinct from attributed historical excerpts; no resumption
+  or completion authority is added.
+  The default workspace presents this reader's evidence with native actions.
+  Detailed transcript search stays lazy and unchanged; neither adds automatic reads.
+  Shared history prompts distinguish picking up work from exact-wording search.
+  `ChatTurnExecution` carries the actual persisted run identity from structured
+  and text-compatible entry paths, so the active request cannot become its own
+  historical evidence. Trace identity is not used as transcript identity.
+  Work recall uses local plural-aware whole-word matching and recorded
+  same-run tool activity to balance original work turns against history-lookup
+  echoes, retaining the newest matching context and exact source locators.
+  One excerpt per known run prevents request/answer duplication. This ranking
+  conveys neither success nor authority; ordinary history search is unchanged.
+- `SwiftToolDispatcher+ArtifactContext.swift` projects existing attachment/tool
+  metadata and live Desk references, with exact source reads and explicit
+  sampling/version/approval limits. It owns no artifact registry or file access.
+- `ToolCatalogSelection.swift` chooses only an explicitly requested unique
+  native match after the app/core catalog merge. The normal loader owns schema
+  persistence; no tool execution or connection probe happens during discovery.
+  The shared same-turn schema refresh recognizes explicit catalog loads, so
+  the next provider call receives the newly callable capability in both loops.
+- `ProviderToolResultRecoveryStore` retains one latest read cursor per existing
+  live turn, preserving query/raw mode and original outcome class. Unavailable
+  evidence and ambiguous first reads never trigger action replay.
+- `ChromeControlRuntime` retains at most 64 current-tab bookmarks keyed by
+  verified chat identity. Existing Chrome leases, observed user sequences and
+  exact snapshots remain authoritative. Connection generation changes clear
+  bookmarks; stale responses cannot reintroduce them. No foreground takeover.
+
+## Advisory helper removal (2026-09-20)
+
+Jev/TypeSafe is no longer part of the app runtime. Turn preparation, tool
+dispatch, memory writes/recall and incoming peer messages use their existing
+owners directly, without helper calls or added advice. The `second_opinion`
+tool, provider row and lane settings are removed. Session directives retain
+legacy provenance decoding solely to refuse old helper-authored hints. Ordinary
+directives remain active. Legacy credential paths remain protected by the file
+and Mac-control secret guards; no runtime reads those credentials.
 
 ## Memories review (2026-09-09)
 
@@ -235,6 +520,33 @@ canonical body tools. The production `BotsShelfView` reads these stores behind
 the rail preference, which defaults to on (`ShellSidebarRail.botsPreviewEnabled
 = true`); Bots shipped in 0.4.10.
 
+**Bot Agent Experience.** `StandingBotSchedule` translates a small explicit
+schedule vocabulary into the existing cadence owner; store validation still
+owns cadence floors. Model choice remains explicit; `bot_list(include_models:
+true)` projects ProviderRouting's local model choices and current credential
+readiness without probing or changing an account. Non-shipped suggestions are
+marked potentially incomplete. Create/update/pause outputs
+lead with the saved job and lifecycle semantics; `details` exposes full settings.
+`StandingBotContinuity` carries the current brief and output request into every
+tool-driven turn, so a first ask or changed job does not depend on an earlier
+scheduled run. `agent_read` on a bot opens its latest full shelf entry through
+the gated `shelf_entry` owner, while explicit entry IDs remain exact reads and
+explicit listing limits retain shelf pagination. `BotRunConversation` records
+only a verified requesting session's return address and exact accepted queue
+request in `AgentConversationStore`; `AgentConversationContinuation` reconciles
+that request against the canonical bot queue/shelf and brings its result back
+through the existing full Agent continuation and delivery lifecycle. Internal
+`bot-run:` bookmarks are distinct from the bot's normal conversation, so a
+queued check does not block ordinary follow-up. No second bot scheduler,
+transcript, authority store, or automatic run replay is introduced.
+
+NativeAgent peer continuations settle only from an exact terminal receipt:
+`remote_evidence.status=ok` with a terminal `original_status`. Pending receipts
+also carry `original_status=working`, which must never settle the conversation.
+If bridge admission is full before a resident turn starts, the continuation
+keeps its frozen receipt/digest and retries admission after 30 seconds through
+the existing runner, without rereading or resending the original effect.
+
 `ContentView` retains one Bots page after first visit to avoid AppKit text-control
 accessibility observer teardown leaks during Chat/Bots navigation. Visibility
 gates actions and AX descendants, cancels the shelf watcher/session read, stops
@@ -250,6 +562,15 @@ native hosts as a performance shortcut without verifying actual behind-window
 transmission as well as interaction. The September 14 native-host experiment was
 withdrawn after User reported lost transparency; the glass materials/tint remain
 at their pre-experiment values.
+
+Main chat follow projects `ChatScrollLayoutExtent` from content height and
+available viewport height. Offset changes do not invalidate that projection;
+text-only publications do not issue redundant scroll commands. The existing
+`ChatScrollCoordinator` retains follow/disarm, coalescing and clearance settles.
+Main/detached streaming-tail observers are enabled only for open transcript
+search; the bubble remains the owner of streamed text rendering. Normal app
+installation defaults to optimized release compilation, with explicit debug
+override retained for diagnosis.
 
 
 | File | Responsibility |
@@ -313,14 +634,40 @@ verification. Generated A2A v1.0.0 messages/interfaces are shared in ChatOrchest
 with development-only regeneration in `script/regenerate_a2a_grpc.sh`. See
 `docs/a2a-grpc-impact.md` for dependency and build measurements.
 
+Agent conversations (2026-09-21): the lazy `agent_message` / `agent_read` facade
+accepts a unique contact name and retains the current conversation within the
+initiating Agent session. Optional human labels select separate discussions;
+explicit exact IDs remain advanced recovery overrides. A new start replaces
+the active binding only after acceptance, and failed continuation cannot silently
+create a replacement. Compact results lead with the speaker, reply and honest
+state; `details` retains technical receipts. Pending replies stay protected
+against duplicate sends. A new explicit message may recover a
+confirmed `sent=false` pre-dispatch refusal through fresh adapter admission;
+pending approvals and uncertain sends cannot use that recovery path. Supported pending remote replies
+are collected underneath this facade, while existing coding-agent callbacks
+keep their delivery owner. Send-only and standalone adapters remain explicit
+about their limits. No new persona, memory store or authority boundary is created.
+`AgentConversationStore` retains scoped operational bookmarks and a bounded
+latest-receipt cache in `agents/conversations.json`; it is not a transcript or
+authority store. `CanonicalToolNameDispatcher` manages this continuity before
+ordinary adapter dispatch. Remote reply recovery uses the existing
+`DelegationOutcomeEventRunner` lifecycle rather than a separate scheduler.
+
 Agent communication (2026-09-15): `AgentConversationRouting` translates local
 `agent_message`/`agent_read` before the existing gates; both facade and executor
 policy names survive. `SwiftToolDispatcher+AgentCommunication` owns configured
 remote exchanges and directory projection. `AgentPeerStore` owns the sole contact
 config, `AgentPeerHTTP` bounded HTTP, `AgentPeerCredentials` dedicated peer keys,
 and `AgentA2AWire` negotiated standard protocol projection. Generic NativeAgent
-routes reuse `ClaudeBridge` and its existing receipt stream. No second transcript,
-execution owner, polling loop or public listener. See `docs/agent-communication.md`.
+routes reuse `ClaudeBridge` and its existing receipt stream. Canonical transcripts,
+execution owners and listener boundaries remain unchanged. See `docs/agent-communication.md`.
+
+Peer approval policy (2026-09-20): `PeerTurnEffectPolicy.requiresPeerApproval`
+is shared by SecurityCenter's inbound-origin checks and the chat dispatcher's
+post-reply gate. Routine agent messages do not acquire a new approval merely
+because a peer replied. Destructive capabilities and unknown code execution
+retain approval. Existing contact binding, revocation and domain gates remain;
+human Full Mac permission resolution is unchanged.
 
 Bidirectional interoperability (2026-09-15): `AgentPeerDiscovery` performs bounded
 same-origin card discovery before pinning an existing contact. Desktop contacts
@@ -392,24 +739,34 @@ Registry reference versions are 0.60.0, 1.51.0, and 2026.09.15 respectively;
 other or unknown installed versions show an untested-version note. Connect
 consent names the resolved executable, reported version, and starting folder;
 the shared `approvedExecutablePath` is the sole launch binding, with the ACP
-identity receipt required to match it. That path, file identity and SHA-256 are rechecked immediately
+identity receipt required to match it. That canonical path, inode and SHA-256 are rechecked immediately
 before spawning by path with the argument array, including version probes and
-the sandbox wrapper. A mismatch refuses the message and raises fresh consent
+the sandbox wrapper. The historical mount device number is retained as metadata,
+not compared as durable identity across restarts. A mismatch refuses the message and raises fresh consent
 showing the changed identity/digest; approval does not replay the message.
 The card describes ordinary Mac app-launch trust in files in the person's folders.
 Reconnect
 renews consent for a changed installation or explicit project folder. Default
-folders start empty inside the app workspace. Vendor restrictions are Gemini
+folders use `agent-bridge-runs/<host id>` inside the app workspace; existing
+contacts retain their approved folder. Vendor restrictions are Gemini
 plan + sandbox, Goose chat, and Cursor ask + sandbox. They are not NativeAgent
 enforcement boundaries: the CLI runs as the person and can act directly;
 NativeAgent asks only when the CLI asks it. `AgentACPClient` negotiates wire version 1,
-creates a session, streams updates, and accepts completion only from the prompt
+returns its session ID as `conversation_id`. An app-owned bounded connection pool
+retains live sessions between messages, including command-only Hermes sessions
+that Hermes has not yet saved. Cold Hermes restoration requires identity evidence;
+missing or ambiguous sessions refuse before sending the new message. Other ACP
+peers retain their negotiated restore behavior and explicit context-loss reporting.
+History replay is excluded from the new answer, and the permission mode is reapplied.
+The client streams new prompt updates and accepts completion only from the prompt
 response's `end_turn`. Cancellation sends `session/cancel`, cancels outstanding
 permission requests, closes stdin and awaits owned process-group shutdown,
 retaining the unreaped leader through escalation even if it exits early. A
 denied request cannot report successful completion. `AgentACPApproval`
 uses the canonical inbox and lifecycle events for one-operation approvals,
-storing only a redacted, bounded preview resolvable on the local Mac. Reconnect
+storing only a redacted, bounded preview resolvable on the local Mac. Captured
+local chat origin places live permission cards in the initiating chat without
+making them replayable tool approvals. Reconnect
 retires old persisted proof; executable changes invalidate turn readiness.
 Optional filesystem/terminal services are not advertised. `session/new` receives
 the existing link tool with a per-contact key; no host settings edit is needed.
@@ -417,9 +774,25 @@ The contact projections distinguish the ability to start a turn and receive an
 answer from a proven round trip. Completed ACP answers write the same scoped
 round-trip receipt as other transports; timestamps alone are not readiness,
 and failure retains historical proof while marking the connection unavailable.
-Each message currently opens a new session;
-session reload and delayed answer recovery are not claimed. Codex/Claude command
-rows and the built-in builder lanes are unchanged.
+Disconnect and app termination close retained connections; idle expiry bounds
+resource retention. The peer owns conversation persistence; the pool stores no
+transcript. Delayed answer recovery is not claimed.
+
+Universal command continuity (2026-09-20): `AgentHostCommandLine` declares
+Codex JSONL session capture and exact `exec resume` arguments. The command
+adapter returns the real `thread.started` UUID as `conversation_id`, verifies
+the same identity on resume, and marks missing or conflicting proof with
+`continuation_available: false`. It never invents an identity, uses `--last`,
+retries automatically, or silently opens a replacement conversation. The final
+reply file remains separate from protocol stdout. Claude Code's existing UUID
+contract and the built-in Codex/Claude/OMP builder lanes remain unchanged.
+
+Antigravity messaging grants (2026-09-20): `AgentHostConfigWriter` owns the two
+exact MCP messaging rules in Antigravity settings. Connect/reconnect preserves
+user Ask/Deny rules, rejects malformed/conflicting authority, and records only
+its own additions for disconnect. No blanket tool grant or automatic callback
+probe is introduced. Installed explicit callback acceptance reached the
+canonical full Agent session and completed reply receipt.
 
 Host review correction (2026-09-19): Grok Bot and VS Code have no settings row.
 Cursor editor global/workspace settings are separate from the Cursor CLI.
@@ -427,6 +800,10 @@ Gemini CLI, Goose and Cursor CLI declare ACP routes; none runs a one-shot
 command. ACP connection supplies reply tools to the session without editing host settings.
 Connected ACP contacts can start turns once their approved executable binding
 is current; a saved connection alone is not round-trip proof.
+ACP timeout evidence distinguishes initialization, conversation startup and
+mode setup from prompt delivery. Before the first attempted prompt write,
+timeouts report `sent:false` with the owning phase. Once a prompt write may
+have begun, delivery remains unknown and automatic replay is forbidden.
 JSON disconnect locates the recorded command plus peer id across renamed or
 moved entries, restores only the replaced entry, and preserves unrelated edits.
 Removal precedes key revocation; its receipt survives until revocation succeeds.
@@ -434,8 +811,9 @@ Removal precedes key revocation; its receipt survives until revocation succeeds.
 One verb and honest states (2026-09-18): a row may also carry `AgentHostCommandLine`
 — executable name, argument templates, where the reply lands — and ONE generic
 adapter in `SwiftToolDispatcher+AgentCommunication` reads it, so `agent_message`
-to such a contact runs that command once, stdin closed, in an empty directory of
-its own, and returns its reply in the same call. It takes the ordinary path for
+to such a contact runs that command once, stdin closed, in the contact's stable
+working directory, and returns its reply in the same call. Each run has its own
+temporary reply directory. It takes the ordinary path for
 running a command: the same Full Mac `file_ops` gate, sandbox profile and audit
 receipt as `shell`, and the same declared capabilities. A host with no command
 line has no outbound route and says so; its window is never read. The run gets a
@@ -544,6 +922,17 @@ Full Mac has no timer (2026-09-12): the grant is saved policy, on or off. There
 is no expiry state, no duration intent, no countdown for a header or a card to
 refresh at. `AppModel.fullMacGrantIsActive` is the display predicate and
 `MacControlGate.fullMacActive` the gate, and they are pinned to agree.
+
+Full Mac capability admission (2026-09-21): use the checked canonical
+`ChatFullMacYoloAdmission` / SecurityCenter origin decision for per-call
+capability access. Fresh default-off integration settings must not silently
+override an admitted Full Mac call. Discovery/preloading and execution agree;
+lower modes still use saved per-feature choices. MCP legacy grants renew through
+the dispatcher against the resolved current implementation; revoked grants and
+unresolvable implementations remain explicit refusals. Activity answers may use
+Full Mac on authenticated operator surfaces, while capture, exclusions,
+retention and malformed-store checks remain owned by ActivityWatch. Full Mac
+does not start recording or change the selected voice/provider.
 
 Providers (2026-09-12): three override groups — Chat, Work, Memory and mind —
 each narrowed to mounted surfaces, plus one row for any mounted surface no group
@@ -1499,10 +1888,7 @@ typed somatic events, settles/expires predictions and updates bounded outcome
 evidence; `OrganismPrediction+Horizon.swift` refreshes canonical horizon sources
 using the same settlement helpers and ledger. `OrganismCapabilitySelfModel.swift`
 derives capability beliefs from outcomes and confidence, never tool availability.
-`OrganismLivingDynamics.swift` derives analytic residual pressure/deadlines;
-`OrganismGeneratedSleepRecalibration.swift` accepts authorized generated samples
-and returns bounded calibration artifacts/results. Generated recalibration is
-not personal learning, provider selection, identity change or effect authority.
+`OrganismLivingDynamics.swift` derives analytic residual pressure/deadlines.
 
 ### Mac perception and action
 
@@ -1685,7 +2071,15 @@ path. Resolution grants no input permission and does not own a second screen cac
   and persistence stay in Core `DeskStore.swift` / `DeskStore+Reduction.swift`;
   the views are not an alternate work ledger.
 - `ClaudeBridge.swift` retains the listener, authenticated routing, message/tool
-  execution and response latch mechanics. Its three chat call sites share a
+  execution and response latch mechanics. `BridgeChatAdmission.swift` serializes
+  its three model-turn call sites and resident agent/bot return turns per chat,
+  so a callback cannot replace another bridge turn's Workspace bindings. It
+  retains at most eight waiting turns per chat and 32 globally, removes canceled
+  waiters, and adds no timer. Durable enqueue acknowledgments and completion
+  deduplication retain their existing owners. Capacity rejection before model
+  start records a digest-bound `not_started` completion phase; uncertain or
+  started work is never released for replay. Other chat surfaces are outside
+  this scoped admission owner. Its three chat call sites share a
   per-request notice sink into `/claude/events`: bounded, secret-redacted
   `message_notice` payloads join admission and terminal events by `requestId`.
   Enqueued notices also carry canonical session/run IDs; ordinary notices carry
@@ -1738,6 +2132,8 @@ path. Resolution grants no input permission and does not own a second screen cac
   and rate admission). `wake_turn_observation.js` owns Codex rollout discovery,
   its per-worker path cache, terminal event waits and liveness evidence, and
   Claude child execution, transcript progress and exit classification.
+  An exact durable Codex terminal event overrides an interrupted hydrated RPC
+  view of a resumed turn; retained answer text alone is not terminal evidence.
   `wake_reply_delivery.js` formats and posts replies, retaining Codex retry and
   saved-job disposition separately from Claude session-store confirmation of
   ambiguous POSTs. `wake_recovery.js` consumes those admission, observation and
@@ -2120,7 +2516,9 @@ These rules are part of the architecture, not optional hardening:
 | `NativeLoopbackListenerParameters.swift` | Shared listener-level loopback binding and preferred/consecutive/system-assigned fallback plan for the Mac Control and Codex/Claude bridges; each bridge publishes its selected port, while accept-time peer checks and bearer auth remain separate defense-in-depth gates |
 | `Extensions/NativeAgentChrome/src/browser-workspace.js` | Placement/presentation adapter inside the canonical lease serial lane: inactive work tabs in a purple NativeAgent group alongside the user's tabs in the last-focused normal Chrome window, then reuse of that exact group's live window. No new window or welcome tab; no tab/window activation. Session storage retains only version/window/group identity, not lease authority. Existing group customization is preserved. `page-agent.js` compacts layout wrappers while retaining article hierarchy/direct text and root-scoped aria-labelledby names. Native modal containers mark backdrop nodes non-actionable; action identity and mutation freshness remain authoritative. |
 | `ChromeControlRuntime.swift` | NativeAgent.app's sole real-Chrome authority and Unix-socket owner. The default-off Trust Center switch is reread before lease acquisition, navigation, structured snapshot, click, fill, sequential type, select, bounded keypress, checked-state, double-click, bounded wait, and scroll effects; disabling it removes the listener and exact native-host registration and releases active leases without closing tabs. Acts remain snapshot-scoped, password-inert, receipt-bearing, no-focus content-script operations; a lost post-dispatch page reply is outcome-unknown and never automatically retried. Structured snapshots aggregate a bounded every-frame content-script walk plus open shadow roots through service-worker-owned opaque node routing; unavailable frames and closed roots remain explicit rather than guessed. A connection is accepted only from the registered relay executable whose PARENT is a Chromium-family browser, presenting this launch's 0600 secret (2026-09-06). "Chromium-family" is decided by the parent's CODE SIGNATURE — `SecStaticCodeCheckValidity` against `anchor apple generic` plus an exact listed signing identifier — not by an Info.plist the impersonator could write, so an unsigned or self-signed browser build is refused (2026-09-06). When the peer's parent is launchd, the browser that launched the relay has exited and the live check cannot answer: the connection is then accepted only if the hello carries the parent evidence the relay validated at launch (bundle id, pid, validation time) AND the relay executable's own signature still matches its bytes; anything else is refused (2026-09-06). |
-| `NativeAgentChromeRelay` | Minimal Swift native-messaging transport for the optional real-Chrome surface. It forwards bounded, length-prefixed top-level JSON objects between Chrome stdin/stdout and the app-owned Unix socket without interpreting browser operations or owning policy, leases, TrustCenter state, receipts, or verification. The host manifest pins the exact extension origin and exists only while the app-owned Chrome control capability is enabled. The bundled relay additionally refuses to start unless Chrome launched it: its parent process must pass code-signature validation as a listed Chromium-family browser and argv must carry the registered extension origin (2026-09-06). It records that parent's signing identifier, pid and validation time and presents them in its hello, which is the only account of the launching browser once that browser has exited (2026-09-06). A bare build-products relay is unaffected — the app does not accept it as a peer. |
+| `Extensions/NativeAgentChrome/src/lease-manager.js` | Owns tab authority and cleanup. In addition to ordinary grouped inactive tabs, create-only rendered work uses a separate unfocused normal window, with exact sole-tab checks before effects and terminal yield on focus, input, minimization or membership change. Cleanup removes only the untouched owned tab. Page snapshots report actual visibility/readiness; a render opportunity is not content-completion proof. |
+| `ChromeExtensionFolder.swift` | Shared Trust-button and lazy chat setup owner: prepares/reveals the bundled extension and opens Chrome extensions. `browser.chrome_status` distinguishes a live channel from historical connection and permission. Neither copying nor opening the setup page establishes installation or grants permission. |
+| `NativeAgentChromeRelay` | Minimal Swift native-messaging transport for the optional real-Chrome surface. It forwards bounded, length-prefixed top-level JSON objects between Chrome stdin/stdout and the app-owned Unix socket without interpreting browser operations or owning policy, leases, TrustCenter state, receipts, or verification. The host manifest pins the exact extension origin and exists only while the app-owned Chrome control capability is enabled. The bundled relay additionally refuses to start unless Chrome launched it: its parent process must pass code-signature validation as a listed Chromium-family browser and argv must carry the registered extension origin (2026-09-06). It records that parent's signing identifier, pid and validation time and presents them in its hello, which is the only account of the launching browser once the browser has exited (2026-09-06). A bare build-products relay is unaffected — the app does not accept it as a peer. |
 | `AppChatToolDispatcher.swift` | App-native notification/browser tools plus lazy `reflex_review`, which routes approve/hold/reject into `NativeCognitionRuntime` rather than writing organism state directly. It is also the sole app-owned chat-body composition boundary: standard surface profiles and purpose-built restricted Workshop dispatchers converge on the same cognition, ContextFlow, memory-atom, provider-lifecycle, and root policy before entering Core. The explicit background profile omits evolution tools, denies external MCP, and does not file approvals without an explicit user-backed filer. One `ToolCausalBoundary.MotorReference` observer replaces per-domain Workshop/Mac/external-send callbacks; the factory still rereads the exact canonical owner before resident consequence admission, while Browser keeps its existing runner-owned readback. Shared chat composition disables only the inner duplicate autonomy decision because `ChatOrchestrationClient` has already authenticated the exact origin and owns the single approval/autonomy membrane; direct/raw app-tool clients retain the inner gate, and all SecurityCenter hard checks still run. |
 | `AppChatToolDispatcher+ToolSchemas.swift` | App-native tool schema declarations and their local JSON schema constructors; preserves lazy catalog construction and ordering. |
 
@@ -2217,7 +2615,7 @@ membrane when autonomy enforcement is delegated, while retaining fresh hard bloc
 | File | Owns |
 |---|---|
 | `NativeClient+ApprovalExecutors.swift` | Generic/misc approval resolution and reconciliation helpers |
-| `NativeClient+BrowserRoutes.swift` | Visible Browser status/routes and the app-owned WebKit effect adapter. Canonical running/terminal/deadline/cancel/recovery state and derived receipts belong to the Core Browser operation store. |
+| `NativeClient+BrowserRoutes.swift` | Visible Browser status/routes and the app-owned WebKit effect adapter. Canonical running/terminal/deadline/cancel/recovery state and derived receipts belong to the Core Browser operation store. Disposable capture writes use Core `BrowserCaptureCache.swift` for shared byte/count/age budgets and paired eviction; user documents/downloads are excluded. |
 | `BrowserWindow.swift` | MainActor-owned visible WKWebView and its optional authenticated loopback IPC adapter; the IPC listener shares the preferred/consecutive/system-assigned fallback contract and publishes `browser_ipc.json`, while browser effects and verification remain in the existing Browser domain path. |
 | `NativeClient+ChatRuntime.swift` | Chat send/stream facades and chat runtime adapters, including payload-free typed final/failure/cancellation evidence and exact Mac turn-identity binding |
 | `NativeClient+ConnectorActions.swift` | Connector action dispatch, status, and receipt helpers |
@@ -2481,6 +2879,7 @@ reconstructing readiness from Mac-side CloudKit configuration.
 | File | Owns |
 |---|---|
 | `MacAppleScriptBridge+Mail.swift` | Apple Mail read/send/search AppleScript actions |
+| `MacAppleScriptBridge+MailWorkspace.swift` | Bounded, paged inbox reads with opaque message locators for the workspace mail window |
 | `MacAppleScriptBridge+MessagesNotes.swift` | Messages and Notes AppleScript actions |
 | `MacAppleScriptBridge+Music.swift` | Apple Music now-playing/search/library/player AppleScript actions |
 | `MacAppleScriptBridge+Runtime.swift` | Shared executor, envelopes, escaping, input coercion, and record parsers |
@@ -2786,7 +3185,7 @@ ledger, memory owner, or turn/retry owner.
 | `PersistenceCore.swift` | Persistence protocol, native file I/O, factory, unique append transaction and strict UTF-8 JSONL reporting; read-only tails retain replacement decoding |
 | `JSONValue.swift` | JSON value representation, Python-compatible byte serialization, and Codable conformance |
 | `RegistryTimestampSortKey.swift` | Package-scoped timestamp truthiness and string-key compatibility shared by SkillsRegistry and WorkflowMerge. |
-| `JSONLRetention.swift` | JSONL retention budgets, capped append transactions, and path-owned retention policy |
+| `JSONLRetention.swift` | JSONL retention budgets, capped append transactions, amortized row checks with rotation headroom, and hard byte ceilings for chemistry/shared trace diagnostics; see `runtime-storage-limits.md` |
 | `PersistenceDataRoot.swift` | Data-root resolution, repository validation, and sandbox repository-root resolution |
 | `DeskStore.swift` | Desk append-under-lock transactions and live-state memo |
 | `DeskStore+Reduction.swift` | Pure Desk op replay, alias ordering, and per-item retention |
@@ -2951,7 +3350,6 @@ The Organism Kernel lives under `CognitiveSubstrate/Organism/`. Its code default
 | `OrganismLivingDynamics.swift` | Analytic decay and shared sleep evidence, pressure, lane and control-state value types. |
 | `OrganismResidualRepair.swift` | Residual repair opportunity and exact pressure/lane evaluation. |
 | `OrganismOperationalConsolidation.swift` | Operational consolidation receipts and identity dream trigger. |
-| `OrganismGeneratedSleepRecalibration.swift` | Generated sleep calibration models, authorization and recalibrator. |
 | `OrganismCapabilitySelfModel.swift` | Capability belief values and existing self-model projection. |
 | `OrganismModels.swift` | Somatic signal, chemical state, body schema, projection, snapshot, and configuration models |
 | `OrganismBodySchema.swift` | Pure body-read merge into BodySchema from bounded app-body reader inputs |
@@ -3122,7 +3520,11 @@ Tool families belong here:
 | `SwiftToolDispatcher+MemoryCurationTools.swift` | `list_memories` (offset or after_id cursor), `rewrite_memory`, `forget_memory`, `rebuild_knowledge_graph`: the agent curates its own store |
 | `SwiftToolDispatcher+ChatHistoryTools.swift` | Chat/session search tools; broad ranked matches are projected through compact 12-result offset pages so provider turns do not absorb the former 25-snippet payload while complete recall remains reachable. Matching and previews run on the substantive text (`ChatTranscriptBoilerplate`), never on bridge routing prefixes or wake-receipt slips. `read_chat_message` pages ONE matched message in full by its `message_id`, through `SessionHistoryReader` |
 | `SwiftToolDispatcher+DelegationTools.swift` | Read-only provider projection over canonical Claude/Codex/OMP job stores; agent filtering precedes compact offset pagination, and full lifecycle detail is explicit rather than paid on every progress check |
-| `SwiftToolDispatcher+AgentCommunication.swift` | `agent_message` / `agent_read` / `agent_contacts`: one lazy interface that finds, messages and reads coding agents, bots and connected peers (A2A, MCP, nativeagent-link); persistent peer conversations |
+| `SwiftToolDispatcher+ArtifactContext.swift` | Lazy artifact projection over existing evidence (paths and versions as recorded); opening still goes through the read tool |
+| `SwiftToolDispatcher+HumanConversations.swift` | Read model over the session index and transcripts for person conversations; no second session store |
+| `SwiftToolDispatcher+WorkContext.swift` | Read-time query shaping for work context lookups; no semantic decision or extra index |
+| `SwiftToolDispatcher+WorkspaceDesk.swift` | Desk view inside the workspace tool: paging, handles and item matches |
+| `SwiftToolDispatcher+AgentCommunication.swift` | `agent_message` / `agent_read` / `agent_contacts`: lazy conversation interface for coding agents, bots and connected peers; unique contact names, scoped current conversations and optional human labels keep exact route/reply identities underneath ordinary conversation. |
 | `SwiftToolDispatcher+DreamDiaryTools.swift` | `dream_diary_read`: the diary the agent writes, readable by the one who wrote it |
 | `SwiftToolDispatcher+InlineInteraction.swift` | `request_interaction`: the agent raises a need themselves as an inline card before hitting a wall (connect, permission, Trust flag, key, model choice) |
 | `QuietComposerVerbs.swift` | The app's own composer worked IN PROCESS — read, set/send draft, pick provider+model through `ChatComposerRoutingReading.select`, set thinking level, open/close a pane of the one composer shell (model, think, trust, context), switch the rail page. No AX round trip (which deadlocks the turn asking) and no activate; reached from `interaction_act` with `target=composer`. No verb sets Trust posture |
@@ -3303,6 +3705,11 @@ Do not create parallel `data/persona/Agent`, `data/memory/USER.md`, installer se
   store receives the documented bootstrap defaults; existing unreadable,
   malformed, or wrongly typed known authority is unavailable, byte-preserved,
   and deny-all until repaired. All mutations revalidate under the owner lock.
+  Durable `_operatorOverrides` keeps explicit human OFF authoritative even under
+  admitted Full Mac; untouched defaults still receive Full Mac admission.
+  Checked legacy human transition receipts are recognized without read-side
+  writes and persisted before receipt rotation on the next ordinary mutation.
+  Agent-origin permission cards cannot undo an operator OFF.
 - Connector truth: connector status/proof gates must prove the account, not just token presence
 - External sends and destructive/system-level changes stay deliberate approval boundaries
 

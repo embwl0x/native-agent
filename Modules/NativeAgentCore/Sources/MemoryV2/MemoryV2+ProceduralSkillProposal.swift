@@ -29,6 +29,7 @@ public enum ProceduralSkillProposalError: String, Error, Sendable, Equatable {
     case approvalNotLocal = "approval_not_local"
     case approvalPayloadMismatch = "approval_payload_mismatch"
     case unsafeSkillName = "unsafe_skill_name"
+    case tooFewDistinctActions = "too_few_distinct_actions"
 }
 
 /// What applying a resolved card did.
@@ -66,6 +67,11 @@ public enum ProceduralSkillProposal {
         }
         guard isSafeSkillName(procedure.suggestedSkillName) else {
             throw ProceduralSkillProposalError.unsafeSkillName
+        }
+        // 2026-09-22: "workspace → workspace" is one tool repeated, not a
+        // procedure worth a skill; it reached User as an approval anyway.
+        guard Set(procedure.steps.map(\.action)).count >= 2 else {
+            throw ProceduralSkillProposalError.tooFewDistinctActions
         }
         let actions = procedure.steps.map(\.action).joined(separator: " → ")
         return try await inbox.create(.object([

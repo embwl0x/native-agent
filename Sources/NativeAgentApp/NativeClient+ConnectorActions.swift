@@ -354,13 +354,7 @@ extension NativeClient {
     }
 
     static func runMacNotify(input: [String: JSONValue]) async throws -> JSONValue {
-        let title = NativeAgentNotificationDefaults.title(connectorInputString(input["title"]))
-        let message = connectorInputString(input["message"]) ?? connectorInputString(input["body"]) ?? ""
-        guard !message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            throw NSError(domain: "NativeAgentSwiftOnly", code: -400, userInfo: [
-                NSLocalizedDescriptionKey: "mac.notify requires message"
-            ])
-        }
+        let (title, message) = try NativeAgentNotificationDefaults.parseInput(input, toolName: "mac.notify")
         let result = await NativeAgentNotifications.postAndReport(title: title, body: message)
         var obj = result.deliveryFields()
         obj.merge([
@@ -371,13 +365,7 @@ extension NativeClient {
     }
 
     static func runMobileNotify(input: [String: JSONValue]) async throws -> JSONValue {
-        let title = NativeAgentNotificationDefaults.title(connectorInputString(input["title"]))
-        let message = connectorInputString(input["message"]) ?? connectorInputString(input["body"]) ?? ""
-        guard !message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            throw NSError(domain: "NativeAgentSwiftOnly", code: -400, userInfo: [
-                NSLocalizedDescriptionKey: "mobile.notify requires message"
-            ])
-        }
+        let (title, message) = try NativeAgentNotificationDefaults.parseInput(input, toolName: "mobile.notify")
         // Item 26: one exit, through the router. Owner-waiting and PINNED to
         // the phone — `mobile.notify` names its channel. Payload unchanged.
         let receipt = try await AttentionRouter.shared.route(

@@ -8,6 +8,7 @@ import MemoryV2
 import ProviderRouting
 import TrustCenter
 import DreamREMCycle
+import NativeAgentTestSupport
 
 // MARK: - CHAT-1 premise proof: the per-iteration TurnContext rebuild is NOT redundant
 //

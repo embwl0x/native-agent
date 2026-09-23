@@ -1548,7 +1548,6 @@ public actor SwiftNativeLoopScheduler {
         if e.contains("internet connection appears to be offline") { return true }
         if e.contains("network connection was lost") { return true }
         if e.contains("socket is not connected") { return true }
-        if e.contains("telegram long poll: unavailable") { return true }
         if e.contains("nsurlerrordomain") {
             for code in ["-1009", "-1005", "-1003"]
             where e.contains("code=\(code)") || e.contains("code \(code)") {
