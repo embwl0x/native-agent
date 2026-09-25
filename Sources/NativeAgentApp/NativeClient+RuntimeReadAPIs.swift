@@ -221,11 +221,17 @@ extension NativeClient {
     /// Both the panel and palette must observe the same native status owner
     /// and app-local PIM adapters. Callers choose only the payload depth.
     private func makeAppMacAssistantStatusClient() -> any MacAssistantStatusClient {
+        Self.makeAppMacAssistantStatusClient(root: dataRootOverride ?? PersistenceCore.defaultDataRoot())
+    }
+
+    /// Every provider reads local state the app already owns — no network.
+    static func makeAppMacAssistantStatusClient(root: URL) -> any MacAssistantStatusClient {
         makeMacAssistantStatusClient(
-            dispatcherTools: StaticDispatcherToolAvailabilityProvider(availableTools: [
-                "calendar_list_upcoming",
-                "reminders_list_due_today",
-            ]),
+            proofs: NativeAppConnectorProofProvider(root: root),
+            push: NativeAppMobilePushStatusProvider(),
+            dispatcherTools: StaticDispatcherToolAvailabilityProvider(
+                availableTools: SwiftToolDispatcher.catalogRegisteredToolNames
+            ),
             localPIM: NativeAppLocalPIMStatusProvider()
         )
     }

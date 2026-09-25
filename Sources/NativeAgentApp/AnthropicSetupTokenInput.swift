@@ -55,7 +55,8 @@ struct AnthropicSetupTokenInput: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(.orange)
-                .disabled(status == .submitting || trimmedToken.count < 80)
+                .disabled(status == .submitting
+                          || token.filter { !$0.isWhitespace }.count < 80)
             }
 
             if let s = lastSuccess {
@@ -71,25 +72,33 @@ struct AnthropicSetupTokenInput: View {
         }
     }
 
-    private var trimmedToken: String {
-        token.trimmingCharacters(in: .whitespacesAndNewlines)
+    @MainActor
+    private func submit() async {
+        guard !token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        lastError = nil
+        lastSuccess = nil
+        status = .submitting
+        let error = Self.save(token)
+        status = .idle
+        if let error {
+            lastError = error
+        } else {
+            token = ""
+            lastSuccess = "Setup token saved."
+            onSuccess?()
+        }
+    }
+
+    /// Save a pasted setup token; nil on success, else the reason. Shared with
+    /// the inline provider card, so both write the one shape.
+    static func save(_ raw: String) -> String? {
+        let t = raw.trimmingCharacters(in: .whitespacesAndNewlines)
             .replacingOccurrences(of: " ", with: "")
             .replacingOccurrences(of: "\n", with: "")
             .replacingOccurrences(of: "\t", with: "")
-    }
-
-    @MainActor
-    private func submit() async {
-        let t = trimmedToken
-        guard !t.isEmpty else { return }
-        lastError = nil
-        lastSuccess = nil
         guard t.hasPrefix("sk-ant-oat") else {
-            lastError = "That isn't a setup token. Setup tokens start with sk-ant-oat."
-            return
+            return "That isn't a setup token. Setup tokens start with sk-ant-oat."
         }
-        status = .submitting
-
         // DAEMON KILLED 2026-06-02. Write the setup_token directly to
         // <dataRoot>/providers/anthropic_oauth_direct.json with the shape
         // AnthropicOAuthDirectAdapter expects:
@@ -106,13 +115,9 @@ struct AnthropicSetupTokenInput: View {
                 "saved_at": now,
             ]
             try writeJSONObject(payload, to: path)
-            status = .idle
-            token = ""
-            lastSuccess = "Setup token saved."
-            onSuccess?()
+            return nil
         } catch {
-            status = .idle
-            lastError = "Failed to save setup-token: \(error.localizedDescription)"
+            return "Failed to save setup-token: \(error.localizedDescription)"
         }
     }
 

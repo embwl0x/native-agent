@@ -333,11 +333,11 @@ struct ChatSessionAgingConsolidationTests {
         // `effectiveAgingThresholdTokens` takes a quarter of the MODEL-CAPPED
         // backstop, and gpt-5.6 has a verified 400k window
         // (FirstPartyModelCatalog), so the backstop is
-        // min(200_000, 0.40 × 400_000) = 160_000 and the aging boundary is a
+        // min(200_000, 0.60 × 400_000) = 200_000 and the aging boundary is a
         // quarter of that. Both numbers are pinned so a window change or a
         // fraction change names itself instead of moving one derived literal.
-        #expect(backstop == 160_000)
-        #expect(aging == 40_000)
+        #expect(backstop == 200_000)
+        #expect(aging == 50_000)
     }
 
     // MARK: 3 — transcript byte-preserved via backup on every path

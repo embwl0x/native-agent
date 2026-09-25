@@ -5,6 +5,11 @@ import Foundation
 /// "the agent". There is no pronoun setting and nothing to pick — the name IS
 /// the voice. A name is always third-person singular, so the verb helpers are
 /// fixed and every templated sentence still agrees.
+///
+/// 2026-09-23: on the settings-family pages (Trust, Settings, Connectors,
+/// Providers, Personality, Bots) the app describes the agent AS the agent —
+/// "I", "my". The name appears only as a title or label there; sentences no
+/// longer go through `subject`/`verb`. Never "it" or "the agent".
 struct AgentVoice: Equatable {
     let name: String
 

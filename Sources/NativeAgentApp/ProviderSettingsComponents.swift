@@ -312,6 +312,7 @@ struct ProviderConfigSheet: View {
                     }
                 }
                     .buttonStyle(.borderedProminent)
+                    .hazeTinted(.button)
                     .controlSize(.regular)
                     .font(ShellType.labelMedium)
                     .disabled(isSaving || isTesting)
@@ -341,6 +342,7 @@ struct ProviderConfigSheet: View {
                                     }
                                 }
                                 .pickerStyle(.segmented)
+                                .hazeTinted(.segments)
                                 .labelsHidden()
                                 .fixedSize()
                             }
@@ -475,6 +477,7 @@ struct ProviderConfigSheet: View {
                             Task { await saveConfig() }
                         }
                         .buttonStyle(.borderedProminent)
+                        .hazeTinted(.button)
                         .disabled(isSaving || modelPickerPresentation.needsReplacement || !authModePickerState.canSave)
 
                         Button(isTesting ? "Testing…" : "Test the connection") {
@@ -935,12 +938,8 @@ struct ProviderSection<Content: View>: View {
     @ViewBuilder var content: Content
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text(label)
-                .font(ShellType.labelSemibold)
-                .textCase(.uppercase)
-                .kerning(0.6)
-                .foregroundStyle(NativeAgentShell.secondary)
+        VStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
+            AliveEyebrow(label)
             content
         }
     }

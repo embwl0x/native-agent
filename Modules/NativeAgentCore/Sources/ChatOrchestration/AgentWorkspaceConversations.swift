@@ -220,33 +220,19 @@ struct AgentWorkSession {
     let sessionID: String, sender: String, topic: String, latest: String, updatedAt: String
     var createdAt = "", summary = ""
 
-    /// 2026-09-22, Agent's ask: every session read "Work session with Claude",
-    /// so the name carries its start day and a few words of what it's about.
-    var title: String {
-        var parts = ["Work session with " + (sender == "agent" ? "another agent" : sender.prefix(1).uppercased() + sender.dropFirst())]
-        let iso = ISO8601DateFormatter()
-        iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let at = iso.date(from: createdAt) ?? ISO8601DateFormatter().date(from: createdAt) {
-            let day = DateFormatter()
-            day.setLocalizedDateFormatFromTemplate("MMMd")
-            parts.append(day.string(from: at))
-        }
-        if !summary.isEmpty { parts.append(summary) } else {
-            // Whole words only, and not the "Agent —" greeting most open with.
-            let words = topic.split(whereSeparator: \.isWhitespace)
-                .drop { $0.lowercased().hasPrefix("agent") || ["—", "-"].contains($0) }.prefix(6)
-            let room = 60 - parts.joined(separator: " · ").count - 3
-            var about = ""
-            for word in words {
-                let next = about.isEmpty ? String(word) : about + " " + word
-                if next.count > room { break }
-                about = next
-            }
-            if !about.isEmpty { parts.append(about) }
-        }
-        let full = parts.joined(separator: " · ")
-        return full.count <= 60 ? full : String(full.prefix(59)) + "…"
+    /// Set by `all()` when two sessions share a title: " · Claude · today 6pm".
+    var display = ""
+    var agentName: String? = nil
+
+    /// 2026-09-22, Agent's ask: every session read "Work session with Claude".
+    /// 2026-09-23 (her screen): named by what it is about; who and when are
+    /// added only where two would otherwise read the same.
+    var title: String { display.isEmpty ? about : display }
+    var about: String {
+        summary.isEmpty ? HerScreen.humanTitle(topic, agentName: agentName).title : HerScreen.clip(summary, 60)
     }
+    var who: String { sender == "agent" ? "Another agent" : sender.prefix(1).uppercased() + sender.dropFirst() }
+
     var location: AgentWorkspaceLocation {
         .record(tool: "chat_conversations", input: ["conversation_session_id": .string(sessionID)], title: title)
     }
@@ -282,7 +268,8 @@ struct AgentWorkSession {
     /// Newest first; names and latest line only. The title is a cheap
     /// prefilter; the transcript metadata decides.
     static func all(dataRoot: URL) -> [Self] {
-        ((try? HumanConversationReader.rows(dataRoot: dataRoot)) ?? []).compactMap { row in
+        let agentName = ChatCompactionDistiller.configuredAgentName(dataRoot: dataRoot)
+        var found: [Self] = ((try? HumanConversationReader.rows(dataRoot: dataRoot)) ?? []).compactMap { row in
             guard let id = HumanConversationReader.string(row["id"]),
                   HumanConversationReader.string(row["title"])?.hasPrefix("[from: ") == true,
                   let parsed = bridgeSender(sessionID: id, dataRoot: dataRoot) else { return nil }
@@ -291,8 +278,12 @@ struct AgentWorkSession {
                          latest: String((preview.split(separator: "\n").first ?? "").prefix(160)),
                          updatedAt: HumanConversationReader.string(row["updatedAt"]) ?? "",
                          createdAt: HumanConversationReader.string(row["createdAt"]) ?? "",
-                         summary: HumanConversationReader.string(row["summary"]) ?? "")
+                         summary: HumanConversationReader.string(row["summary"]) ?? "", agentName: agentName)
         }
+        let titles = HerScreen.disambiguate(found.map(\.about), who: found.map(\.who),
+            at: found.map { HerScreen.date($0.createdAt) })
+        for index in found.indices where titles[index] != found[index].about { found[index].display = titles[index] }
+        return found
     }
 
     static func people(dataRoot: URL) -> [(agent: String, name: String)] {

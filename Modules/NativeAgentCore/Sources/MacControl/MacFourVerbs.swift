@@ -75,6 +75,9 @@ public struct MacFourVerbs: Sendable {
     /// returns blind before a single observer exists.
     let effectObserverSource: any MacAXEffectObserverSource
     let appActivationSource: any MacAppActivationObserverSource
+    /// Her-screen 09-24 — the last app window this verb saw, for her home's
+    /// "my windows". Nil unless the caller asks.
+    public var sightRecorder: MacSightRecorder?
 
     public init(
         host: any MacFourVerbsHost,
@@ -94,4 +97,19 @@ public struct MacFourVerbs: Sendable {
         self.appActivationSource = appActivationSource
     }
 
+}
+
+/// The last window one verb call saw: its app, its kind (AX role/subrole,
+/// never a title) and its top readout as the look redacted it.
+public final class MacSightRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var seen: (app: String, kind: String?, readouts: [String], before: [String])?
+    public init() {}
+    /// Every readout the look let through, ranked; `before` is the same app's
+    /// readouts one look earlier in this call (an act's pre-action look), so
+    /// the one the act changed can be told apart.
+    func record(app: String, kind: String?, readouts: [String]) {
+        lock.withLock { seen = (app, kind, readouts, seen?.app == app ? seen?.readouts ?? [] : []) }
+    }
+    public var last: (app: String, kind: String?, readouts: [String], before: [String])? { lock.withLock { seen } }
 }

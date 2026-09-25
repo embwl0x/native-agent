@@ -1298,8 +1298,8 @@ extension SwiftToolDispatcher {
                 try? stdout.fileHandleForReading.close()
                 try? stderr.fileHandleForReading.close()
 
-                let stdoutText = String(data: stdoutBuf.data, encoding: .utf8) ?? ""
-                let stderrText = String(data: stderrBuf.data, encoding: .utf8) ?? ""
+                let stdoutText = String(decoding: stdoutBuf.data, as: UTF8.self)
+                let stderrText = String(decoding: stderrBuf.data, as: UTF8.self)
                 let pipeTruncated = stdoutBuf.truncated || stderrBuf.truncated
                 let processExitCode = proc.terminationStatus
                 let maskedExitCode = processExitCode == 0

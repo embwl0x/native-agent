@@ -26,9 +26,10 @@ enum MomentsLaneSetting {
 /// onto the Trust Center presets that already own the policy write.
 ///
 /// ── THE MAPPING ─────────────────────────────────────────────────────────────
-///   Ask      → `TrustPolicyPreset.safe`     (access `read_only`, strict)
-///   Balanced → `TrustPolicyPreset.work`     (access `workspace`, outside deny)
-///   Trusted  → `TrustPolicyPreset.builder`  (access `workspace`, outside ask)
+///   ask      → Safe      `TrustPolicyPreset.safe`     (access `read_only`, strict)
+///   balanced → Work mode `TrustPolicyPreset.work`     (access `workspace`, outside deny)
+///   trusted  → Builder   `TrustPolicyPreset.builder`  (access `workspace`, outside ask)
+///   everything → Full Mac `TrustPolicyPreset.fullMac`
 ///
 /// Full Mac YOLO and Developer Mode are deliberately NOT reachable from here.
 /// They are a security-domain escalation with their own confirmation alert and
@@ -46,28 +47,23 @@ enum SetupPosture: String, CaseIterable, Identifiable, Sendable {
 
     var id: String { rawValue }
 
-    var title: String {
-        switch self {
-        case .ask: "Ask"
-        case .balanced: "Balanced"
-        case .trusted: "Trusted"
-        case .everything: "Everything"
-        }
-    }
+    /// The Trust page's own preset names, so one level has one name
+    /// everywhere (2026-09-23: this picker said Ask/Balanced/Trusted/Everything
+    /// for the very same four presets).
+    var title: String { preset.title }
 
-    /// One plain sentence that changes with the choice, spoken in the agent's
-    /// name. User, 2026-09-02: "Everything" has to read as what it is — full
-    /// run, no asking, nothing held back.
+    /// One plain sentence that changes with the choice, in the agent's own
+    /// voice. Same meaning as `TrustPolicyPreset.summary` on the Trust card.
     func sentence(_ voice: AgentVoice) -> String {
         switch self {
         case .ask:
-            "Asks before anything that changes something, and reads only what you point \(voice.object) at."
+            "I read the files you point me at. No changes, no Mac control."
         case .balanced:
-            "Asks before anything that changes something outside this app."
+            "I edit your approved workspaces. Nothing outside them, no shell."
         case .trusted:
-            "Works alone in your folders, and still asks before touching anything outside them."
+            "I edit your workspaces and ask before writing outside them. No shell."
         case .everything:
-            "Full run of this Mac. \(voice.Subject) can change anything within reach."
+            "Full run of this Mac: files anywhere, shell and system control, without asking."
         }
     }
 

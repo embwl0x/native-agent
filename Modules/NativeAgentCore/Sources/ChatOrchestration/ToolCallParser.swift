@@ -14,6 +14,9 @@ struct ParsedToolCall: Equatable {
     /// 2026-09-22: <invoke> parameters that were JSON-typed, as written, so a
     /// string-schema param given text "42" can be restored to the string.
     var invokeRawText: [String: String] = [:]
+    /// The block carried a result-shaped field (output/result/response) the
+    /// tool does not take; it was dropped, and the real result says so.
+    var wroteResult = false
 }
 
 // MARK: - Parsing

@@ -2,7 +2,79 @@ import Foundation
 
 /// Display copy only. Tool schemas and saved descriptions keep their original text.
 enum CapabilitiesPlainCopy {
+    /// One case style for every row: sentence case, proper nouns kept.
     static func title(for capability: CapabilityRecord) -> String {
+        sentenceCase(rawTitle(for: capability))
+    }
+
+    /// Records that are the same capability reached another way. The X
+    /// `_v1` actions call the same endpoint as their base action, signed with
+    /// OAuth1 instead of the OAuth2 bearer. Both tools stay registered; the
+    /// list shows one row.
+    static let displayAliases: [String: String] = [
+        "x.timeline_home_v1": "x.timeline_home",
+        "x.user_tweets_v1": "x.user_tweets",
+    ]
+
+    /// The records to list: an alias is dropped only when its base is there.
+    /// Built-in features first, then each service's actions together
+    /// (`slack.*`, `x.*`, …), by title within a group.
+    static func displayRecords(_ records: [CapabilityRecord]) -> [CapabilityRecord] {
+        let present = Set(records.compactMap(\.sourceId))
+        func service(_ record: CapabilityRecord) -> String {
+            let id = record.sourceId ?? ""
+            return id.contains(".") ? String(id.prefix { $0 != "." }).lowercased() : ""
+        }
+        return records.filter { record in
+            guard let source = record.sourceId, let base = displayAliases[source] else { return true }
+            return !present.contains(base)
+        }
+        .map { (service($0), title(for: $0), $0) }
+        .sorted { ($0.0, $0.1.lowercased()) < ($1.0, $1.1.lowercased()) }
+        .map(\.2)
+    }
+
+    /// "Slack List Channels" → "Slack list channels". Only a title written in
+    /// Title Case is lowered (anything else may carry names this can't know);
+    /// proper nouns, acronyms and mixed-case words (GitHub, iPhone, OAuth1)
+    /// keep their case.
+    static func sentenceCase(_ title: String) -> String {
+        var words = title.split(separator: " ", omittingEmptySubsequences: false).map(String.init)
+        // Title-ish when at least half the later words are capitalised
+        // ("X Following timeline"); mixed-case words (iPhone) don't count against.
+        let later = words.dropFirst().filter { $0.first?.isLetter == true && !smallWords.contains($0) }
+        let capitalised = later.filter { $0.first?.isUppercase == true }
+        let isTitleCase = !later.isEmpty && capitalised.count * 2 >= later.count
+        if isTitleCase {
+            for index in words.indices.dropFirst() {
+                let word = words[index]
+                guard word.first?.isUppercase == true else { continue }
+                let keeps = properNouns.contains(word)
+                    || word.dropFirst().contains(where: { $0.isUppercase || $0.isNumber })
+                    || !word.allSatisfy(\.isLetter)
+                if !keeps { words[index] = word.lowercased() }
+            }
+        }
+        if let first = words.first, let letter = first.first, letter.isLowercase,
+           !first.dropFirst().contains(where: \.isUppercase) {
+            words[0] = letter.uppercased() + first.dropFirst()
+        }
+        return words.joined(separator: " ")
+    }
+
+    /// Words kept as written inside a sentence-cased title.
+    private static let properNouns: Set<String> = [
+        "X", "I", "Mac", "Slack", "Notion", "Gmail", "Google", "Telegram", "Apple",
+        "Spotlight", "Safari", "Chrome", "Finder", "Shortcuts", "Calendar",
+        "Swift", "Python", "Markdown", "Codex", "Claude",
+    ]
+
+    /// Small words a Title Case string leaves lowercase.
+    private static let smallWords: Set<String> = [
+        "a", "an", "and", "as", "at", "by", "for", "from", "in", "of", "on", "or", "the", "to", "via", "with",
+    ]
+
+    private static func rawTitle(for capability: CapabilityRecord) -> String {
         switch capability.sourceId {
         case "mac_assistant_watch_setup": return "Watch for changes on your Mac"
         case "chat_sessions": return "Conversations"
@@ -17,12 +89,14 @@ enum CapabilitiesPlainCopy {
         case "mcp_runtime": return "Connected tools"
         case "research_browser": return "Web research"
         case "connectors": return "Connected apps and accounts"
-        case "trust_doctor": return "Trust and Diagnostics"
+        case "trust_doctor": return "Trust and diagnostics"
         case "nextgen_runtime": return "Feature readiness"
         case "native_mac_power": return "Mac controls"
         case "eval_release_ops": return "Update checks and support"
-        case "x.timeline_home_v1": return "X Following timeline"
-        case "x.user_tweets_v1": return "X user posts"
+        case "x.timeline_home", "x.timeline_home_v1": return "X Following timeline"
+        case "x.user_tweets", "x.user_tweets_v1": return "X user posts"
+        case "x.me", "x_me": return "Your X profile"
+        case "x.post_tweet", "x_post_tweet": return "Post on X"
         case "mac.jxa": return "Automate Mac apps with JavaScript"
         default: return (capability.name ?? capability.id).withoutStaleNextGenPhaseCopy
         }
@@ -107,6 +181,19 @@ enum CapabilitiesPlainCopy {
         case "mobile.notify", "mobile_notify": return "Send a notification to your iPhone."
         case "mac.notify", "mac_notify": return "Show a notification on your Mac."
         case "x.status", "x_status": return "Check your X connection."
+        // Per-action copy: the family line below ("Find conversations and
+        // exchange messages") was landing on every Slack row, status included.
+        case "slack.status", "slack_status": return "Check your Slack connection."
+        case "slack.list_channels", "slack_list_channels": return "List the Slack channels I can reach."
+        case "slack.search_messages", "slack_search_messages": return "Search messages in Slack."
+        case "slack.post_message", "slack_post_message": return "Post a message to a Slack channel."
+        case "slack.list_unreads": return "See which Slack channels have unread messages."
+        case "github.status", "github_status": return "Check your GitHub connection."
+        case "gmail.status", "gmail_status": return "Check your Gmail connection."
+        case "agentmail.status": return "Check my AgentMail connection."
+        case "calendar.status": return "Check your Google Calendar connection."
+        case "notion.status", "notion_status": return "Check your Notion connection."
+        case "markets.status": return "Check which market data sources are ready."
         case "x.me", "x_me": return "Read your X profile."
         case "x.search_recent", "x_search": return "Search recent posts on X."
         case "x.post_tweet": return "Publish a post on X."

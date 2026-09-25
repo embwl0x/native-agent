@@ -1357,6 +1357,33 @@ public actor ActiveToolsStore {
         }
     }
 
+    /// Whether `addLoaded(names)` would fit without evicting anything the
+    /// session holds (a preload among them). A search's automatic load asks
+    /// first and stands aside when it would not; an explicit load still may.
+    public func fitsWithoutEvicting(sessionId: String, names: Set<String>) async -> Bool {
+        var state = await load(sessionId: sessionId)
+        let held = state.activeTools
+        state.activeTools.formUnion(names)
+        Self.enforceCapInPlace(&state, protected: names)
+        guard Self.enforceFloorBoundInPlace(&state, protected: names)?.isEmpty == true else { return false }
+        return held.isSubset(of: state.activeTools)
+    }
+
+    /// `names` plus the rest of each one's family (ToolPreloadHeuristics.family)
+    /// that is `available`, when that fits without evicting anything held;
+    /// else plus the family's reading tools if those fit; else `names` alone.
+    public func withFamily(sessionId: String, names: Set<String>, available: Set<String>) async -> Set<String> {
+        let family = names.reduce(into: Set<String>()) { $0.formUnion(ToolPreloadHeuristics.family(of: $1)) }
+        // Siblings she already holds add nothing and stay out of the receipt.
+        let held = await load(sessionId: sessionId).activeTools.union(LLMCallContext.turnActiveTools ?? [])
+        let extra = family.intersection(available).subtracting(names).subtracting(held)
+        guard !extra.isEmpty else { return names }
+        if await fitsWithoutEvicting(sessionId: sessionId, names: names.union(extra)) { return names.union(extra) }
+        let reads = ToolPreloadHeuristics.familyReads(extra)
+        if !reads.isEmpty, await fitsWithoutEvicting(sessionId: sessionId, names: names.union(reads)) { return names.union(reads) }
+        return names
+    }
+
     @discardableResult
     public func addLoaded(
         sessionId: String,

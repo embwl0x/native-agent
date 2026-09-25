@@ -393,6 +393,11 @@ enum InlineInteractionResolver {
     /// what the chat card, the transcript row and every notification read — so
     /// an agent-made answer cannot be mistaken for a tap anywhere it shows.
     /// Nil for a tap, which needs no explaining.
+    ///
+    /// `setupError` is the owner's own refusal from the save the card just
+    /// ran (a token the service rejected, a sign-in that did not finish): the
+    /// card fails in those words instead of a generic "still isn't connected".
+    /// `note` is how the owner checked it, added to the settled receipt.
     @discardableResult
     static func complete(
         id: String,
@@ -401,6 +406,8 @@ enum InlineInteractionResolver {
         scope: InlineInteraction.Scope? = nil,
         expectedRevision: Int? = nil,
         attribution: String? = nil,
+        setupError: String? = nil,
+        note: String? = nil,
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) async throws -> InlineInteraction {
         let current = try await require(id: id, sessionID: sessionID, dataRoot: dataRoot)
@@ -409,9 +416,18 @@ enum InlineInteractionResolver {
             throw ResolveError.alreadySettled(current.state.name)
         }
 
-        let verification = await verify(
-            current, selection: selection, scope: scope, dataRoot: dataRoot
-        )
+        var verification: Verification
+        if let setupError {
+            verification = .failure(setupError)
+        } else {
+            verification = await verify(
+                current, selection: selection, scope: scope, dataRoot: dataRoot
+            )
+        }
+        if case .success(var outcome) = verification, let note, !note.isEmpty {
+            outcome.summary += " \u{00B7} \(note)"
+            verification = .success(outcome)
+        }
         switch verification {
         case .failure(let reason):
             // Not verified is NOT settled. The card keeps its control, the
@@ -525,6 +541,69 @@ enum InlineInteractionResolver {
         case failure(String)
     }
 
+    /// Settle a waiting card ONLY if its owner now says it is done; otherwise
+    /// write nothing. For re-checks while the person is away in System
+    /// Settings: a grant still in progress must not fail the card under them.
+    @discardableResult
+    static func completeIfVerified(
+        id: String,
+        sessionID: String,
+        dataRoot: URL = PersistenceCore.defaultDataRoot()
+    ) async -> Bool {
+        guard let current = await interaction(id: id, sessionID: sessionID, dataRoot: dataRoot),
+              current.state.isOpen
+        else { return true }
+        guard case .success = await verify(
+            current, selection: current.target, scope: nil, dataRoot: dataRoot
+        ) else { return false }
+        return (try? await complete(
+            id: id, sessionID: sessionID, selection: current.target, dataRoot: dataRoot
+        ))?.state.outcome != nil
+    }
+
+    /// READ SIDE ONLY. A card whose thing is already done — connected in the
+    /// sheet, on the Connectors page, by Agent, before a relaunch — draws as
+    /// the receipt its owner would give now. Nothing is written and nothing
+    /// resumes: the owner's live state is the answer, every read. Kinds that
+    /// need a pick (model, choose) are left to their own controls; Mail reads
+    /// macOS's live grant instead of its AppleScript probe.
+    static func liveProjection(
+        _ interaction: InlineInteraction,
+        dataRoot: URL
+    ) async -> InlineInteraction {
+        switch interaction.state {
+        case .pending, .running, .failed, .declined: break
+        default: return interaction
+        }
+        switch interaction.kind {
+        case .connector, .permission, .apiKey, .capability: break
+        default: return interaction
+        }
+        if interaction.kind == .connector, interaction.target == "mail" {
+            // Mail's own check is an AppleScript round trip; the cheap read is
+            // macOS's live Automation grant (never prompts; Mail not running
+            // reads as unknown, so the card stays), plus read access here.
+            guard await MacIntegrationPermissionStore(dataRoot: dataRoot).allows(MacIntegrationID.mail, mode: .read),
+                  await MacIntegrationView.probeAppleEventApp("Mail") == "granted"
+            else { return interaction }
+            return interaction.settled(.init(selection: "mail", summary: "Mail connected"),
+                                       at: interaction.settledAt ?? interaction.createdAt)
+        }
+        guard case .success(let outcome) = await verify(
+            interaction, selection: interaction.target, scope: nil, dataRoot: dataRoot
+        ) else { return interaction }
+        return interaction.settled(outcome, at: interaction.settledAt ?? interaction.createdAt)
+    }
+
+    private static func githubLogin(dataRoot: URL) -> String? {
+        let path = dataRoot.appendingPathComponent("connectors/github/auth.json")
+        guard let data = try? Data(contentsOf: path),
+              let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let login = object["login"] as? String, !login.isEmpty
+        else { return nil }
+        return login
+    }
+
     private static func verify(
         _ interaction: InlineInteraction,
         selection: String?,
@@ -544,6 +623,20 @@ enum InlineInteractionResolver {
                 }
                 return .success(.init(selection: "mail", summary: "Mail connected"))
             }
+            if interaction.target == "chrome" {
+                let status = await ChromeControlRuntime.shared.setupConnectionStatus()
+                guard status.enabled, status.state == .connected else {
+                    return .failure("Chrome\u{2019}s extension isn\u{2019}t connected yet: on chrome://extensions, "
+                        + InlineCardProjection.chromeSteps)
+                }
+                return .success(.init(selection: "chrome", summary: "Chrome connected"))
+            }
+            if interaction.target == "iphone" {
+                guard PairedPhoneStore.pairedCount() > 0 else {
+                    return .failure("No iPhone is paired yet: open NativeAgent on the iPhone, then choose Pair here when the codes match.")
+                }
+                return .success(.init(selection: "iphone", summary: "iPhone paired"))
+            }
             // Connectors' own derived auth state — the same field the
             // Connectors page shows. A pasted-but-invalid token does not read
             // as connected here, which is the point.
@@ -554,14 +647,20 @@ enum InlineInteractionResolver {
             }) else {
                 return .failure("\(interaction.title) isn't in Connectors on this Mac.")
             }
-            guard record.authState == "connected" else {
+            // Telegram's row says `configured` (a saved, enabled bot) rather
+            // than `connected`; with health ok that is its connected.
+            guard record.authState == "connected"
+                || (record.authState == "configured" && record.healthStatus == "ok")
+            else {
                 return .failure(
                     "\(InlineInteractionRegistry.connectorDisplayName(target, dataRoot: dataRoot)) still isn't connected."
                 )
             }
+            let account = target == "github" ? githubLogin(dataRoot: dataRoot).map { " \u{00B7} @\($0)" } : nil
             return .success(.init(
                 selection: target,
                 summary: "\(InlineInteractionRegistry.connectorDisplayName(target, dataRoot: dataRoot)) connected"
+                    + (account ?? "")
             ))
 
         case .permission:
@@ -614,6 +713,9 @@ enum InlineInteractionResolver {
                 return .failure(
                     "Still not allowed: \(InlineInteractionRegistry.englishList(names))."
                 )
+            }
+            if let blocked = SystemPermissionPreflight.cardBlockReason(interaction.allTargets, mode: interaction.mode) {
+                return .failure(blocked)
             }
             let names = interaction.allTargets.map {
                 InlineInteractionRegistry.macCapabilityDisplayName($0)
@@ -669,17 +771,23 @@ enum InlineInteractionResolver {
         case .apiKey:
             // The provider's own readiness, as Providers reports it. A key
             // that was typed but rejected is not ready, and does not settle.
+            // A provider you sign into counts as connected through either
+            // door: the pasted key's own row, or the signed-in account's.
+            let target = InlineInteractionRegistry.canonicalProviderID(interaction.target)
+            let doors = [target] + [InlineInteractionRegistry.providerSignIn(for: target)?.oauthProviderID]
+                .compactMap { $0 }
             let providers = (try? await NativeClient(baseURL: "").listProviders()) ?? []
-            guard let provider = providers.first(where: { $0.provider_id == interaction.target })
-            else {
+            let rows = doors.compactMap { id in providers.first { $0.provider_id == id } }
+            guard let first = rows.first else {
                 return .failure("No provider named \(interaction.target).")
             }
-            guard provider.auth_status.state.lowercased() == "ready" else {
-                return .failure("\(provider.display_name) still isn't ready.")
+            guard let provider = rows.first(where: { $0.auth_status.state.lowercased() == "ready" }) else {
+                return .failure("\(first.display_name) still isn't ready.")
             }
+            let model = provider.default_model ?? provider.models.first?.id
             return .success(.init(
                 selection: provider.provider_id,
-                summary: "\(provider.display_name) ready"
+                summary: model.map { "Connected \u{00B7} \($0) ready" } ?? "\(provider.display_name) ready"
             ))
 
         case .capability:
@@ -692,6 +800,9 @@ enum InlineInteractionResolver {
                   block[flag.policyKey] == .bool(true)
             else {
                 return .failure("\(flag.displayName) is still off.")
+            }
+            if let blocked = SystemPermissionPreflight.cardBlockReason([flag.id], mode: nil) {
+                return .failure(blocked)
             }
             return .success(.init(
                 selection: flag.id,

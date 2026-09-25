@@ -40,6 +40,11 @@ final class PairedPhoneStore: ObservableObject {
         return rows
     }
 
+    /// Phones paired right now, read from disk (a setup card's done-check).
+    static func pairedCount() -> Int {
+        ((try? shared.read()) ?? []).filter { $0.status == .paired }.count
+    }
+
     func reload() {
         do { phones = try read() } catch { message = StoreError.unavailable.localizedDescription }
     }

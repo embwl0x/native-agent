@@ -159,17 +159,11 @@ extension SwiftNativeChatOrchestrationClient {
             ?? UUID().uuidString
         ChatTurnExecution.current?.bindHistoryRunID(runId)
         let outputMilestoneGate = TurnLifecycleFirstOutputGate()
-        // B7 (review round 2, MED): derive + clear the per-session cancel flag
-        // AT TURN ACCEPT — before the user append and autocompact awaits — so
-        // the window where a cross-process Stop meant for THIS turn could be
-        // wiped is effectively zero, while a stale flag from a prior turn still
-        // cannot kill this one. The loop polls the same path per iteration.
-        let cancelFlagPath = dataRoot
-            .appendingPathComponent("chat", isDirectory: true)
-            .appendingPathComponent("sessions", isDirectory: true)
-            .appendingPathComponent(resolvedSession, isDirectory: true)
-            .appendingPathComponent("cancelled.flag")
-        try? FileManager.default.removeItem(at: cancelFlagPath)
+        // B7: derive the per-session cancel flag AT TURN ACCEPT, keyed by this
+        // run, so a stale flag from a prior turn cannot kill this one and a
+        // Stop naming this run can (ChatCancelFlag).
+        let cancelFlagPath = ChatCancelFlag.accept(dataRoot: dataRoot, sessionId: resolvedSession, runId: runId)
+        defer { ChatCancelFlag.finish(cancelFlagPath) }
 
         // Native vision: convert image attachments to per-turn DYNAMIC image
         // content blocks on the CURRENT user message. Raw `message` text goes
@@ -744,17 +738,10 @@ extension SwiftNativeChatOrchestrationClient {
             ?? UUID().uuidString
         ChatTurnExecution.current?.bindHistoryRunID(runId)
         let outputMilestoneGate = TurnLifecycleFirstOutputGate()
-        // #19 + B7 review round 2 (MED): derive + clear the per-session cancel
-        // flag AT TURN ACCEPT — before the user append / autocompact awaits —
-        // so the window where a Stop meant for THIS turn could be wiped is
-        // effectively zero, while a stale flag from a prior turn still cannot
-        // kill this one. Kept in lockstep with the non-streaming sibling.
-        let cancelFlagPath = dataRoot
-            .appendingPathComponent("chat", isDirectory: true)
-            .appendingPathComponent("sessions", isDirectory: true)
-            .appendingPathComponent(resolvedSession, isDirectory: true)
-            .appendingPathComponent("cancelled.flag")
-        try? FileManager.default.removeItem(at: cancelFlagPath)
+        // #19 + B7: derive the run-keyed cancel flag AT TURN ACCEPT.
+        // Kept in lockstep with the non-streaming sibling.
+        let cancelFlagPath = ChatCancelFlag.accept(dataRoot: dataRoot, sessionId: resolvedSession, runId: runId)
+        defer { ChatCancelFlag.finish(cancelFlagPath) }
 
         // 2026-09-06: same Trust ▸ Multimodal gates as the non-streaming lane —
         // vision off means the images never become blocks, and an attached

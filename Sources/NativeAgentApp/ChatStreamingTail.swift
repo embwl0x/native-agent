@@ -76,3 +76,48 @@ extension View {
         background(ChatStreamingTailObserver(messageID: messageID, enabled: enabled, onChanged: onChanged))
     }
 }
+
+/// The streaming reply's raw text, one `Text` per paragraph.
+///
+/// User, 2026-09-23: one `Text` holding the whole growing reply was re-typeset
+/// from its first word on every published chunk (~1 ms at the start of a
+/// 1,500-word reply, ~70 ms at the end), so a long reply pinned the main
+/// thread at 14 chunks a second and starved its own stream. Split at blank
+/// lines, finished paragraphs are unchanged `Text`s that keep their cached
+/// layout and only the last one re-lays out (~2 ms at the end).
+///
+/// Same pixels: the dropped `\n` of each `\n\n` becomes the stack's gap, which
+/// is the environment's own line spacing, so the break is the one the single
+/// `Text` drew. The settled reply does not come through here.
+struct StreamingParagraphText: View {
+    let text: String
+    @Environment(\.lineSpacing) private var lineSpacing
+
+    var body: some View {
+        let paragraphs = Self.paragraphs(text)
+        VStack(alignment: .leading, spacing: lineSpacing) {
+            // Positional ids: paragraphs only append while a reply streams,
+            // so a finished one keeps its id and its layout.
+            ForEach(paragraphs.indices, id: \.self) { index in
+                Text(paragraphs[index])
+            }
+        }
+    }
+
+    /// Splits at each `\n\n`, dropping its first `\n`; the second stays as the
+    /// next paragraph's leading empty line.
+    static func paragraphs(_ text: String) -> [Substring] {
+        var out: [Substring] = []
+        var start = text.startIndex
+        var from = text.startIndex
+        while let range = text[from...].range(of: "\n\n") {
+            if range.lowerBound > start {
+                out.append(text[start..<range.lowerBound])
+                start = text.index(after: range.lowerBound)
+            }
+            from = range.upperBound
+        }
+        out.append(text[start...])
+        return out
+    }
+}

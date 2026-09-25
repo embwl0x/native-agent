@@ -80,10 +80,20 @@ public final class CanonicalToolNameDispatcher: ToolDispatchClient, @unchecked S
         let result = try await inner.withToolArguments(tool: Self.canonical(tool), input: input) { input in
             try await dispatchNormalized(tool: tool, input: input, surface: surface)
         }
+        // A released Chrome tab leaves her screen's windows and home too.
+        if case .object(let fields) = result, fields["tool"] == .string("browser.chrome_release"),
+           fields["released"] == .bool(true), case .string(let lease)? = fields["leaseId"], let root = peerDataRoot,
+           let scope = ChatToolSessionContext.verifiedSessionId ?? conversationScope, !scope.isEmpty {
+            let tab: Int64? = if case .int(let id)? = fields["tabId"] { id } else { nil }
+            await AgentWorkspaceNavigation.shared.forgetTab(lease: lease, tabID: tab,
+                                                            key: root.standardizedFileURL.path + "\u{0}" + scope)
+        }
         // Attach to structured owner results so every provider lane receives
         // the same replayable receipt, without altering scalar/file contents,
         // adding synthetic chat turns, or changing the cached prompt prefix.
-        guard !AgentWorkspaceArrivals.insideWorkspaceDispatch,
+        // The person's own thread send has no agent reading its result, so it
+        // must not use up her arrival notices.
+        guard !AgentWorkspaceArrivals.insideWorkspaceDispatch, PersonInitiatedSend.current == nil,
               case .object(var fields) = result,
               fields["workspace_arrivals"] == nil,
               let notice = await AgentWorkspaceArrivals.pending(dataRoot: peerDataRoot,
@@ -105,21 +115,46 @@ public final class CanonicalToolNameDispatcher: ToolDispatchClient, @unchecked S
             guard case .object(let prepared) = admission,
                   prepared["status"] == .string("prepared"),
                   prepared["execution"] == .string("requires_workspace_runtime") else { return admission }
-            return try await AgentWorkspaceArrivals.$insideWorkspaceDispatch.withValue(true) {
+            // Phase 3: workspace looks keep their own Mac frame slot.
+            let result = try await MacLookFrameStore.$source.withValue("workspace") {
+              try await AgentWorkspaceArrivals.$insideWorkspaceDispatch.withValue(true) {
               try await AgentWorkspaceReadiness.withSnapshot(dataRoot: root) {
               try await AgentWorkspace.dispatch(input: input, scope: scope, dataRoot: root,
                 catalog: { try await self.inner.listAvailableToolSchemas() }) { name, arguments in
+                // Her own app is never read through the workspace's Mac verbs.
+                if let refusal = await HerScreen.ownAppRefusal(tool: name, input: arguments) { return refusal }
                 let scoped = ChatToolSessionInjection.apply(toolName: name, input: arguments, sessionId: scope)
                 return try await self.dispatch(tool: name, input: scoped, surface: surface)
               }
               }
+              }
             }
+            // Phase 3: opening a place loads its whole tool group, so her next
+            // call needs no tool_load round trip. Loading grants nothing; every
+            // call still clears its own gates.
+            let key = root.standardizedFileURL.path + "\u{0}" + scope
+            if let group = Self.placeToolGroup(await AgentWorkspaceNavigation.shared.current(key: key)) {
+                _ = try? await dispatchExact(tool: "tool_load", input: ChatToolSessionInjection.apply(
+                    toolName: "tool_load", input: ["category": .string(group)], sessionId: scope), surface: surface)
+            }
+            return result
         }
         // Translate the conversational facade before every admission owner.
         // Both the facade policy and the actual executor policy remain visible.
         // Dotted facade aliases are deliberately unsupported: this context has
         // two policy identities, not three.
         let input = try namingSavedContact(tool, input)
+        // Agent 09-24: "agent_message connects if needed and hands back the
+        // thread, so it's one call." A known agent that is not a contact yet
+        // is connected first, through agent_connect's own gates and card.
+        if tool == "agent_message", PersonInitiatedSend.current == nil,
+           case .string(let name)? = input["agent"], !name.contains(":"),
+           !["codex", "claude", "omp", "claude"].contains(name.lowercased()),
+           let row = AgentHostDirectory.row(named: name), let root = peerDataRoot,
+           // "Grok" while "Grok Bot" is saved means that contact, not a second route.
+           !((try? AgentPeerStore(dataRoot: root).list()) ?? []).contains(where: { $0.name.localizedCaseInsensitiveContains(name) }) {
+            return try await connectThenMessage(row: row, input: input, surface: surface)
+        }
         if Self.canonical(tool) == "bot_run_once", let root = peerDataRoot,
            let scope = ChatToolSessionContext.verifiedSessionId ?? conversationScope, !scope.isEmpty {
             return try await BotRunConversation.dispatch(input: input, surface: surface, scope: scope, dataRoot: root) { _, input in
@@ -135,6 +170,57 @@ public final class CanonicalToolNameDispatcher: ToolDispatchClient, @unchecked S
                 }
         }
         return try await dispatchExact(tool: tool, input: input, surface: surface)
+    }
+
+    /// Connect by name, then send the message to the saved contact in the same
+    /// call. Not connected afterwards: the connect's own answer, and nothing sent.
+    private func connectThenMessage(row: AgentHostRow, input: [String: JSONValue], surface: String) async throws -> JSONValue {
+        var request: [String: JSONValue] = ["name": .string(row.displayName)]
+        for key in ["session_id", "__session_id"] { request[key] = input[key] }
+        var connect: [String: JSONValue]
+        do {
+            let result = try await dispatch(tool: "agent_connect", input: request, surface: surface)
+            if case .object(let fields) = result { connect = fields } else { connect = ["result": result] }
+        } catch {
+            connect = ["status": .string("failed"), "detail": .string(ChatToolOutcome.errorMessage(error))]
+        }
+        // Send only to the contact this connect made or confirmed, never to
+        // another saved peer that happens to share a name.
+        var handle: String?
+        if case .string(let status)? = connect["status"], ["configured", "connected", "already_configured", "set up"].contains(status) {
+            if case .object(let contact)? = connect["contact"], case .string(let agent)? = contact["agent"] { handle = agent }
+            else if status == "set up", let root = peerDataRoot,
+                    let peer = ((try? AgentPeerStore(dataRoot: root).list()) ?? []).first(where: {
+                        $0.transport == .grokBot && $0.name.caseInsensitiveCompare(row.displayName) == .orderedSame }) {
+                handle = "peer:" + peer.id
+            }
+        }
+        var named = input
+        guard let handle, handle.hasPrefix("peer:") else {
+            connect["sent"] = .bool(false)
+            connect["message"] = .string("\(row.displayName) is not connected, so the message was not sent. Once it is, send it again with agent_message.")
+            return .object(connect)
+        }
+        named["agent"] = .string(handle)
+        var result = try await dispatchNormalized(tool: "agent_message", input: named, surface: surface)
+        if case .object(var fields) = result {
+            fields["connected_first"] = .object(["status": connect["status"] ?? .string("unknown"),
+                                                 "detail": connect["detail"] ?? connect["state_detail"] ?? .null])
+            result = .object(fields)
+        }
+        return result
+    }
+
+    /// The tool group a place on her screen works with, if it has one.
+    static func placeToolGroup(_ location: AgentWorkspaceLocation) -> String? {
+        switch location {
+        case .page(let inner, _): return placeToolGroup(inner)
+        case .browserBookmark, .record("browser.chrome_snapshot", _, _): return "browser"
+        case .area(let id):
+            return ["browser": "browser", "research": "research", "mail": "mail", "calendar": "calendar",
+                    "today": "calendar", "messages": "messages", "gmail": "gmail", "agentmail": "agentmail", "notes": "notes", "contacts": "contacts"][id]
+        default: return nil
+        }
     }
 
     private func dispatchExact(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
@@ -1320,6 +1406,30 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
             decision = .requireApproval(
                 reason: PeerTurnEffectPolicy.approvalReason(tool: tool, requester: requester)
             )
+        }
+        // THE PERSON'S OWN SEND. Typed in a contact's thread and sent by their
+        // click, it needs no card for the send itself. Anything more (running a
+        // program on this Mac, a Trust refusal) is said plainly, never carded.
+        if PersonInitiatedSend.current?.claim(tool: tool, input: input, surface: surface) == true {
+            let name: String = {
+                guard case .string(let agent)? = input["agent"], agent.hasPrefix("peer:") else { return "This contact" }
+                return peerDisplayName(peerID: String(agent.dropFirst(5))) ?? "This contact"
+            }()
+            switch decision {
+            case .allow: break
+            case .requireApproval where Set(envelope.capabilities).isSubset(of: PersonInitiatedSend.sendOnly):
+                try? await securityCenter.record(Self.securityEnvelope(envelope, decision: .allow,
+                    reason: "person-initiated send from a contact thread"))
+                decision = .allow
+            case .requireApproval:
+                try? await securityCenter.record(Self.securityEnvelope(envelope, decision: .ask,
+                    reason: "person-initiated send needs more than the send"))
+                return PersonInitiatedSend.refusal("\(name) runs on this Mac, and your Trust setting asks before starting it. Nothing was sent.")
+            case .deny:
+                try? await securityCenter.record(Self.securityEnvelope(envelope, decision: .block,
+                    reason: "person-initiated send refused by Trust"))
+                return PersonInitiatedSend.refusal("Your Trust settings don't allow messaging \(name) right now. Nothing was sent.")
+            }
         }
         switch decision {
         case .allow:

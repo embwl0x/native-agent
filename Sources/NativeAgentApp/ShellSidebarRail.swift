@@ -29,7 +29,7 @@ struct ShellRailItem: View {
             HStack(spacing: 5) {
                 Text(item.shellRailTitle)
                     .font(ShellType.rail)
-                    .foregroundStyle(isSelected ? (item == .bots ? NativeAgentShell.needsYou : NativeAgentShell.text)
+                    .foregroundStyle(isSelected ? NativeAgentShell.text
                         : (hovering ? NativeAgentShell.text.opacity(0.75) : NativeAgentShell.secondary))
                     // The hover fade belongs to the word and nothing else. It
                     // used to sit on the whole Button, one modifier outside the
@@ -67,7 +67,7 @@ struct ShellRailItem: View {
                 // row keeps its own bar and they cross-fade: travel is exactly
                 // what that setting asks us to drop.
                 let bar = RoundedRectangle(cornerRadius: 1, style: .continuous)
-                    .fill(item == .bots ? NativeAgentShell.needsYou : NativeAgentShell.text)
+                    .fill(NativeAgentShell.text)
                     .frame(width: 2, height: 20)
                     .padding(.leading, NativeAgentShellLayout.barInset)
                 if reduceMotion {
@@ -92,7 +92,22 @@ struct ShellRailItem: View {
     }
 }
 
-/// Two quiet groups on glass, with Settings at the foot.
+/// Keyboard focus on a rail word: a rounded ring in the haze's edge light,
+/// inset like the plate's own corners, instead of the square system ring.
+struct ShellRailFocusRing: View {
+    @AppStorage(HazeColor.key) private var hazeRaw = HazeColor.defaultValue.rawValue
+
+    var body: some View {
+        RoundedRectangle(cornerRadius: 10, style: .continuous)
+            .strokeBorder(HazeColor(stored: hazeRaw).edgeLight, lineWidth: 1.5)
+            .padding(.horizontal, 4)
+            .padding(.vertical, 4)
+            .allowsHitTesting(false)
+            .accessibilityHidden(true)
+    }
+}
+
+/// Two quiet groups on a floating glass plate, with Settings at the foot.
 struct ShellSidebarRail: View {
     @Binding var selection: SidebarItem
     /// Every item except the last renders at the top; the last (Settings) is
@@ -110,6 +125,10 @@ struct ShellSidebarRail: View {
     static let selectionBarID = "shell.rail.selection-bar"
     @Namespace private var selectionBar
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    /// Regular, like the composer: never mix clear and regular on one screen
+    /// (WWDC25 219). One token if the pixels say otherwise.
+    static let plateGlass: Glass = .regular
 
     var body: some View {
         VStack(spacing: 4) {
@@ -147,45 +166,40 @@ struct ShellSidebarRail: View {
         // share one first-text baseline at window y 72 (the 28pt title strip
         // plus 44 — the 24pt unit's nearest whole beat). At 13pt medium
         // centred in a 44pt row the word's baseline sits 27.3 below the top
-        // of the stack, so 14 lands it on 72.
-        .padding(.top, 14)
-        .padding(.bottom, 14)
+        // of the stack, so 14 lands it on 72 — now 10 of that outside the
+        // plate and 4 inside it. Settings keeps its 14 from the bottom the
+        // same way.
+        .padding(.top, 14 - NativeAgentShellLayout.railPlateInset)
+        .padding(.bottom, 14 - NativeAgentShellLayout.railPlateInset)
         .frame(width: NativeAgentShellLayout.railWidth)
         .frame(maxHeight: .infinity)
-        // User, 2026-09-03: the rail is navigation — the functional layer — so
-        // it wears real Liquid Glass now. The NSVisualEffectView that used to
-        // sit under it is gone: an AppKit effect view beneath a sidebar stops
-        // the glass showing through, which is why the coat kept getting
-        // heavier and the rail kept not looking like glass. What is left is a
-        // hint of the rail's own tone, nothing like a coat, so the rail reads
-        // more transparent than the room beside it. Reduce transparency takes
-        // the fill opaque and the glass to .identity: that setting asks for
-        // more opacity, never less.
-        // User, 2026-09-03: "it should all look like one." The rail is the
-        // same sheet as the room, same material, same coat, so the desktop
-        // bleeds through it exactly as it does through the chat; its own
-        // glass plate read flatter than the room beside it. The column keeps
-        // a hairline on its trailing edge so you can still see where it ends.
-        // The sheet is the window's (ShellFrame); the rail is transparent over
-        // it and keeps only its hairline.
-        .overlay(alignment: .trailing) {
-            Rectangle()
-                .fill(NativeAgentShell.hairline)
-                .frame(width: 1)
-                .ignoresSafeArea()
+        // User, 2026-09-23 ("alive glass"): the rail alone floats — a rounded
+        // plate of glass inset from the window's top (below the traffic
+        // lights), bottom and leading edges. This changes the 2026-09-03 "one
+        // sheet, not three plates" rule for the rail only: the list column and
+        // every page stay transparent over the window's one sheet
+        // (ShellFrame). Agent, same day: the plate must read as that same
+        // sheet, just shaped — no seam, no brightness jump — so it wears
+        // `.clear` glass (the edge and the lensing, none of `.regular`'s frost
+        // over a room that is already coated) and no drawn border; the
+        // trailing hairline is gone because the plate's edge is the boundary.
+        // Reduce transparency: `.identity`, the flat rail over the opaque room.
+        // While she thinks before replying, a shimmer drifts through it
+        // (ThinkingGlow, a leaf).
+        .background {
+            ThinkingGlow(kind: .shimmer, cornerRadius: NativeAgentShellLayout.railPlateRadius)
         }
+        .glassEffect(
+            reduceTransparency ? .identity : Self.plateGlass,
+            in: RoundedRectangle(cornerRadius: NativeAgentShellLayout.railPlateRadius, style: .continuous)
+        )
+        .padding([.top, .bottom, .leading], NativeAgentShellLayout.railPlateInset)
+        .padding(.trailing, 6)
         // Agent, 2026-09-02: the 1px light hairline that used to sit on the
         // rail's top edge is gone. With the title bar transparent the rail now
         // reaches the window's own edge, so that line drew itself across the
         // traffic-light row — a strip, which is the thing the shell does not
         // paint on glass.
-        // Agent, 2026-09-02: and the trailing hairline down the rail/list edge
-        // is gone too. A column boundary in this shell is a material change,
-        // not a drawn rule — over a live desktop the line was the one place
-        // the wallpaper's bleed crossed a seam and stopped dead. The rail's
-        // coat (NativeAgentShell.rail) and the list's (.list) already differ;
-        // if they ever read as one column the answer is to take the rail's
-        // coat a step further off, never to put the line back.
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Places")
     }

@@ -1012,9 +1012,15 @@ extension SwiftNativeMacControl {
         // Chrome's setter returns kAXErrorCannotComplete and the flag STILL
         // takes effect, so the status is discarded and the READ-BACK is the
         // evidence. A false read-back is reported, not treated as fatal.
-        let readsBack = SystemMacAXElementSource.setEnhancedAccessibility(pid: pid, enabled: true)
+        // Her-screen Phase 4 — ours to clear only if WE set it: a flag already
+        // on (a screen reader, the app itself) is left exactly as found.
+        let ours = await MacChromiumAccessibilityState.shared.current() == pid
+        let preexisting = !ours && SystemMacAXElementSource.enhancedAccessibilityIsOn(pid: pid)
+        let readsBack = preexisting
+            || SystemMacAXElementSource.setEnhancedAccessibility(pid: pid, enabled: true)
         seam["enhanced_ax_set"] = .bool(readsBack)
-        await MacChromiumAccessibilityState.shared.note(pid: pid)
+        seam["enhanced_ax_preexisting"] = .bool(preexisting)
+        if !preexisting { await MacChromiumAccessibilityState.shared.note(pid: pid) }
 
         if !MacChromiumAccessibility.hasWebArea(read?.snapshot) {
             let deadline = now().addingTimeInterval(MacChromiumAccessibility.settleSeconds)
@@ -1120,6 +1126,34 @@ extension SwiftNativeMacControl {
             anchoredApp = app
         }
 
+        // Her-screen Phase 4 — a background act is over: put the app's
+        // enhanced-AX flag back, only if this module set it. No walk.
+        if body["release_enhanced_ax"] == .bool(true) {
+            var released = false
+            var stillOn = false
+            #if canImport(ApplicationServices) && os(macOS)
+            if let pid = anchorPid, accessibilitySource is SystemMacAXElementSource,
+               await MacChromiumAccessibilityState.shared.current() == pid {
+                // The read-back is the evidence. Still on ⇒ keep the ownership
+                // record so the next release (or the lazy clear) tries again.
+                stillOn = SystemMacAXElementSource.setEnhancedAccessibility(pid: pid, enabled: false)
+                if !stillOn { await MacChromiumAccessibilityState.shared.note(pid: nil) }
+                released = !stillOn
+            }
+            #endif
+            return MacControlResult(
+                ok: true,
+                action: "look",
+                output: .object([
+                    "released_enhanced_ax": .bool(released),
+                    "enhanced_ax_still_on": .bool(stillOn),
+                ]),
+                error: nil,
+                durationMs: Int(now().timeIntervalSince(started) * 1000),
+                viaSwift: true
+            )
+        }
+
         if grade == "stare" {
             // The SAME payload mac_ax_tree returns, from the same handler.
             let tree = handleAXTree(body)
@@ -1164,14 +1198,20 @@ extension SwiftNativeMacControl {
             // frontmost window": the app is running but has no readable window
             // (minimized, or all windows closed). Saying the frontmost thing
             // would describe a window that was never asked about.
-            let status = anchoredApp == nil ? "no_frontmost_window" : "no_window_in_app"
+            // A locked session publishes no app windows at all — say THAT,
+            // not "minimized or closed".
+            let locked = MacScreenLock.isLocked()
+            let status = locked ? "mac_locked"
+                : anchoredApp == nil ? "no_frontmost_window" : "no_window_in_app"
             var output: [String: JSONValue] = [
                 "trusted": .bool(true),
                 "grade": .string(grade),
                 "status": .string(status),
                 "error": .string(status),
             ]
-            if let anchoredApp {
+            if locked {
+                output["message"] = .string(MacScreenLock.reply)
+            } else if let anchoredApp {
                 output["requested_app"] = .string(anchoredApp.name)
                 output["message"] = .string(
                     "\(anchoredApp.name) is running but has no window I can read right now "
@@ -1197,12 +1237,34 @@ extension SwiftNativeMacControl {
             maxAffordances: Self.intValue(body, "max_affordances") ?? MacPerceptionCompiler.maxAffordances
         )
 
+        // Her-screen — the four verbs (`app_map`) get EVERY affordance the look
+        // kept (its 60/400 limits), never the byte-trimmed subset: the JSON is
+        // theirs to resolve names against, and what she reads is their own
+        // capped text render. The window's KIND (role/subrole, never a title)
+        // rides in the envelope so a verified act can be remembered.
+        let fourVerbs = body["app_map"] == .bool(true) && grade == "look"
+        let windowKind = fourVerbs
+            ? MacAppMaps.windowKind(role: read.windowIdentity?.role, subrole: read.windowIdentity?.subrole)
+            : nil
+
         // Render FIRST, so the frame mints handles only for the rows she will
         // actually see (the byte budget may trim the tail) — "handles valid for
         // this frame_id" means the handles in THIS payload. A glance shows no
         // rows, so it mints every affordance and says how many are addressable.
         let capturedAt = now()
         let frameId = UUID().uuidString
+        // Her-screen Phase 4 — for an anchored look, WHO is in front (pid) and
+        // its key window, so a `front:true` act can put exactly that back.
+        // Never an AX read of our own process.
+        let frontmostAppJSON: JSONValue = {
+            guard anchoredApp != nil, let front = accessibilitySource.frontmostApp(),
+                  case .object(var object) = front.toJSON() else { return .null }
+            if front.processIdentifier != getpid(),
+               let window = accessibilityActSource.focusedWindow(pid: front.processIdentifier) {
+                object["window"] = window.identity.toJSON()
+            }
+            return .object(object)
+        }()
 
         /// Everything except the byte accounting, so the S5 loop below can
         /// serialize the COMPLETE object — envelope, `how_to_read` and all —
@@ -1226,6 +1288,9 @@ extension SwiftNativeMacControl {
                     } ?? true
                 ),
                 "anchored": .bool(anchoredApp != nil),
+                // Her-screen Phase 4 — whose app IS in front, so a `front:true`
+                // act can put it back afterwards.
+                "frontmost_app": frontmostAppJSON,
                 // Agent round 2 — `max_nodes`/`max_depth` read as "silently
                 // ignored" because nothing in the payload said what they
                 // resolved to. They are honored and CLAMPED (a caller may only
@@ -1248,6 +1313,7 @@ extension SwiftNativeMacControl {
             if let windowFrame = read.windowIdentity?.frame {
                 output["window_frame"] = windowFrame.toJSON()
             }
+            if let windowKind { output["window_kind"] = .string(windowKind) }
             if grade == "glance" {
                 output["glance"] = .string(percept.glanceLine())
                 output["addressable_handles"] = .int(Int64(percept.affordances.count))
@@ -1279,9 +1345,11 @@ extension SwiftNativeMacControl {
             (try? JSONValue.object(object).serializedData(pretty: false).count) ?? 0
         }
 
-        var rendering: MacLookPercept.LookRendering? = grade == "look" ? percept.lookJSON() : nil
+        var rendering: MacLookPercept.LookRendering? = grade == "look"
+            ? (fourVerbs ? percept.lookJSON(byteBudget: 1 << 30) : percept.lookJSON())
+            : nil
         var output = envelopeJSON(rendering)
-        if grade == "look" {
+        if grade == "look", !fourVerbs {
             // gpt-5.5 round-2 S5 — the EXACT final cap. The old code held back a
             // fixed 768-byte reserve for the envelope and then measured; a
             // window with a long title and a fat `seam` blew straight through

@@ -67,12 +67,18 @@ extension SwiftToolDispatcher {
     /// surface the runner's honest typed error as a `failed` envelope the tool
     /// loop classifies as failed (not a crash), mirroring impl_commit_memory.
     func impl_workshop_submit(input: [String: JSONValue]) async throws -> JSONValue {
-        let text = try requireString(input, "text")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        // 2026-09-24: an exact copy says what it is by source and destination;
+        // blank text used to come back as "an access rule blocks it".
+        var text = (optionalString(input, "text") ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        if text.isEmpty, let source = optionalString(input, "source"), !source.isEmpty,
+           let destination = optionalString(input, "destination"), !destination.isEmpty {
+            text = "Copy \(source) to \(destination)"
+        }
         guard !text.isEmpty else {
-            throw AutonomyGateError.toolDenied(
-                reason: "SwiftToolDispatcher: workshop_submit requires non-empty 'text'"
-            )
+            return .object([
+                "status": .string("failed"),
+                "reason": .string("Say what the task is in text; nothing was started."),
+            ])
         }
         // `context` is an optional short title; default to a prefix of the
         // objective (the runner itself truncates title to 160 / objective to

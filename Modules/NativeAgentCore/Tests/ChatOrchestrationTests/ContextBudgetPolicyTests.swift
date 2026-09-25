@@ -159,22 +159,28 @@ struct ContextBudgetFloorRegimeTests {
         )
     }
 
-    @Test func knownModelsResolveTheirRealWindow() {
-        #expect(ContextBudgetPolicy.windowTokens(forModel: "kimi-k3") == 1_048_576)
-        #expect(ContextBudgetPolicy.windowTokens(forModel: "claude-opus-5") == 1_000_000)
-        #expect(ContextBudgetPolicy.windowTokens(forModel: "  Kimi-K3  ") == 1_048_576)
+    /// A model's raw window as budgets see it: her effective window on it.
+    private func herWindow(_ native: Int) -> Int? {
+        ChatSessionAutocompactionConfig.productionDefault()
+            .effectiveWindowTokens(nativeWindowTokens: native)
+    }
+
+    @Test func knownModelsResolveHerWindow() {
+        #expect(ContextBudgetPolicy.windowTokens(forModel: "kimi-k3") == herWindow(1_048_576))
+        #expect(ContextBudgetPolicy.windowTokens(forModel: "claude-opus-5") == herWindow(1_000_000))
+        #expect(ContextBudgetPolicy.windowTokens(forModel: "  Kimi-K3  ") == herWindow(1_048_576))
     }
 
     @Test func exactProviderTupleSelectsVerifiedWindow() throws {
         #expect(ContextBudgetPolicy.windowTokens(
             forModel: "gpt-5.6-sol", providerID: "openai"
-        ) == 400_000)
+        ) == herWindow(400_000))
         #expect(ContextBudgetPolicy.windowTokens(
             forModel: "gpt-5.6-sol", providerID: "openai_oauth_direct"
-        ) == 372_000)
+        ) == herWindow(372_000))
         #expect(ContextBudgetPolicy.windowTokens(
             forModel: "anthropic/claude-sonnet-5", providerID: "openrouter"
-        ) == 1_000_000)
+        ) == herWindow(1_000_000))
         #expect(ContextBudgetPolicy.windowTokens(
             forModel: "anthropic/claude-sonnet-5", providerID: "anthropic"
         ) == nil)
@@ -197,7 +203,7 @@ struct ContextBudgetFloorRegimeTests {
         )
         #expect(ContextBudgetPolicy.windowTokens(
             forModel: "vendor/live-model", providerID: "openrouter", dataRoot: root
-        ) == 654_321)
+        ) == herWindow(654_321))
     }
 
     /// The RENDERED block, not just the numbers: a floor-regime render must be
@@ -260,7 +266,7 @@ struct ContextBudgetScalingTableTests {
 
         let mid = ContextBudgetPolicy.resolve(windowTokens: 200_000, surface: "chat")
         #expect(mid.isDerived)
-        #expect(mid.historyChars == 96_000)
+        #expect(mid.historyChars == 550_400)   // 90% of 200k÷0.6, less the 128k request reserve, × 3.2
         #expect(mid.memoryRowChars == 1_936)   // 24,000/12 net of row markup
         #expect(mid.memoryBlockChars == 24_000)
         // Exactly 200k QUALIFIES for wide recall (the `>=` boundary): the
@@ -277,7 +283,7 @@ struct ContextBudgetScalingTableTests {
 
         let wide = ContextBudgetPolicy.resolve(windowTokens: 1_048_576, surface: "chat")
         #expect(wide.isDerived)
-        #expect(wide.historyChars == 96_000)      // ceiling
+        #expect(wide.historyChars == 3_355_443)   // her window replays whole: × 3.2
         #expect(wide.recallRowLimit == 12)         // wide breadth at/above 200k
         #expect(wide.memoryRowChars == 1_936)      // 24,000/12 net of row markup
         #expect(wide.memoryBlockChars == 24_000)   // 12 full rows fit the ceiling
@@ -291,11 +297,12 @@ struct ContextBudgetScalingTableTests {
 
     /// The wide-recall boundary is INCLUSIVE. A strict `>` put the whole 200k
     /// tier — the models we actually route to — on the narrow limit, so the
-    /// wide band only ever applied to 1M windows.
-    @Test func wideRecallBoundaryIsInclusiveAt200k() {
-        #expect(ContextBudgetPolicy.resolve(windowTokens: 199_999, surface: "chat")
+    /// wide band only ever applied to 1M windows. The boundary is in her-window
+    /// terms: 120k is 60% of a 200k model.
+    @Test func wideRecallBoundaryIsInclusiveAt120k() {
+        #expect(ContextBudgetPolicy.resolve(windowTokens: 119_999, surface: "chat")
             .recallRowLimit == ContextBudgetPolicy.baseRecallRowLimit)
-        #expect(ContextBudgetPolicy.resolve(windowTokens: 200_000, surface: "chat")
+        #expect(ContextBudgetPolicy.resolve(windowTokens: 120_000, surface: "chat")
             .recallRowLimit == ContextBudgetPolicy.wideRecallRowLimit)
         #expect(ContextBudgetPolicy.resolve(windowTokens: 1_048_576, surface: "chat")
             .recallRowLimit == ContextBudgetPolicy.wideRecallRowLimit)

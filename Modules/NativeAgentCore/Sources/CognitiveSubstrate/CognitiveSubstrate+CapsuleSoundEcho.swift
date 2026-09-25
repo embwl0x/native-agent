@@ -87,10 +87,9 @@ extension CognitiveSubstrate {
     /// naturally after the wording changes; otherwise one bad afternoon would nag
     /// the persona for a week.
     ///
-    /// The first sentence carries openings; the final two
-    /// (`soundRutEdgeSentenceCount`) carry sign-offs, pet names, and closing
-    /// vocatives. Keeping only those edges avoids mistaking repeated project
-    /// vocabulary in the body for a voice tic.
+    /// Only forms of address (", X." closing a sentence), the opening clause
+    /// and a short closing sentence count — never body vocabulary, so repeated
+    /// project words are not mistaken for a voice tic.
     ///
     /// `soundEchoRegisterTolerance` is the half-width of the register band:
     /// candidates are ranked by how well they MATCH the current room, not by how
@@ -282,10 +281,13 @@ extension CognitiveSubstrate {
         /// it (2026-09-01).
         var line: String?
         var leadingWasNegative: Bool?
-        /// A stable signature of the worn edge/fragment token SET, or nil when
-        /// no rut is present. Identity, not just presence: an unchanged
+        /// A stable signature of the named verbal rut (kind + phrase), or nil
+        /// when there is none. Identity, not just presence: an unchanged
         /// signature is the case that used to nag every turn.
         var wornSignature: String?
+        /// The one line that NAMES the rut, spoken through the same cadence
+        /// gate as the signature. Nil exactly when `wornSignature` is nil.
+        var rutLine: String? = nil
 
         static let silent = SoundEchoSelection(line: nil, leadingWasNegative: nil, wornSignature: nil)
     }
@@ -314,10 +316,8 @@ extension CognitiveSubstrate {
         // with the rut nudge always allowed. The production capsule runs the
         // nudge through `soundRutAwarenessShouldSpeak`, whose cadence is
         // asserted directly against that function.
-        guard let line = selection.line else {
-            return selection.wornSignature == nil ? nil : Self.soundRutAwarenessLine
-        }
-        return selection.wornSignature == nil ? line : line + Self.soundRutAwarenessSuffix
+        guard let line = selection.line else { return selection.rutLine }
+        return selection.rutLine.map { line + "\n" + $0 } ?? line
     }
 
     func soundEchoSelection(
@@ -340,27 +340,33 @@ extension CognitiveSubstrate {
         let fieldNodes = frozenFieldNodes ?? field.peekNodes()
         // Her OWN live conversation turns only — never User's words as her voice,
         // never tool/system summaries (the feltDaySummary injection-safety rule).
-        let assistantTurns = fieldNodes.filter { node in
-            guard node.turnKind == .live,
-                  node.kind == .conversationFocus,
-                  node.subjectReference.type == "chat.assistant_turn" else { return false }
-            // A recalled turn is active now, not newly spoken now. The Sound
-            // line describes recent conversation, so admission and ranking use
-            // the original per-turn creation time rather than reactivation.
-            let age = now.timeIntervalSince(node.createdAt)
-            return age >= 0 && age <= dyn.soundEchoWindow
+        let herTurns = fieldNodes.filter { node in
+            node.turnKind == .live
+                && node.kind == .conversationFocus
+                && node.subjectReference.type == "chat.assistant_turn"
+                && now.timeIntervalSince(node.createdAt) >= 0
         }
-        guard !assistantTurns.isEmpty else { return .silent }
+        // A recalled turn is active now, not newly spoken now. The Sound
+        // line describes recent conversation, so admission and ranking use
+        // the original per-turn creation time rather than reactivation.
+        let assistantTurns = herTurns.filter {
+            now.timeIntervalSince($0.createdAt) <= dyn.soundEchoWindow
+        }
 
-        // 2026-08-09 — CLOSING-TIC FIX. The original verbal-rut detector
-        // examined only `soundEchoFragment`, intentionally the first sentence.
-        // That caught an opening such as "Morning, handsome" but could not see
-        // the same word repeated as a closing vocative in otherwise varied
-        // replies. Analyze bounded conversational EDGES across the recent-turn
-        // window: first sentence plus final two. This remains local, pure Swift
-        // over nodes already in RAM; it adds no provider call, store, or output
-        // rewriting. The cue never names the worn word, so it cannot re-seed it.
-        let recentAssistantTurns = assistantTurns
+        // 2026-09-24 — THE RUT IS NAMED, AND ONLY WHEN THERE IS ONE. The old
+        // cue counted any ≥4-letter word at a reply edge, so it fired on most
+        // turns ("a few of the same words keep echoing") and never said which
+        // word — low signal, and the "boss" loop ran straight past it. Now her
+        // last `soundRutRecentTurnLimit` live replies are read for a repeated
+        // form of address (", X." closing a sentence), stock opener or stock
+        // closer; one that recurs in ≥`verbalRutMinimumReplies` of them is
+        // named in one concrete line. Silent otherwise. Any word — nothing
+        // here knows which words are pet names. Local, over nodes in RAM.
+        // ACROSS EVERY SESSION AND SURFACE (2026-09-25): she is one mind, and a
+        // habit spread over many short sessions ("babe" in 4 of 15 one-turn
+        // sessions) is invisible to a per-session window. The line names the
+        // form, never who it was said to. Capped by COUNT, not days.
+        let recentAssistantTurns = herTurns
             .sorted {
                 if $0.createdAt != $1.createdAt {
                     return $0.createdAt > $1.createdAt
@@ -368,17 +374,32 @@ extension CognitiveSubstrate {
                 return $0.id.uuidString < $1.id.uuidString
             }
             .prefix(dyn.soundRutRecentTurnLimit)
-        var edgeTokenCounts: [String: Int] = [:]
-        for node in recentAssistantTurns {
-            for token in soundRutEdgeTokens(node.summary, edgeSentenceCount: dyn.soundRutEdgeSentenceCount) {
-                edgeTokenCounts[token, default: 0] += 1
-            }
-        }
-        let wornEdgeTokens = Set(
-            edgeTokenCounts
-                .filter { $0.value >= dyn.wornEchoThreshold }
-                .map(\.key)
+        let ruts = Self.verbalRut(
+            in: recentAssistantTurns.map { node in
+                var full: Int?
+                if case .int(let count)? = node.metadata[Self.replyCharacterCountMetadataKey] {
+                    full = Int(clamping: count)
+                }
+                // The node keeps the first 500 characters of a reply; a long
+                // reply's last ~300 ride as `replyTail`. A cut reply without a
+                // tail has no trustworthy closing edge.
+                var tail: String?
+                if case .string(let text)? = node.metadata[Self.replyTailMetadataKey] {
+                    tail = text
+                }
+                let complete = full.map { $0 <= node.summary.count } ?? (node.summary.count < 500)
+                return (node.summary, tail, complete)
+            },
+            minimum: Self.verbalRutMinimumReplies
         )
+        let rutSignature = Self.verbalRutSignature(ruts)
+        let rutLine = verbalRutLine(ruts)
+        func quiet() -> SoundEchoSelection {
+            SoundEchoSelection(
+                line: nil, leadingWasNegative: nil,
+                wornSignature: rutSignature, rutLine: rutLine)
+        }
+        guard !assistantTurns.isEmpty else { return quiet() }
         // W7/P5 — THE SIGN GATE IS GONE. `emotionalValence > 0` used to stand
         // here beside the warmth floor, and it is the reason the anti-drift
         // organ was dark on hard days: under friction the candidate pool emptied
@@ -408,18 +429,10 @@ extension CognitiveSubstrate {
         let shouldEcho = ignoringCadence
             || Self.soundEchoShouldSpeak(seed: latestActivity, dutyCycle: dyn.soundEchoDutyCycle)
         if !shouldEcho {
-            return SoundEchoSelection(
-                line: nil,
-                leadingWasNegative: nil,
-                wornSignature: Self.wornTokenSignature(wornEdgeTokens)
-            )
+            return quiet()
         }
         if candidates.isEmpty {
-            return SoundEchoSelection(
-                line: nil,
-                leadingWasNegative: nil,
-                wornSignature: Self.wornTokenSignature(wornEdgeTokens)
-            )
+            return quiet()
         }
         // REGISTER MATCH (see soundEchoRegisterScore): mirror the voice that
         // fits the room now, instead of always the warmest voice on record.
@@ -463,18 +476,16 @@ extension CognitiveSubstrate {
         // and fragments carrying a WORN word (one that appears across ≥3 of
         // the window's candidate fragments) lose to varied ones; a total-rut
         // week still echoes rather than going silent. (2) AWARENESS — when a
-        // rut exists her subconscious says so, WITHOUT naming the word:
-        // naming it would re-seed the exact loop this exists to break.
+        // rut exists it is named in its own line (2026-09-24, see above), and
+        // a fragment carrying the rutted phrase is never quoted back at all —
+        // the echo quoting "Good morning, boss" was feeding the loop.
         let fragged: [(fragment: String, tokens: Set<String>, valence: Double)] = ranked.compactMap { node in
             guard let f = soundEchoFragment(node.summary, maxCharacters: dyn.soundEchoFragmentMaxCharacters) else { return nil }
+            if ruts.contains(where: { Self.containsRutPhrase(f, $0.phrase) }) { return nil }
             return (f, Self.distinctiveEchoTokens(f), node.emotionalValence)
         }
         guard !fragged.isEmpty else {
-            return SoundEchoSelection(
-                line: nil,
-                leadingWasNegative: nil,
-                wornSignature: Self.wornTokenSignature(wornEdgeTokens)
-            )
+            return quiet()
         }
         var tokenCounts: [String: Int] = [:]
         for entry in fragged {
@@ -503,11 +514,7 @@ extension CognitiveSubstrate {
         pick(allowWorn: false)
         if fragments.isEmpty { pick(allowWorn: true) }
         guard !fragments.isEmpty else {
-            return SoundEchoSelection(
-                line: nil,
-                leadingWasNegative: nil,
-                wornSignature: Self.wornTokenSignature(wornEdgeTokens)
-            )
+            return quiet()
         }
         // "lately", not "when it landed" — warmth on her turn is the room's
         // temperature at encode (assistant completions never raise warmth
@@ -517,14 +524,173 @@ extension CognitiveSubstrate {
         return SoundEchoSelection(
             line: line,
             leadingWasNegative: (leadValence ?? 0) < 0,
-            wornSignature: Self.wornTokenSignature(wornEdgeTokens.union(wornFragmentTokens))
+            wornSignature: rutSignature,
+            rutLine: rutLine
         )
     }
 
-    static let soundRutAwarenessSuffix =
-        " — a few of the same words keep echoing lately; you've got more range than that"
-    static let soundRutAwarenessLine =
-        "- Sound: a few of the same words keep echoing lately; you've got more range than that"
+    /// A form of address, stock opener or stock closer she keeps reaching for.
+    struct VerbalRut: Sendable, Equatable {
+        enum Kind: Int, Sendable {
+            case address, opener, closer
+            var name: String { ["address", "opener", "closer"][rawValue] }
+        }
+        var kind: Kind
+        /// Lowercased words, as she wrote them.
+        var phrase: String
+        var count: Int
+        var window: Int
+        var signature: String { "\(kind.name):\(phrase)" }
+    }
+
+    /// A form must recur in at least this many of the window's replies before
+    /// it is a rut and not a coincidence.
+    static let verbalRutMinimumReplies = 4
+
+    /// Courtesy and function words that close a clause after a comma without
+    /// naming anyone ("fair hit, though." · "done, thanks."). Grammar, not a
+    /// list of pet names.
+    static let notAnAddress: Set<String> = [
+        "too", "though", "tho", "anyway", "anyways", "again", "please", "yet",
+        "now", "then", "instead", "honestly", "right", "okay", "ok", "either",
+        "already", "lol", "haha", "maybe", "probably", "really", "still",
+        "first", "today", "tonight", "tomorrow", "yesterday", "here", "there",
+        "sure", "yes", "no", "yeah", "yep", "nope", "even", "ever", "all",
+        "both", "etc", "anymore", "later", "soon", "together",
+        "thanks", "thank", "thx", "ty", "cheers", "sorry", "done", "good",
+        "great", "cool", "nice", "fine", "deal", "noted", "exactly", "indeed",
+        "agreed", "true", "correct", "definitely", "absolutely", "sadly",
+        "apparently", "obviously", "otherwise", "anyhow", "besides",
+    ]
+
+    /// Every repeated form in her recent replies (newest first), counted once
+    /// per reply; up to two at or above `minimum`, most frequent first (address before
+    /// opener before closer on a tie). Pure and deterministic.
+    static func verbalRut(
+        in replies: [(text: String, tail: String?, complete: Bool)],
+        minimum: Int
+    ) -> [VerbalRut] {
+        struct Form: Hashable { var kind: Int; var phrase: String }
+        var counts: [Form: Int] = [:]
+        for reply in replies {
+            let head = soundRutSentences(reply.text)
+            guard let first = head.first else { continue }
+            // A cut head's last sentence may itself be cut, and a tail starts
+            // mid-sentence, so both broken edges are skipped.
+            var sentences = reply.complete ? head : Array(head.dropLast())
+            var hasEnd = reply.complete
+            if !reply.complete, let tail = reply.tail {
+                sentences += soundRutSentences(tail).dropFirst()
+                hasEnd = true
+            }
+            var forms = Set<Form>()
+            // A vocative can close any sentence ("That's elite trolling, boss.").
+            for sentence in sentences {
+                if let word = trailingVocative(sentence) {
+                    forms.insert(Form(kind: VerbalRut.Kind.address.rawValue, phrase: word))
+                }
+            }
+            // The opening clause, when it is a stock phrase (≤3 words before
+            // the first break): "good morning", "honestly", "not yet".
+            let clause = first.prefix { !",.!?:;—–".contains($0) }
+            let openerWords = rutWords(String(clause))
+            if (1...3).contains(openerWords.count) {
+                forms.insert(Form(
+                    kind: VerbalRut.Kind.opener.rawValue,
+                    phrase: openerWords.joined(separator: " ")))
+            }
+            if hasEnd, sentences.count > 1, let last = sentences.last {
+                let closerWords = rutWords(last)
+                if (1...4).contains(closerWords.count) {
+                    forms.insert(Form(
+                        kind: VerbalRut.Kind.closer.rawValue,
+                        phrase: closerWords.joined(separator: " ")))
+                }
+            }
+            for form in forms { counts[form, default: 0] += 1 }
+        }
+        // Up to two forms, most frequent first, so a loud rut cannot hide a
+        // second real one.
+        return counts
+            .filter({ $0.value >= minimum })
+            .sorted(by: { lhs, rhs in
+                if lhs.value != rhs.value { return lhs.value > rhs.value }
+                if lhs.key.kind != rhs.key.kind { return lhs.key.kind < rhs.key.kind }
+                return lhs.key.phrase < rhs.key.phrase
+            })
+            .prefix(2)
+            .compactMap { entry in
+                VerbalRut.Kind(rawValue: entry.key.kind).map {
+                    VerbalRut(kind: $0, phrase: entry.key.phrase,
+                              count: entry.value, window: replies.count)
+                }
+            }
+    }
+
+    /// Gate identity of the rut SET: sorted, so a reorder is not news but a
+    /// form joining or leaving is.
+    static func verbalRutSignature(_ ruts: [VerbalRut]) -> String? {
+        ruts.isEmpty ? nil : ruts.map(\.signature).sorted().joined(separator: "|")
+    }
+
+    /// The one line naming the rut(s). Concrete, so it carries signal.
+    func verbalRutLine(_ ruts: [VerbalRut]) -> String? {
+        guard let first = ruts.first else { return nil }
+        guard ruts.count > 1 else { return verbalRutLine(first) }
+        func form(_ rut: VerbalRut) -> String {
+            let phrase = rut.phrase.prefix(1).uppercased() + rut.phrase.dropFirst()
+            switch rut.kind {
+            case .address: return "\u{201C}, \(rut.phrase).\u{201D}"
+            case .opener: return "\u{201C}\(phrase)\u{2026}\u{201D}"
+            case .closer: return "\u{201C}\u{2026}\(rut.phrase)\u{201D}"
+            }
+        }
+        let named = ruts.map { "\(form($0)) (\($0.count))" }.joined(separator: " and ")
+        let verb = ruts.allSatisfy { $0.kind == .address } ? "have closed lines" : "keep coming back"
+        return "- Sound: \(named) \(verb) in your last \(first.window) replies — let the moment pick the words"
+    }
+
+    func verbalRutLine(_ rut: VerbalRut) -> String {
+        // Worded by FORM, never as a claim about who was meant.
+        let tally = "\(rut.count) of your last \(rut.window) replies"
+        let phrase = rut.phrase.prefix(1).uppercased() + rut.phrase.dropFirst()
+        switch rut.kind {
+        case .address:
+            return "- Sound: \u{201C}, \(rut.phrase).\u{201D} has closed a line in \(tally) — let the moment pick the word"
+        case .opener:
+            return "- Sound: you've opened \(tally) with \u{201C}\(phrase)\u{201D} — let the moment pick the words"
+        case .closer:
+            return "- Sound: you've closed \(tally) with \u{201C}\(phrase)\u{201D} — let the moment pick the words"
+        }
+    }
+
+    /// ", X" closing a sentence, with only punctuation/emoji/markup after it.
+    static func trailingVocative(_ sentence: String) -> String? {
+        guard let comma = sentence.lastIndex(of: ",") else { return nil }
+        let after = String(sentence[sentence.index(after: comma)...])
+        let words = rutWords(after)
+        guard words.count == 1, let word = words.first,
+              word.count >= 2, !notAnAddress.contains(word) else { return nil }
+        return word
+    }
+
+    /// Lowercased letter words; apostrophes kept inside a word.
+    static func rutWords(_ text: String) -> [String] {
+        text.lowercased()
+            .replacingOccurrences(of: "\u{2019}", with: "'")
+            .split { !($0.isLetter || $0 == "'") }
+            .map { $0.trimmingCharacters(in: CharacterSet(charactersIn: "'")) }
+            .filter { !$0.isEmpty }
+    }
+
+    static func containsRutPhrase(_ text: String, _ phrase: String) -> Bool {
+        let needle = phrase.split(separator: " ").map(String.init)
+        let hay = rutWords(text)
+        guard !needle.isEmpty, hay.count >= needle.count else { return false }
+        return (0...(hay.count - needle.count)).contains {
+            Array(hay[$0..<($0 + needle.count)]) == needle
+        }
+    }
 
     /// Stable identity of a worn-token set. Sorted so the signature depends on
     /// WHICH words are worn, never on hash order — a set that has not changed
@@ -588,10 +754,10 @@ extension CognitiveSubstrate {
         return speak
     }
 
-    /// Distinctive tokens at the conversational edges of one assistant turn.
-    /// `soundEchoFragment` remains the exemplar source; this separate view is
-    /// awareness-only so a closing tic can be noticed without quoting it back.
-    private func soundRutEdgeTokens(_ summary: String, edgeSentenceCount: Int) -> Set<String> {
+    /// Sentences of one assistant turn, her own words only: quoted material and
+    /// any trailing "User message:" payload removed. Awareness-only —
+    /// `soundEchoFragment` remains the exemplar source.
+    static func soundRutSentences(_ summary: String) -> [String] {
         var cleaned = summary
         if let quoted = cleaned.range(of: "User message:", options: [.caseInsensitive]) {
             cleaned = String(cleaned[..<quoted.lowerBound])
@@ -626,18 +792,8 @@ extension CognitiveSubstrate {
             return out
         }
 
-        // Bound work without losing the actual closer on a long reply: the
-        // old prefix-only scan recreated the same blind spot for any response
-        // whose sign-off landed after the cap.
-        let openingSentences = sentences(in: String(cleaned.prefix(800)))
-        let closingSentences = sentences(in: String(cleaned.suffix(800)))
-        guard let first = openingSentences.first else { return [] }
-
-        let tail = closingSentences.suffix(edgeSentenceCount)
-        let edges = ([first] + tail)
-            .map { String($0.prefix(320)) }
-            .joined(separator: " ")
-        return Self.distinctiveEchoTokens(edges)
+        // Bounded work; the node summary is already capped upstream.
+        return sentences(in: String(cleaned.prefix(1_600)))
     }
 
     // How many of the window's candidate fragments a distinctive word must

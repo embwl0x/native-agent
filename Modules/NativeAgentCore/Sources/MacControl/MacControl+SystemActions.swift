@@ -4,6 +4,9 @@ import PersistenceCore
 #if canImport(CryptoKit)
 import CryptoKit
 #endif
+#if canImport(AppKit)
+import AppKit
+#endif
 
 extension SwiftNativeMacControl {
     // MARK: file/read
@@ -306,6 +309,9 @@ extension SwiftNativeMacControl {
     }
 
     func handleFocusApp(_ body: [String: JSONValue]) async throws -> MacControlResult {
+        if let rawPid = Self.intValue(body, "pid") {
+            return await handleFocusExact(pid: Int32(clamping: rawPid), body: body)
+        }
         let app = try requestedAppName(body)
         let started = now()
         do {
@@ -361,6 +367,89 @@ extension SwiftNativeMacControl {
                 viaSwift: true
             )
         }
+    }
+
+    /// Her-screen Phase 4 — focus an EXACT process, and optionally one exact
+    /// window of it: `frame_id` (the window a look was of — must still be
+    /// there) or `window` (a recorded identity; falls back to the app's top
+    /// window). Never by name, never another instance, never a launch: a pid
+    /// that is gone answers `app_gone`. `ok` only when the frontmost pid IS
+    /// this pid afterwards.
+    func handleFocusExact(pid: Int32, body: [String: JSONValue]) async -> MacControlResult {
+        let started = now()
+        func finish(_ status: String, _ extra: [String: JSONValue] = [:]) -> MacControlResult {
+            let front = accessibilitySource.frontmostApp()?.processIdentifier == pid
+            let ok = status == "focused" && front
+            let reported = ok || status != "focused" ? status : "focus_failed"
+            var output: [String: JSONValue] = [
+                "status": .string(reported),
+                "pid": .int(Int64(pid)),
+                "frontmost_pid_matches": .bool(front),
+                "verified": .bool(ok),
+            ]
+            for (key, value) in extra { output[key] = value }
+            return MacControlResult(
+                ok: ok, action: "focus_app", output: .object(output),
+                error: ok ? nil : reported,
+                durationMs: Int(now().timeIntervalSince(started) * 1000), viaSwift: true
+            )
+        }
+        #if canImport(AppKit)
+        guard pid > 0, let app = NSRunningApplication(processIdentifier: pid), !app.isTerminated else {
+            return finish("app_gone")
+        }
+        if pid == getpid() {
+            // Our own app: activate it, never an AX read of ourselves. From the
+            // back, NSRunningApplication.activate is cooperative on macOS 14+
+            // and the raised app never yields, so NativeAgent was never put
+            // back (3 of 3 in her traces, 09-24). NSApp's own call still takes it.
+            await MainActor.run { NSApplication.shared.activate(ignoringOtherApps: true) }
+            if accessibilitySource.frontmostApp()?.processIdentifier != pid { _ = app.activate() }
+            for _ in 0..<20 where accessibilitySource.frontmostApp()?.processIdentifier != pid {
+                try? await Task.sleep(nanoseconds: 50_000_000)
+            }
+            return finish("focused")
+        }
+        let exact = body.stringValue("frame_id")
+        var identity: MacAXWindowIdentity?
+        if let exact {
+            identity = await lookFrameStore.frame(frameId: exact)?.windowIdentity
+            guard let recorded = identity, recorded.pid == pid else { return finish("front_window_changed") }
+        } else if case .object(let recorded)? = body["window"] {
+            // Title leaves redacted, so the recorded rect/role carry the match.
+            let frame = MacFourVerbs.frame(recorded["frame"])
+            if case .string(let role)? = recorded["role"] {
+                var subrole: String?
+                if case .string(let value)? = recorded["subrole"] { subrole = value }
+                identity = MacAXWindowIdentity(pid: pid, index: nil, role: role, subrole: subrole, frame: frame)
+            }
+        }
+        let windows = accessibilityActSource.windows(pid: pid)
+        var chosen: MacAXWindowRef?
+        var windowMatched = false
+        if let identity,
+           case .matched(let hit, _) = MacAXWindowIdentity.match(identity, among: windows.map { ($0, $0.identity) }) {
+            chosen = hit
+            windowMatched = true
+        } else if exact != nil {
+            return finish("front_window_changed")
+        } else {
+            chosen = windows.first
+        }
+        guard let chosen else { return finish("app_has_no_window") }
+        let outcome = accessibilityActSource.raise(chosen)
+        guard outcome == .performed else {
+            var extra: [String: JSONValue] = ["raise": .string(outcome.rawValue)]
+            if let why = accessibilityActSource.raiseDiagnostic { extra["diagnostic"] = .string(why) }
+            return finish("focus_failed", extra)
+        }
+        return finish("focused", [
+            "window_matched": .bool(windowMatched),
+            "window_frame": chosen.identity.frame?.toJSON() ?? .null,
+        ])
+        #else
+        return finish("unsupported")
+        #endif
     }
 
     /// Launch Services acceptance is transport evidence, not settlement. The

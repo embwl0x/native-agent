@@ -165,11 +165,14 @@ public enum FirstPartyModelCatalog {
     /// xAI text models retained by NativeAgent plus the current Grok 4.5
     /// flagship. Priority processing is supported on xAI text inference.
     public static let xAIModels: [FirstPartyModelDescriptor] = [
+        // 2026-09-23 (docs.x.ai/docs/models): 4.7 is xAI's flagship; 4.6/4.7 take low…xhigh, default high.
+        .init(id: "grok-4.7", name: "Grok 4.7", contextLength: 500_000, supportsJSONMode: true, defaultReasoningEffort: "high", supportedReasoningEfforts: ["low", "medium", "high", "xhigh"], supportsFast: true),
+        .init(id: "grok-4.6", name: "Grok 4.6", contextLength: 500_000, supportsJSONMode: true, defaultReasoningEffort: "high", supportedReasoningEfforts: ["low", "medium", "high", "xhigh"], supportsFast: true),
         .init(id: "grok-4.5", name: "Grok 4.5", contextLength: 500_000, supportsJSONMode: true, defaultReasoningEffort: "high", supportedReasoningEfforts: grok45Efforts, supportsFast: true),
-        .init(id: "grok-4.20-multi-agent-0309", name: "Grok 4.20 Multi-Agent", contextLength: 256_000, supportsJSONMode: true, defaultReasoningEffort: "high", supportedReasoningEfforts: ["low", "medium", "high", "xhigh"], supportsFast: true),
-        .init(id: "grok-4.20-0309-reasoning", name: "Grok 4.20 Reasoning", contextLength: 256_000, supportsJSONMode: true, defaultReasoningEffort: "high", supportedReasoningEfforts: ["high"], supportsFast: true),
-        .init(id: "grok-4.20-0309-non-reasoning", name: "Grok 4.20 Non-Reasoning", contextLength: 256_000, supportsJSONMode: true, defaultReasoningEffort: "none", supportedReasoningEfforts: ["none"], supportsFast: true),
-        .init(id: "grok-4.3", name: "Grok 4.3", contextLength: 256_000, supportsJSONMode: true, defaultReasoningEffort: "high", supportedReasoningEfforts: ["high"], supportsFast: true),
+        .init(id: "grok-4.20-multi-agent-0309", name: "Grok 4.20 Multi-Agent", contextLength: 1_000_000, supportsJSONMode: true, defaultReasoningEffort: "high", supportedReasoningEfforts: ["low", "medium", "high", "xhigh"], supportsFast: true),
+        .init(id: "grok-4.20-0309-reasoning", name: "Grok 4.20 Reasoning", contextLength: 1_000_000, supportsJSONMode: true, defaultReasoningEffort: "high", supportedReasoningEfforts: ["high"], supportsFast: true),
+        .init(id: "grok-4.20-0309-non-reasoning", name: "Grok 4.20 Non-Reasoning", contextLength: 1_000_000, supportsJSONMode: true, defaultReasoningEffort: "none", supportedReasoningEfforts: ["none"], supportsFast: true),
+        .init(id: "grok-4.3", name: "Grok 4.3", contextLength: 1_000_000, supportsJSONMode: true, defaultReasoningEffort: "low", supportedReasoningEfforts: ["none", "low", "medium", "high", "xhigh"], supportsFast: true),
         .init(id: "grok-build-0.1", name: "Grok Build 0.1", contextLength: 256_000, supportsJSONMode: true, defaultReasoningEffort: "high", supportedReasoningEfforts: ["high"], supportsFast: true),
     ]
 

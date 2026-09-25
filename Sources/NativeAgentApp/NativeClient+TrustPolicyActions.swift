@@ -57,6 +57,14 @@ extension NativeClient {
         ])
     }
 
+    /// Security Center's "Pause everything": `securityPolicy.killSwitchEnabled`,
+    /// deep-merged through the one trust-write chokepoint.
+    func saveKillSwitchEnabled(_ enabled: Bool) async throws -> TrustPolicy {
+        try await postTrustWrite(body: [
+            "securityPolicy": ["killSwitchEnabled": enabled]
+        ])
+    }
+
     // PATCH-2026-05-07: mac-control-ui-1 POST macControlPolicy block to /v1/trust.
     func saveMacControlPolicy(
         _ policy: TrustMacControlPolicy,

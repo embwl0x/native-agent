@@ -89,7 +89,7 @@ struct InlineApprovalCard: View {
                 switch taken {
                 case .primary: Task { await resolve("approved") }
                 case .secondary: Task { await resolve("denied") }
-                case .retry, .stop: break
+                case .retry, .stop, .fullSetup: break
                 }
             }
             if let resolveError {

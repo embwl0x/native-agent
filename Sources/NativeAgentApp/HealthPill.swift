@@ -120,6 +120,7 @@ public struct HealthPill: View {
     @Environment(AppModel.self) var appModel
     @AppStorage("showDeveloperSurfaces") private var showDeveloperSurfaces = false
     @State private var showPopover = false
+    @Environment(\.aliveCards) private var aliveCards
 
     public init() {}
 
@@ -138,7 +139,8 @@ public struct HealthPill: View {
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 4)
-            .background(.ultraThinMaterial, in: Capsule())
+            // Inside an alive page this is content, and content is a fill.
+            .background(aliveCards ? AnyShapeStyle(NativeAgentShell.quietFill) : AnyShapeStyle(.ultraThinMaterial), in: Capsule())
             .overlay {
                 Capsule()
                     .strokeBorder(statusColor.opacity(0.32), lineWidth: 0.8)

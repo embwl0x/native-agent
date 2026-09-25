@@ -75,6 +75,10 @@ struct ContentView: View {
     // ui-simplify 2026-09-02: the kill switch. ON restores the previous
     // List sidebar + nine primaries, unchanged.
     @AppStorage(NativeAgentShellPreference.classicShellKey) private var classicShell = false
+    /// Simple | Advanced (SimpleViewMode.swift). The classic shell is always Advanced.
+    @AppStorage(SimpleViewMode.key) private var viewModeRaw = ""
+    private var showsSimpleView: Bool { !classicShell && SimpleViewMode.resolved(viewModeRaw) == SimpleViewMode.simple }
+    private var showsAgentView: Bool { !classicShell && SimpleViewMode.resolved(viewModeRaw) == SimpleViewMode.agent }
     @State private var tourReplayCoordinator = OnboardingTourReplayCoordinator.shared
     @State private var didCheckFirstRunOnboarding = false
     @State private var showFirstRunOnboarding = false
@@ -174,6 +178,12 @@ struct ContentView: View {
         // scalar) actually cut root re-evaluations.
         RenderAudit.bump("contentview.body")
         return ZStack {
+            Group {
+            if showsSimpleView {
+                SimpleShellView()
+            } else if showsAgentView {
+                AgentScreenView()
+            } else {
             ShellFrame(classic: classicShell) {
                 // ui-simplify 2026-09-02 (Lane A): the rail. Five places with
                 // their words under them, at a fixed 84pt. The classic List
@@ -384,7 +394,7 @@ struct ContentView: View {
                     case .trust: if classicShell { TrustCenterView() } else { TrustRailPage() }
                     case .providers:
                         if classicShell { ProviderSettingsView() }
-                        else { ShellRailPage(title: "Providers", subtitle: SidebarItem.providers.shellPageSubtitle, wide: true) { ProviderSettingsView() } }
+                        else { ShellRailPage(title: "Providers", subtitle: SidebarItem.providers.shellPageSubtitle, wide: true, alive: true) { ProviderSettingsView() } }
                     case .macIntegration: MacIntegrationView()
                     case .settings:
                         if classicShell {
@@ -400,7 +410,7 @@ struct ContentView: View {
                     // ── Advanced / routed child surfaces ──────────────────────
                     case .capabilities:
                         if classicShell { CapabilitiesView() }
-                        else { ShellRailPage(title: "Capabilities", subtitle: SidebarItem.capabilities.shellPageSubtitle) { CapabilitiesView() } }
+                        else { ShellRailPage(title: "Capabilities", subtitle: SidebarItem.capabilities.shellPageSubtitle, alive: true) { CapabilitiesView() } }
                     case .knowledge: KnowledgeGraphView()
                     case .dreams: DreamsView()
                     // B2.4/B2.6 (fence-B handoff): the Observatory's surviving
@@ -418,7 +428,7 @@ struct ContentView: View {
                     case .telegram: TelegramView()
                     case .inboxPolicy:
                         if classicShell { InboxSettingsView() }
-                        else { ShellRailPage(title: "Notifications", subtitle: SidebarItem.inboxPolicy.shellPageSubtitle) { InboxSettingsView() } }
+                        else { ShellRailPage(title: "Notifications", alive: true) { InboxSettingsView() } }
                     case .mcp: MCPHubView()
                     // ── Legacy aliases (unreachable post-normalize, kept exhaustive) ───
                     // .autoImprovement → .activity and .panels → .diagnostics
@@ -472,6 +482,8 @@ struct ContentView: View {
                 }
                 }
             }
+            }
+            }
             .toolbar {
                 // ui-simplify 2026-09-02: the "N warnings" pill is the first
                 // thing a stranger used to read — before they had said hello.
@@ -507,6 +519,7 @@ struct ContentView: View {
         .overlay(alignment: .bottom) {
             SystemToastBar(center: appModel.systemToasts)
         }
+        .viewModeSwitch(hidden: classicShell)
         .animation(
             NativeAgentMotion.respecting(NativeAgentMotion.standard, reduceMotion: reduceMotion),
             value: showTour
@@ -542,6 +555,7 @@ struct ContentView: View {
             self.navigationMountID = nil
         }
         .task {
+            await appModel.reloadPersonality()
             await checkFirstRunOnboardingIfNeeded()
         }
         // All Mac projections of chat sessions share AppModel's one canonical
@@ -568,7 +582,10 @@ struct ContentView: View {
                 Task {
                     await OnboardingWizardCompletionRoute.complete(
                         selectChat: { selectionRaw = SidebarItem.chat.rawValue },
-                        refreshChat: { await appModel.refreshForSidebarItem(.chat) },
+                        refreshChat: {
+                            await appModel.reloadPersonality()
+                            return await appModel.refreshForSidebarItem(.chat)
+                        },
                         // Fire the first-run welcome right when onboarding finishes
                         // and chat is loaded — ChatView's .task is only a backup.
                         sendGreeting: { await appModel.maybeSendFirstRunGreeting() },

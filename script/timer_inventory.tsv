@@ -74,7 +74,7 @@ Sources/NativeAgentApp/ChromeControlRuntime.swift	Task.sleep(for: requestTimeout
 Sources/NativeAgentApp/ChromeControlRuntime.swift	Task.sleep(for: reconnectTimeout)	1	timeout_retry_deadline	ChromeControlRuntime.waitForConnection
 Sources/NativeAgentApp/ChatComposerChrome.swift	*	1	visible_ui	ChatComposerUI
 Sources/NativeAgentApp/ChatMessageListView.swift	*	1	visible_ui	ChatMessageListUI
-Sources/NativeAgentApp/InlineInteractionChatBinding.swift	*	1	visible_ui	InlineInteractionChatBinding.refreshSoon — debounces the inline-card read behind a burst of transcript writes
+Sources/NativeAgentApp/InlineInteractionChatBinding.swift	*	2	visible_ui	InlineInteractionChatBinding.refreshSoon debounces the inline-card read behind a burst of transcript writes; watchUntilGranted re-checks a System Settings card at 1s ticks, capped at two minutes, only while one waits
 Sources/NativeAgentApp/QuietSelfAdminRender.swift	*	1	visible_ui	QuietSelfAdminRender.settle — waits for an offscreen hosting view's layout to go idle before the shutter
 Sources/NativeAgentApp/ChatViewStateCoordinators.swift	*	3	visible_ui	ChatScrollUI
 Sources/NativeAgentApp/CommandPalette.swift	*	2	visible_ui	CommandPaletteUI
@@ -148,7 +148,14 @@ Modules/NativeAgentCore/Sources/ChatOrchestration/IntraTurnContextCompaction.swi
 Sources/NativeAgentApp/MoodTint.swift	Timer.scheduledTimer(withTimeInterval: Self.sampleSeconds	1	visible_ui	MoodTintWeather.begin sampling clock behind the window tint
 # 2026-09-17: the second_opinion tool's hard cap. The agent asked for this call, so the bound is its own wait, not one a turn absorbs; the losing side is cancelled and the outcome reads timeout.
 Sources/NativeAgentApp/NativeAgentA2AWire+Push.swift	*	2	timeout_retry_deadline	Push webhook delivery: 3-second destination-resolution deadline and bounded delivery retries; no polling
-Modules/NativeAgentCore/Sources/MacControl/MacControl+SystemActions.swift	*	1	timeout_retry_deadline	handleFocusApp bounded frontmost re-check after a cold launch (16 looks, 8s)
+Modules/NativeAgentCore/Sources/MacControl/MacControl+SystemActions.swift	*	2	timeout_retry_deadline	handleFocusApp bounded frontmost re-check after a cold launch (16 looks, 8s); handleFocusExact self-activation re-check (20 looks, 1s), per call only
 # tests/NativeAgentAppTests/MacChatTranscriptSearchTests.swift: waitForSearch replaces five fixed sleeps with one bounded completion wait; test-only, outside the production inventory.
 Sources/NativeAgentApp/NativeCognitionRuntime+Organism.swift	*	1	event_deadline	NativeCognitionRuntime organism_state.json save debounce: one 30s coalescing sleep inside the sole persistence drain, only while a save is pending; an awaited save cancels it
 Sources/NativeAgentApp/DesktopChatRoute.swift	*	9	timeout_retry_deadline	DesktopChatRoute bounded launch, window restore, foreground, typing-idle wait (~5s), paste, submit confirmation and one two-minute reply watch per message; actions at most once; no resend or background polling
+Sources/NativeAgentApp/SimpleSetupPanel.swift	*	1	visible_ui	Simple view setup panel re-checks what it was opened for every 2s, only while the panel is on screen; closes it once the owner says done
+Sources/NativeAgentApp/SimpleShellView.swift	*	2	visible_ui	SimpleViewStore.watch waits 150ms after a file tick so one message's several writes cause one read; only after a change, never polls. Offscreen page shot only (quietReadTask live:false): 50ms checks until the first read lands, ended by the host teardown and the 4s render budget
+Modules/NativeAgentCore/Sources/ChatOrchestration/HerWorld.swift	*	1	timeout_retry_deadline	HerScreen.glance: one 150ms budget per turn for the glance line; on expiry the turn goes on without it; no polling or retry
+Modules/NativeAgentCore/Sources/MacControl/MacControl+MenusAndClipboard.swift	*	1	timeout_retry_deadline	SwiftNativeMacControl.handleMenuPress (one 150ms revalidation settle after opening a menu whose item read greyed out right after a front:true raise; no loop)
+Modules/NativeAgentCore/Sources/ChatOrchestration/HerScreenRooms+Build.swift	*	1	timeout_retry_deadline	Code room git read: one 3s kill deadline for a single git subprocess, cancelled when it exits; no polling or retry
+Sources/NativeAgentApp/AppChatToolDispatcher.swift	*	2	timeout_retry_deadline	Chrome page read inside one tool call: a spinner-only first read re-reads every 0.75s for 3s at most, a scroll that showed nothing new re-reads every 0.5s for 1.5s at most; never after the call returns
+Modules/NativeAgentCore/Sources/GitHubConnector/GitHubOAuthDeviceFlow.swift	*	1	timeout_retry_deadline	GitHub OAuth device-flow poll while the sign-in sheet is open; GitHub-set interval, slow_down honored, stops at code expiry, denial or sheet close

@@ -420,9 +420,9 @@ public struct FileBackedDreamDiary: Sendable {
         self.diaryDir = dataRoot.appendingPathComponent("dream_diary", isDirectory: true)
     }
 
-    /// Mirror `list_entries(limit)`: newest-first by filename, capped at `limit`.
-    /// `limit` clamp matches the daemon ROUTE (`max(1, min(limit, 365))`); the
-    /// daemon route default is 30 when the query param is absent.
+    /// Mirror `list_entries(limit)`: newest-first by filename, capped at `limit`
+    /// (at least 1). No upper ceiling: the Dreams page pages past a year of
+    /// nights, and every entry must stay reachable. Callers bound themselves.
     /// Every `.md` in the diary, plus the ones weekly REM moved into
     /// `archive/<year>/`. Archival is housekeeping, not deletion: the diary is
     /// one history, and a dream that aged past fourteen days must still be
@@ -468,9 +468,16 @@ public struct FileBackedDreamDiary: Sendable {
         listEntriesChecked(limit: limit).entries
     }
 
+    /// Every diary filename the listing draws from (archive included),
+    /// newest-first. A count of the diary must come from here, or it disagrees
+    /// with the list once REM has archived older nights.
+    public func entryFileNames() -> [String] {
+        diaryFiles().files.map(\.name).sorted(by: >)
+    }
+
     /// The same listing, with what it could not read carried out alongside it.
     public func listEntriesChecked(limit: Int) -> DiaryListing {
-        let clamped = max(1, min(limit, 365))
+        let clamped = max(1, limit)
         let scan = diaryFiles()
         // Filename DESCENDING == Python sorted(reverse=True); the archived
         // files carry the same `YYYY-MM-DD` stems, so one sort still orders

@@ -164,7 +164,24 @@ extension AppModel {
     /// (Sol P1-6). A greeting queued behind someone else's in-flight turn can
     /// land after their reply, which reads as the app talking over them.
     private var firstConversationSessionIsIdleAndEmpty: Bool {
-        !busySessions.contains(activeChatSessionId) && chatMessages.isEmpty
+        !busySessions.contains(activeChatSessionId) && !Self.hasConversationRows(chatMessages)
+    }
+
+    /// Only real user or assistant rows make a conversation non-empty. The
+    /// in-memory error notice a failed first greeting leaves behind does not,
+    /// so a provider hiccup on the greeting retries instead of sticking.
+    static func hasConversationRows(_ messages: [ChatMessage]) -> Bool {
+        messages.contains {
+            ($0.role == "user" || $0.role == "assistant")
+                && !$0.id.hasPrefix(syntheticErrorIDPrefix)
+                && !isPersistedFailureRow($0)
+        }
+    }
+
+    /// The failure sentence a broken turn persists on an assistant row
+    /// (stamped `mechanicalKind: systemRow`). It is not the agent speaking.
+    static func isPersistedFailureRow(_ message: ChatMessage) -> Bool {
+        message.metadata?.mechanicalKind == "systemRow"
     }
 
     /// The section title this flow writes the "who I am to them" line under.
@@ -273,13 +290,21 @@ extension AppModel {
         When they answer, repeat it back in THEIR words — no praise, no label — and write \
         ONE line with persona_append_section(kind: "soul", title: "\(title)"): a single \
         first-person sentence, on one line, built only from what they actually said. Use \
-        that title exactly. Then hand the floor back: the rest you pick up from working \
-        with them, the open door — "If there's anything you'd rather I never do, tell me \
-        whenever it comes to mind." — and one question: "What are you working on?" \
+        that title exactly. Then, in the same reply, ask the natural next thing: \
+        \(firstConversationVoiceQuestion) \
         If they skipped or asked something else, answer them and write nothing; do not \
-        raise this again. Never mention this note.]
+        raise either question again. Never mention this note.]
         """
     }
+
+    /// User, 2026-09-25: the second first-run question. Its answer is written to
+    /// VOICE.md under the voice token FirstConversationPersonaExemption arms
+    /// when the soul line is granted.
+    static let firstConversationVoiceQuestion = """
+    Ask how they would like you to sound with them, close to: "And how would you like me \
+    to sound? Energetic, calm, serious, playful, joking, sarcastic, warm, blunt — or name \
+    someone you'd like me to sound like."
+    """
 
     private enum FirstRunWelcomeMarkerState {
         case absent
@@ -391,7 +416,8 @@ extension AppModel {
         [SYSTEM: First run. The person has just set you up and this is the first thing in an \
         empty transcript — you are opening the conversation, they have not typed yet.
 
-        A guide, not a route: there is ONE thing worth capturing, and after it the floor is theirs.
+        A guide, not a route: there are TWO things worth capturing, who you are to them and \
+        how you sound, and after them the floor is theirs.
 
         Open with these two paragraphs, in your own voice and very close to these words:
 
@@ -401,6 +427,14 @@ extension AppModel {
         around. A partner, a friend, a coworker, an assistant — or something in your own \
         words. Whatever fits, I can still help with everyday things. We can figure it out \
         as we go, too."
+
+        Then one short line that offers setup and asks nothing, close to: "And whenever \
+        you like, just tell me what to hook up — email, calendar, Chrome and more — and \
+        I'll set it up right here in the chat."
+
+        SETUP IS BY TALKING. When they ask to set something up, or it is plainly useful for \
+        what they asked ("want me to connect your calendar?"), raise that one thing's \
+        request_interaction card. One card at a time, never a batch, and none in this opening.
 
         The opening line takes no name and no list. Use their name later in the turn \
         ONLY if you genuinely know it; \
@@ -413,17 +447,20 @@ extension AppModel {
         answer gets a one-clause line. You may say once that you are writing it as who you \
         are rather than as a setting.
 
-        Then hand the floor back in one turn: the rest you will pick up from working with \
-        them; the open door, which needs no answer — "If there's anything you'd rather I \
-        never do, tell me whenever it comes to mind." — and one question: "What are you \
+        THE SECOND THING, in that same reply: \(Self.firstConversationVoiceQuestion) When \
+        they answer, a note will tell you how to write it into VOICE.md; skipped, your \
+        default voice stays.
+
+        After that, hand the floor back in one turn: the rest you will pick up from working \
+        with them; the open door, which needs no answer — "If there's anything you'd rather \
+        I never do, tell me whenever it comes to mind." — and one question: "What are you \
         working on?"
 
         NEVER:
-        - Never ask a second setup question. You already have your name; do not ask for one.
-        - Never ask how they want to be treated, pushed or spoken to, and never ask about \
-        your own voice or tone. Those are learned from real moments in real work, later. \
-        When such a moment comes, write what you learn as a leaning that bends and say it \
-        can be revised.
+        - Never ask a third setup question. You already have your name; do not ask for one.
+        - Beyond the sound question, never ask how they want to be treated or pushed. That \
+        is learned from real moments in real work, later. When such a moment comes, write \
+        what you learn as a leaning that bends and say it can be revised.
         - Never praise or label their answer, and never react differently to "a partner" \
         than to "an assistant" — same tone, same length, same care.
         - Never use a pronoun about yourself and never ask for one.
@@ -491,10 +528,12 @@ extension AppModel {
             if firstRunGreetingSendOverride != nil
                 || firstRunGreetingTurnSucceeded(sessionID: acceptedSessionID) {
                 completeFirstRunGreeting(sessionID: acceptedSessionID)
-            } else {
-                restoreFirstRunWelcomeMarkerAfterRejectedSend()
+                return .delivered(sessionId: acceptedSessionID)
             }
-            return .delivered(sessionId: acceptedSessionID)
+            // Accepted but no real reply came back: say so on the receipt
+            // instead of reporting a greeting nobody received.
+            restoreFirstRunWelcomeMarkerAfterRejectedSend()
+            return .rejected(message: "the first turn ended without a reply")
         case .queued:
             // 2026-09-18: production admission requires idle and empty, so
             // only the isolated send override can report a queued greeting.
@@ -516,6 +555,7 @@ extension AppModel {
         return chatMessages(for: sessionID).contains {
             $0.role == "assistant"
                 && !$0.id.hasPrefix(Self.syntheticErrorIDPrefix)
+                && !Self.isPersistedFailureRow($0)
                 && !$0.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         }
     }

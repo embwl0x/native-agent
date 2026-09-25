@@ -297,8 +297,10 @@ enum SessionHistoryPromptRenderer {
         if isTool {
             content = toolSummary(content: message.content, metadata: metadata)
         } else if isCompactionSummary {
+            // A recollection never replays what people call each other as a
+            // trait — that line became a verbal habit (2026-09-24).
             content = normalize(
-                message.content,
+                ChatSessionRecollections.droppingAddressTraits(message.content),
                 inputCap: compactionNormalizationInputCharacterCap
             )
         } else {

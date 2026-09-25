@@ -424,7 +424,7 @@ struct TelegramView: View {
 
     @ViewBuilder
     private var authorizationSection: some View {
-        TelegramSection(label: "Who can reach \(AgentVoice.live.object)") {
+        TelegramSection(label: "Who can reach me") {
             TelegramCard {
                 VStack(alignment: .leading, spacing: 12) {
                     Toggle("Telegram is on", isOn: Bindable(appModel).telegramEnabled)
@@ -488,6 +488,7 @@ struct TelegramView: View {
                             }
                         }
                         .pickerStyle(.segmented)
+                        .hazeTinted(.segments)
                         .labelsHidden()
                         .fixedSize()
                         .onChange(of: appModel.telegramModel) { _, model in
@@ -594,15 +595,16 @@ struct TelegramView: View {
             }
 
             TelegramSection(label: "Recent replies") {
-                TelegramCard {
-                    VStack(alignment: .leading, spacing: 12) {
+                // Alive glass (2026-09-23): one group card, a row per event.
+                AliveGroupCard {
+                    Group {
                         if let issue = status.receiptsIssue {
                             TelegramNote(text: issue, tone: .trouble)
                         }
                         if status.receipts.isEmpty {
                             TelegramNote(
                                 text: status.receiptsIssue == nil
-                                    ? "Replies \(AgentVoice.live.subject) \(AgentVoice.live.verb("send")) over Telegram will be listed here."
+                                    ? "Replies I send over Telegram will be listed here."
                                     : "No readable reply records are available.",
                                 tone: .quiet
                             )
@@ -624,8 +626,9 @@ struct TelegramView: View {
             }
 
             TelegramSection(label: "Blocked and ignored") {
-                TelegramCard {
-                    VStack(alignment: .leading, spacing: 12) {
+                // Alive glass (2026-09-23): one group card, a row per event.
+                AliveGroupCard {
+                    Group {
                         if let issue = status.blockedIssue {
                             TelegramNote(text: issue, tone: .trouble)
                         }
@@ -655,8 +658,8 @@ struct TelegramView: View {
 
             if status.errorsIssue != nil || !status.errors.isEmpty {
                 TelegramSection(label: "Recent errors") {
-                    TelegramCard {
-                        VStack(alignment: .leading, spacing: 12) {
+                    AliveGroupCard {
+                        Group {
                             if let issue = status.errorsIssue {
                                 TelegramNote(text: issue, tone: .trouble)
                             }
@@ -713,12 +716,8 @@ private struct TelegramSection<Content: View>: View {
     @ViewBuilder var content: Content
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text(label)
-                .font(ShellType.labelSemibold)
-                .textCase(.uppercase)
-                .kerning(0.6)
-                .foregroundStyle(NativeAgentShell.secondary)
+        VStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
+            AliveEyebrow(label)
             content
         }
     }
@@ -730,7 +729,9 @@ private struct TelegramCard<Content: View>: View {
     var body: some View {
         content
             .padding(16)
-            .settingsCardSurface()
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .aliveCard()
+            .accessibilityElement(children: .contain)
     }
 }
 
@@ -755,15 +756,18 @@ private struct TelegramStatusLine: View {
     let tone: TelegramTone
 
     var body: some View {
+        // The mark carries the tone; the words stay in text colour, since
+        // light calm and trouble fail 4.5:1 on the card fill.
         HStack(alignment: .top, spacing: 8) {
             Image(systemName: systemImage)
                 .font(ShellType.labelSemibold)
+                .foregroundStyle(tone.color)
             Text(text)
                 .font(ShellType.label)
+                .foregroundStyle(NativeAgentShell.text)
                 .fixedSize(horizontal: false, vertical: true)
                 .textSelection(.enabled)
         }
-        .foregroundStyle(tone.color)
     }
 }
 
@@ -830,7 +834,7 @@ struct TelegramEventRow: View {
             }
             Text(metadata)
                 .font(ShellType.caption)
-                .foregroundStyle(NativeAgentShell.tertiary)
+                .foregroundStyle(NativeAgentShell.secondary)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .textSelection(.enabled)

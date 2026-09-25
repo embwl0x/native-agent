@@ -454,6 +454,11 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
                         // `response.incomplete` frame — see the buffered
                         // sibling. Same omission, same misclassification.
                         var incompleteReason: String?
+                        // 2026-09-25: the loop guard every other streaming
+                        // adapter has. Without it a looping reply ran to the
+                        // model's own cap (no max_output_tokens is sent).
+                        var runaway = RunawayOutputDetector()
+                        var runawayTripped = false
 
                         func stampTTFT() {
                             emittedProviderOutput = true
@@ -492,6 +497,10 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
                                 if let delta = event["delta"] as? String, !delta.isEmpty {
                                     stampTTFT()
                                     continuation.yield(.textDelta(delta))
+                                    if runaway.feed(delta) {
+                                        runawayTripped = true
+                                        return true
+                                    }
                                 }
                             } else if etype == "response.output_item.added" {
                                 if let item = event["item"] as? [String: Any],
@@ -615,6 +624,21 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
                             throw CancellationError()
                         } catch {
                             throw mapTransportError(error, fallback: transientNetworkError(error, endpoint: endpoint, operation: "streamMessages"))
+                        }
+                        if runawayTripped {
+                            await self.telemetry.record(
+                                requestBody: req.httpBody,
+                                provider: self.providerId,
+                                model: coercedModel,
+                                streaming: true,
+                                usage: capturedUsage,
+                                ttftMs: ttftMs,
+                                durationMs: Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000),
+                                status: "incomplete",
+                                substitutedFrom: substitutedFrom,
+                                stopReason: "client_runaway"
+                            )
+                            throw runaway.stopError
                         }
                         guard shouldStop else {
                             // Byte stream ended WITHOUT a terminal event

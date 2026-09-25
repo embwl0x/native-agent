@@ -268,7 +268,34 @@ public enum AgentPeerCredentials {
     /// Revocation removes both forms, so fallback cannot resurrect a key.
     public static func read(peerID: String) throws -> String? {
         guard automaticTestDataRoot() == nil else { throw CredentialError.unavailable }
-        return try compatibleToken(service: service) { try readToken(peerID: peerID, service: $0) }
+        let (cached, generation) = cache.withLock { ($0.tokens[peerID], $0.generations[peerID, default: 0]) }
+        if let cached { return cached }
+        let token = try compatibleToken(service: service) { try readToken(peerID: peerID, service: $0) }
+        // A write or delete that landed during the read wins; hold nothing.
+        cache.withLock { if $0.generations[peerID, default: 0] == generation { $0.tokens[peerID] = .some(token) } }
+        return token
+    }
+    /// 2026-09-25: every contact projection checks every peer's key, so one
+    /// people list read the Keychain ~120 times (5.5k SecItemCopyMatching in
+    /// 6h). Reads (a missing key too) are held in memory; this process is the
+    /// only writer, and write/delete drop the entry and bump its generation
+    /// so a read already in flight cannot put the old key back. Failures are
+    /// not held.
+    private static let cache = LockedPeerTokens()
+    private final class LockedPeerTokens: @unchecked Sendable {
+        private let lock = NSLock()
+        struct State {
+            var tokens: [String: String?] = [:]
+            var generations: [String: Int] = [:]
+        }
+        private var state = State()
+        func withLock<T>(_ body: (inout State) -> T) -> T {
+            lock.lock(); defer { lock.unlock() }
+            return body(&state)
+        }
+        func forget(_ peerID: String) {
+            withLock { $0.tokens[peerID] = nil; $0.generations[peerID, default: 0] += 1 }
+        }
     }
     static func compatibleToken(service: String, read: (String) throws -> String?) throws -> String? {
         if let current = try read(service) { return current }
@@ -276,6 +303,7 @@ public enum AgentPeerCredentials {
     }
     public static func write(_ token: String, peerID: String) throws {
         let query = try query(peerID: peerID)
+        defer { cache.forget(peerID) }
         guard AgentPeerHTTP.validToken(token) else { throw CredentialError.invalidToken }
         let attributes = [kSecValueData as String: Data(token.utf8)]
         var status = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
@@ -289,6 +317,7 @@ public enum AgentPeerCredentials {
         guard status == errSecSuccess else { throw CredentialError.unavailable }
     }
     public static func delete(peerID: String) throws {
+        defer { cache.forget(peerID) }
         try revoke(service: service) { service in
             let status = SecItemDelete(try query(peerID: peerID, service: service) as CFDictionary)
             guard status == errSecSuccess || status == errSecItemNotFound else { throw CredentialError.unavailable }

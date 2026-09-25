@@ -105,6 +105,12 @@ extension SwiftNativeMacControl {
             )
         }
         let waitMs = MacActClosedLoop.clampedWaitMs(Self.intValue(body, "wait_ms"))
+        // Her-screen Phase 4 — BACKGROUND HANDS. The frame came from an
+        // anchored look at an app that is (usually) not in front. Pure AX runs
+        // there; anything that needs the window server is NOT raised into
+        // User's screen — it comes back `needs_front` with the reason.
+        let background = body["background"] == .bool(true)
+        let frontBefore = accessibilitySource.frontmostApp()
 
         // 2. HANDLE → PATH, through the frame store and its own failure
         //    vocabulary. Each failure names what to do next, because "that
@@ -199,6 +205,14 @@ extension SwiftNativeMacControl {
         //     outlives the element handle — pid + role/subrole + title + rect +
         //     window index — and no match, or an ambiguous one, REFUSES.
         let actWindows = accessibilityActSource.windows(pid: framePid)
+        if actWindows.isEmpty, MacScreenLock.isLocked() {
+            return injectionRefusal(
+                action: "act",
+                error: "mac_locked",
+                status: 409,
+                extra: ["guidance": .string(MacScreenLock.reply)]
+            )
+        }
         guard !actWindows.isEmpty else {
             return injectionRefusal(
                 action: "act",
@@ -547,7 +561,8 @@ extension SwiftNativeMacControl {
             target: target,
             text: text,
             direction: direction,
-            inputRefusal: inputRefusal
+            inputRefusal: inputRefusal,
+            background: background
         )
         await screenViewStore.invalidate()
 
@@ -598,6 +613,13 @@ extension SwiftNativeMacControl {
             until: navigationVerb ? MacActClosedLoop.navigationNotificationKinds : []
         )
         observerGuard.stop()
+        // Her-screen 09-23 — a background act that opened a menu must not
+        // leave it hanging open over the person's screen: cancel it through
+        // the element that opened it, and say whether that took.
+        var menuLeftOpen: Bool?
+        if background, wait.notifications.contains("AXMenuOpened") {
+            menuLeftOpen = accessibilityActSource.perform(performed.target, action: "AXCancel") != .performed
+        }
 
         // 9. RE-COMPILE the same look percept and DIFF it against the frame.
         let limits = Self.axLimits(from: body)
@@ -713,6 +735,15 @@ var effect: [String: JSONValue] = [
         }
         for (key, value) in performed.extra { output[key] = value }
         if let error = performed.error { output["error"] = .string(error) }
+        // Whether the person's front app moved during this act — the proof
+        // flag for "User's screen touched".
+        let frontAfter = accessibilitySource.frontmostApp()
+        output["front_app_changed"] = .bool(frontBefore?.processIdentifier != frontAfter?.processIdentifier)
+        output["background"] = .bool(background)
+        if let menuLeftOpen {
+            output["menu_opened"] = .bool(true)
+            output["menu_left_open"] = .bool(menuLeftOpen)
+        }
 
         guard let read else {
             // The window went away under the act (she closed it, or dismissed
@@ -946,7 +977,11 @@ var effect: [String: JSONValue] = [
         /// Round 7 — non-nil when the frame's window is NOT key, i.e. when any
         /// synthesized event would land somewhere other than the window she
         /// looked at. Consulted at every posting site; pure-AX paths ignore it.
-        inputRefusal: MacActClosedLoop.KeyWindowRefusal?
+        inputRefusal: MacActClosedLoop.KeyWindowRefusal?,
+        /// Her-screen Phase 4 — never raise; a site that needs the front
+        /// refuses `needs_front` instead, and `type` inserts through AX or
+        /// keys addressed to the app's pid.
+        background: Bool = false
     ) -> MacActPerformed? {
         /// Every synthesized-input site calls this FIRST. Non-nil ⇒ return it:
         /// nothing posted, nothing selected, nothing pressed. The AX paths above
@@ -1120,7 +1155,7 @@ var effect: [String: JSONValue] = [
                 return false
             }
 
-            if !didActuate, !raiseAttempted {
+            if !didActuate, !raiseAttempted, !background {
                 raiseAttempted = true
                 let outcome = accessibilityActSource.raise(actWindow)
                 if outcome == .performed, raiseSettled() {
@@ -1147,6 +1182,27 @@ var effect: [String: JSONValue] = [
                         // here would report "could not raise" for "you were
                         // never allowed to."
                         + (accessibilityActSource.raiseDiagnostic.map { " \($0)" } ?? "")
+                )
+            }
+            // Background: the rung above needs the front. Say so — and if an
+            // accessibility action already went out unconfirmed, say that too
+            // (round 8's rule: its status is not proof it did nothing).
+            if background {
+                return MacActPerformed(
+                    ok: false,
+                    method: didActuate ? "ax_action" : "none",
+                    requestedAction: requestedAction,
+                    fallbackReason: inputRefusal.reason,
+                    error: "needs_front",
+                    target: target,
+                    postState: didActuate ? accessibilityActSource.reread(target) : nil,
+                    actedHandle: handle,
+                    extra: [
+                        "posted_events": .int(0),
+                        "ax_delivered": .bool(didActuate),
+                        "actuations_attempted": .array(actuationsAttempted.map { .string($0) }),
+                        "needs_front_reason": .string(MacActClosedLoop.needsFrontReason(requestedAction)),
+                    ]
                 )
             }
             // ALREADY ACTUATED. We still refuse to POST — an event into the app
@@ -1259,8 +1315,123 @@ var effect: [String: JSONValue] = [
             }
         }
 
+        /// Her-screen Phase 4 — typing into an app that stays in the back.
+        /// Insert at the field's own insertion point (AXSelectedText), else
+        /// replace its value (AXValue), else focus it inside its app and send
+        /// keys addressed to THAT pid — only while the act window is the app's
+        /// own focused window. Never a keystroke into whatever is key.
+        func typeInBackground(_ text: String) -> MacActPerformed {
+            // A single-line field is replaced, as a person retyping it would.
+            if ["AXTextField", "AXComboBox"].contains(target.role),
+               case .success(let result) = ledgeredActuatorAct(action: nil, value: text, resolved: target), result.ok {
+                return summarize(result, target: target, actedHandle: handle,
+                                 extra: ["background_route": .string("ax_value_replace")])
+            }
+            noteActuation("AXSelectedText")
+            if accessibilityActSource.setSelectedText(target, text: text) == .performed {
+                return MacActPerformed(
+                    ok: true, method: "ax_selected_text", requestedAction: "type",
+                    fallbackReason: nil, error: nil, target: target,
+                    postState: accessibilityActSource.reread(target), actedHandle: handle
+                )
+            }
+            if case .success(let result) = ledgeredActuatorAct(action: nil, value: text, resolved: target),
+               result.ok {
+                return summarize(result, target: target, actedHandle: handle,
+                                 extra: ["background_route": .string("ax_value_replace")])
+            }
+            func needsFront() -> MacActPerformed {
+                MacActPerformed(
+                    ok: false, method: "none", requestedAction: "type",
+                    fallbackReason: "value_not_settable", error: "needs_front", target: target,
+                    postState: accessibilityActSource.reread(target), actedHandle: handle,
+                    extra: [
+                        "posted_events": .int(0),
+                        "needs_front_reason": .string(MacActClosedLoop.needsFrontReason("type")),
+                    ]
+                )
+            }
+            if let refusal = MacActClosedLoop.secureInputRefusal(active: eventSink.secureKeyboardEntryActive) {
+                return MacActPerformed(
+                    ok: false, method: "none", requestedAction: "type",
+                    fallbackReason: refusal.reason, error: refusal.reason, target: target,
+                    postState: nil, actedHandle: handle,
+                    extra: ["posted_events": .int(0), "guidance": .string(refusal.note)]
+                )
+            }
+            /// The keys go to the pid, and the app routes them to ITS focus:
+            /// so the act window must be the app's focused window AND the
+            /// target field its focused element — re-asked before every chunk.
+            func focusHolds() -> Bool {
+                guard let focused = accessibilityActSource.focusedWindow(pid: framePid),
+                      focused.handle == actWindow.handle else { return false }
+                return accessibilityActSource.isFocusedElement(target, pid: framePid)
+            }
+            guard eventSink.isAvailable,
+                  ledgeredSetFocused(target) == .performed,
+                  focusHolds() else { return needsFront() }
+            var posted = 0
+            var charactersSent = 0
+            let characters = Array(text)
+            let chunk = 4
+            sending: while charactersSent < characters.count {
+                guard focusHolds() else {
+                    // Stop where focus moved: never another key into whatever
+                    // took it. What already went is said, not hidden.
+                    return MacActPerformed(
+                        ok: false, method: "keystroke_to_pid", requestedAction: "type",
+                        fallbackReason: "value_not_settable", error: "focus_moved", target: target,
+                        postState: accessibilityActSource.reread(target), actedHandle: handle,
+                        extra: [
+                            "posted_events": .int(Int64(posted)),
+                            "characters_sent": .int(Int64(charactersSent)),
+                            "text_character_count": .int(Int64(characters.count)),
+                            "guidance": .string(
+                                "focus moved off that field inside the app, so I stopped typing after "
+                                + "\(charactersSent) of \(characters.count) characters — check the screen below"
+                            ),
+                        ]
+                    )
+                }
+                let slice = String(characters[charactersSent..<min(characters.count, charactersSent + chunk)])
+                for event in MacEventPlanner.typeText(slice) {
+                    guard eventSink.post(key: event, toPid: framePid) else { break sending }
+                    posted += 1
+                }
+                charactersSent += slice.count
+            }
+            guard posted > 0 else { return needsFront() }
+            if charactersSent < characters.count {
+                return MacActPerformed(
+                    ok: false, method: "keystroke_to_pid", requestedAction: "type",
+                    fallbackReason: "value_not_settable", error: "keystroke_delivery_stopped", target: target,
+                    postState: accessibilityActSource.reread(target), actedHandle: handle,
+                    extra: ["posted_events": .int(Int64(posted)), "characters_sent": .int(Int64(charactersSent))]
+                )
+            }
+            return MacActPerformed(
+                ok: true, method: "keystroke_to_pid", requestedAction: "type",
+                fallbackReason: "value_not_settable", error: nil, target: target,
+                postState: accessibilityActSource.reread(target), actedHandle: handle,
+                extra: ["posted_events": .int(Int64(posted)), "text_character_count": .int(Int64(text.count))]
+            )
+        }
+
         switch verb {
         case .click, .select, .toggle:
+            // Background: pressing something whose job is to open a menu would
+            // pop that menu over the person's screen. It needs the front.
+            if background, ["AXMenuBarItem", "AXMenuButton", "AXPopUpButton"].contains(target.role) {
+                return MacActPerformed(
+                    ok: false, method: "none", requestedAction: MacAccessibilityActuator.defaultAction,
+                    fallbackReason: "opens_a_menu", error: "needs_front", target: target,
+                    postState: nil, actedHandle: handle,
+                    extra: [
+                        "posted_events": .int(0),
+                        "needs_front_reason": .string("it opens a menu, and menus need the app in front"),
+                    ]
+                )
+            }
             // One mechanism, three intentions. AXPress runs the app's OWN
             // handler — which is what "select this row" and "toggle this
             // checkbox" mean to the app — and the actuator falls back to a
@@ -1293,7 +1464,9 @@ var effect: [String: JSONValue] = [
             // therefore fired on a window that was not key AND outside the
             // actuation ledger. Both halves of Agent's round-9 receipt come
             // from those two lines of distance.
-            if let refusal = refuseInput("AXOpen") { return refusal }
+            // Background: AXOpen is pure AX and runs in the back; the gate
+            // still stands in front of every synthesized fallback below.
+            if !background, let refusal = refuseInput("AXOpen") { return refusal }
 
             if target.actions.contains("AXOpen"),
                ledgeredPerform(target, action: "AXOpen") == .performed {
@@ -1365,7 +1538,7 @@ var effect: [String: JSONValue] = [
             // re-read the fallback path is entitled to — and if the first
             // AXOpen already delivered, the ledger makes this report what
             // happened instead of claiming nothing did.
-            if let refusal = refuseInput("AXOpen") { return refusal }
+            if !background, let refusal = refuseInput("AXOpen") { return refusal }
 
             // 1. THE SEMANTIC PATH, any role. `AXUIElementPerformAction` does
             //    what the app says it does; it cannot land somewhere else, so a
@@ -1576,6 +1749,9 @@ var effect: [String: JSONValue] = [
                     ]
                 )
             }
+            if background {
+                return typeInBackground(text)
+            }
             // AXSetValue first: that is how you fill a field without
             // simulating 40 keystrokes, and it cannot be intercepted by
             // whatever else has focus.
@@ -1649,6 +1825,16 @@ var effect: [String: JSONValue] = [
                 )
             }
             if let refusal = refuseInput("type") { return refusal }
+            // Replace, as a person does (and as AXSetValue above would have):
+            // the field has focus, so select its own text first. A save sheet
+            // selects only the base name, which turned "hello.txt" into
+            // "hello.txt.txt". Single-line fields only: in a document body
+            // (a text area, a web editor) select-all would wipe the document.
+            if ["AXTextField", "AXComboBox"].contains(target.role) {
+                for event in MacEventPlanner.chord(MacKeyChord(modifiers: .command, keyCode: 0x00, source: "cmd+a")) {
+                    eventSink.post(key: event)
+                }
+            }
             for event in MacEventPlanner.typeText(text) {
                 eventSink.post(key: event)
             }
@@ -1672,7 +1858,19 @@ var effect: [String: JSONValue] = [
             // CURRENT frame and scoped by path prefix to the modal — a window
             // behind a sheet often has its own "Close", and pressing that would
             // act on the wrong surface entirely.
-            if let dismissEntry = MacActClosedLoop.dismissTarget(in: frame),
+            // The press must answer to what she named: the named control itself
+            // when it IS a Cancel/Close/Done/OK, else the dismiss button of the
+            // SAME modal the named thing sits in. "dismiss Delete" never presses
+            // some other modal's Cancel.
+            let namedDismiss = MacActClosedLoop.normalizedLabel(entry.label).map {
+                MacActClosedLoop.dismissLabels.contains($0.lowercased())
+            } ?? false
+            let sameModalDismiss: MacLookFrameEntry? = {
+                if namedDismiss { return entry }
+                guard let modalPath = frame.modalPath, entry.path.starts(with: modalPath) else { return nil }
+                return MacActClosedLoop.dismissTarget(in: frame)
+            }()
+            if let dismissEntry = sameModalDismiss,
                case .resolved(let dismissTarget) = accessibilityActSource.resolve(
                    path: dismissEntry.path,
                    inWindow: actWindow

@@ -99,6 +99,11 @@ struct AgentConversationContinuation: Sendable {
                     }
                     $0.nextReadAt = Date().addingTimeInterval(Date().timeIntervalSince(row.operationStartedAt ?? row.updatedAt) > 300 ? 60 : 15)
                 }
+                if settled, row.personInitiated == true {
+                    // The person's own send: its answer settles in the thread, no agent turn.
+                    try finish(row, delivered: true, runID: nil)
+                    continue
+                }
                 if settled {
                     try await deliver(row, receipt: cached, peer: peer)
                     return
@@ -191,7 +196,7 @@ struct AgentConversationContinuation: Sendable {
             } catch {
                 try? await lifecycle.markOutcomeUnknown(deliveryId: deliveryID, requestDigest: digest,
                     detail: "Resident continuation interrupted; never rerun automatically")
-                try? attention(row, "Agent's reply handling was interrupted. The peer reply is retained; no message was repeated.", receipt: receipt)
+                try? attention(row, "Reply handling was interrupted. The peer reply is retained; no message was repeated.", receipt: receipt)
                 throw error
             }
         }

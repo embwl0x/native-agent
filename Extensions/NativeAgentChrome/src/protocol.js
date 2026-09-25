@@ -260,7 +260,10 @@ function requireKeySpec(value) {
     "Enter", "Tab", "Escape", "ArrowDown", "ArrowUp", "ArrowLeft", "ArrowRight",
     "Home", "End", "PageUp", "PageDown", "Backspace", "Delete", "Space", "A",
   ]);
-  if (!bases.has(base) || parts.some((part, index) => !modifiers.has(part) || parts.indexOf(part) !== index)) {
+  // 2026-09-24: one printable character too (X's j/k, GitHub's "/"): sites
+  // read those in their own handlers, which synthetic events do reach.
+  const printable = typeof base === "string" && [...base].length === 1 && base.trim().length === 1;
+  if ((!bases.has(base) && !printable) || parts.some((part, index) => !modifiers.has(part) || parts.indexOf(part) !== index)) {
     throw new ProtocolError("invalid_payload", "key uses an unsupported key or modifier combination.");
   }
 }

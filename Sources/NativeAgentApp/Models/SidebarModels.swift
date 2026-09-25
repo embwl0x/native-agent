@@ -256,6 +256,8 @@ enum SidebarItem: String, CaseIterable, Identifiable, Sendable {
         case .skills: "Skills & Tools"
         // User, 2026-09-04: they are notifications, everywhere they are named.
         case .inboxPolicy: "Notifications"
+        // The page calls them helpers; the route id stays "Bots".
+        case .bots: "Helpers"
         default: rawValue
         }
     }
@@ -288,6 +290,7 @@ enum SidebarItem: String, CaseIterable, Identifiable, Sendable {
         case .skills: "Skills"
         // User, 2026-09-04: they are notifications, and more controls will join them.
         case .inboxPolicy: "Notifications"
+        case .bots: "Helpers"
         default: rawValue
         }
     }

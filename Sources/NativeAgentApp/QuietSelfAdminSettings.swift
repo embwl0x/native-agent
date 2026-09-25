@@ -848,7 +848,8 @@ enum QuietSettings {
             id: "chat.mood_tint", page: "chat", label: "Warmth in the glass",
             key: MoodTintPreference.key, defaultOn: true,
             note: "The glass takes a breath of warmth from how the agent is "
-                + "feeling, damped over hours. Off leaves dark mode exactly as it is."
+                + "feeling, damped over hours. Dark mode only; light mode never takes it. "
+                + "Off leaves dark mode exactly as it is."
         ))
         rows.append(QuietSetting(
             id: "chat.model", page: "chat", label: "Chat's own model",
@@ -891,11 +892,29 @@ enum QuietSettings {
             label: "Read replies aloud", key: "voiceAutoRead",
             note: "Speaks new replies through the speakers."
         ))
+        rows.append(QuietSetting(
+            id: "chat.context_window_mode", page: "chat", label: "Context window",
+            kind: .choice, choices: ["model", "custom"],
+            note: "model: 60% of the model's window. custom: the custom size, "
+                + "never past 60% of the model's window. She compacts at this window.",
+            read: { _ in
+                .string(ChatSessionAutocompactionConfig.productionDefault().contextWindowMode.rawValue)
+            },
+            write: { _, value in
+                UserDefaults.standard.set(
+                    try choiceValue(value, "Context window", ["model", "custom"]),
+                    forKey: ChatSessionAutocompactionConfig.contextWindowModeKey
+                )
+            }
+        ))
         rows.append(defaultsInt(
             id: "chat.compaction_threshold_tokens", page: "chat",
-            label: "Compaction threshold (tokens)", key: "nativeagent.compactionThresholdTokens",
-            fallback: 0, minimum: 0, maximum: 1_000_000,
-            note: "0 means the built-in default."
+            label: "Context window custom size (tokens)", key: ChatSessionAutocompactionConfig.defaultsKey,
+            // The Settings stepper's range and default, so a size written here
+            // is one Settings can show (0 read as "0 tokens" there).
+            fallback: ChatSessionAutocompactionConfig.defaultThresholdTokens,
+            minimum: 50_000, maximum: 500_000,
+            note: "Used when Context window is custom."
         ))
 
         rows.append(defaultsBool(
@@ -1250,9 +1269,19 @@ enum QuietSettings {
             id: "settings.dark_mode", page: "settings",
             label: "Dark appearance", key: "nativeagent.darkMode"
         ))
-        rows.append(defaultsBool(
-            id: "settings.classic_sidebar", page: "settings",
-            label: "Use the classic sidebar", key: NativeAgentShellPreference.classicShellKey
+        rows.append(defaultsChoice(
+            id: "settings.haze_color", page: "settings",
+            label: "Haze colour", key: HazeColor.key,
+            choices: HazeColor.allCases.map(\.rawValue), fallback: HazeColor.teal.rawValue,
+            note: "The one colour of the soft light drifting behind the window. "
+                + "Only these presets; there are no custom colours."
+        ))
+        rows.append(defaultsChoice(
+            id: "settings.view_mode", page: "settings",
+            label: "View", key: SimpleViewMode.key,
+            choices: SimpleViewMode.choices, fallback: SimpleViewMode.unsetDefault,
+            note: "simple: the agent, its agents and helpers beside one chat, no settings pages. "
+                + "advanced: the full app. agent: a window onto the agent's own screen."
         ))
         rows.append(defaultsBool(
             id: "settings.developer_surfaces", page: "settings",

@@ -28,6 +28,14 @@ public enum MCPSubprocessError: Error, Equatable, Sendable {
     case httpTransport(serverId: String, status: Int?, detail: String)
 }
 
+/// A malformed-input message reads as itself, not as `malformedResponse("…")`.
+extension MCPSubprocessError: LocalizedError {
+    public var errorDescription: String? {
+        if case .malformedResponse(let detail) = self { return detail }
+        return nil
+    }
+}
+
 // MARK: - Session status
 
 /// Live snapshot mirroring `Runtime.list_mcp_session_statuses()` shape

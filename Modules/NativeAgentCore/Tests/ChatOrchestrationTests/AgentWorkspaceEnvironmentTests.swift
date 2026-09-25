@@ -103,9 +103,10 @@ struct AgentWorkspaceEnvironmentTests {
         #expect(await owner.calls.last?.args["path"] == .string("/workspace/chosen-folder/draft.md"))
         let opened = saved
         let places = try await call(["action": action(opened, "Open places")], nav, owner)
-        #expect(object(places)["total_items"] == .int(2))
+        // Only the file she wrote is a window; opening Files to look left none.
+        #expect(object(places)["total_items"] == .int(1))
         guard case .array(let items)? = object(places)["items"] else { Issue.record("Missing places"); return }
-        #expect(items.contains { object($0)["title"] == .string("Files") })
+        #expect(!items.contains { object($0)["title"] == .string("Files") })
         _ = try await call(["action": action(places, "Reopen")], nav, owner)
         #expect(await owner.calls.map(\.name) == ["list_dir", "write_file", "read_file", "read_file"])
         #expect(await owner.calls.last?.args["path"] == .string("/workspace/chosen-folder/draft.md"))
@@ -127,7 +128,7 @@ struct AgentWorkspaceEnvironmentTests {
         let nav = AgentWorkspaceNavigation(), key = "places-test"
         let operation = try await nav.begin(key: key)
         for index in 0..<28 {
-            try await nav.navigate(.record(tool: "read_file", input: ["path": .string("/workspace/\(index).md")], title: "File \(index)"), key: key)
+            try await nav.navigate(.browserBookmark(url: "https://example.com/\(index)", title: "File \(index)"), key: key)
         }
         try await nav.navigate(.receipt(tool: "write_file", title: "Saved", value: .object(["status": .string("saved")])), key: key)
         let places = await nav.openPlaces(key: key)
@@ -165,23 +166,17 @@ struct AgentWorkspaceEnvironmentTests {
         await nav.end(key: key, operation: operation)
     }
 
-    @Test func webSearchEncodesTextAndUsesNewBackgroundRoute() async throws {
-        let nav = AgentWorkspaceNavigation(), owner = EnvironmentOwner([Self.schema("browser.chrome_acquire")])
+    @Test func webSearchIsPrivateSearchNotAChromeTab() async throws {
+        let nav = AgentWorkspaceNavigation(), owner = EnvironmentOwner([Self.schema(AgentWorkspaceKnowledge.webSearchTool), Self.schema("browser.chrome_acquire")])
         let home = try await call([:], nav, owner)
         let research = try await call(["action": action(home, "Open Research")], nav, owner)
         let query = "a & b # unicode café"
         _ = try await call(["action": action(research, "Search the web"), "text": .string(query)], nav, owner)
         let calls = await owner.calls
         #expect(calls.count == 1)
-        #expect(calls.first?.name == "browser.chrome_acquire")
-        #expect(calls.first?.args["mode"] == .string("create"))
-        guard case .string(let url)? = calls.first?.args["initial_url"] else { Issue.record("Missing URL"); return }
-        let components = try #require(URLComponents(string: url))
-        #expect(components.queryItems == [.init(name: "q", value: query)])
-        #expect(components.host == "www.google.com")
-        #expect(components.fragment == nil)
-        _ = try await call([:], nav, owner)
-        #expect(await owner.calls.count == 1)
+        #expect(calls.first?.name == AgentWorkspaceKnowledge.webSearchTool)
+        #expect(calls.first?.args["query"] == .string(query))
+        #expect(!calls.contains { $0.name == "browser.chrome_acquire" })
     }
 
     @Test func unfinishedDraftSurvivesDetourAndValidationButCannotReplayAfterSubmit() async throws {

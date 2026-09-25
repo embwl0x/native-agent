@@ -668,7 +668,19 @@ extension NativeClient {
         let divisor: Double = resolvedModel.lowercased().contains("claude") ? 3.5 : 4.0
         let transcriptTokens = max(0, Int((Double(totalChars) / divisor).rounded()))
 
-        let budget = ProviderRouting.contextLength(forModel: resolvedModel)
+        // Her window (`effectiveWindowTokens`): 60% of the selected model's,
+        // capped by a Custom size; an injected size is Custom. The ring is of
+        // it, the same window the composer card reads, and she compacts at it.
+        // An unknown model takes the same 60% of the catalog's gauge default.
+        var windowConfig = ChatSessionAutocompactionConfig.productionDefault()
+        if let configuredThresholdTokens, configuredThresholdTokens > 0 {
+            windowConfig.thresholdTokens = configuredThresholdTokens
+            windowConfig.contextWindowMode = .custom
+        }
+        let gaugeWindow = ProviderRouting.contextLength(forModel: resolvedModel)
+        let budget = windowConfig.effectiveWindowTokens(forModel: resolvedModel)
+            ?? windowConfig.effectiveWindowTokens(nativeWindowTokens: gaugeWindow)
+            ?? gaugeWindow
 
         let providerUsagePath = root
             .appendingPathComponent("chat", isDirectory: true)
@@ -699,23 +711,7 @@ extension NativeClient {
         let usedTokens = providerReceipt?.lastRequestInputTokens ?? transcriptTokens
         let promptTokens = max(0, usedTokens - transcriptTokens)
 
-        // The user's preference is the ceiling. The shared compaction policy
-        // clamps it to 40% of the selected model's window so a 200k global
-        // preference cannot fire too late on a 128k model.
-        let configuredThreshold: Int = {
-            if let configuredThresholdTokens, configuredThresholdTokens > 0 {
-                return configuredThresholdTokens
-            }
-            let storedThreshold = UserDefaults.standard.integer(
-                forKey: "nativeagent.compactionThresholdTokens"
-            )
-            return storedThreshold > 0
-                ? storedThreshold
-                : ChatSessionAutocompactionConfig.defaultThresholdTokens
-        }()
-        let threshold = ChatSessionAutocompactionConfig(
-            thresholdTokens: configuredThreshold
-        ).effectiveThresholdTokens(forModel: resolvedModel)
+        let threshold = windowConfig.effectiveThresholdTokens(forModel: resolvedModel)
 
         // A carried-over receipt counts tokens against the PREVIOUS model's
         // window, so an 800k figure over a fresh 128k budget would read 600%.

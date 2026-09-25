@@ -245,6 +245,24 @@ extension SwiftNativeTurnEngine {
             ))
             payload["volatileBlockBytes"] = .int(Int64(volatileBlock.utf8.count))
         }
+        // Text tool lane: the provider gets no tools array, so the schema JSON
+        // above is never sent. Each tool rides as one prose row, the always-on
+        // floor inside the system prompt and this session's loads in the turn
+        // brief. Measure those rows where they actually sit, so the receipt
+        // can name the tool cost without counting JSON that never left.
+        if systemPrompt.contains(AnthropicOAuthDirectAdapter.textToolProtocolHeader) {
+            let catalog = textToolCatalogSections(
+                schemas: context.toolSchemas,
+                names: context.toolsAvailable
+            )
+            func bytes(_ text: String, in host: String) -> Int {
+                !text.isEmpty && host.contains(text) ? text.utf8.count : 0
+            }
+            payload["toolCatalogSystemBytes"] = .int(Int64(
+                bytes(catalog.floor, in: systemPrompt) + bytes(catalog.appended, in: systemPrompt)
+            ))
+            payload["toolCatalogBriefBytes"] = .int(Int64(bytes(catalog.appended, in: volatileBlock)))
+        }
         if let prefix = ConversationPrefixTelemetry.current {
             for (key, value) in prefix.payload { payload[key] = value }
         }

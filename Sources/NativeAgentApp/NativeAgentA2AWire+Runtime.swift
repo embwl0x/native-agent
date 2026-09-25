@@ -47,7 +47,12 @@ struct AgentContactA2AEndpoint: Sendable {
                 let value = try await tasks.push(operation: operation, owner: principal.id, parameters: parameters)
                 return .json(NativeAgentA2AWire.result(id, AgentContactPart.object(value) as! [String: Any]))
             case .send(let send):
-                let task = try await tasks.send(send, principal: principal, digest: AgentPeerReplayClaimStore.digest(body))
+                // Method and params, not the envelope: a client retrying the same
+                // messageId mints a new JSON-RPC id.
+                let replayObject: [String: Any] = ["method": method, "params": envelope?["params"] ?? NSNull()]
+                let replayBytes = JSONSerialization.isValidJSONObject(replayObject)
+                    ? (try? JSONSerialization.data(withJSONObject: replayObject, options: .sortedKeys)) ?? body : body
+                let task = try await tasks.send(send, principal: principal, digest: AgentPeerReplayClaimStore.digest(replayBytes))
                 if send.streaming {
                     return .stream(id: id, events: try await tasks.subscribe(task.id, owner: principal.id), version: wireVersion)
                 }
@@ -164,8 +169,11 @@ enum AgentContactRuntime {
            let value = try? JSONDecoder().decode(JSONValue.self, from: bytes), case .object = value {
             parts.append(.data(value, metadata: .object(["source": .string("agent"), "taskId": .string(taskID)])))
         }
+        // A file too big to send drops out, not the finished reply with it.
+        let omitted = "[Files produced by this reply were too large to send and were left out.]"
+        var dropped = false
         for attachment in ChatGeneratedImageArtifacts.attachments(from: result.toolDispatches, dataRoot: dataRoot) {
-            parts.append(try AgentContactPart.output(attachment, taskID: taskID))
+            if let part = try? AgentContactPart.output(attachment, taskID: taskID) { parts.append(part) } else { dropped = true }
         }
         // A successful write receipt proves the produced bytes. Do not scan
         // reply prose for paths or read an arbitrary path from a tool result.
@@ -182,9 +190,9 @@ enum AgentContactRuntime {
         }
         let size = try JSONSerialization.data(withJSONObject: parts.map(\.wire03)).count
         guard size <= AgentContactPart.maximumOutputBytes else {
-            throw AgentContactFailure(code: -32603, message: "The produced files are too large to send together")
+            return parts.filter { if case .file = $0 { return false }; return true } + [.text(omitted)]
         }
-        return parts
+        return dropped ? parts + [.text(omitted)] : parts
     }
 }
 

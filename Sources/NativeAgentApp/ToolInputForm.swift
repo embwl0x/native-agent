@@ -203,6 +203,7 @@ struct ToolInputForm: View {
                 Button("Run") { attemptSubmit() }
                     .keyboardShortcut(.return, modifiers: [.command])
                     .buttonStyle(.borderedProminent)
+                    .hazeTinted(.button)
                     .accessibilityIdentifier("tool-input-form-run")
             }
             .padding(.horizontal, NativeAgentSpacing.lg)
@@ -287,6 +288,7 @@ private struct ToolFieldRow: View {
                         .foregroundStyle(.secondary)
                 }
                 .toggleStyle(.switch)
+                .hazeTinted()
                 .controlSize(.small)
                 .accessibilityIdentifier("tool-input-field-\(name)")
 

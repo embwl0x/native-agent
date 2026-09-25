@@ -176,17 +176,13 @@ extension NativeClient {
         guard let safeSessionId = NativeAgentChatSessionID.normalizedPathComponent(sessionId) else {
             throw invalidChatSessionIDError(operation: "cancel chat session")
         }
-        let flagPath = root
-            .appendingPathComponent("chat", isDirectory: true)
-            .appendingPathComponent("sessions", isDirectory: true)
-            .appendingPathComponent(safeSessionId, isDirectory: true)
-            .appendingPathComponent("cancelled.flag")
+        let flagPath = ChatCancelFlag.path(dataRoot: root, sessionId: safeSessionId)
         let persistence = SwiftNativePersistenceCore()
         try await persistence.withFileLock(flagPath) {
             let parent = flagPath.deletingLastPathComponent()
             try? FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
-            let stamp = SwiftNativeManifestSigner.isoTimestamp(Date())
-            try Data(stamp.utf8).write(to: flagPath, options: .atomic)
+            // The runs in flight on this session, so only they stop (ChatCancelFlag).
+            try Data(ChatCancelFlag.stopContent(forFlagAt: flagPath).utf8).write(to: flagPath, options: .atomic)
         }
         return EmptyResponse()
     }

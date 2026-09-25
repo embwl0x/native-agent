@@ -150,11 +150,11 @@ public actor BotRunner {
             throw BotRunnerError.cannotRun(problem)
         }
         return try await BotRunQueue.$ancestry.withValue(BotRunQueue.ancestry.union([id])) {
-            try await perform(bot, message: question, requestID: nil)
+            try await perform(bot, message: question, requestID: nil, asked: true)
         }
     }
 
-    private func perform(_ bot: BotDefinition, message: String, requestID: UUID?) async throws -> ShelfEntry {
+    private func perform(_ bot: BotDefinition, message: String, requestID: UUID?, asked: Bool = false) async throws -> ShelfEntry {
         let start = Date()
         let clock = ContinuousClock.now
         // A refused daily reservation means the turn never started: it is a run
@@ -207,6 +207,7 @@ public actor BotRunner {
         entry.sessionID = bot.sessionID
         entry.model = outcome.model ?? bot.model
         entry.approvalID = outcome.approvalID
+        if asked { entry.asked = true }
         try shelf.append(entry)
         return entry
     }

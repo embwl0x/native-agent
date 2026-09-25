@@ -305,7 +305,6 @@ final class ComposerShellState {
     /// without starting a second, asynchronous read of the trace ledger — the
     /// pane said "Context pane is open" and then listed nothing.
     var contextReceipt: ComposerContextReceiptState = .loading
-    var contextWindowLine: String?
 
     /// Which provider's models are showing, derived from the pane so there is
     /// one source of truth.
@@ -379,42 +378,8 @@ final class ComposerShellState {
     /// the same words the card draws, from the same loaded receipt. Nothing
     /// here is a control, so `activateRow` still refuses the pane.
     private func contextRows() -> [ComposerShellRow] {
-        switch contextReceipt {
-        case .loading:
-            return [ComposerShellRow(id: "loading", label: "Reading the last turn…", isSelected: false)]
-        case .noTurn:
-            return [ComposerShellRow(id: "no-turn", label: "No turn yet", isSelected: false)]
-        case .unavailable(let reason):
-            return [ComposerShellRow(
-                id: "unavailable",
-                label: "The turn trace could not be read: \(reason)",
-                isSelected: false
-            )]
-        case .receipt(let receipt):
-            var rows = receipt.rows.map { row in
-                ComposerShellRow(
-                    id: row.id,
-                    label: ComposerContextReceiptPresentation.rowAccessibility(
-                        row, share: receipt.share(row)
-                    ),
-                    isSelected: false
-                )
-            }
-            rows.append(ComposerShellRow(
-                id: "assembled",
-                label: "Assembled \(ComposerContextReceiptPresentation.size(receipt.assembledBytes))",
-                isSelected: false
-            ))
-            if let window = contextWindowLine {
-                rows.append(ComposerShellRow(id: "window", label: window, isSelected: false))
-            }
-            let ran = ComposerContextReceiptPresentation.ranAt(receipt.ranAt)
-            rows.append(ComposerShellRow(
-                id: "ran",
-                label: receipt.model.map { "\($0) · \(ran)" } ?? ran,
-                isSelected: false
-            ))
-            return rows
+        ComposerContextReceiptPresentation.lines(contextReceipt).map {
+            ComposerShellRow(id: $0.id, label: $0.label, isSelected: false)
         }
     }
 
@@ -767,11 +732,34 @@ struct ChatComposerSettings: View, ChatComposerRoutingReading {
         HStack(spacing: 0) {
             Spacer(minLength: 0)
 
+            // 2026-09-23: one cluster at the right — ring and percent, model,
+            // thinking, trust, dotted like words in a line. Fast rides at the
+            // cluster's leading end: in a trailing-aligned row nothing to its
+            // right moves when it comes and goes, so it no longer holds an
+            // empty slot between the thinking word and the trust word.
+            if fastIsOn {
+                Button { toggle(.model) } label: {
+                    Text("Fast")
+                        .font(ShellType.label)
+                        .foregroundStyle(NativeAgentShell.text)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3)
+                        .background(NativeAgentShell.softFill, in: Capsule())
+                        .contentShape(Capsule())
+                }
+                .buttonStyle(.plain)
+                .padding(.trailing, 10)
+                .help("Fast is on. Turn it off in the model card.")
+                .accessibilityIdentifier("chat.composer.fast")
+                .accessibilityLabel("Fast is on")
+            }
+
             // How full the context is, at a glance — and the receipt behind
             // it: click the ring and the last turn's assembled context opens
             // in the same shell as the words, above the ring.
             contextRing
-                .padding(.trailing, 14)
+
+            separator
 
             word(
                 .model,
@@ -782,14 +770,12 @@ struct ChatComposerSettings: View, ChatComposerRoutingReading {
                 accessibility: isBotConversation ? "Bot model. Edit in Bots" : "Model: \(modelWord)",
                 identifier: "chat.composer.model"
             )
+            // At most 220, but no wider than the name: a greedy frame held
+            // the ring out in the middle of the bar.
             .frame(maxWidth: 220, alignment: .trailing)
+            .fixedSize(horizontal: true, vertical: false)
 
-            // Punctuation between two hit targets, not a control.
-            Text("·")
-                .font(ShellType.label)
-                .foregroundStyle(NativeAgentShell.secondary)
-                .padding(.horizontal, 6)
-                .accessibilityHidden(true)
+            separator
 
             word(
                 .effort,
@@ -803,32 +789,7 @@ struct ChatComposerSettings: View, ChatComposerRoutingReading {
                 identifier: "chat.composer.effort"
             )
 
-            // Fast is the one state worth a chip: turned on for a while and
-            // forgotten. Off, it is not on screen. It opens the card that
-            // holds its switch.
-            //
-            // 2026-09-17: the chip used to be inserted and removed, so toggling
-            // Fast shifted the whole right-aligned words row sideways — under an
-            // open pane, which is anchored to a word. It keeps its space at zero
-            // opacity instead, and nothing can take it while it is not there.
-            Button { toggle(.model) } label: {
-                Text("Fast")
-                    .font(ShellType.label)
-                    .foregroundStyle(NativeAgentShell.text)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 3)
-                    .background(NativeAgentShell.softFill, in: Capsule())
-                    .contentShape(Capsule())
-            }
-            .buttonStyle(.plain)
-            .padding(.leading, 12)
-            .opacity(fastIsOn ? 1 : 0)
-            .disabled(!fastIsOn)
-            .allowsHitTesting(fastIsOn)
-            .accessibilityHidden(!fastIsOn)
-            .help("Fast is on. Turn it off in the model card.")
-            .accessibilityIdentifier("chat.composer.fast")
-            .accessibilityLabel("Fast is on")
+            separator
 
             word(
                 .trust,
@@ -837,7 +798,6 @@ struct ChatComposerSettings: View, ChatComposerRoutingReading {
                 accessibility: "Trust: \(trustWord)",
                 identifier: "chat.composer.trust"
             )
-            .padding(.leading, 14)
         }
         .frame(maxWidth: .infinity, alignment: .trailing)
         .font(ShellType.label)
@@ -892,13 +852,23 @@ struct ChatComposerSettings: View, ChatComposerRoutingReading {
         cardState?.activePane.word == card
     }
 
+    /// Punctuation between two hit targets, not a control.
+    private var separator: some View {
+        Text("·")
+            .font(ShellType.label)
+            .foregroundStyle(NativeAgentShell.secondary)
+            .padding(.horizontal, 6)
+            .accessibilityHidden(true)
+    }
+
     /// The ring is the context pane's word. It carries the same anchor, the
     /// same focus ring, the same hover rule and the same keys as the three
     /// settings words, so the receipt is reachable exactly like they are — and
     /// it opens the one shell, not a card of its own.
     private var contextRing: some View {
         Button { toggle(.context) } label: {
-            ComposerContextRing(sessionId: appModel.activeChatSessionId)
+            ComposerContextRing(sessionId: appModel.activeChatSessionId,
+                                model: isBotConversation ? botContract?.model : nil)
                 .padding(.horizontal, 5)
                 .padding(.vertical, 4)
                 .background {
@@ -1443,7 +1413,8 @@ struct ChatComposerCardLayer: View, ChatComposerRoutingReading {
     /// animates it, and the ring opens it.
     @ViewBuilder
     private var contextPane: some View {
-        ComposerContextReceiptCard(sessionId: appModel.activeChatSessionId, shell: state)
+        ComposerContextReceiptCard(sessionId: appModel.activeChatSessionId, shell: state,
+                                   model: isBotConversation ? botContract?.model : nil)
             .padding(NativeAgentSpacing.md)
     }
 

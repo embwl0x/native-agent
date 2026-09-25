@@ -414,7 +414,12 @@ actor ProviderToolResultRecoveryStore {
 extension SwiftToolDispatcher {
     func impl_tool_result_page(input: [String: JSONValue]) async -> JSONValue {
         if input["continue"] == .bool(true) {
-            guard ["page", "query", "raw"].allSatisfy({ input[$0] == nil || input[$0] == .null }) else {
+            // Blank defaults a strict schema fills in (page 0, query "", raw false) select nothing.
+            let blank: (JSONValue?) -> Bool = {
+                if case .string(let text)? = $0 { return text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+                return [nil, .null, .int(0), .bool(false)].contains($0)
+            }
+            guard ["page", "query", "raw"].allSatisfy({ blank(input[$0]) }) else {
                 return .object(["status": .string("failed"), "reason": .string("conflicting_read_selection"),
                     "recovery_hint": .string("Use continue:true alone (optional result_handle), or select an explicit page/query/raw mode. Continue retains the previous mode and position.")])
             }

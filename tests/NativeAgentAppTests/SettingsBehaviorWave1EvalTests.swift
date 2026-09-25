@@ -39,6 +39,12 @@ struct SettingsBehaviorWave1EvalTests {
         let config = ChatSessionAutocompactionConfig.productionDefault(defaults: defaults)
         #expect(config.thresholdTokens == 345_678)
         #expect(config.enabled)
+        // A size saved before the mode existed carries over as Custom; with
+        // nothing saved she uses the model's default window.
+        #expect(config.contextWindowMode == .custom)
+        #expect(ChatSessionAutocompactionConfig.productionDefault(
+            defaults: try isolatedDefaults()
+        ).contextWindowMode == .modelDefault)
     }
 
     @Test func compactionRejectsZeroAndNegativePersistedThresholds() throws {
@@ -65,7 +71,7 @@ struct SettingsBehaviorWave1EvalTests {
         let config = ChatSessionAutocompactionConfig(thresholdTokens: 500_000)
         // `gpt-5.4` was retired on 2026-09-13, so the small-window example is a
         // model this build still carries: Claude Haiku 4.5 at 200k.
-        #expect(config.effectiveThresholdTokens(forModel: "claude-haiku-4-5", providerID: "anthropic") == 80_000)
+        #expect(config.effectiveThresholdTokens(forModel: "claude-haiku-4-5", providerID: "anthropic") == 120_000)
     }
 
     @Test func compactionRetainsTheUserThresholdWhenTheModelWindowIsUnknown() {

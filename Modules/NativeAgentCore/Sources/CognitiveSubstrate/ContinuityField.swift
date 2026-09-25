@@ -744,6 +744,9 @@ struct ContinuityField: Sendable {
             "source",
             "toolName",
             "event_class",
+            // The Sound rut detector's view of a long reply's sign-off.
+            "replyCharacterCount",
+            "replyTail",
         ]
         let presentPriority = priority.filter { metadata[$0] != nil }
         let prioritySet = Set(presentPriority)

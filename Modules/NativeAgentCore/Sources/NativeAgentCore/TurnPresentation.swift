@@ -80,7 +80,7 @@ public struct TurnPresentationState: Sendable, Equatable {
     // Accumulated model text never enters presentation state. Its length is
     // enough to coalesce duplicate streaming snapshots while observing real
     // movement.
-    var streamedTextLength: Int
+    public internal(set) var streamedTextLength: Int
 
     public var isTerminal: Bool { phase.isTerminal }
 

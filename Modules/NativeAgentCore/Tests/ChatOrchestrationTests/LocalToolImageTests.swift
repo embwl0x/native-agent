@@ -151,10 +151,10 @@ private struct ImageFileDispatcher: ToolDispatchClient {
         try Data("unchanged text".utf8).write(to: text)
         #expect(LocalToolImage.readAuthorizedFile(text) == nil)
         let slots = await SwiftNativeTurnEngine.runIterationDispatchGroups(
-            prepared: (0..<6).map { .init(pairedId: "read-\($0)", internalName: "read_file", dispatchInput: ["path": .string("a.png")]) },
+            prepared: (0..<10).map { .init(pairedId: "read-\($0)", internalName: "read_file", dispatchInput: ["path": .string("a.png")]) },
             modelId: "gpt-6-astra", surface: "studio_wander", tools: ImageFileDispatcher(root: root),
             progress: nil, onToolUse: { _ in }, onOutcome: { _, _, _ in })
-        #expect(slots.flatMap(\.images).count == 4)
+        #expect(slots.flatMap(\.images).count == 8)
         #expect(slots.suffix(2).allSatisfy { $0.isError })
     }
 }

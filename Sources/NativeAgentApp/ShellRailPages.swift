@@ -12,6 +12,7 @@ enum ShellRailTab {
 
 struct MemoriesRailPage: View {
     @AppStorage(ShellRailTab.storageKey(.memories)) private var tab = "memories"
+    @Environment(AppModel.self) private var appModel
 
     var body: some View {
         ShellTabbedPage(
@@ -20,12 +21,18 @@ struct MemoriesRailPage: View {
                 ShellTab(key: "memories", title: "Memories"),
                 ShellTab(key: "knowledge", title: "Knowledge graph"),
             ],
-            selection: $tab
+            selection: $tab,
+            alive: true
         ) { key in
-            switch key {
-            case "knowledge": KnowledgeGraphView()
-            default: MemoriesPageView(embedded: true)
+            Group {
+                switch key {
+                case "knowledge": KnowledgeGraphView()
+                default: MemoriesPageView(embedded: true)
+                }
             }
+            // One sentence for both tabs, from the read the rail page's
+            // selection already makes (`refreshForSidebarItem(.memories)`).
+            .alivePageLine(MemoriesPageContent.headerLine(appModel), id: "memories.kept-line")
         }
     }
 }
@@ -39,10 +46,11 @@ struct PersonalityRailPage: View {
             subtitle: SidebarItem.personality.shellPageSubtitle,
             tabs: [
                 ShellTab(key: "personality", title: "Personality"),
-                ShellTab(key: "minds", title: "\(AgentVoice.live.possessive) minds"),
+                ShellTab(key: "minds", title: "My minds"),
                 ShellTab(key: "dreams", title: "Dreams"),
             ],
-            selection: $tab
+            selection: $tab,
+            alive: true
         ) { key in
             switch key {
             case "minds": SetupMindsView()
@@ -64,7 +72,8 @@ struct TrustRailPage: View {
                 ShellTab(key: "trust", title: "Trust"),
                 ShellTab(key: "mac", title: "Mac integration"),
             ],
-            selection: $tab
+            selection: $tab,
+            alive: true
         ) { key in
             switch key {
             case "mac": MacIntegrationView()
@@ -91,7 +100,8 @@ struct ConnectorsRailPage: View {
             title: "Connectors",
             subtitle: SidebarItem.connectors.shellPageSubtitle,
             tabs: Self.tabs,
-            selection: $tab
+            selection: $tab,
+            alive: true
         ) { key in
             switch key {
             case "agents": AgentContactsSection()
@@ -112,6 +122,7 @@ struct ConnectorsRailPage: View {
 
 struct DiagnosticsRailPage: View {
     @AppStorage(ShellRailTab.storageKey(.diagnostics)) private var tab = DiagnosticsView.DiagnosticsMode.doctor.rawValue
+    @Environment(AppModel.self) private var appModel
 
     var body: some View {
         ShellTabbedPage(
@@ -121,11 +132,19 @@ struct DiagnosticsRailPage: View {
                 // Skills and Tools are tabs here, not a segmented control
                 // under the tab row (the reviewer's catch, 2026-09-04).
                 + [ShellTab(key: "skills", title: "Skills"), ShellTab(key: "tools", title: "Tools")],
-            selection: $tab
+            selection: $tab,
+            alive: true
         ) { key in
             switch key {
-            case "skills": SkillLifecycleView()
-            case "tools": ToolsView()
+            // The same kit cards and header line as the Diagnostics tabs.
+            case "skills":
+                SkillLifecycleView()
+                    .environment(\.aliveCards, true)
+                    .alivePageLine(DiagnosticsView.headerLine(appModel), id: "diagnostics.line")
+            case "tools":
+                ToolsView()
+                    .environment(\.aliveCards, true)
+                    .alivePageLine(DiagnosticsView.headerLine(appModel), id: "diagnostics.line")
             default:
                 DiagnosticsView(
                     initialMode: DiagnosticsView.DiagnosticsMode(rawValue: key) ?? .doctor,

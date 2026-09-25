@@ -214,6 +214,9 @@ struct InboxSettingsView: View {
     @State private var statusSlot = InboxPolicyStatusSlot()
     @State private var trustReadState: InboxPolicyTrustReadState = .loading
     @State private var inboxHistoryRoute = InboxHistoryRoute()
+    /// The trigger read has come back once, either way: the header may speak.
+    @State private var triggersRead = false
+    @AppStorage(NativeAgentShellPreference.classicShellKey) private var classicShell = false
 
     // File watcher watched paths (comma-separated editing)
     @State private var watchedPaths: String = ""
@@ -241,18 +244,174 @@ struct InboxSettingsView: View {
 
     var body: some View {
         ScrollView {
+            if classicShell { classicContent } else { aliveContent }
+        }
+        // One save path for either shell's switch: a user flip writes, a
+        // programmatic load does not.
+        .onChange(of: masterEnabled) { _, val in
+            if suppressMasterSave {
+                suppressMasterSave = false
+                return
+            }
+            Task { await saveMaster(enabled: val) }
+        }
+        .alivePageLine(classicShell ? nil : headerLine)
+        // ui-taste-sweep 2026-06-07: was falling back to the bundle name.
+        .navigationTitle("Notifications")
+        .quietReadTask { await load() }
+        .sheet(isPresented: Binding(
+            get: { inboxHistoryRoute.isPresented },
+            set: { presented in
+                if !presented { inboxHistoryRoute.close() }
+            }
+        )) {
+            InboxHistoryView(
+                route: inboxHistoryRoute,
+                onRefresh: { await refreshInboxHistory() },
+                onClose: { inboxHistoryRoute.close() }
+            )
+            .environment(appModel)
+            .presentationDetents([.large])
+        }
+    }
+
+    // ── Alive glass (Advanced shell, 2026-09-23) ──────────────────────────
+
+    /// The header's one sentence, in the agent's own voice. No "waiting"
+    /// count: this page holds settings, not things waiting on him. Nil until
+    /// both the setting and the triggers have been read.
+    private var headerLine: String? {
+        guard triggersRead else { return nil }
+        switch trustReadState {
+        case .loading: return nil
+        case .unavailable: return "I couldn't read these settings just now."
+        case .loaded(enabled: false): return "I keep quiet until you ask."
+        case .loaded(enabled: true):
+            guard !triggers.isEmpty else { return "I bring you things without being asked." }
+            let on = triggers.filter(\.enabled).count
+            return "I bring you things without being asked; \(on) of \(triggers.count) kinds are on."
+        }
+    }
+
+    /// Same controls, same writes: the master switch and every trigger in ONE
+    /// group card, each row a title, a detail and the haze switch; the history
+    /// is a quiet line under it.
+    private var aliveContent: some View {
+        VStack(alignment: .leading, spacing: AliveMetrics.sectionSpacing) {
+            VStack(alignment: .leading, spacing: 12) {
+                AliveGroupCard {
+                    InboxAliveSwitchRow(
+                        title: "Let \(agentDisplayName) raise things unasked",
+                        detail: "When this is on, \(agentDisplayName) can share observations, file changes, finished Desk tasks and check-ins without being asked.",
+                        isOn: $masterEnabled
+                    )
+                    .disabled(masterToggleDisabled)
+
+                    switch triggersPanelGate {
+                    case .enabled:
+                        ForEach(triggers) { trigger in
+                            TriggerRowView(
+                                trigger: trigger,
+                                watchedPaths: trigger.name == "file_watch" ? $watchedPaths : .constant(""),
+                                onToggle: { enabled in await setTriggerEnabled(trigger.name, enabled: enabled) },
+                                alive: true
+                            )
+                        }
+                    case .disabled:
+                        EmptyView()
+                    case .loading:
+                        Text("Checking whether notifications from \(agentDisplayName) are on…")
+                            .font(.system(size: 13))
+                            .foregroundStyle(NativeAgentShell.secondary)
+                    case .unavailable(let detail):
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("The notification setting could not be read. Notification options are unavailable until it can be loaded.")
+                                .font(.system(size: 13, weight: .medium))
+                                .foregroundStyle(NativeAgentShell.text)
+                                .fixedSize(horizontal: false, vertical: true)
+                            Text(detail)
+                                .font(.system(size: 13))
+                                .foregroundStyle(NativeAgentShell.secondary)
+                                .lineLimit(3)
+                        }
+                    }
+                }
+
+                if !statusSlot.entries.isEmpty {
+                    VStack(alignment: .leading, spacing: 4) {
+                        ForEach(statusSlot.entries, id: \.source) { entry in
+                            Text(entry.status.text)
+                                .font(ShellType.label)
+                                .foregroundStyle(statusColor(entry.status.tone))
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                }
+
+                Button {
+                    Task { await openInboxHistory() }
+                } label: {
+                    HStack(spacing: 6) {
+                        Text("Notification history")
+                            .font(.system(size: 13, weight: .medium))
+                        Image(systemName: "chevron.right")
+                            .font(ShellType.captionSemibold)
+                    }
+                    .foregroundStyle(NativeAgentShell.secondary)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .disabled(inboxHistoryRoute.isLoading)
+            }
+
+            if triggersPanelGate == .enabled,
+               triggers.first(where: { $0.name == "file_watch" })?.enabled == true {
+                VStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
+                    AliveEyebrow("Folders \(agentDisplayName) watches")
+                    AliveGroupCard {
+                        VStack(alignment: .leading, spacing: 10) {
+                            Text("One folder path per line.")
+                                .font(.system(size: 13))
+                                .foregroundStyle(NativeAgentShell.secondary)
+                            watchedPathsEditor
+                            Button("Save paths") {
+                                Task { await saveWatchedPaths() }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        .padding(.bottom, 32)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var watchedPathsEditor: some View {
+        TextEditor(text: $watchedPaths)
+            .accessibilityLabel("Folders the agent watches")
+            .accessibilityHint("Enter one folder path per line.")
+            .font(ShellType.code)
+            .scrollContentBackground(.hidden)
+            .frame(minHeight: 80)
+            .padding(8)
+            .background(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(NativeAgentShell.quietFill)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .strokeBorder(NativeAgentShell.hairline, lineWidth: 1)
+            )
+    }
+
+    // ── Classic shell: unchanged ──────────────────────────────────────────
+
+    private var classicContent: some View {
             VStack(alignment: .leading, spacing: 24) {
                 // ── Master toggle ──────────────────────────────────────────
                 InboxSection(title: "Notifications from the agent") {
                     Toggle("Let the agent raise things unasked", isOn: $masterEnabled)
                         .disabled(masterToggleDisabled)
-                        .onChange(of: masterEnabled) { _, val in
-                            if suppressMasterSave {
-                                suppressMasterSave = false
-                                return
-                            }
-                            Task { await saveMaster(enabled: val) }
-                        }
 
                     Text("When this is on, \(agentDisplayName) can share observations, file changes, finished Desk tasks and check-ins without being asked.")
                         .font(ShellType.label)
@@ -340,24 +499,6 @@ struct InboxSettingsView: View {
             }
             .padding(.bottom, 32)
             .frame(maxWidth: .infinity, alignment: .leading)
-        }
-        // ui-taste-sweep 2026-06-07: was falling back to the bundle name.
-        .navigationTitle("Notifications")
-        .quietReadTask { await load() }
-        .sheet(isPresented: Binding(
-            get: { inboxHistoryRoute.isPresented },
-            set: { presented in
-                if !presented { inboxHistoryRoute.close() }
-            }
-        )) {
-            InboxHistoryView(
-                route: inboxHistoryRoute,
-                onRefresh: { await refreshInboxHistory() },
-                onClose: { inboxHistoryRoute.close() }
-            )
-            .environment(appModel)
-            .presentationDetents([.large])
-        }
     }
 
     // ── Data loading ──────────────────────────────────────────────────────
@@ -399,6 +540,7 @@ struct InboxSettingsView: View {
         } catch {
             statusSlot.record(InboxPolicyStatus(.triggersLoadFailed(error.localizedDescription)), from: .triggersRead)
         }
+        triggersRead = true
         // Load watched paths for file_watch trigger
         if let fw = triggers.first(where: { $0.name == "file_watch" }),
            let paths = fw.config?["paths"] {
@@ -648,17 +790,43 @@ struct TriggerRowView: View {
     // visual toggle when the server write fails.
     let onToggle: (Bool) async -> Bool
 
+    /// The Advanced shell's row: title, detail, haze switch. No glyph, and no
+    /// pulsing dot: the switch already says on, and nothing here animates
+    /// per frame.
+    let alive: Bool
+
     @State private var toggleState: InboxTriggerToggleStateMachine
 
-    init(trigger: InboxTriggerConfig, watchedPaths: Binding<String>, onToggle: @escaping (Bool) async -> Bool) {
+    init(trigger: InboxTriggerConfig, watchedPaths: Binding<String>, onToggle: @escaping (Bool) async -> Bool,
+         alive: Bool = false) {
         self.trigger = trigger
         self._watchedPaths = watchedPaths
         self.onToggle = onToggle
+        self.alive = alive
         self._toggleState = State(initialValue: InboxTriggerToggleStateMachine(serverEnabled: trigger.enabled))
     }
 
-    // PATCH-2026-05-07: polish-InboxSettingsView PulsingDot for enabled triggers
     var body: some View {
+        Group {
+            if alive {
+                InboxAliveSwitchRow(
+                    title: trigger.displayName,
+                    detail: trigger.description,
+                    isOn: Binding(
+                        get: { toggleState.visualEnabled },
+                        set: { requestToggle($0) }
+                    ))
+            } else {
+                classicRow
+            }
+        }
+        .onChange(of: trigger.enabled) { _, val in
+            toggleState.synchronizeServer(enabled: val)
+        }
+    }
+
+    // PATCH-2026-05-07: polish-InboxSettingsView PulsingDot for enabled triggers
+    private var classicRow: some View {
         HStack(alignment: .center, spacing: 8) {
             ZStack(alignment: .bottomTrailing) {
                 Image(systemName: trigger.systemImage)
@@ -692,9 +860,6 @@ struct TriggerRowView: View {
                 .labelsHidden()
         }
         .frame(minHeight: 48)
-        .onChange(of: trigger.enabled) { _, val in
-            toggleState.synchronizeServer(enabled: val)
-        }
     }
 
     private func requestToggle(_ enabled: Bool) {
@@ -702,6 +867,37 @@ struct TriggerRowView: View {
         Task {
             let accepted = await onToggle(request.requestedEnabled)
             toggleState.completed(request, accepted: accepted)
+        }
+    }
+}
+
+/// One row of the alive settings card: a title, a detail under it, and the
+/// haze switch on the right. The switch carries the title as its label, so
+/// it names itself the way the labelled toggle it replaces did.
+private struct InboxAliveSwitchRow: View {
+    let title: String
+    let detail: String?
+    @Binding var isOn: Bool
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 16) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title)
+                    .font(.system(size: 15, weight: .medium))
+                    .foregroundStyle(NativeAgentShell.text)
+                    .fixedSize(horizontal: false, vertical: true)
+                if let detail, !detail.isEmpty {
+                    Text(detail)
+                        .font(.system(size: 13))
+                        .foregroundStyle(NativeAgentShell.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            Spacer(minLength: 12)
+            Toggle(title, isOn: $isOn)
+                .labelsHidden()
+                .toggleStyle(.switch)
+                .hazeTinted()
         }
     }
 }

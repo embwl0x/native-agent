@@ -88,29 +88,27 @@ struct NativePanel<Content: View>: View {
     var systemImage: String?
     var tint: Color? = nil
     @ViewBuilder var content: () -> Content
+    @Environment(\.aliveCards) private var aliveCards
 
     var body: some View {
-        VStack(alignment: .leading, spacing: NativeAgentSpacing.md) {
+        VStack(alignment: .leading, spacing: aliveCards ? AliveMetrics.eyebrowGap : NativeAgentSpacing.md) {
             if let title {
-                Text(title.uppercased())
-                    .font(ShellType.labelSemibold)
-                    .tracking(0.6)
-                    .foregroundStyle(NativeAgentShell.secondary)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                if aliveCards {
+                    AliveEyebrow(title)
+                } else {
+                    Text(title.uppercased())
+                        .font(ShellType.labelSemibold)
+                        .tracking(0.6)
+                        .foregroundStyle(NativeAgentShell.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
             }
             VStack(alignment: .leading, spacing: NativeAgentSpacing.md) {
                 content()
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(NativeAgentSpacing.lg)
-            .background(
-                RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
-                    .fill(TodayPalette.cardFill)
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
-                    .strokeBorder(TodayPalette.cardStroke, lineWidth: 1)
-            )
+            .modifier(SharedCardFill())
         }
         // Keep each card's controls in a semantic group. Flattening a whole
         // settings page makes SwiftUI repeatedly order unrelated descendants
@@ -151,18 +149,45 @@ struct InfoPill: View {
 struct SettingsCardSection<Content: View>: View {
     let title: String
     @ViewBuilder var content: Content
+    @Environment(\.aliveCards) private var aliveCards
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text(title)
-                .font(ShellType.labelSemibold)
-                .textCase(.uppercase)
-                .kerning(0.6)
-                .foregroundStyle(NativeAgentShell.secondary)
-                .padding(.horizontal, 2)
+        VStack(alignment: .leading, spacing: aliveCards ? AliveMetrics.eyebrowGap : 8) {
+            if aliveCards {
+                AliveEyebrow(title)
+            } else {
+                Text(title)
+                    .font(ShellType.labelSemibold)
+                    .textCase(.uppercase)
+                    .kerning(0.6)
+                    .foregroundStyle(NativeAgentShell.secondary)
+                    .padding(.horizontal, 2)
+            }
             VStack(alignment: .leading, spacing: 12) { content }
                 .padding(16)
                 .settingsCardSurface()
+        }
+    }
+}
+
+/// The settings card's fill and rim, or the alive card inside a page that
+/// asked for it (`aliveCards`).
+private struct SharedCardFill: ViewModifier {
+    @Environment(\.aliveCards) private var aliveCards
+
+    func body(content: Content) -> some View {
+        if aliveCards {
+            content.aliveCard()
+        } else {
+            content
+                .background(
+                    RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
+                        .fill(TodayPalette.cardFill)
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
+                        .strokeBorder(TodayPalette.cardStroke, lineWidth: 1)
+                )
         }
     }
 }
@@ -172,14 +197,7 @@ extension View {
     func settingsCardSurface() -> some View {
         self
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(
-                RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
-                    .fill(TodayPalette.cardFill)
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
-                    .strokeBorder(TodayPalette.cardStroke, lineWidth: 1)
-            )
+            .modifier(SharedCardFill())
             .accessibilityElement(children: .contain)
     }
 
@@ -695,7 +713,13 @@ enum NativeAgentShellLayout {
         roomAnchor == .seam ? .topLeading : .top
     }
     static let userBubbleMaxWidth: CGFloat = 640
-    static let composerRadius: CGFloat = 16
+    /// User, 2026-09-23 ("alive glass"): a generous round box, 16 -> 22.
+    static let composerRadius: CGFloat = 22
+    /// The rail's floating plate (2026-09-23).
+    static let railPlateRadius: CGFloat = 18
+    /// How far the plate floats in from the window's leading and bottom edges,
+    /// and down from the title strip.
+    static let railPlateInset: CGFloat = 10
     /// 16pt body at 1.6 line height → 9.6pt of extra leading.
     static let replyLineSpacing: CGFloat = 8
     /// Agent, 2026-09-02: the per-message action bar used to float over the

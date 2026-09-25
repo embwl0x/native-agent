@@ -93,7 +93,8 @@ enum GitHubCommandCheckoutResolver {
             .replacingOccurrences(of: "ssh://git@github.com/", with: "github.com/")
             .replacingOccurrences(of: "https://", with: "")
             .replacingOccurrences(of: "http://", with: "")
-            .replacingOccurrences(of: ".git", with: "")
+            // Only the suffix: "o/o.github.io.git" is o/o.github.io.
+            .replacingOccurrences(of: #"\.git$"#, with: "", options: .regularExpression)
     }
 
     private static func git(_ arguments: [String], at directory: URL) -> String {

@@ -91,6 +91,13 @@ actor AgentACPClient {
     private var restoredHistory = false
     private var initialized: JSONValue?
 
+    /// The peer said at initialize it can reopen a session by id.
+    var canRestoreSession: Bool {
+        let capabilities = initialized?.objectValue?["agentCapabilities"]?.objectValue
+        return capabilities?["loadSession"] == .bool(true)
+            || capabilities?["sessionCapabilities"]?.objectValue?["resume"]?.objectValue != nil
+    }
+
     func turn(executable: String, arguments: [String], directory: URL,
               environment: [String: String], message: String, mcpServers: [JSONValue] = [],
               permissionMode: String? = nil,
@@ -513,6 +520,7 @@ actor AgentACPConnections {
         var generation: UUID = UUID()
         var busy: Bool
         var expiry: Task<Void, Never>?
+        var idleSince = Date()
     }
     private var entries: [String: Entry] = [:]
 
@@ -531,6 +539,21 @@ actor AgentACPConnections {
             entry.expiry?.cancel()
             await entry.client.close()
             guard entries[key] == nil else { throw AgentACPClient.Failure.busy }
+        }
+        // Finished conversations idle for 30 min; at the cap an idle one makes
+        // room instead of every new conversation reading "already answering".
+        // First one whose peer reopens sessions by id; otherwise the longest
+        // idle, only once it has sat 10 min (it cannot continue after this).
+        if entries.count >= 8 {
+            let idle = entries.filter { !$0.value.busy }.sorted { $0.value.idleSince < $1.value.idleSince }
+            var victim: String?
+            for candidate in idle where await candidate.value.client.canRestoreSession { victim = candidate.key; break }
+            if victim == nil, let oldest = idle.first, Date().timeIntervalSince(oldest.value.idleSince) > 600 { victim = oldest.key }
+            if let victim, entries[victim]?.busy == false, let evicted = entries.removeValue(forKey: victim) {
+                evicted.expiry?.cancel()
+                await evicted.client.close()
+                guard entries[key] == nil else { throw AgentACPClient.Failure.busy }
+            }
         }
         guard entries.count < 8 else { throw AgentACPClient.Failure.busy }
         let client = AgentACPClient()

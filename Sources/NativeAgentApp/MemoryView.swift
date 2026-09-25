@@ -179,6 +179,7 @@ struct MemoryView: View {
                 }
             }
             .pickerStyle(.segmented)
+            .hazeTinted(.segments)
             .labelsHidden()
 
             if let spotlightStatus, !spotlightStatus.isEmpty {
@@ -546,6 +547,7 @@ private struct MemoryProposalReviewRow: View {
                     .controlSize(.small)
                 Button("Approve", systemImage: "checkmark", action: onApprove)
                     .buttonStyle(.borderedProminent)
+                    .hazeTinted(.button)
                     .controlSize(.small)
             }
         }

@@ -283,7 +283,7 @@ struct MacChatComposerControlStrip<InputContent: View>: View {
 
 
 
-    /// ui-simplify 2026-09-02 (Lane A). ON: one material, 16pt radius, a single
+    /// ui-simplify 2026-09-02 (Lane A). ON: one material, 22pt radius, a single
     /// hairline, a soft shadow, plus and mic on the left and a plain send arrow
     /// on the right — the thing you sit down at. OFF: the previous GlassCard
     /// strip, unchanged, for the `uiClassicShell` kill switch and the detached
@@ -444,42 +444,46 @@ struct MacChatComposerControlStrip<InputContent: View>: View {
                     Spacer(minLength: 0)
                 }
 
+                // Alive glass, 2026-09-23: Stop takes Send's slot while a turn
+                // runs — same place, same size — so nothing on the row moves
+                // when a turn starts. A calm circle in the send button's fill,
+                // the glyph in the text colour; red was the loudest thing on
+                // screen. Return still queues a draft during a turn.
                 if isRunning {
                     Button(action: onStop) {
                         Image(systemName: "stop.fill")
-                            .font(ShellType.labelSemibold)
+                            .font(ShellType.label)
                             .frame(width: 36, height: 36)
-                            .background(
-                                Color.red.opacity(0.85),
-                                in: RoundedRectangle(cornerRadius: 10, style: .continuous)
-                            )
-                            .foregroundStyle(.white)
+                            .background(Color.primary.opacity(0.12), in: Circle())
+                            .foregroundStyle(NativeAgentShell.text)
+                            .contentShape(Circle())
                     }
                     .buttonStyle(.plain)
+                    .shellKeyboardTarget(.send)
                     .help("Stop generation")
                     .accessibilityLabel("Stop generation")
+                } else {
+                    Button(action: onSend) {
+                        Image(systemName: "arrow.right")
+                            .font(ShellType.body)
+                            .frame(width: 36, height: 36)
+                            .background(
+                                canSend ? Color.primary.opacity(0.12) : NativeAgentShell.quietFill,
+                                in: RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            )
+                            .foregroundStyle(canSend ? NativeAgentShell.text : NativeAgentShell.tertiary)
+                    }
+                    .buttonStyle(.plain)
+                    .shellKeyboardTarget(.send)
+                    .disabled(!canSend)
+                    .animation(
+                        NativeAgentMotion.respecting(NativeAgentMotion.quick, reduceMotion: reduceMotion),
+                        value: canSend
+                    )
+                    .help("\(sendAction.label). \(sendAction.hint)")
+                    .accessibilityLabel(sendAction.label)
+                    .accessibilityHint(sendAction.hint)
                 }
-
-                Button(action: onSend) {
-                    Image(systemName: "arrow.right")
-                        .font(ShellType.body)
-                        .frame(width: 36, height: 36)
-                        .background(
-                            canSend ? Color.primary.opacity(0.12) : NativeAgentShell.quietFill,
-                            in: RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        )
-                        .foregroundStyle(canSend ? NativeAgentShell.text : NativeAgentShell.tertiary)
-                }
-                .buttonStyle(.plain)
-                .shellKeyboardTarget(.send)
-                .disabled(!canSend)
-                .animation(
-                    NativeAgentMotion.respecting(NativeAgentMotion.quick, reduceMotion: reduceMotion),
-                    value: canSend
-                )
-                .help("\(sendAction.label). \(sendAction.hint)")
-                .accessibilityLabel(sendAction.label)
-                .accessibilityHint(sendAction.hint)
             }
         }
         // The room's gutter, inside the glass: the field's first character
@@ -512,6 +516,13 @@ struct MacChatComposerControlStrip<InputContent: View>: View {
                     .strokeBorder(NativeAgentShell.hairline, lineWidth: 1)
                 }
             }
+            // User, 2026-09-23 ("alive glass"): a faint inner glow of the haze
+            // along the bottom edge, and while she thinks before replying, a
+            // caustic shimmer drifting through the glass. Both sit between the
+            // glass and the words, so neither washes the draft. Leaves only:
+            // see ThinkingGlow.swift.
+            HazeBottomGlow(cornerRadius: NativeAgentShellLayout.composerRadius)
+            ThinkingGlow(kind: .shimmer, cornerRadius: NativeAgentShellLayout.composerRadius)
         }
         .glassEffect(
             reduceTransparency ? .identity : .regular.interactive(),
@@ -537,6 +548,9 @@ struct MacChatComposerControlStrip<InputContent: View>: View {
             }
         }
         .animation(reduceMotion ? nil : NativeAgentMotion.quick, value: isFocused)
+        // The thinking rim: one arc of light travelling round the edge. Outside
+        // the focus animation's scope; it carries its own fade.
+        .overlay { ThinkingGlow(kind: .rim, cornerRadius: NativeAgentShellLayout.composerRadius) }
         .contentShape(Rectangle())
         .onTapGesture {
             composerCardState?.dismiss()

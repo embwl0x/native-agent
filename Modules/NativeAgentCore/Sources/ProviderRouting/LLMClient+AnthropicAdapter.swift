@@ -687,6 +687,8 @@ public final class AnthropicAdapter: LLMAdapter {
                     var ttftMs: Int?
                     var yieldedAnyText = false
                     var lastStopReason: String?
+                    var runaway = RunawayOutputDetector(endsAtToolBoundary:
+                        system?.contains(AnthropicOAuthDirectAdapter.textToolProtocolHeader) == true)
                     for try await sse in SSEEventStream(bytes) {
                         try Task.checkCancellation()
                         let payload = sse.data
@@ -737,6 +739,9 @@ public final class AnthropicAdapter: LLMAdapter {
                                     expectedOutput: "answer text"
                                 )
                             }
+                            // Same rule as the OAuth lane (2026-09-22): a
+                            // max_tokens reply is truncated, never finished.
+                            if lastStopReason == "max_tokens" { throw runaway.stopError }
                             continuation.finish()
                             return
                         case "content_block_delta":
@@ -749,7 +754,31 @@ public final class AnthropicAdapter: LLMAdapter {
                                     ttftMs = Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
                                 }
                                 yieldedAnyText = true
-                                continuation.yield(text)
+                                let stop = runaway.feed(text)
+                                let kept = runaway.keptPart(of: text)
+                                if !kept.isEmpty { continuation.yield(kept) }
+                                if stop {
+                                    // Ended by us, not by message_stop: record the call anyway, so
+                                    // the turn's cost stays visible (usage has message_start's input
+                                    // and cache counts; output tokens are unknown after cancel).
+                                    // A loop trip is recorded too: it is the costliest call.
+                                    await telemetry.record(
+                                        requestBody: req.httpBody,
+                                        provider: providerId,
+                                        model: model,
+                                        streaming: true,
+                                        usage: usage.isEmpty ? nil : usage,
+                                        ttftMs: ttftMs,
+                                        durationMs: Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000),
+                                        status: runaway.toolBoundary != nil ? "ok" : "incomplete",
+                                        stopReason: runaway.toolBoundary != nil ? "client_tool_boundary" : "client_runaway"
+                                    )
+                                    // Ended at a complete tool block, like a
+                                    // stop sequence: the calls before it run.
+                                    guard runaway.toolBoundary != nil else { throw runaway.stopError }
+                                    continuation.finish()
+                                    return
+                                }
                             case "thinking_delta", "input_json_delta":
                                 // Liveness (2026-07-21 audit; port of the OAuth
                                 // adapter's .keepAlive fix to this legacy String

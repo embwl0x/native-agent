@@ -47,6 +47,18 @@ final class ChatTurnExecution: @unchecked Sendable {
         let text = [detail, capabilityNote].compactMap { $0 }.joined(separator: "\n")
         return text.isEmpty ? nil : text
     }
+    /// Her-screen Phase 6 — the source-frame fingerprint of the last image
+    /// `screen` attached per window this turn. A match means the window has
+    /// not changed, so the picture already in her context stands.
+    private var attachedPixels: [String: String] = [:]
+    func pixelsAlreadyAttached(window: String, fingerprint: String) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return attachedPixels[window] == fingerprint
+    }
+    func notePixelsAttached(window: String, fingerprint: String) {
+        lock.lock(); defer { lock.unlock() }
+        attachedPixels[window] = fingerprint
+    }
     private var records: [TurnEngineResult.ToolDispatchRecord] = []
     var toolRecords: [TurnEngineResult.ToolDispatchRecord] { lock.lock(); defer { lock.unlock() }; return records }
     func keepTools(_ values: [TurnEngineResult.ToolDispatchRecord]) { lock.lock(); defer { lock.unlock() }; records += values }

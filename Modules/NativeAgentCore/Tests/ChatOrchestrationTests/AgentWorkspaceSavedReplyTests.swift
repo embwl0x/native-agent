@@ -159,9 +159,10 @@ struct AgentWorkspaceSavedReplyTests {
 
     @Test func savedAnswerTitleIsRecognizableWithoutCopyingTheAnswer() {
         let title = AgentWorkspaceSavedReply.title(.object(["agent_name": .string("Sideways"),
-            "runAt": .string("2026-09-10T14:38:30Z"), "headline": .string(String(repeating: "paragraph ", count: 100))]))
-        #expect(title == "Sideways — Sep 10, 14:38:30 UTC")
-        #expect(title.count < 60)
+            "runAt": .string("2026-09-10T14:38:30Z"), "headline": .string(String(repeating: "paragraph ", count: 100))]),
+            now: ISO8601DateFormatter().date(from: "2026-09-10T16:38:30Z")!)
+        #expect(title.hasPrefix("Sideways — 2h0m ago — paragraph"))
+        #expect(title.count < 160)
     }
 
     @Test func unfilteredShelfNamesEachHelperAndKeepsMissingDefinitionsHonest() async throws {

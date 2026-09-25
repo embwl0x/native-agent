@@ -22,7 +22,7 @@ extension NativeClient {
             // A statement whose successor is already recorded is not offered for
             // approval beside its own correction (Astra comb 4, lane5 finding 2).
             // History reads are untouched — a retired row keeps its page.
-            .filter { status != "pending" || SwiftNativeMemoryV2.supersededByMarker(in: $0.metadata) == nil }
+            .filter { status != "pending" || SwiftNativeMemoryV2.awaitsReview(content: $0.content, source: $0.source, metadata: $0.metadata) }
             .compactMap { proposal in
             Self.memoryProposalPresentationRecord(
                 id: proposal.id,

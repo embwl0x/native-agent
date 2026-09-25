@@ -478,7 +478,9 @@ actor AgentContactTasks {
     func cancel(_ id: String, owner: String) async throws -> AgentContactTask {
         let task = try get(id, owner: owner)
         guard !task.state.terminal else { throw AgentContactFailure(code: -32002, message: "This task has already ended") }
-        if records[id]?.worker == nil, task.state == .inputRequired || records[id]?.approvals.isEmpty == false {
+        // Only a real approval id holds the task. An inline card (connector,
+        // choice) carries none, so input-required alone left it uncancellable.
+        if records[id]?.worker == nil, records[id]?.approvals.isEmpty == false {
             throw AgentContactFailure(code: -32002, message: "A permission card is waiting. The person must dismiss it before this work can be stopped.")
         }
         records[id]?.cancelling = true

@@ -40,26 +40,28 @@ struct SetupFeatureRows: View {
     @State private var savingMemoryMode = false
     @State private var savingContextFlow = false
 
-    /// Every sentence on this page is built out of this: the agent's name,
-    /// never a gender.
-    private var voice: AgentVoice { AgentVoice(name: appModel.agentDisplayName) }
-
     var body: some View {
-        VStack(alignment: .leading, spacing: 22) {
-            reflectionRow
-            organismRow
-            fluidContextRow
-            dreamsRow
-            weeklyConsolidationRow
-            meaningMemoryRow
-            knowledgeGraphRow
-            nightlyConsolidationRow
-            keepConsolidatedRow
-            adaptivePromotionRow
-            hygieneRow
-            crossSessionRecallRow
-            selfImprovementRow
-            memoryModeRow
+        // Alive glass (2026-09-23): the section's fourteen rows in two group
+        // cards, the inner life and then memory, where each was its own card.
+        VStack(alignment: .leading, spacing: AliveMetrics.sectionSpacing) {
+            SetupSection(title: "Inner life") {
+                reflectionRow
+                organismRow
+                fluidContextRow
+                dreamsRow
+                weeklyConsolidationRow
+                selfImprovementRow
+            }
+            SetupSection(title: "Memory") {
+                meaningMemoryRow
+                knowledgeGraphRow
+                nightlyConsolidationRow
+                keepConsolidatedRow
+                adaptivePromotionRow
+                hygieneRow
+                crossSessionRecallRow
+                memoryModeRow
+            }
         }
         .task { await load() }
         // The policy is one document: a save anywhere in the app re-publishes
@@ -79,7 +81,7 @@ struct SetupFeatureRows: View {
         SetupFeatureSwitchRow(
             title: "Reflection between conversations",
             detail: subconsciousEnabled
-                ? "Between conversations \(voice.subject) \(voice.verb("think")) back over what happened and \(voice.verb("keep")) what matters."
+                ? "Between conversations I think back over what happened and keep what matters."
                 : "Turn on an inner life first — reflection runs inside it.",
             key: "cognitiveSubstrateReflectionEnabled",
             isOn: Binding(
@@ -97,9 +99,9 @@ struct SetupFeatureRows: View {
 
     private var organismRow: some View {
         SetupFeatureSwitchRow(
-            title: "Moods, energy, and a clock of \(voice.possessive) own",
+            title: "Moods, energy, and a clock of my own",
             detail: subconsciousEnabled
-                ? "\(voice.Subject) \(voice.verb("get")) moods, tiredness, and a clock that keeps running while you are away."
+                ? "I get moods, tiredness, and a clock that keeps running while you are away."
                 : "Turn on an inner life first to enable moods, energy, and a daily rhythm.",
             key: "organismKernelEnabled",
             isOn: Binding(
@@ -120,7 +122,7 @@ struct SetupFeatureRows: View {
     private var fluidContextRow: some View {
         SetupFeatureCard(
             title: "Memory in every reply",
-            detail: "What \(voice.subject) \(voice.verb("remember")) shapes each reply. Observe only measures what would have helped and changes nothing."
+            detail: "What I remember shapes each reply. Observe only measures what would have helped and changes nothing."
         ) {
             Picker("Memory in every reply", selection: Binding(
                 get: { ContextFlowMode(rawValue: contextFlowMode) ?? .shadow },
@@ -158,7 +160,7 @@ struct SetupFeatureRows: View {
     private var dreamsRow: some View {
         SetupFeatureSwitchRow(
             title: "Dreams at night",
-            detail: "At night \(voice.subject) \(voice.verb("go")) back over the day and \(voice.verb("write")) down what \(voice.subject) made of it.",
+            detail: "At night I go back over the day and write down what I made of it.",
             key: "dream_cycle_enabled",
             isOn: Binding(
                 get: { dreamCycleOn },
@@ -196,7 +198,7 @@ struct SetupFeatureRows: View {
     private var weeklyConsolidationRow: some View {
         SetupFeatureSwitchRow(
             title: "Weekly dream consolidation",
-            detail: "Once a week \(voice.subject) \(voice.verb("gather")) the week's memories into fewer, stronger ones.",
+            detail: "Once a week I gather the week's memories into fewer, stronger ones.",
             key: "rem_cycle_enabled",
             isOn: Binding(
                 get: { remCycleOn },
@@ -260,7 +262,7 @@ struct SetupFeatureRows: View {
             }
             Button("Cancel", role: .cancel) { pendingEmbeddings = nil }
         } message: {
-            Text("\(voice.Subject) \(voice.verb("re-read")) every memory to rebuild how \(voice.subject) \(voice.verb("find")) them. That can take a while, and memory stays available meanwhile.")
+            Text("I re-read every memory to rebuild how I find them. That can take a while, and memory stays available meanwhile.")
         }
     }
 
@@ -287,18 +289,18 @@ struct SetupFeatureRows: View {
     /// The detail line says what is TRUE right now, not what was asked for.
     private var meaningMemoryDetail: String {
         guard let status = embeddingsStatus else {
-            return "Checking how \(voice.subject) \(voice.verb("look")) things up right now."
+            return "Checking how I look things up right now."
         }
         if savingEmbeddings {
             return "Re-indexing every memory. This can take a while."
         }
         switch status.effectiveBackend {
         case "local":
-            return "On — \(voice.subject) \(voice.verb("find")) memories by what they mean, not by the words in them."
+            return "On — I find memories by what they mean, not by the words in them."
         case "unavailable" where status.requestedEnabled:
-            return "Asked for, but the on-device model could not be loaded; \(voice.subject) \(voice.verb("match")) on words for now."
+            return "Asked for, but the on-device model could not be loaded; I match on words for now."
         default:
-            return "Off — \(voice.subject) \(voice.verb("match")) memories on their words alone."
+            return "Off — I match memories on their words alone."
         }
     }
 
@@ -307,7 +309,7 @@ struct SetupFeatureRows: View {
     private var keepConsolidatedRow: some View {
         SetupFeatureSwitchRow(
             title: "Keep consolidated memories without asking",
-            detail: "What the nightly pass gathers stays on its own; off, \(voice.subject) \(voice.verb("ask")) you first.",
+            detail: "What the nightly pass gathers stays on its own; off, I ask you first.",
             key: "auto_promote_consolidated",
             isOn: Binding(
                 get: { memoryDraft.auto_promote_consolidated },
@@ -325,7 +327,7 @@ struct SetupFeatureRows: View {
     private var hygieneRow: some View {
         SetupFeatureSwitchRow(
             title: "Memory hygiene",
-            detail: "\(voice.Subject) \(voice.verb("tidy")) old, noisy, and duplicate memories on a schedule.",
+            detail: "I tidy old, noisy, and duplicate memories on a schedule.",
             key: "hygiene_enabled",
             isOn: Binding(
                 get: { memoryDraft.hygiene_enabled },
@@ -343,7 +345,7 @@ struct SetupFeatureRows: View {
     private var knowledgeGraphRow: some View {
         SetupFeatureSwitchRow(
             title: "Knowledge graph",
-            detail: "\(voice.Subject) \(voice.verb("join")) up the people, places, and things your conversations keep mentioning.",
+            detail: "I join up the people, places, and things your conversations keep mentioning.",
             key: "knowledge_graph_enabled",
             isOn: Binding(
                 get: { memoryDraft.knowledge_graph_enabled },
@@ -361,7 +363,7 @@ struct SetupFeatureRows: View {
     private var nightlyConsolidationRow: some View {
         SetupFeatureSwitchRow(
             title: "Memory consolidation",
-            detail: "Once a week \(voice.subject) \(voice.verb("gather")) what keeps coming up into fewer, stronger memories and \(voice.verb("offer")) them for review.",
+            detail: "Once a week I gather what keeps coming up into fewer, stronger memories and offer them for review.",
             key: "consolidation_enabled",
             isOn: Binding(
                 get: { memoryDraft.consolidation_enabled },
@@ -382,7 +384,7 @@ struct SetupFeatureRows: View {
     private var adaptivePromotionRow: some View {
         SetupFeatureSwitchRow(
             title: "Memories that recur become facts",
-            detail: "When something keeps coming back, \(voice.subject) \(voice.verb("propose")) it as a durable fact for you to accept.",
+            detail: "When something keeps coming back, I propose it as a durable fact for you to accept.",
             key: "adaptive_promotion",
             isOn: Binding(
                 get: { memoryDraft.adaptive_promotion },
@@ -400,7 +402,7 @@ struct SetupFeatureRows: View {
     private var crossSessionRecallRow: some View {
         SetupFeatureSwitchRow(
             title: "Remember across conversations",
-            detail: "\(voice.Subject) \(voice.verb("bring")) in what is relevant from every past conversation, not just this one.",
+            detail: "I bring in what is relevant from every past conversation, not just this one.",
             key: "cross_session_recall",
             isOn: Binding(
                 get: { memoryDraft.cross_session_recall },
@@ -420,7 +422,7 @@ struct SetupFeatureRows: View {
     private var selfImprovementRow: some View {
         SetupFeatureSwitchRow(
             title: "Weekly self-improvement pass",
-            detail: "Once a week \(voice.subject) \(voice.verb("review")) how things actually went and \(voice.verb("propose")) safe changes.",
+            detail: "Once a week I review how things actually went and propose safe changes.",
             key: "selfImprovementEnabled",
             isOn: $selfImprovementEnabled
         )
@@ -457,7 +459,7 @@ struct SetupFeatureRows: View {
 
     private var memoryModeDetail: String {
         guard let status = embeddingsStatus else {
-            return "Checking how much \(voice.subject) \(voice.verb("keep")) loaded for recall."
+            return "Checking how much I keep loaded for recall."
         }
         return EmbeddingsSettingsStatusPresentation(status: status).memoryModeDescription
     }
@@ -557,31 +559,15 @@ struct SetupFeatureRows: View {
 
 // MARK: - The one card shape
 
-/// EXACTLY the shape of the page's rest-cards (`appearanceRow`, SetupView):
-/// a 13 semibold title, one secondary sentence in a fixed 50pt box, and one
-/// control on the right. Fixed, not minimum — a minimum drifts the moment a
-/// name or a sentence changes length.
+/// EXACTLY the page's one row shape (`SetupRow`, SetupView): a title, one
+/// secondary sentence in the fixed row box, and one control on the right.
 private struct SetupFeatureCard<Trailing: View>: View {
     let title: String
     let detail: String
     @ViewBuilder var trailing: Trailing
 
     var body: some View {
-        SetupCardShell {
-            HStack {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(title).fontWeight(.semibold).lineLimit(1)
-                    Text(detail)
-                        .font(ShellType.labelMedium)
-                        .foregroundStyle(NativeAgentShell.secondary)
-                        .lineLimit(2)
-                        .truncationMode(.tail)
-                }
-                .frame(height: SetupMetrics.restCardContentHeight, alignment: .topLeading)
-                Spacer(minLength: 12)
-                trailing
-            }
-        }
+        SetupRow(title: title, detail: detail) { trailing }
     }
 }
 
@@ -599,7 +585,7 @@ private struct SetupFeatureSwitchRow: View {
             Toggle(title, isOn: $isOn)
                 .labelsHidden()
                 .toggleStyle(.switch)
-                .tint(NativeAgentBrand.accent)
+                .hazeTinted()
                 .disabled(disabled)
                 .accessibilityLabel(title)
                 .accessibilityHint(detail)

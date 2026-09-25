@@ -58,7 +58,8 @@ struct SessionContextStatusTests {
         #expect(fable.prompt_tokens == 9_658)
         #expect(fable.previous_turn_tokens == 11_100)
         #expect(fable.turn_delta_tokens == 558)
-        #expect(fable.budget == 1_000_000)
+        // Her window: min(Custom 200k, 60% of the 1M native window).
+        #expect(fable.budget == 200_000)
         #expect(fable.auto_compact_threshold == 200_000)
         #expect(fable.context_loaded == true)
         #expect(fable.context_mode == "provider_receipt")
@@ -77,8 +78,9 @@ struct SessionContextStatusTests {
         #expect(smallerModel.used_tokens == 11_658)
         #expect(smallerModel.transcript_tokens == 1_750)
         #expect(smallerModel.prompt_tokens == 9_908)
-        #expect(smallerModel.budget == 262_144)
-        #expect(smallerModel.auto_compact_threshold == 104_857)
+        // min(Custom 200k, 60% of 262,144) = 157,286; she compacts at it.
+        #expect(smallerModel.budget == 157_286)
+        #expect(smallerModel.auto_compact_threshold == 157_286)
         #expect(smallerModel.context_loaded == true)
         #expect(smallerModel.context_mode == "provider_receipt_prior_model")
         #expect(smallerModel.previous_turn_tokens == nil)

@@ -245,3 +245,118 @@ public enum ChatSessionRecollections {
         return nil
     }
 }
+
+extension ChatSessionRecollections {
+    /// A recollection records what happened, never what people call each
+    /// other. 2026-09-24: one compaction wrote a standing trait ("…calls me
+    /// 'boss' and 'momma'") into the note that heads her replayed history,
+    /// every later recollection folded it forward, and she started saying it
+    /// every few replies. The distiller prompt no longer mints such lines; this
+    /// drops the ones already on disk at render time, by SHAPE (a habitual
+    /// naming claim aimed at a person), never by word — so the next word is
+    /// covered the same way. Only the claiming CLAUSE goes; the rest of its
+    /// sentence stays.
+    public static func droppingAddressTraits(_ text: String) -> String {
+        guard matchesAddressTrait(text) else { return text }
+        var kept: [String] = []
+        for line in text.components(separatedBy: "\n") {
+            let sentences = splitSentences(line)
+            let survivors = sentences.compactMap(droppingAddressClauses)
+            if survivors == sentences {
+                kept.append(line)
+            } else if survivors.contains(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty }) {
+                kept.append(survivors.joined(separator: " "))
+            }
+        }
+        return kept.joined(separator: "\n")
+    }
+
+    /// The sentence without its habit-of-address clause(s); nil when nothing
+    /// else is left.
+    private static func droppingAddressClauses(_ sentence: String) -> String? {
+        guard matchesAddressTrait(sentence) else { return sentence }
+        let ns = sentence as NSString
+        var clauses: [(separator: String, text: String)] = []
+        var cursor = 0
+        var separator = ""
+        let whole = NSRange(location: 0, length: ns.length)
+        for match in clauseSeparator.matches(in: sentence, range: whole) {
+            let range = NSRange(location: cursor, length: match.range.location - cursor)
+            clauses.append((separator, ns.substring(with: range)))
+            separator = ns.substring(with: match.range)
+            cursor = match.range.location + match.range.length
+        }
+        clauses.append((separator, ns.substring(from: cursor)))
+        let kept = clauses.filter { !matchesAddressTrait($0.text) }
+        guard let first = kept.first else { return nil }
+        var out = first.text
+        if first.separator.isEmpty == false {
+            // The opening clause went; the survivor now starts the sentence.
+            out = out.prefix(1).uppercased() + out.dropFirst()
+        }
+        for clause in kept.dropFirst() { out += clause.separator + clause.text }
+        if let last = clauses.last, matchesAddressTrait(last.text) {
+            // The sentence's ending went with the dropped clause.
+            out = out.trimmingCharacters(in: CharacterSet(charactersIn: " ,;—–")) + "."
+        }
+        return out
+    }
+
+    private static let clauseSeparator = try! NSRegularExpression(
+        pattern: ",[\"”’]?\\s+(?:and|but|while|so)\\s+|;\\s+|\\s+[—–]\\s+",
+        options: [.caseInsensitive]
+    )
+
+    private static func matchesAddressTrait(_ text: String) -> Bool {
+        addressTraitPattern.firstMatch(
+            in: text, range: NSRange(text.startIndex..., in: text)
+        ) != nil
+    }
+
+    private static let addressTraitPattern: NSRegularExpression = {
+        let person = "(?:me|him|her|them|us|you|each other|one another)"
+        // What follows the person when "call" means a phone call or a summons,
+        // not a name — so "I'll call him back" survives.
+        let notAName = "(?!(?:back|later|again|soon|now|today|tonight|tomorrow|out|up|over|in|on|off|when|if|to|at|about|and|or|after|before|first|once|right|whenever)\\b)"
+        // HABITUAL claims about people only: "calls me 'X'" files a trait; "he
+        // called me perfect" is a moment that happened and stays, and so does
+        // any mention of a nickname that is not a claim about a person. An
+        // unquoted capitalized word is a real name ("calls me Agent").
+        let patterns = [
+            // calls me "X" · call him X. · calling her X and Y
+            "\\bcall(?:s|ing)?\\s+\(person)\\s+(?:[\"“‘*]|\(notAName)(?-i:\\p{Ll})[\\p{L}'’-]*(?:\\s*(?:[.,;:!?)\"”]|$)|\\s+(?:and|or)\\b))",
+            // refers to me as · addressing him as · nicknames me
+            "\\b(?:refer(?:s|ring)?\\s+to|address(?:es|ing)?)\\s+\(person)\\s+as\\b",
+            "\\bnicknam(?:es|ing)\\s+\(person)\\b",
+            // his (pet) name for me · User's pet name for me
+            "\\b(?:his|her|their|my|your|our|\\p{L}+['’]s)\\s+(?:pet\\s+)?(?:name|word)s?\\s+for\\s+\(person)\\b",
+        ]
+        return try! NSRegularExpression(
+            pattern: patterns.joined(separator: "|"),
+            options: [.caseInsensitive, .anchorsMatchLines]
+        )
+    }()
+
+    /// Sentences of one line, each keeping its own closing quotes/markup.
+    private static func splitSentences(_ line: String) -> [String] {
+        var out: [String] = []
+        var current = ""
+        var pendingEnd = false
+        for character in line {
+            if pendingEnd, character.isWhitespace {
+                out.append(current)
+                current = ""
+                pendingEnd = false
+                continue
+            }
+            current.append(character)
+            if ".!?…".contains(character) {
+                pendingEnd = true
+            } else if pendingEnd, !"\"”’')]*_".contains(character) {
+                pendingEnd = false
+            }
+        }
+        out.append(current)
+        return out
+    }
+}

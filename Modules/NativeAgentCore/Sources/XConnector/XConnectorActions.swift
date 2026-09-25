@@ -60,7 +60,8 @@ public enum XConnectorActions {
             var query: [(String, String)] = [
                 ("query", window.query),
                 ("max_results", String(maxResults)),
-                ("tweet.fields", "id,text,author_id,created_at,public_metrics")
+                ("tweet.fields", "id,text,author_id,created_at,public_metrics"),
+                ("expansions", "author_id"), ("user.fields", "username")
             ] + window.params
             // 2026-09-23: meta.next_token was returned but could not be sent back.
             // Search pages with next_token (timelines use pagination_token).
@@ -639,7 +640,8 @@ public enum XConnectorActions {
     static func timelineQuery(input: [String: JSONValue]) -> [(String, String)] {
         var query: [(String, String)] = [
             ("max_results", String(clampedInt(input["max"], defaultValue: 25, min: 1, max: 100))),
-            ("tweet.fields", tweetFields)
+            ("tweet.fields", tweetFields),
+            ("expansions", "author_id"), ("user.fields", "username")
         ]
         if let exclude = inputString(input["exclude"])?.trimmingCharacters(in: .whitespacesAndNewlines), !exclude.isEmpty {
             query.append(("exclude", exclude))
@@ -670,8 +672,17 @@ public enum XConnectorActions {
     }
 
     private static func tweetsAndMetaFields(_ payload: [String: Any]) -> [String: JSONValue] {
-        [
-            "tweets": JSONValue(fromFoundation: payload["data"] ?? []),
+        // Each post carries its author's handle, so from:<name> needs no id lookup.
+        let users = (payload["includes"] as? [String: Any])?["users"] as? [[String: Any]] ?? []
+        var handles: [String: String] = [:]
+        for user in users { if let id = user["id"] as? String, let name = user["username"] as? String { handles[id] = name } }
+        let tweets = (payload["data"] as? [[String: Any]] ?? []).map { tweet -> [String: Any] in
+            var tweet = tweet
+            if let author = tweet["author_id"] as? String, let handle = handles[author] { tweet["author"] = handle }
+            return tweet
+        }
+        return [
+            "tweets": JSONValue(fromFoundation: tweets),
             "meta": JSONValue(fromFoundation: payload["meta"] ?? [:])
         ]
     }

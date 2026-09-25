@@ -21,7 +21,7 @@ public enum GitHubConnectorError: Error, Sendable, Equatable, LocalizedError, Co
         switch self {
         case .invalidInput(let message): return message
         case .notConfigured:
-            return "GitHub token is not configured. Paste a Personal Access Token in Connectors > GitHub."
+            return "GitHub is not connected. Connect with GitHub in the GitHub card."
         case .invalidResponse(let message): return "GitHub returned an invalid response: \(message)"
         case .transport(let message): return "GitHub request failed: \(message)"
         case .http(let status, let message, let remaining, let reset):
@@ -446,6 +446,14 @@ public enum GitHubConnectorActions {
         guard let http = resp as? HTTPURLResponse else {
             throw GitHubConnectorError.invalidResponse("missing HTTP response")
         }
+        // A stored OAuth sign-in that GitHub rejects gets one refresh and one retry.
+        if http.statusCode == 401, explicitToken == nil,
+           // A failed refresh leaves GitHub's own 401 as the answer.
+           let fresh = (try? await GitHubCredentialStore.shared.refreshAfterRejection(token, dataRoot: dataRoot)) ?? nil,
+           fresh != token {
+            return try await call(path: path, params: params, method: method, body: body,
+                                  token: fresh, dataRoot: dataRoot)
+        }
         guard http.statusCode < 400 else {
             let message: String
             if let object = parsed as? [String: Any],
@@ -661,11 +669,11 @@ extension GitHubConnectorActions {
             || lowered.contains("abuse detection")
             || lowered.contains("please wait a few minutes")
         guard status == 429 || status == 403 else { return nil }
-        // A 403 with budget still on the clock is a THROTTLE, not exhaustion;
-        // primary exhaustion (remaining 0) keeps its reset stamp and must not
-        // be swallowed by this gate.
-        let healthyBudget = (rateLimitRemaining ?? 0) > 0
-        guard saysSecondary || status == 429 || healthyBudget else { return nil }
+        // A 403 is a throttle only when GitHub says so (wording or Retry-After).
+        // 2026-09-24: "Resource not accessible by personal access token" (403,
+        // budget 4994) closed every GitHub tool for 60s. Primary exhaustion
+        // (remaining 0) keeps its own reset-stamped error.
+        guard saysSecondary || status == 429 || retryAfterHeader != nil else { return nil }
         if let retryAfterHeader, let seconds = TimeInterval(retryAfterHeader), seconds > 0 {
             return seconds
         }

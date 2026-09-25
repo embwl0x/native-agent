@@ -92,6 +92,7 @@ struct DiagnosticsView: View {
                     }
                 }
                 .pickerStyle(.segmented)
+                .hazeTinted(.segments)
                 .labelsHidden()
             }
 
@@ -131,6 +132,9 @@ struct DiagnosticsView: View {
             .motionArrival(when: appModel.panelRefreshStatus[.diagnostics] != nil)
         }
         .frame(maxWidth: .infinity, alignment: .topLeading)
+        // Alive glass (2026-09-23): the tabs' panels and cards wear the kit.
+        .environment(\.aliveCards, true)
+        .alivePageLine(Self.headerLine(appModel), id: "diagnostics.line")
         .navigationTitle("Diagnostics")
         .liveTask {
             guard mode == .status || mode == .runs else { return }
@@ -140,6 +144,21 @@ struct DiagnosticsView: View {
             guard nextMode == .status || nextMode == .runs else { return }
             Task { await refreshSnapshot() }
         }
+    }
+
+    /// The header's one sentence, from the last health check. Nil before one
+    /// has run: the frame keeps its plain subtitle rather than guess.
+    @MainActor
+    static func headerLine(_ appModel: AppModel) -> String? {
+        guard let report = appModel.doctorReport else { return nil }
+        let summary = DoctorPlainCopy.summarize(report.checks)
+        let total = summary.total
+        guard total > 0 else { return nil }
+        let checks = total == 1 ? "check" : "checks"
+        if summary.failing > 0 { return "\(summary.failing) of my \(total) health \(checks) failed." }
+        if summary.warning > 0 { return "I'm running; \(summary.warning) of \(total) health \(checks) need a look." }
+        if summary.unclear > 0 { return "I'm running; \(summary.unclear) of \(total) health \(checks) came back unclear." }
+        return total == 1 ? "My last health check passed." : "All \(total) of my health checks passed."
     }
 
     @MainActor

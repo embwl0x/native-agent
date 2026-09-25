@@ -603,7 +603,8 @@ extension NativeClient {
     // DAEMON-DEAD PORT (2026-06-02): native reachability probe. Resolves the
     // API key via LLMCredentialResolver (env → providers/<id>.json), then for
     // OpenAI hits GET /v1/models with a Bearer token and reports latency.
-    // Anthropic has no free probe endpoint so we report tested:false.
+    // Anthropic (GET /v1/models, x-api-key) and OpenRouter (GET /api/v1/key)
+    // are probed the same way; 401 (and Anthropic 403) reads "key rejected".
     //
     // User, 2026-09-06: `apiKeyOverride` is the key typed into the provider
     // sheet but not saved yet. Without it the button tested the credential on
@@ -640,6 +641,7 @@ extension NativeClient {
             case "anthropic": return ("ANTHROPIC_API_KEY", "anthropic.json")
             case "moonshot": return ("MOONSHOT_API_KEY", "moonshot.json")
             case "kimi-code": return ("KIMI_CODE_API_KEY", "kimi-code.json")
+            case "openrouter": return ("OPENROUTER_API_KEY", "openrouter.json")
             default: return (nil, nil)
             }
         }()
@@ -658,14 +660,6 @@ extension NativeClient {
                 provider_id: id, status: "error", tested: false,
                 response: nil, model_used: nil,
                 detail: nil, error: "no api key configured"
-            ))
-        }
-
-        if id == "anthropic" {
-            return await recordProbeResult(ProviderTestResult(
-                provider_id: id, status: "ok", tested: false,
-                response: nil, model_used: nil,
-                detail: "anthropic probe skipped", error: nil
             ))
         }
 
@@ -717,12 +711,23 @@ extension NativeClient {
             }
         }
 
-        let modelsEndpoint = id == "moonshot"
-            ? MoonshotModelCatalog.endpoint
-            : URL(string: "https://api.openai.com/v1/models")!
+        // Free authenticated GETs: a models list, or OpenRouter's own key
+        // endpoint. The key rides only in a header, never the URL, so no
+        // error or log line below can carry it.
+        let modelsEndpoint: URL = switch id {
+        case "moonshot": MoonshotModelCatalog.endpoint
+        case "anthropic": URL(string: "https://api.anthropic.com/v1/models")!
+        case "openrouter": URL(string: "https://openrouter.ai/api/v1/key")!
+        default: URL(string: "https://api.openai.com/v1/models")!
+        }
         var req = URLRequest(url: modelsEndpoint)
         req.httpMethod = "GET"
-        req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        if id == "anthropic" {
+            req.setValue(apiKey, forHTTPHeaderField: "x-api-key")
+            req.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+        } else {
+            req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        }
         req.timeoutInterval = 15
         let start = Date()
         do {
@@ -742,13 +747,16 @@ extension NativeClient {
             return await recordProbeResult(ProviderTestResult(
                 provider_id: id, status: "error", tested: true,
                 response: nil, model_used: nil,
-                detail: "latency=\(ms)ms", error: "HTTP \(code)"
+                // Anthropic answers a bad key with 401 or 403.
+                detail: "latency=\(ms)ms",
+                error: code == 401 || (id == "anthropic" && code == 403) ? "key rejected" : "HTTP \(code)"
             ))
         } catch {
             return await recordProbeResult(ProviderTestResult(
                 provider_id: id, status: "error", tested: true,
                 response: nil, model_used: nil,
                 detail: nil, error: error.localizedDescription
+                    .replacingOccurrences(of: apiKey, with: "[redacted]")
             ))
         }
     }

@@ -64,7 +64,8 @@ public struct PersonalityDynamicsConfiguration: Sendable, Equatable {
     public var soundEchoDutyCycle: Int
     /// How many recent assistant turns the verbal-rut detector reads.
     public var soundRutRecentTurnLimit: Int
-    /// How many closing sentences count as a conversational edge.
+    /// Unread since 2026-09-24 (the named-rut detector reads every sentence
+    /// for a vocative); kept so existing configurations still decode.
     public var soundRutEdgeSentenceCount: Int
     /// Half-width of the register band: candidates are ranked by how well they
     /// MATCH the room, not by how warm they are in absolute terms.
@@ -226,7 +227,7 @@ public struct PersonalityDynamicsConfiguration: Sendable, Equatable {
         soundEchoCount: Int = 2,
         soundEchoRecencyHalfLife: TimeInterval = 2.5 * 24 * 60 * 60,
         soundEchoDutyCycle: Int = 4,
-        soundRutRecentTurnLimit: Int = 12,
+        soundRutRecentTurnLimit: Int = 20,
         soundRutEdgeSentenceCount: Int = 2,
         soundEchoRegisterTolerance: Double = 0.35,
         wornEchoThreshold: Int = 3,

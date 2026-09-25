@@ -1084,6 +1084,12 @@ public enum OwnerAttentionPolicy {
     /// The row-level predicate. Deliberately identical to
     /// `DeskItem.requiresOwnerInput`: a nonterminal row that names the human
     /// as the party it waits on.
+    /// An approval waits on him while it is pending, whatever the case of
+    /// its saved status. The Today page and the agent's home share this.
+    public static func approvalWaits(status: String) -> Bool {
+        status.lowercased() == "pending"
+    }
+
     public static func waitsOnOwner(_ item: DeskItem) -> Bool {
         item.requiresOwnerInput
     }

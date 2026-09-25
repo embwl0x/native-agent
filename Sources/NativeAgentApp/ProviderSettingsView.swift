@@ -202,8 +202,14 @@ struct ProviderSettingsView: View {
 
     // Opaque local surfaces keep secondary text legible over the shell wallpaper.
     private var secondaryInk: Color { colorScheme == .dark ? Color(white: 0.82) : Color(white: 0.28) }
+    /// Alive glass (2026-09-23): the page's cards wear the Today/Desk card
+    /// surface — a fill, never glassEffect.
     private func card<Content: View>(@ViewBuilder content: () -> Content) -> some View {
-        content().padding(16).settingsCardSurface()
+        content()
+            .padding(16)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .aliveCard()
+            .accessibilityElement(children: .contain)
     }
 
     private var surfaceGroups: [ProviderSettingsSurfaceGroup] {
@@ -569,44 +575,51 @@ struct ProviderSettingsView: View {
                 configureSheet = provider
             } label: {
                 HStack {
-                    Text(provider.display_name).fixedSize(horizontal: false, vertical: true)
+                    Text(provider.display_name)
+                        .font(.system(size: 14, weight: .medium))
+                        .foregroundStyle(NativeAgentShell.text)
+                        .fixedSize(horizontal: false, vertical: true)
                     Spacer(minLength: 4)
                     Text(provider.auth_modes.contains("api_key") ? "API key" : "Sign in")
-                        .foregroundStyle(secondaryInk)
-                    Image(systemName: "chevron.right").foregroundStyle(secondaryInk)
+                        .font(.system(size: 12))
+                        .foregroundStyle(NativeAgentShell.secondary)
+                    Image(systemName: "chevron.right")
+                        .font(ShellType.captionSemibold)
+                        .foregroundStyle(NativeAgentShell.secondary)
                 }
-                .font(ShellType.label)
-                .padding(.vertical, 3)
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .accessibilityLabel("Set up \(provider.display_name), \(provider.auth_modes.contains("api_key") ? "API key" : "account sign-in")")
         } else {
-            VStack(alignment: .leading, spacing: 4) {
-                HStack(alignment: .firstTextBaseline) {
-                    Text(provider.display_name).font(ShellType.labelSemibold)
+            // One row: the name, its status under it, Manage on the right.
+            HStack(alignment: .center, spacing: 8) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(provider.display_name)
+                        .font(.system(size: 14, weight: .medium))
+                        .foregroundStyle(NativeAgentShell.text)
                         .fixedSize(horizontal: false, vertical: true)
-                    Spacer(minLength: 8)
-                    Button(provider.auth_status.state == "ready" ? "Manage" : "Set up") {
-                        configureSheet = provider
-                    }
-                    .buttonStyle(.bordered).controlSize(.small)
-                    .accessibilityLabel("\(provider.auth_status.state == "ready" ? "Manage" : "Set up") \(provider.display_name)")
+                    Text(ProviderAccountStateLinePresentation.line(
+                        state: provider.auth_status.state,
+                        detail: provider.auth_status.detail))
+                        .font(.system(size: 12)).foregroundStyle(NativeAgentShell.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Text(provider.auth_modes.map { mode in
+                        switch mode {
+                        case "api_key": "API key"
+                        case "oauth": "Account sign-in"
+                        default: mode.replacingOccurrences(of: "_", with: " ")
+                        }
+                    }.joined(separator: " · "))
+                        .font(.system(size: 12)).foregroundStyle(NativeAgentShell.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
-                Text(ProviderAccountStateLinePresentation.line(
-                    state: provider.auth_status.state,
-                    detail: provider.auth_status.detail))
-                    .font(ShellType.caption).foregroundStyle(secondaryInk)
-                    .fixedSize(horizontal: false, vertical: true)
-                Text(provider.auth_modes.map { mode in
-                    switch mode {
-                    case "api_key": "API key"
-                    case "oauth": "Account sign-in"
-                    default: mode.replacingOccurrences(of: "_", with: " ")
-                    }
-                }.joined(separator: " · "))
-                    .font(ShellType.caption).foregroundStyle(secondaryInk)
-                    .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 8)
+                Button(provider.auth_status.state == "ready" ? "Manage" : "Set up") {
+                    configureSheet = provider
+                }
+                .buttonStyle(.bordered).controlSize(.small)
+                .accessibilityLabel("\(provider.auth_status.state == "ready" ? "Manage" : "Set up") \(provider.display_name)")
             }
         }
     }
@@ -621,12 +634,9 @@ struct ProviderSettingsView: View {
             LazyVStack(alignment: .leading, spacing: 24) {
                 Text("Choose an account and a chat model. Model changes save immediately.")
                     .font(ShellType.label)
-                    .foregroundStyle(secondaryInk)
+                    .foregroundStyle(NativeAgentShell.secondary)
                     .fixedSize(horizontal: false, vertical: true)
-
-                    .padding(12)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .settingsCardSurface()
 
                 ProviderSection(label: "Accounts & API keys") {
                     VStack(alignment: .leading, spacing: 8) {
@@ -660,12 +670,10 @@ struct ProviderSettingsView: View {
                                 )
                             }
                         } else {
-                            card {
-                                LazyVStack(alignment: .leading, spacing: 10) {
-                                    ForEach(providers.sorted { ($0.auth_status.state == "ready" ? 0 : 1, $0.display_name) < ($1.auth_status.state == "ready" ? 0 : 1, $1.display_name) }) { provider in
-                                        accountRow(provider)
-                                        Divider()
-                                    }
+                            // One group card, a row per account, hairlines between.
+                            AliveGroupCard {
+                                ForEach(providers.sorted { ($0.auth_status.state == "ready" ? 0 : 1, $0.display_name) < ($1.auth_status.state == "ready" ? 0 : 1, $1.display_name) }) { provider in
+                                    accountRow(provider)
                                 }
                             }
                         }
@@ -823,11 +831,9 @@ struct ProviderSettingsView: View {
                                 )
                             }
                         } else {
-                            card {
-                                VStack(alignment: .leading, spacing: 0) {
-                                    ForEach(surfaceGroups.filter { $0.id == ProviderSettingsSurfaceGroup.chat.id }) { group in
-                                        groupRow(group)
-                                    }
+                            AliveGroupCard {
+                                ForEach(surfaceGroups.filter { $0.id == ProviderSettingsSurfaceGroup.chat.id }) { group in
+                                    groupRow(group)
                                 }
                             }
                         }
@@ -838,11 +844,10 @@ struct ProviderSettingsView: View {
                     VStack(alignment: .leading, spacing: 12) {
                         Text(exceptionSummary).font(ShellType.caption).foregroundStyle(secondaryInk)
                             .fixedSize(horizontal: false, vertical: true)
-                        card {
-                            VStack(alignment: .leading, spacing: 0) {
-                                ForEach(surfaceGroups.filter { $0.id != ProviderSettingsSurfaceGroup.chat.id }) { group in
-                                    groupRow(group)
-                                }
+                        // Every other surface in ONE card, hairlines between.
+                        AliveGroupCard {
+                            ForEach(surfaceGroups.filter { $0.id != ProviderSettingsSurfaceGroup.chat.id }) { group in
+                                groupRow(group)
                             }
                         }
                     }
@@ -871,7 +876,7 @@ struct ProviderSettingsView: View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
             Text(group.title)
-                .font(.system(size: 14, weight: .bold))
+                .font(.system(size: 14, weight: .semibold))
                 .foregroundStyle(NativeAgentShell.text)
             if mixed {
                 Text("Mixed").font(ShellType.caption).foregroundStyle(secondaryInk)
@@ -994,6 +999,7 @@ struct ProviderSettingsView: View {
                     }
                 ))
                 .toggleStyle(.switch)
+                .hazeTinted()
                 .controlSize(.small)
                 .font(ShellType.label)
                 .fixedSize(horizontal: true, vertical: false)
@@ -1020,7 +1026,6 @@ struct ProviderSettingsView: View {
                     }
             }
         }
-        .padding(.vertical, 7)
     }
 
     /// Restore inheritance from Chat for every surface in the group. `chat`

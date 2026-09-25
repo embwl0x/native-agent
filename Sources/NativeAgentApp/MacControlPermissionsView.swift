@@ -330,28 +330,10 @@ private enum MacIntegrationPreset: String, Identifiable {
 
     var subtitle: String {
         switch self {
-        case .off: return "Read-only"
-        case .watch: return "Receipts + watchers"
-        case .assistant: return "Work mode"
-        case .full: return "Full access"
-        }
-    }
-
-    var systemImage: String {
-        switch self {
-        case .off: return "lock"
-        case .watch: return "eye"
-        case .assistant: return "macbook.and.iphone"
-        case .full: return "flame"
-        }
-    }
-
-    var tint: Color {
-        switch self {
-        case .off: return .secondary
-        case .watch: return .teal
-        case .assistant: return .blue
-        case .full: return .red
+        case .off: return "Read only"
+        case .watch: return "Notifications and watches"
+        case .assistant: return "Mac work, asks before risky steps"
+        case .full: return "Files anywhere, shell"
         }
     }
 }
@@ -385,14 +367,14 @@ enum MacControlSetupStatusBadges {
                 access: Badge(text: "Checking setup", status: "unknown"),
                 iOSRemote: Badge(text: "iOS remote unknown", status: "unknown"),
                 receipts: Badge(text: "receipts unknown", status: "unknown"),
-                detail: "Checking the saved Mac Control policy. Setup status is not known yet."
+                detail: "Checking your saved Mac control settings."
             )
         case .unavailable:
             return State(
                 access: Badge(text: "Setup unavailable", status: "failed"),
                 iOSRemote: Badge(text: "iOS remote unknown", status: "failed"),
                 receipts: Badge(text: "receipts unknown", status: "failed"),
-                detail: "NativeAgent could not read the saved Mac Control policy. No setup badge is claiming that Mac Control is ready."
+                detail: "I could not read your saved Mac control settings, so I am not claiming any of it is ready."
             )
         case .available:
             guard let savedPolicy else {
@@ -400,7 +382,7 @@ enum MacControlSetupStatusBadges {
                     access: Badge(text: "Setup unavailable", status: "failed"),
                     iOSRemote: Badge(text: "iOS remote unknown", status: "failed"),
                     receipts: Badge(text: "receipts unknown", status: "failed"),
-                    detail: "The saved Trust policy did not include Mac Control settings."
+                    detail: "Your saved Trust settings did not include Mac control."
                 )
             }
 
@@ -408,18 +390,18 @@ enum MacControlSetupStatusBadges {
             let detail: String
             if !savedPolicy.enabled {
                 access = Badge(text: "Mac Control off", status: "disabled")
-                detail = "Mac integration is read-only. The agent can inspect app data but Mac Control actions stay blocked."
+                detail = "I can read app data, but I cannot act on this Mac."
             } else if savedPolicy.shellAllowed && savedPolicy.fileOpsAllowed
                         && savedPolicy.accessibilityAllowed && savedPolicy.approvalRequiredFor.isEmpty {
                 access = Badge(text: "Full Mac configured", status: "ready")
-                detail = "Full Mac enables broad local file and app control. Destructive shell/system actions still require Developer Mode."
+                detail = "I can work with files and apps anywhere on this Mac. Destructive shell and system actions still need developer mode."
             } else if savedPolicy.fileOpsAllowed || savedPolicy.shellAllowed || savedPolicy.systemControlAllowed
                         || savedPolicy.accessibilityAllowed || savedPolicy.applesScriptAllowed || savedPolicy.jxaAllowed {
                 access = Badge(text: "Assistant configured", status: "ready")
-                detail = "Assistant mode enables workspace-safe Mac work, iPhone remote receipts, and approvals for risky categories."
+                detail = "I can do workspace-safe Mac work and send results to your iPhone, and I ask before anything risky."
             } else {
                 access = Badge(text: "Watch configured", status: "ready")
-                detail = "Watch mode turns on the local Mac bridge for receipts, Spotlight, Shortcuts, and watch setup without shell or file writes."
+                detail = "I can post notifications, search with Spotlight and run background watches. No shell commands and no file writes."
             }
 
             return State(
@@ -470,42 +452,44 @@ struct MacControlPermissionsView: View {
         policy != savedPolicy
     }
 
+    // Alive glass (2026-09-23): the setup, the watches and the Advanced fold
+    // wear the Trust page's kit — an eyebrow over one group card per section,
+    // hairline rows, switches, and no per-row timing pills. The one timing
+    // fact left (Save, then restart for two switches) is the fold's footnote.
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
+        VStack(alignment: .leading, spacing: 24) {
             macIntegrationSetupPanel
             MacAssistantWatchSetupView(refreshToken: assistantWatchRefreshToken)
 
-            DisclosureGroup(isExpanded: $showAdvancedMacControls) {
-                if MacControlAdvancedDisclosurePresentation.savePathIsVisible(
-                    isExpanded: showAdvancedMacControls
-                ) {
-                    advancedMacControlControls
-                        .padding(.top, 10)
-                }
-            } label: {
-                HStack(spacing: 8) {
-                    Image(systemName: "slider.horizontal.3")
-                        .foregroundStyle(.secondary)
+            // An eyebrow like its sibling sections; the fold row is a row.
+            VStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
+                AliveEyebrow("Advanced Mac control")
+                TrustFold(isExpanded: $showAdvancedMacControls) {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("Advanced Mac Control")
-                            .font(NativeAgentFont.section)
-                        Text("Category switches, shell, approvals, workbench, and audit log.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                        Text("Controls, commands and audit log")
+                            .font(.system(size: 14, weight: .medium))
+                            .foregroundStyle(NativeAgentShell.text)
+                        Text("Each kind of control, shell commands, what I ask about first, the workbench and the audit log.")
+                            .font(.system(size: 12))
+                            .foregroundStyle(NativeAgentShell.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
-                    Spacer()
+                    .accessibilityElement(children: .combine)
+                    .accessibilityIdentifier("macControl.advanced.disclosure")
+                } trailing: {
+                    // Unsaved edits wait on him: the one teal word here.
                     if hasUnsavedChanges {
-                        StatusBadge(text: "Unsaved", status: "warn")
+                        Text("Unsaved")
+                            .font(ShellType.captionSemibold)
+                            .foregroundStyle(NativeAgentShell.needsYou)
+                    }
+                } content: {
+                    if MacControlAdvancedDisclosurePresentation.savePathIsVisible(
+                        isExpanded: showAdvancedMacControls
+                    ) {
+                        advancedMacControlControls
                     }
                 }
-                .togglesDisclosure($showAdvancedMacControls)
-                .accessibilityIdentifier("macControl.advanced.disclosure")
-            }
-            .padding(NativeAgentSpacing.lg)
-            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: NativeAgentRadius.panel, style: .continuous))
-            .overlay {
-                RoundedRectangle(cornerRadius: NativeAgentRadius.panel, style: .continuous)
-                    .strokeBorder(Color.primary.opacity(0.08), lineWidth: 1)
             }
         }
         .task {
@@ -541,308 +525,322 @@ struct MacControlPermissionsView: View {
         }
     }
 
-    @ViewBuilder
-    private var macIntegrationSetupPanel: some View {
-        NativePanel(title: "Mac Integration Setup", systemImage: "macbook.and.iphone", tint: macIntegrationTint) {
-            VStack(alignment: .leading, spacing: 12) {
-                HStack(spacing: 8) {
-                    StatusBadge(text: setupBadges.access.text, status: setupBadges.access.status)
-                        .accessibilityIdentifier("mac-control.setup.access")
-                    StatusBadge(text: setupBadges.iOSRemote.text, status: setupBadges.iOSRemote.status)
-                        .accessibilityIdentifier("mac-control.setup.ios-remote")
-                    StatusBadge(text: setupBadges.receipts.text, status: setupBadges.receipts.status)
-                        .accessibilityIdentifier("mac-control.setup.receipts")
-                    Spacer()
-                    if hasUnsavedChanges {
-                        StatusBadge(text: "Unsaved details", status: "warn")
-                    }
-                }
-
-                Text(setupBadges.detail)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-
-                if let applyingPreset {
-                    ProgressView("Applying \(applyingPreset.title)...")
-                        .controlSize(.small)
-                }
-
-                HStack(spacing: 8) {
-                    Button("Enable Mac Access", systemImage: "switch.2") {
-                        Task { await enableMacAccess() }
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(isSaving || isProbingAppleData)
-
-                    Button("Probe Apple Data", systemImage: "calendar.badge.checkmark") {
-                        Task { await probeAppleDataAccess() }
-                    }
-                    .buttonStyle(.bordered)
-                    .disabled(isSaving || isProbingAppleData)
-
-                    if isProbingAppleData {
-                        ProgressView()
-                            .controlSize(.small)
-                    }
-                }
-
-                LazyVGrid(columns: [GridItem(.adaptive(minimum: 145), spacing: 10)], spacing: 10) {
-                    MacIntegrationPresetButton(preset: .off, active: activePreset == .off, disabled: isSaving) {
-                        Task { await applyIntegrationPreset(.off) }
-                    }
-                    MacIntegrationPresetButton(preset: .watch, active: activePreset == .watch, disabled: isSaving) {
-                        Task { await applyIntegrationPreset(.watch) }
-                    }
-                    MacIntegrationPresetButton(preset: .assistant, active: activePreset == .assistant, disabled: isSaving) {
-                        Task { await applyIntegrationPreset(.assistant) }
-                    }
-                    MacIntegrationPresetButton(preset: .full, active: activePreset == .full, disabled: isSaving) {
-                        showFullMacConfirm = true
-                    }
-                }
-
-                HStack(spacing: 8) {
-                    Button("Open Accessibility", systemImage: "cursorarrow.motionlines") {
-                        openSystemSettings(.accessibility)
-                    }
-                    .buttonStyle(.bordered)
-
-                    Button("Open Automation", systemImage: "gearshape.2") {
-                        openSystemSettings(.automation)
-                    }
-                    .buttonStyle(.bordered)
-
-                    Button("Open Full Disk Access", systemImage: "externaldrive.badge.checkmark") {
-                        openSystemSettings(.fullDiskAccess)
-                    }
-                    .buttonStyle(.bordered)
-
-                    Button("Test Notification", systemImage: "bell") {
-                        Task { await sendTestNotification() }
-                    }
-                    .buttonStyle(.bordered)
-                    .disabled(isTestingNotif || !policy.enabled || !policy.notificationsAllowed)
-
-                    if isSaving || isTestingNotif {
-                        ProgressView()
-                            .controlSize(.small)
-                    }
-                    if let status = testNotifStatus {
-                        Text(status)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                }
-
-                if let appleDataProbeStatus {
-                    Text(appleDataProbeStatus)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-
-                if let err = saveError {
-                    Text(err)
-                        .font(.caption)
-                        .foregroundStyle(.red)
-                }
-            }
+    /// The setup badges' words, said plainly. The presentation keeps its own
+    /// strings (they are pinned); only what the person reads changes here.
+    private static func plainSetupWord(_ text: String) -> String {
+        switch text {
+        case "Mac Control off": "Mac control is off"
+        case "Full Mac configured": "Full Mac"
+        case "Assistant configured": "Assistant"
+        case "Watch configured": "Watch"
+        case "Checking setup": "Checking…"
+        case "Setup unavailable": "Setup unavailable"
+        default:
+            text.replacingOccurrences(of: "iOS remote", with: "iPhone remote control")
+                .replacingOccurrences(of: "receipts", with: "notifications")
         }
     }
 
     @ViewBuilder
-    private var advancedMacControlControls: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            NativePanel(title: "Mac Control", systemImage: "macbook.and.iphone") {
+    private var macIntegrationSetupPanel: some View {
+        VStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
+            AliveEyebrow("Mac control")
+            // The presets are cards themselves, so they sit above the group
+            // card rather than inside it — a card in a card is a plate.
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 145), spacing: 10, alignment: .top)], spacing: 10) {
+                MacIntegrationPresetButton(preset: .off, active: activePreset == .off, disabled: isSaving) {
+                    Task { await applyIntegrationPreset(.off) }
+                }
+                MacIntegrationPresetButton(preset: .watch, active: activePreset == .watch, disabled: isSaving) {
+                    Task { await applyIntegrationPreset(.watch) }
+                }
+                MacIntegrationPresetButton(preset: .assistant, active: activePreset == .assistant, disabled: isSaving) {
+                    Task { await applyIntegrationPreset(.assistant) }
+                }
+                MacIntegrationPresetButton(preset: .full, active: activePreset == .full, disabled: isSaving) {
+                    showFullMacConfirm = true
+                }
+            }
+            .padding(.bottom, 2)
+
+            AliveGroupCard {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(Self.plainSetupWord(setupBadges.access.text))
+                        .font(.system(size: 14, weight: .medium))
+                        .foregroundStyle(setupBadges.access.status == "failed" ? NativeAgentShell.trouble : NativeAgentShell.text)
+                        .accessibilityIdentifier("mac-control.setup.access")
+                    Text(setupBadges.detail)
+                        .font(.system(size: 12))
+                        .foregroundStyle(NativeAgentShell.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    HStack(spacing: 6) {
+                        Text(Self.plainSetupWord(setupBadges.iOSRemote.text))
+                            .accessibilityIdentifier("mac-control.setup.ios-remote")
+                        Text("·")
+                        Text(Self.plainSetupWord(setupBadges.receipts.text))
+                            .accessibilityIdentifier("mac-control.setup.receipts")
+                    }
+                    .font(.system(size: 12))
+                    .foregroundStyle(NativeAgentShell.secondary)
+                    if let applyingPreset {
+                        ProgressView("Applying \(applyingPreset.title)…")
+                            .controlSize(.small)
+                            .padding(.top, 4)
+                    }
+                }
+
                 VStack(alignment: .leading, spacing: 8) {
-                    HStack {
-                        Toggle("Enable Mac Control", isOn: Binding(
-                            get: { policy.enabled },
-                            set: { policy.enabled = $0 }
-                        ))
-                        .font(.headline)
-                        EffectTimingTag(timing: .restart)
-                        Spacer()
-                    }
-                    Text("Lets the app-owned Swift agent control this Mac via AppleScript, Shortcuts, Accessibility APIs, shell, and more. The quick setup above chooses safe defaults.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    if hasUnsavedChanges {
-                        Label("Unsaved changes. Save before using the workbench.", systemImage: "exclamationmark.triangle.fill")
-                            .font(.caption)
-                            .foregroundStyle(.orange)
-                    }
-                    HStack {
-                        Button("Save") {
-                            Task { await save() }
+                    HStack(spacing: 8) {
+                        Button("Set up Mac access", systemImage: "switch.2") {
+                            Task { await enableMacAccess() }
                         }
                         .buttonStyle(.borderedProminent)
-                        .disabled(isSaving || !hasUnsavedChanges)
-                        .accessibilityIdentifier("macControl.advanced.save")
+                        .hazeTinted(.button)
+                        .disabled(isSaving || isProbingAppleData)
 
-                        if isSaving {
-                            ProgressView("Saving...")
+                        Button("Check Calendar and Reminders", systemImage: "calendar.badge.checkmark") {
+                            Task { await probeAppleDataAccess() }
+                        }
+                        .disabled(isSaving || isProbingAppleData)
+
+                        if isProbingAppleData {
+                            ProgressView()
                                 .controlSize(.small)
                         }
                     }
+                    Text("Set up Mac access picks the Assistant preset, then asks macOS for Calendar and Reminders.")
+                        .font(.system(size: 12))
+                        .foregroundStyle(NativeAgentShell.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    if let appleDataProbeStatus {
+                        Text(appleDataProbeStatus)
+                            .font(.system(size: 12))
+                            .foregroundStyle(NativeAgentShell.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                 }
-            }
 
-            NativePanel(title: "Categories", systemImage: "slider.horizontal.3", tint: .blue) {
-                VStack(alignment: .leading, spacing: 12) {
-                    MacControlCategoryRow(
-                        label: "Notifications",
-                        detail: "Post system notifications from the agent.",
-                        safeDefault: true,
-                        masterEnabled: policy.enabled,
-                        isOn: macControlBinding(\.notificationsAllowed)
-                    )
-                    MacControlCategoryRow(
-                        label: "Spotlight Search",
-                        detail: "Run Spotlight queries (read-only).",
-                        safeDefault: true,
-                        masterEnabled: policy.enabled,
-                        isOn: macControlBinding(\.spotlightAllowed)
-                    )
-                    MacControlUnavailableCategoryRow(
-                        label: "macOS Shortcuts",
-                        detail: "Unavailable in this Swift build. Shortcut execution is not implemented, so there is no permission switch or workbench action to enable."
-                    )
-                    MacControlUnavailableCategoryRow(
-                        label: "System Control",
-                        detail: "Unavailable in this Swift build. System actions such as lock screen and sleep display are not implemented, so there is no permission switch or workbench action to enable."
-                    )
-                    MacControlCategoryRow(
-                        label: "File Operations",
-                        detail: "Read/write files. Also gated by the file policy in Trust Center.",
-                        safeDefault: false,
-                        masterEnabled: policy.enabled,
-                        isOn: macControlBinding(\.fileOpsAllowed)
-                    )
-                    MacControlCategoryRow(
-                        label: "Accessibility",
-                        detail: "Keystroke injection, mouse clicks, read focused app. Requires System Settings > Privacy & Security > Accessibility.",
-                        safeDefault: false,
-                        masterEnabled: policy.enabled,
-                        isOn: macControlBinding(\.accessibilityAllowed)
-                    )
-                    MacControlCategoryRow(
-                        label: "AppleScript",
-                        detail: "Run AppleScript programs. Approval required by default.",
-                        safeDefault: false,
-                        masterEnabled: policy.enabled,
-                        isOn: macControlBinding(\.applesScriptAllowed)
-                    )
-                    MacControlCategoryRow(
-                        label: "JavaScript for Automation (JXA)",
-                        detail: "Run JXA programs. Approval required by default.",
-                        safeDefault: false,
-                        masterEnabled: policy.enabled,
-                        isOn: macControlBinding(\.jxaAllowed)
-                    )
-                }
-            }
-
-            NativePanel(title: "Shell Commands", systemImage: "terminal", tint: .red) {
                 VStack(alignment: .leading, spacing: 8) {
-                    HStack(spacing: 6) {
-                        Image(systemName: "exclamationmark.triangle.fill")
-                            .foregroundStyle(.orange)
-                        Text("Powerful - use with care")
-                            .font(.headline)
-                            .foregroundStyle(.orange)
+                    Text("macOS asks for these separately.")
+                        .font(.system(size: 12))
+                        .foregroundStyle(NativeAgentShell.secondary)
+                    AliveFlow(spacing: 8, lineSpacing: 8) {
+                        Button("Open Accessibility", systemImage: "cursorarrow.motionlines") {
+                            openSystemSettings(.accessibility)
+                        }
+                        Button("Open Automation", systemImage: "gearshape.2") {
+                            openSystemSettings(.automation)
+                        }
+                        Button("Open Full Disk Access", systemImage: "externaldrive.badge.checkmark") {
+                            openSystemSettings(.fullDiskAccess)
+                        }
+                        Button("Send a test notification", systemImage: "bell") {
+                            Task { await sendTestNotification() }
+                        }
+                        .disabled(isTestingNotif || !policy.enabled || !policy.notificationsAllowed)
                     }
-                    Text("Allows arbitrary shell execution. Keep this off unless Developer Mode is intentionally enabled for the operator session.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    HStack {
-                        Toggle("Enable Shell Commands", isOn: Binding(
-                            get: { policy.shellAllowed },
-                            set: {
-                                if $0 { policy.enabled = true }
-                                policy.shellAllowed = $0
+                    if isSaving || isTestingNotif || testNotifStatus != nil {
+                        HStack(spacing: 8) {
+                            if isSaving || isTestingNotif {
+                                ProgressView()
+                                    .controlSize(.small)
                             }
-                        ))
-                        EffectTimingTag(timing: .restart)
-                        Spacer()
-                    }
-                }
-            }
-
-            NativePanel(title: "Ask Me First About", systemImage: "checkmark.shield") {
-                VStack(alignment: .leading, spacing: 10) {
-                    Text("NativeAgent stops and asks for your approval before it does any of these, however it was asked to.")
-                        .font(.caption).foregroundStyle(.secondary)
-                    // Sweep R4 C9 — COPY ONLY. These were rendered as their raw
-                    // policy keys (shell, file_ops, applescript, jxa,
-                    // accessibility). The KEY is unchanged and still what gets
-                    // written to `approvalRequiredFor`; only the label the user
-                    // reads changed, with the key kept as a caption so a support
-                    // conversation can still name the exact row.
-                    ForEach(MacControlApprovalCategory.all) { category in
-                        let isRequired = policy.approvalRequiredFor.contains(category.key)
-                        HStack(alignment: .top) {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Toggle(category.title, isOn: Binding(
-                                    get: { isRequired },
-                                    set: { newVal in
-                                        if newVal {
-                                            if !policy.approvalRequiredFor.contains(category.key) {
-                                                policy.approvalRequiredFor.append(category.key)
-                                            }
-                                        } else {
-                                            policy.approvalRequiredFor.removeAll { $0 == category.key }
-                                        }
-                                    }
-                                ))
-                                Text(category.detail)
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                    .fixedSize(horizontal: false, vertical: true)
-                                Text(category.key)
-                                    .font(NativeAgentFont.mono)
-                                    .foregroundStyle(.tertiary)
-                                    .textSelection(.enabled)
-                                    .help("Policy key for this row — quote it when asking for support.")
+                            if let status = testNotifStatus {
+                                Text(status)
+                                    .font(.system(size: 12))
+                                    .foregroundStyle(NativeAgentShell.secondary)
                             }
-                            EffectTimingTag(timing: .now)
-                            Spacer()
                         }
                     }
                 }
-            }
 
-            NativePanel(title: "iOS Remote Control", systemImage: "iphone.and.arrow.forward", tint: .cyan) {
-                VStack(alignment: .leading, spacing: 8) {
-                    HStack {
-                        Toggle("Allow iOS remote control", isOn: Binding(
-                            get: { policy.remoteFromIosAllowed },
-                            set: {
-                                if $0 { policy.enabled = true }
-                                policy.remoteFromIosAllowed = $0
-                            }
-                        ))
-                        EffectTimingTag(timing: .now)
-                        Spacer()
+                if let err = saveError {
+                    Text(err)
+                        .font(.system(size: 12))
+                        .foregroundStyle(NativeAgentShell.trouble)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+        .accessibilityElement(children: .contain)
+    }
+
+    private func aliveSection<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
+            AliveEyebrow(title)
+            AliveGroupCard { content() }
+        }
+        .accessibilityElement(children: .contain)
+    }
+
+    @ViewBuilder
+    private var advancedMacControlControls: some View {
+        VStack(alignment: .leading, spacing: 24) {
+            aliveSection("Mac control") {
+                MacControlSwitchRow(
+                    title: "Mac control",
+                    detail: "I control this Mac with AppleScript, Accessibility, shell commands and more. The presets above choose safe defaults.",
+                    isOn: Binding(
+                        get: { policy.enabled },
+                        set: { policy.enabled = $0 }
+                    )
+                )
+                HStack(spacing: 10) {
+                    Button("Save") {
+                        Task { await save() }
                     }
-                    if !policy.enabled {
-                        Text("Turning this on also enables Mac Control.")
-                            .font(.caption).foregroundStyle(.secondary)
-                    } else {
-                        Text("Lets the paired iOS app trigger Mac Control actions remotely via iCloudBridge.")
-                            .font(.caption).foregroundStyle(.secondary)
+                    .buttonStyle(.borderedProminent)
+                    .hazeTinted(.button)
+                    .disabled(isSaving || !hasUnsavedChanges)
+                    .accessibilityIdentifier("macControl.advanced.save")
+
+                    if isSaving {
+                        ProgressView("Saving…")
+                            .controlSize(.small)
+                    } else if hasUnsavedChanges {
+                        Text("Unsaved changes. Save before using the workbench.")
+                            .font(.system(size: 12))
+                            .foregroundStyle(NativeAgentShell.needsYou)
                     }
                 }
+            }
+
+            aliveSection("Kinds of control") {
+                MacControlCategoryRow(
+                    label: "Notifications",
+                    detail: "I post notifications on this Mac.",
+                    safeDefault: true,
+                    masterEnabled: policy.enabled,
+                    isOn: macControlBinding(\.notificationsAllowed)
+                )
+                MacControlCategoryRow(
+                    label: "Spotlight search",
+                    detail: "I search with Spotlight (read only).",
+                    safeDefault: true,
+                    masterEnabled: policy.enabled,
+                    isOn: macControlBinding(\.spotlightAllowed)
+                )
+                MacControlUnavailableCategoryRow(
+                    label: "macOS Shortcuts",
+                    detail: "Not built yet: I can't run Shortcuts in this version, so there is nothing to switch on."
+                )
+                MacControlUnavailableCategoryRow(
+                    label: "System control",
+                    detail: "Not built yet: system actions like locking the screen or sleeping the display aren't in this version, so there is nothing to switch on."
+                )
+                MacControlCategoryRow(
+                    label: "File operations",
+                    detail: "I read and write files. The file rules in Access and policy still apply.",
+                    safeDefault: false,
+                    masterEnabled: policy.enabled,
+                    isOn: macControlBinding(\.fileOpsAllowed)
+                )
+                MacControlCategoryRow(
+                    label: "Accessibility",
+                    detail: "I type, click and read the app in front. macOS must also allow it in System Settings → Privacy & Security → Accessibility.",
+                    safeDefault: false,
+                    masterEnabled: policy.enabled,
+                    isOn: macControlBinding(\.accessibilityAllowed)
+                )
+                MacControlCategoryRow(
+                    label: "AppleScript",
+                    detail: "I run AppleScript. I ask you first by default.",
+                    safeDefault: false,
+                    masterEnabled: policy.enabled,
+                    isOn: macControlBinding(\.applesScriptAllowed)
+                )
+                MacControlCategoryRow(
+                    label: "JavaScript for Automation (JXA)",
+                    detail: "I run JXA scripts. I ask you first by default.",
+                    safeDefault: false,
+                    masterEnabled: policy.enabled,
+                    isOn: macControlBinding(\.jxaAllowed)
+                )
+            }
+
+            aliveSection("Shell commands") {
+                MacControlSwitchRow(
+                    title: "Shell commands",
+                    detail: "I can run any command, as if typed into Terminal. Powerful: keep this off unless you turned on developer mode on purpose.",
+                    isOn: Binding(
+                        get: { policy.shellAllowed },
+                        set: {
+                            if $0 { policy.enabled = true }
+                            policy.shellAllowed = $0
+                        }
+                    )
+                )
+            }
+
+            aliveSection("Ask me first about") {
+                Text("I stop and ask for your approval before I do any of these, however I was asked to.")
+                    .font(.system(size: 12))
+                    .foregroundStyle(NativeAgentShell.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                // Sweep R4 C9 — COPY ONLY. These were rendered as their raw
+                // policy keys (shell, file_ops, applescript, jxa,
+                // accessibility). The KEY is unchanged and still what gets
+                // written to `approvalRequiredFor`; only the label the user
+                // reads changed, with the key kept as a caption so a support
+                // conversation can still name the exact row.
+                ForEach(MacControlApprovalCategory.all) { category in
+                    let isRequired = policy.approvalRequiredFor.contains(category.key)
+                    MacControlSwitchRow(
+                        title: category.title,
+                        detail: category.detail,
+                        caption: category.key,
+                        isOn: Binding(
+                            get: { isRequired },
+                            set: { newVal in
+                                if newVal {
+                                    if !policy.approvalRequiredFor.contains(category.key) {
+                                        policy.approvalRequiredFor.append(category.key)
+                                    }
+                                } else {
+                                    policy.approvalRequiredFor.removeAll { $0 == category.key }
+                                }
+                            }
+                        )
+                    )
+                }
+            }
+
+            aliveSection("iPhone remote control") {
+                MacControlSwitchRow(
+                    title: "Allow iPhone remote control",
+                    detail: policy.enabled
+                        ? "The paired iPhone app can ask me to run Mac control actions, through iCloud."
+                        : "Turning this on also turns on Mac control.",
+                    isOn: Binding(
+                        get: { policy.remoteFromIosAllowed },
+                        set: {
+                            if $0 { policy.enabled = true }
+                            policy.remoteFromIosAllowed = $0
+                        }
+                    )
+                )
             }
 
             MacControlWorkbenchView(policy: policy, policySaved: !hasUnsavedChanges)
 
-            NativePanel(title: "Audit", systemImage: "doc.text.magnifyingglass") {
-                Button("View Audit Log") {
-                    Task { await loadAudit() }
-                    showAuditSheet = true
+            aliveSection("Audit log") {
+                HStack(spacing: 12) {
+                    Text("Every Mac control action I ran or was blocked from running.")
+                        .font(.system(size: 12))
+                        .foregroundStyle(NativeAgentShell.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 12)
+                    Button("View audit log") {
+                        Task { await loadAudit() }
+                        showAuditSheet = true
+                    }
                 }
-                .buttonStyle(.bordered)
             }
+
+            Text("None of these settings change until you press Save. After that, the Mac control and shell command switches take effect at the next restart; the rest apply right away.")
+                .font(.system(size: 12))
+                .foregroundStyle(NativeAgentShell.secondary)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 
@@ -870,20 +868,6 @@ struct MacControlPermissionsView: View {
             readState: policyReadState,
             savedPolicy: policyReadState == .available ? savedPolicy : nil
         )
-    }
-
-    private var macIntegrationTint: Color {
-        switch policyReadState {
-        case .loading: return .orange
-        case .unavailable: return .red
-        case .available: break
-        }
-        switch activePreset(for: savedPolicy) {
-        case .off: return .secondary
-        case .watch: return .teal
-        case .assistant: return .blue
-        case .full: return .red
-        }
     }
 
     private func applyIntegrationPreset(_ preset: MacIntegrationPreset) async {
@@ -1061,7 +1045,50 @@ struct MacControlPermissionsView: View {
     }
 }
 
-// MARK: - Category Row
+// MARK: - Rows (Alive glass)
+
+/// One switch row on a group card: the words on the left, the switch on the
+/// right, and an optional support caption (a policy key) under the detail.
+private struct MacControlSwitchRow: View {
+    let title: String
+    var detail: String? = nil
+    var caption: String? = nil
+    var note: String? = nil
+    @Binding var isOn: Bool
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 12) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title)
+                    .font(.system(size: 14, weight: .medium))
+                    .foregroundStyle(NativeAgentShell.text)
+                if let detail {
+                    Text(detail)
+                        .font(.system(size: 12))
+                        .foregroundStyle(NativeAgentShell.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if let note {
+                    Text(note)
+                        .font(.system(size: 12))
+                        .foregroundStyle(NativeAgentShell.secondary)
+                }
+                if let caption {
+                    Text(caption)
+                        .font(NativeAgentFont.mono)
+                        .foregroundStyle(NativeAgentShell.secondary)
+                        .textSelection(.enabled)
+                        .help("Policy key for this row — quote it when asking for support.")
+                }
+            }
+            Spacer(minLength: 12)
+            Toggle(title, isOn: $isOn)
+                .labelsHidden()
+                .toggleStyle(.switch)
+                .hazeTinted()
+        }
+    }
+}
 
 private struct MacControlCategoryRow: View {
     let label: String
@@ -1071,93 +1098,94 @@ private struct MacControlCategoryRow: View {
     @Binding var isOn: Bool
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 3) {
-            HStack {
-                Toggle(label, isOn: $isOn)
-                    .opacity(masterEnabled ? 1 : 0.85)
-                    .font(.body.weight(.medium))
-                EffectTimingTag(timing: .now)
-                Spacer()
-            }
-            Text(detail)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            if !masterEnabled {
-                Text("Turning this on also enables Mac Control.")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-            }
-            if safeDefault {
-                Text("Default safe")
-                    .font(.caption2)
-                    .foregroundStyle(.green)
-            }
-        }
+        let notes = [
+            masterEnabled ? nil : "Turning this on also turns on Mac control.",
+            safeDefault ? "Safe by default." : nil,
+        ].compactMap { $0 }
+        MacControlSwitchRow(
+            title: label,
+            detail: detail,
+            note: notes.isEmpty ? nil : notes.joined(separator: " "),
+            isOn: $isOn
+        )
     }
 }
 
 /// A capability the Swift Mac Control runtime deliberately does not offer yet.
 /// It is a status row rather than a disabled Toggle: a toggle suggests a user
 /// can make the action available, while these actions would only return 501.
+/// A state, not trouble: the word is quiet.
 private struct MacControlUnavailableCategoryRow: View {
     let label: String
     let detail: String
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 3) {
-            HStack {
-                Label(label, systemImage: "exclamationmark.triangle.fill")
-                    .font(.body.weight(.medium))
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Text("Unavailable")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.orange)
+        HStack(alignment: .firstTextBaseline, spacing: 12) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(label)
+                    .font(.system(size: 14, weight: .medium))
+                    .foregroundStyle(NativeAgentShell.text)
+                Text(detail)
+                    .font(.system(size: 12))
+                    .foregroundStyle(NativeAgentShell.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
-            Text(detail)
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            Spacer(minLength: 12)
+            Text("Not available")
+                .font(.system(size: 12))
+                .foregroundStyle(NativeAgentShell.secondary)
         }
         .accessibilityElement(children: .combine)
     }
 }
 
+/// One Mac integration preset as a selectable card, the same shape as Trust's
+/// four presets: a quiet card, and a ring in the haze on the chosen one.
 private struct MacIntegrationPresetButton: View {
     var preset: MacIntegrationPreset
     var active: Bool
     var disabled: Bool
     var action: () -> Void
+    @AppStorage(HazeColor.key) private var colorRaw = HazeColor.defaultValue.rawValue
 
     var body: some View {
+        let haze = HazeColor(stored: colorRaw).base
+        let shape = RoundedRectangle(cornerRadius: AliveMetrics.cardRadius, style: .continuous)
         Button(action: action) {
-            HStack(spacing: 10) {
-                Image(systemName: preset.systemImage)
-                    .foregroundStyle(preset.tint)
-                    .frame(width: 20)
-                VStack(alignment: .leading, spacing: 2) {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 6) {
                     Text(preset.title)
-                        .font(NativeAgentFont.section)
-                        .foregroundStyle(disabled ? .secondary : .primary)
-                    Text(preset.subtitle)
-                        .font(NativeAgentFont.tag)
-                        .foregroundStyle(.secondary)
+                        .font(.system(size: 14, weight: .medium))
+                        .foregroundStyle(NativeAgentShell.text)
+                    Spacer(minLength: 4)
+                    // Not colour alone: the chosen one also carries a mark.
+                    if active {
+                        Image(systemName: "checkmark.circle.fill")
+                            .font(.system(size: 13))
+                            .foregroundStyle(haze)
+                            .accessibilityHidden(true)
+                    }
                 }
-                Spacer()
-                if active {
-                    Image(systemName: "checkmark.circle.fill")
-                        .foregroundStyle(preset.tint)
-                }
+                Text(preset.subtitle)
+                    .font(.system(size: 12))
+                    .foregroundStyle(NativeAgentShell.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
-            .padding(NativeAgentSpacing.md)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(preset.tint.opacity(active ? 0.16 : 0.07), in: RoundedRectangle(cornerRadius: NativeAgentRadius.panel, style: .continuous))
+            .padding(.horizontal, 14)
+            .padding(.vertical, 12)
+            .frame(maxWidth: .infinity, minHeight: 64, alignment: .topLeading)
+            .aliveCard()
             .overlay {
-                RoundedRectangle(cornerRadius: NativeAgentRadius.panel, style: .continuous)
-                    .strokeBorder(preset.tint.opacity(active ? 0.35 : 0.12), lineWidth: active ? 1 : 0.8)
+                if active {
+                    shape.strokeBorder(haze, lineWidth: 2)
+                }
             }
+            .contentShape(shape)
         }
-        .buttonStyle(.plain)
+        .buttonStyle(.naFeel)
         .disabled(disabled)
+        .opacity(disabled ? 0.6 : 1)
+        .accessibilityAddTraits(active ? [.isSelected] : [])
     }
 }
 
@@ -1354,22 +1382,31 @@ struct MacControlWorkbenchView: View {
     @State private var resultBody = "Try an action to see its results, any errors, and whether it needs your approval."
 
     var body: some View {
-        NativePanel(title: "Mac Control Workbench", systemImage: "wrench.and.screwdriver", tint: .indigo) {
-            VStack(alignment: .leading, spacing: 12) {
+        // Alive glass: an eyebrow over one group card — the notes, the action
+        // and its inputs, then the result, each a row.
+        VStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
+            AliveEyebrow("Workbench")
+            AliveGroupCard {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Try one Mac control action by hand and see what happens. Shortcuts and system actions are not in this version.")
+                    .font(.system(size: 12))
+                    .foregroundStyle(NativeAgentShell.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
                 if !policySaved {
-                    Label("Save your Mac Control permissions before trying an action.", systemImage: "lock.fill")
-                        .font(.caption)
-                        .foregroundStyle(.orange)
+                    // Waiting on him (an unsaved edit), so teal, not trouble.
+                    Label("Save your Mac control settings before trying an action.", systemImage: "lock.fill")
+                        .font(.system(size: 12))
+                        .foregroundStyle(NativeAgentShell.needsYou)
                 }
-                Label("Shortcuts and system actions are not supported in this version of NativeAgent.", systemImage: "exclamationmark.triangle.fill")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+            }
+            VStack(alignment: .leading, spacing: 12) {
                 Picker("Action", selection: $mode) {
                     ForEach(MacControlWorkbenchMode.allCases) { mode in
                         Text(mode.rawValue).tag(mode)
                     }
                 }
                 .pickerStyle(.segmented)
+                .hazeTinted(.segments)
 
                 switch mode {
                 case .shell:
@@ -1409,6 +1446,10 @@ struct MacControlWorkbenchView: View {
                         .lineLimit(2...6)
                         .textFieldStyle(.roundedBorder)
                     Toggle("Append instead of replace", isOn: $fileAppend)
+                        .toggleStyle(.switch)
+                        .hazeTinted()
+                        .controlSize(.small)
+                        .font(.system(size: 13))
                     HStack {
                         workbenchButton(.fileRead, availability: readAvailability) {
                             await run(path: MacControlWorkbenchAction.fileRead.path, body: [
@@ -1449,13 +1490,15 @@ struct MacControlWorkbenchView: View {
                     }
                     availabilityHint(availability)
                 }
+            }
 
-                Divider()
+            VStack(alignment: .leading, spacing: 10) {
                 HStack {
                     Image(systemName: isRunning ? "hourglass" : "terminal")
-                        .foregroundStyle(isRunning ? .orange : NativeAgentTheme.statusColor(resultTitle))
+                        .foregroundStyle(resultColor)
                     Text(resultTitle)
-                        .font(NativeAgentFont.section)
+                        .font(.system(size: 14, weight: .medium))
+                        .foregroundStyle(resultColor)
                     Spacer()
                     if isRunning {
                         ProgressView().controlSize(.small)
@@ -1464,14 +1507,25 @@ struct MacControlWorkbenchView: View {
                 ScrollView {
                     Text(resultBody)
                         .font(NativeAgentFont.mono)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(NativeAgentShell.secondary)
                         .textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 .frame(minHeight: 90, maxHeight: 180)
                 .padding(10)
-                .background(Color.black.opacity(0.05), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .background(NativeAgentShell.softFill, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
             }
+            }
+        }
+        .accessibilityElement(children: .contain)
+    }
+
+    /// Failed is trouble; waiting for approval waits on him; the rest is quiet.
+    private var resultColor: Color {
+        switch resultTitle {
+        case "Failed": NativeAgentShell.trouble
+        case "Pending Approval": NativeAgentShell.needsYou
+        default: NativeAgentShell.secondary
         }
     }
 
@@ -1488,7 +1542,7 @@ struct MacControlWorkbenchView: View {
         if let message = availability.message {
             Label(message, systemImage: availability.isUnavailable ? "exclamationmark.triangle.fill" : "lock.fill")
                 .font(.caption)
-                .foregroundStyle(availability.isUnavailable ? .orange : .secondary)
+                .foregroundStyle(NativeAgentShell.secondary)
         }
     }
 

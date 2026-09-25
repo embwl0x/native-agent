@@ -100,7 +100,8 @@ extension MacAppleScriptBridge {
                 try Task.checkCancellation()
                 result.merge(history) { _, new in new }
             }
-            return .object(result)
+            // People by their Contacts names where known; handles stay the identity.
+            return .object(MacContactsAdapter.naming(result))
         } catch let AppleScriptError.permissionDenied(app) {
             return deniedEnvelope(integration: "messages", app: app)
         } catch {
@@ -138,6 +139,10 @@ extension MacAppleScriptBridge {
         }
         guard let body = inputString(input["body"]), !body.isEmpty else {
             return failedEnvelope(integration: "messages", reason: "missing_body")
+        }
+        if let to, !to.isEmpty, !to.contains("@"), !to.contains(where: \.isNumber) {
+            return .object(["status": .string("failed"), "integration": .string("messages"), "reason": .string("recipient_is_a_name"),
+                "message": .string("\"\(to)\" is a name, not a phone number or email. Look it up with contacts_search, then send to that number. Nothing was sent.")])
         }
         let bodyAS = escapeForAppleScript(body)
         let source: String
@@ -198,106 +203,92 @@ extension MacAppleScriptBridge {
     /// List recent Apple Notes. Optional: "limit" (default 10, max 50).
     /// Returns the same bounded record shape as `notesSearch`.
     public static func notesListRecent(input: [String: JSONValue]) async throws -> JSONValue {
-        let limit = clampedInt(input["limit"], defaultValue: 10, min: 1, max: 50)
-        let source = """
-        tell application "Notes"
-            if (count of accounts) is 0 then return "__NATIVEAGENT_NOTES_NOT_CONFIGURED__"
-            if (count of folders) is 0 then return "__NATIVEAGENT_NOTES_NOT_CONFIGURED__"
-            set noteList to notes
-            set output to ""
-            set countNote to 0
-            repeat with i from 1 to (count of noteList)
-                if countNote ≥ \(limit) then exit repeat
-                set n to item i of noteList
-                set nm to ""
-                set bp to ""
-                set md to ""
-                try
-                    set nm to (name of n) as string
-                end try
-                try
-                    set bp to text 1 thru 200 of ((body of n) as string)
-                on error
-                    try
-                        set bp to (body of n) as string
-                    end try
-                end try
-                try
-                    set md to ((modification date of n) as string)
-                end try
-                set output to output & nm & "|||" & bp & "|||" & md & "###"
-                set countNote to countNote + 1
-            end repeat
-            return output
-        end tell
-        """
-        do {
-            let raw = try await runAppleScript(source)
-            if let setup = readSetupEnvelope(raw: raw, integration: "notes") { return setup }
-            let notes = parseNoteRecords(raw)
-            return .object([
-                "status": .string("completed"),
-                "count": .int(Int64(notes.count)),
-                "notes": .array(notes),
-            ])
-        } catch let AppleScriptError.permissionDenied(app) {
-            return deniedEnvelope(integration: "notes", app: app)
-        } catch {
-            return failedEnvelope(integration: "notes", error: error)
-        }
+        await notesRead(selection: "notes", limit: clampedInt(input["limit"], defaultValue: 10, min: 1, max: 50), whole: false)
     }
 
-    /// Search Apple Notes by title/body. Required: "query". Optional: "limit"
-    /// (default 10, max 50).
-    /// Returns: {status, count, notes: [{name, body_preview, modified_at}]}
+    /// Search Apple Notes by title/body; blank query lists recent notes, and
+    /// `title` (exact) reads that note's whole text in the same call. A single
+    /// hit carries its text too (2026-09-24).
+    /// Returns: {status, count, total, notes: [{name, body_preview | body, modified_at, folder}]}
     public static func notesSearch(input: [String: JSONValue]) async throws -> JSONValue {
-        guard let query = inputString(input["query"]), !query.isEmpty else {
-            return failedEnvelope(integration: "notes", reason: "missing_query")
-        }
         let limit = clampedInt(input["limit"], defaultValue: 10, min: 1, max: 50)
-        let escapedQuery = escapeForAppleScript(query)
+        // A note's own id reads exactly that note, whatever else shares its title.
+        if let id = inputString(input["id"])?.trimmingCharacters(in: .whitespacesAndNewlines), !id.isEmpty {
+            return await notesRead(selection: "notes whose id is \"\(escapeForAppleScript(id))\"", limit: 1, whole: true)
+        }
+        if let title = inputString(input["title"])?.trimmingCharacters(in: .whitespacesAndNewlines), !title.isEmpty {
+            return await notesRead(selection: "notes whose name is \"\(escapeForAppleScript(title))\"", limit: 1, whole: true)
+        }
+        guard let query = inputString(input["query"])?.trimmingCharacters(in: .whitespacesAndNewlines), !query.isEmpty else {
+            return await notesRead(selection: "notes", limit: limit, whole: false)
+        }
+        let q = escapeForAppleScript(query)
+        return await notesRead(selection: "notes whose (name contains \"\(q)\") or (body contains \"\(q)\")", limit: limit, whole: false)
+    }
+
+    /// Plain text (not the HTML body): 200 characters a row, up to 4000 when
+    /// one note is the answer.
+    private static func notesRead(selection: String, limit: Int, whole: Bool) async -> JSONValue {
         let source = """
         tell application "Notes"
             if (count of accounts) is 0 then return "__NATIVEAGENT_NOTES_NOT_CONFIGURED__"
             if (count of folders) is 0 then return "__NATIVEAGENT_NOTES_NOT_CONFIGURED__"
-            set q to "\(escapedQuery)"
-            set hits to (notes whose (name contains q) or (body contains q))
-            set output to ""
+            set hits to \(selection)
+            set totalHits to count of hits
+            set previewChars to 200
+            if \(whole ? "true" : "false") or totalHits is 1 then set previewChars to 4000
+            set output to "__TOTAL__" & (totalHits as text) & "###"
             set countNote to 0
-            repeat with i from 1 to (count of hits)
+            repeat with i from 1 to totalHits
                 if countNote ≥ \(limit) then exit repeat
                 set n to item i of hits
                 set nm to ""
                 set bp to ""
                 set md to ""
+                set fd to ""
+                set nid to ""
+                try
+                    set nid to (id of n) as string
+                end try
                 try
                     set nm to (name of n) as string
                 end try
                 try
-                    set bp to text 1 thru 200 of ((body of n) as string)
-                on error
-                    try
-                        set bp to (body of n) as string
-                    end try
+                    set bp to (plaintext of n) as string
+                    if (count of bp) > previewChars then set bp to text 1 thru previewChars of bp
                 end try
                 try
                     set md to ((modification date of n) as string)
                 end try
-                set output to output & nm & "|||" & bp & "|||" & md & "###"
+                try
+                    set fd to (name of container of n) as string
+                end try
+                set output to output & nm & "|||" & bp & "|||" & md & "|||" & fd & "|||" & nid & "###"
                 set countNote to countNote + 1
             end repeat
             return output
         end tell
         """
         do {
-            let raw = try await runAppleScript(source)
+            var raw = try await runAppleScript(source)
             if let setup = readSetupEnvelope(raw: raw, integration: "notes") { return setup }
-            let notes = parseNoteRecords(raw)
-            return .object([
-                "status": .string("completed"),
-                "count": .int(Int64(notes.count)),
-                "notes": .array(notes),
-            ])
+            var total: Int64?
+            if raw.hasPrefix("__TOTAL__"), let end = raw.range(of: "###") {
+                total = Int64(raw[raw.index(raw.startIndex, offsetBy: 9)..<end.lowerBound])
+                raw = String(raw[end.upperBound...])
+            }
+            var notes = parseNoteRecords(raw)
+            if whole && notes.isEmpty { return failedEnvelope(integration: "notes", reason: "no_matching_note") }
+            if notes.count == 1, case .object(var row) = notes[0], let text = row.removeValue(forKey: "body_preview") {
+                row["body"] = text
+                notes[0] = .object(row)
+            }
+            var result: [String: JSONValue] = ["status": .string("completed"), "count": .int(Int64(notes.count)), "notes": .array(notes)]
+            if let total {
+                result["total"] = .int(total)
+                if total > Int64(notes.count) { result["message"] = .string("Showing \(notes.count) of \(total); narrow with query, or read one with title.") }
+            }
+            return .object(result)
         } catch let AppleScriptError.permissionDenied(app) {
             return deniedEnvelope(integration: "notes", app: app)
         } catch {
@@ -384,7 +375,9 @@ extension MacAppleScriptBridge {
     /// or "new_title" (rename) must be provided. body + append are mutually
     /// exclusive. Returns: {status, action: "updated", title}.
     public static func notesUpdate(input: [String: JSONValue]) async throws -> JSONValue {
-        guard let title = inputString(input["title"]), !title.isEmpty else {
+        let noteID = inputString(input["id"])?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let title = inputString(input["title"]) ?? ""
+        guard !noteID.isEmpty || !title.isEmpty else {
             return failedEnvelope(integration: "notes", reason: "missing_title")
         }
         let body = inputString(input["body"])
@@ -424,24 +417,34 @@ extension MacAppleScriptBridge {
         }
         let source = """
         tell application "Notes"
-            set hits to (notes whose name is "\(titleAS)")
+            set hits to \(noteID.isEmpty ? "(notes whose name is \"\(titleAS)\")" : "(notes whose id is \"\(escapeForAppleScript(noteID))\")")
             if (count of hits) is 0 then return "0"
+            if (count of hits) > 1 then return "-3|" & ((count of hits) as text)
             set targetNote to first item of hits
+            set finalName to ""
             \(bodyStmt)
             \(renameStmt)
-            return "1"
+            try
+                set finalName to (name of targetNote) as string
+            end try
+            return "1|" & finalName
         end tell
         """
         do {
-            let raw = try await runAppleScript(source)
-            let updated = (Int(raw.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0) > 0
-            if !updated {
+            let raw = try await runAppleScript(source).trimmingCharacters(in: .whitespacesAndNewlines)
+            let parts = raw.split(separator: "|", maxSplits: 1, omittingEmptySubsequences: false).map(String.init)
+            // Two notes with one title: which is meant is unknown, so neither changes (2026-09-24).
+            if parts.first == "-3" {
+                return .object(["status": .string("failed"), "integration": .string("notes"), "reason": .string("several_notes_match"),
+                    "message": .string("\(parts.count > 1 ? parts[1] : "Several") notes are titled \"\(title)\", so nothing changed. Pass the id of one from notes_search.")])
+            }
+            guard parts.first == "1" else {
                 return failedEnvelope(integration: "notes", reason: "no_matching_note")
             }
             return .object([
                 "status": .string("completed"),
                 "action": .string("updated"),
-                "title": .string(newTitle?.isEmpty == false ? newTitle! : title),
+                "title": .string(parts.count > 1 && !parts[1].isEmpty ? parts[1] : (newTitle?.isEmpty == false ? newTitle! : title)),
             ])
         } catch let AppleScriptError.permissionDenied(app) {
             return deniedEnvelope(integration: "notes", app: app)

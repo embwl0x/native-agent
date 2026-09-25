@@ -225,11 +225,23 @@ extension SwiftNativeMacControl {
             "max_text_items": .int(80),
         ]))
 
+        // A front:true act: every event is posted only while that app is in
+        // front — User switching mid-act stops the hand before it reaches his app.
+        let requiredFront = Self.intValue(body, "require_front_pid").map { Int32(clamping: $0) }
         for step in executionPlan {
             if Task.isCancelled { return interruptedResult() }
             if let refusal = await attentionActionRefusal(action: "hand", body: body) {
                 recoverNeutral()
                 return refusal
+            }
+            let posts: Bool = if case .wait = step { false } else { true }
+            if let requiredFront, posts, accessibilitySource.frontmostApp()?.processIdentifier != requiredFront {
+                let released = recoverNeutral()
+                return injectionRefusal(action: "hand", error: "front_changed", extra: [
+                    "requested_events_emitted": .int(Int64(emittedEvents)),
+                    "recovery_events_emitted": .int(Int64(released)),
+                    "effects_may_have_occurred": .bool(emittedEvents > 0),
+                ])
             }
             if Task.isCancelled { return interruptedResult() }
             switch step {

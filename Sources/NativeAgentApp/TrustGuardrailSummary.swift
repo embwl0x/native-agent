@@ -97,7 +97,7 @@ enum TrustGuardrailSummary {
         }
         return TrustGuardrailRow(
             id: "files",
-            title: "Files it can reach",
+            title: "Files I can reach",
             value: value,
             detail: fileReachSentence(policy, accessMode: accessMode),
             systemImage: "folder",
@@ -130,15 +130,15 @@ enum TrustGuardrailSummary {
     private static func fileReachSentence(_ policy: TrustPolicy, accessMode: String) -> String {
         let state = fileChangeState(policy, accessMode: accessMode)
         if state == .unavailable {
-            return "It can read the files and folders you point it at."
+            return "I can read the files and folders you point me at."
         }
         if state == .fullMac || AppModel.normalizedAgentAccessMode(accessMode) == "full" {
-            return "It can reach files anywhere on this Mac, inside and outside your workspaces. "
+            return "I can reach files anywhere on this Mac, inside and outside your workspaces. "
                 + "macOS still asks separately for access to protected folders."
         }
         let head = AppModel.normalizedAgentAccessMode(accessMode) == "workspace"
-            ? "It can reach files in your workspace folders"
-            : "It can read files you point it at and change files in your workspace folders"
+            ? "I can reach files in your workspace folders"
+            : "I can read files you point me at and change files in your workspace folders"
         switch policy.filePolicy?.outsideWorkspaceDefault ?? "deny" {
         case "allow": return head + ", and files outside them too."
         case "ask": return head + "; files outside them need your approval."
@@ -165,10 +165,10 @@ enum TrustGuardrailSummary {
         let tone: TrustGuardrailTone
         switch state {
         case .fullMac:
-            value = "Full Mac autonomy active"
-            detail = "Enabled routine actions, file changes included, run without asking on this Mac "
-                + "and trusted remote surfaces, including external messages. macOS permissions, "
-                + "account setup, explicit tool blocks, and external-agent safeguards still apply."
+            value = "Changes without asking"
+            // Sending has its own row below; this one is changes only.
+            detail = "Under Full Mac I make changes without asking. "
+                + "macOS permissions and account setup still ask."
             tone = .danger
         case .unavailable:
             value = "Not available"
@@ -184,12 +184,12 @@ enum TrustGuardrailSummary {
             tone = .caution
         case .supervised:
             value = "Asks you first"
-            detail = "It asks you before it changes or deletes a file."
+            detail = "I ask you before I change or delete a file."
             tone = .ok
         }
         return TrustGuardrailRow(
             id: "autonomy",
-            title: "Before it changes something",
+            title: "Before I change something",
             value: value,
             detail: detail,
             systemImage: "hand.raised",
@@ -201,7 +201,7 @@ enum TrustGuardrailSummary {
         let on = policy.filePolicy?.requireBackupBeforeWrite ?? true
         return TrustGuardrailRow(
             id: "backups",
-            title: "If it gets something wrong",
+            title: "If I get something wrong",
             value: on ? "Backup required before changes" : "No backup required",
             detail: on
                 ? "Before an allowed file write, a backup is required so you can restore the previous version."
@@ -258,10 +258,19 @@ enum TrustGuardrailSummary {
         if mac.shortcutsAllowed { out.append("Shortcuts") }
         if mac.applesScriptAllowed || mac.jxaAllowed { out.append("App automation") }
         if mac.accessibilityAllowed { out.append("Clicking and typing") }
-        if mac.fileOpsAllowed { out.append("Mac-controlled files") }
+        if mac.fileOpsAllowed { out.append("Files anywhere on this Mac") }
         if mac.systemControlAllowed { out.append("System settings") }
         if mac.shellAllowed { out.append("Terminal commands") }
         return out
+    }
+
+    /// Category names joined into a sentence: the first keeps its capital, the
+    /// rest go lowercase unless they are names (Mac, Shortcuts, Spotlight).
+    static func sentenceList(_ names: [String]) -> String {
+        names.enumerated().map { index, name in
+            guard index > 0, !["Mac", "Shortcuts", "Spotlight"].contains(where: name.hasPrefix) else { return name }
+            return name.prefix(1).lowercased() + name.dropFirst()
+        }.joined(separator: ", ")
     }
 
     /// The short status word and the single readable list beneath it, from one
@@ -272,7 +281,7 @@ enum TrustGuardrailSummary {
     ) -> (value: String, detail: String) {
         let categories: [(key: String, name: String, allowed: Bool)] = [
             ("shell", "Terminal commands", mac.shellAllowed),
-            ("file_ops", "Mac-controlled files", mac.fileOpsAllowed),
+            ("file_ops", "Files anywhere on this Mac", mac.fileOpsAllowed),
             ("applescript", "App automation", mac.applesScriptAllowed),
             ("jxa", "App automation", mac.jxaAllowed),
             ("accessibility", "Clicking and typing", mac.accessibilityAllowed),
@@ -301,9 +310,14 @@ enum TrustGuardrailSummary {
             value = "Some ask first"
         }
         var sentences: [String] = []
-        if !automatic.isEmpty { sentences.append("Runs without asking: \(automatic.joined(separator: ", ")).") }
-        if !asks.isEmpty { sentences.append("Asks first: \(asks.joined(separator: ", ")).") }
-        if !unavailable.isEmpty { sentences.append("Not available: \(unavailable.joined(separator: ", ")).") }
+        // The label the status already says is not said again: the list leads.
+        if !automatic.isEmpty {
+            sentences.append((asks.isEmpty ? "" : "Runs without asking: ") + "\(sentenceList(automatic)).")
+        }
+        if !asks.isEmpty {
+            sentences.append((automatic.isEmpty ? "" : "Asks first: ") + "\(sentenceList(asks)).")
+        }
+        if !unavailable.isEmpty { sentences.append("Not available: \(sentenceList(unavailable)).") }
         sentences.append("File access limits\(fullMacActive(policy) ? " and protected-action checks" : ", risk checks, and tool permissions") still apply.")
         return (value, sentences.joined(separator: "\n"))
     }
@@ -312,9 +326,11 @@ enum TrustGuardrailSummary {
         if fullMacActive(policy) {
             return TrustGuardrailRow(
                 id: "external_send", title: "Sending things to other people",
-                value: "Full Mac sending active",
-                detail: "Admitted Full Mac actions can send through connected accounts without an additional app approval. External-agent safeguards still apply.",
-                systemImage: "paperplane.fill", tone: .caution
+                value: "Sends without asking",
+                detail: "Under Full Mac I can send through your connected accounts without an additional app approval. Requests from other assistants still need your permission.",
+                // As loud as file reach: this is the one that reaches other
+                // people, so it never wears a quieter word than the files row.
+                systemImage: "paperplane.fill", tone: .danger
             )
         }
         // NEVER claim "sends without asking" from this one flag: email and
@@ -354,7 +370,7 @@ struct TrustGuardrailSummaryPanel: View {
     }
 
     var body: some View {
-        NativePanel(title: "What \(AgentVoice.live.subject) can do right now", systemImage: "eye") {
+        NativePanel(title: "What I can do right now", systemImage: "eye") {
             if rows.isEmpty {
                 HStack(spacing: NativeAgentSpacing.sm) {
                     ProgressView().controlSize(.small)
@@ -364,15 +380,40 @@ struct TrustGuardrailSummaryPanel: View {
                 }
             } else {
                 VStack(alignment: .leading, spacing: NativeAgentSpacing.md) {
-                    Text("Every line below is read from your settings as they are right now, not a description of how the app usually works.")
+                    Text("Live from your settings.")
                         .font(ShellType.caption)
                         .foregroundStyle(NativeAgentShell.tertiary)
                         .fixedSize(horizontal: false, vertical: true)
                     ForEach(rows) { row in
                         TrustGuardrailRowView(row: row)
+                        // The one control on this card: a manual backup sits
+                        // with the row that answers "if I get something wrong".
+                        if row.id == "backups" {
+                            backupNowButton
+                        }
                     }
                 }
             }
+        }
+    }
+}
+
+extension TrustGuardrailSummaryPanel {
+    /// What `NativeClient.createBackup` copies: the app's own data under its
+    /// data root (settings, memory, chats, skills, tools, connectors, jobs,
+    /// persona), never files in the person's folders.
+    fileprivate var backupNowButton: some View {
+        HStack(alignment: .firstTextBaseline, spacing: NativeAgentSpacing.md) {
+            Text("Copies what I keep on this Mac: settings, memory, chats, skills, connectors and scheduled jobs. Your own files are not part of it. Restore from Advanced → Backups.")
+                .font(ShellType.label)
+                .foregroundStyle(NativeAgentShell.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: NativeAgentSpacing.sm)
+            Button("Back up now") {
+                Task { await appModel.createBackup(reason: "manual Trust Center backup") }
+            }
+            .controlSize(.small)
+            .accessibilityIdentifier("trust.backup-now")
         }
     }
 }

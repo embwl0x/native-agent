@@ -82,7 +82,7 @@ struct ToolLoadRequestRetentionTests {
         defer { try? FileManager.default.removeItem(at: root) }
         let dispatcher = SwiftToolDispatcher(dataRoot: root)
         let session = UUID().uuidString
-        let name = "market_status"
+        let name = "workshop_status"
         let oldStamp = try await seedOldLoadout(root: root, session: session, names: [name], oldest: name)
         let result = try object(try await dispatcher.dispatch(tool: "tool_load", input: [
             "session_id": .string(session), "names": .array([.string(name)]),

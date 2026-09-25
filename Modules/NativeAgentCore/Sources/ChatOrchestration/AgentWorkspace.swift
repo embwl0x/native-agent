@@ -26,7 +26,7 @@ indirect enum AgentWorkspaceLocation: Sendable, Equatable {
 
     var title: String {
         switch self {
-        case .home: return "Workspace"
+        case .home: return "Home"
         case .openPlaces: return "Open places"
         case .savedWorkspaces: return "Saved workspaces"
         case .workOverview: return "This work"
@@ -216,6 +216,11 @@ actor AgentWorkspaceNavigation {
         var arrivalReturn: AgentWorkspaceArrivals.ReturnPlace?
         var controlsExpanded = false
         var switchingWindow = false
+        /// An effect just ran (a receipt was shown): the place it reads back is a window.
+        var actedJustNow = false
+        /// Conversations, tasks and bots she read: watched for arrivals like
+        /// open places, never shown as windows (Sol, 09-24).
+        var watched: [AgentWorkspaceLocation] = []
         var buttonPrefix = ""
         var buttonCount = 0
     }
@@ -239,6 +244,7 @@ actor AgentWorkspaceNavigation {
         var session = sessions[key] ?? restoredSession(dataRoot: persistenceEnabled ? dataRoot : nil, scope: scope)
         session.operation = operation
         session.touched = Date()
+        session.actedJustNow = false
         sessions[key] = session
         return operation
     }
@@ -256,7 +262,7 @@ actor AgentWorkspaceNavigation {
         }
         guard let session = sessions[key], Date().timeIntervalSince(session.issuedAt) <= 1800,
               let button = session.buttons[id] else {
-            throw AgentWorkspaceFailure(message: "That action is no longer in this chat's current view. Open workspace without arguments to refresh it. Nothing was repeated.")
+            throw AgentWorkspaceFailure(message: "That action is no longer in this chat's current view, and it is not a name on your home screen. Open workspace without arguments for home and use a name from it. Nothing was repeated.")
         }
         // Claim before dispatch. In particular, retrying a lost send response
         // cannot repeat a message using the same button reference.
@@ -278,7 +284,30 @@ actor AgentWorkspaceNavigation {
             guard case .browserBookmark = place, !pages.contains(place) else { continue }
             pages.append(place)
         }
-        return pages
+        return pages.filter { if case .browserBookmark(_, _, let tab?) = $0 { !ChromePageMirror.isClosed(tab) } else { true } }
+    }
+
+    /// A released tab leaves this chat's windows and home (desk walk 3,
+    /// 09-24: home and the window list still showed it after tabClosed).
+    func forgetTab(lease: String, tabID: Int64?, key: String) {
+        guard var session = sessions[key] else { return }
+        // Only this lease's window and the bookmark it recorded: a tab id
+        // alone can be reused after Chrome restarts.
+        let identity = "browser.chrome_snapshot:" + lease
+        let bookmark = session.browserBookmarks[identity].flatMap { saved -> AgentWorkspaceLocation? in
+            guard case .browserBookmark(_, _, let tab) = saved else { return nil }
+            return tab == nil || tabID == nil || tab == tabID ? saved : nil
+        }
+        func gone(_ place: AgentWorkspaceLocation) -> Bool {
+            if case .record("browser.chrome_snapshot", let input, _) = place { return input["lease_id"] == .string(lease) }
+            return bookmark != nil && place == bookmark
+        }
+        guard session.places.contains(where: gone) || session.browserBookmarks[identity] != nil else { return }
+        session.places.removeAll(where: gone)
+        session.browserBookmarks[identity] = nil
+        if let current = session.browserBookmark, gone(current) { session.browserBookmark = nil }
+        session.arrivals?.monitor.invalidate()
+        sessions[key] = session
     }
 
     func compactDesktop(_ value: JSONValue, key: String) -> JSONValue {
@@ -301,7 +330,7 @@ actor AgentWorkspaceNavigation {
             session.switchingWindow = false
             session.path = [.home]
         }
-        let oldPlaces = session.places
+        let oldPlaces = session.places, oldWatched = session.watched
         if case .form(let form) = location {
             guard session.drafts.contains(where: { $0.draftID == form.draftID }) || session.drafts.count < 4 else {
                 throw AgentWorkspaceFailure(message: "Four unfinished drafts are already open. Open places to finish or discard one before starting another; existing drafts were preserved.")
@@ -325,7 +354,24 @@ actor AgentWorkspaceNavigation {
         if case .record(let tool, let input, _) = location, tool == "desk_read", input["handle"] != nil {
             session.workAnchor = location
         }
-        if let identity = Self.placeIdentity(location) {
+        // A window is something she acts in: a draft or a browser page. A read
+        // leaves no window behind (desk walk 09-24: a read-only tour grew
+        // `windows` to 25); keeping a place is the separate `keep` verb.
+        var actsIn: Bool = switch location {
+        case .form, .browserBookmark: true
+        case .record(let tool, _, _): tool.hasPrefix("browser.") || tool == "read_page"
+        default: false
+        }
+        // A receipt means an effect ran; the place it reads back is kept.
+        if case .receipt = location { session.actedJustNow = true }
+        else if session.actedJustNow { actsIn = true; session.actedJustNow = false }
+        if !actsIn, case .record(let tool, _, _) = location,
+           ["chat_conversations", "task_ledger_list", "agent_read"].contains(tool) {
+            session.watched.removeAll { $0 == location }
+            session.watched.append(location)
+            if session.watched.count > 24 { session.watched.removeFirst(session.watched.count - 24) }
+        }
+        if actsIn, let identity = Self.placeIdentity(location) {
             session.places.removeAll { Self.placeIdentity($0) == identity }
             session.places.append(location)
             while session.places.count > 24 {
@@ -334,7 +380,7 @@ actor AgentWorkspaceNavigation {
             }
         }
         session.buttons = [:]
-        if oldPlaces != session.places { session.arrivals?.monitor.invalidate() }
+        if oldPlaces != session.places || oldWatched != session.watched { session.arrivals?.monitor.invalidate() }
         sessions[key] = session
     }
 
@@ -382,7 +428,9 @@ actor AgentWorkspaceNavigation {
                 return tool
             default: return nil
             }
-            guard case .string(let value)? = input[target] else { return nil }
+            guard case .string(var value)? = input[target] else { return nil }
+            // One helper, whatever case its id was saved in: one window.
+            if tool == "agent_read", value.lowercased().hasPrefix("bot:") { value = value.lowercased() }
             let conversation: String
             if case .string(let value)? = input["conversation"] ?? input["session_id"] { conversation = value } else { conversation = "" }
             return tool + ":" + value + "\u{0}" + conversation
@@ -437,8 +485,10 @@ actor AgentWorkspaceNavigation {
         sessions[key] = session
     }
 
+    static let referenceState = "Reference; current evidence is read on reopen."
+
     static func recognition(_ location: AgentWorkspaceLocation) -> JSONValue {
-        var row: [String: JSONValue] = ["state": .string("Reference; current evidence is read on reopen.")]
+        var row: [String: JSONValue] = ["state": .string(referenceState)]
         switch location {
         case .form(let form):
             row["state"] = .string("Unfinished draft; reopening never submits it. Supported inputs survive restart when desktop storage is saved.")
@@ -458,6 +508,22 @@ actor AgentWorkspaceNavigation {
         }
         return .object(row)
     }
+
+    /// Home is not a window: entering it keeps the trail and the ids earlier
+    /// views offered, so an old action still works after a look at home.
+    func enterHome(key: String) {
+        guard var session = sessions[key] else { return }
+        session.switchingWindow = false
+        session.controlsExpanded = false
+        if session.path.last != .home {
+            session.path.append(.home)
+            if session.path.count > 8 { session.path.removeFirst(session.path.count - 8) }
+        }
+        sessions[key] = session
+    }
+
+    func places(key: String) -> [AgentWorkspaceLocation] { sessions[key]?.places ?? [] }
+    func drafts(key: String) -> [AgentWorkspaceForm] { sessions[key]?.drafts ?? [] }
 
     func back(key: String) -> AgentWorkspaceLocation {
         if (sessions[key]?.path.count ?? 0) > 1 { sessions[key]?.path.removeLast() }
@@ -499,7 +565,7 @@ actor AgentWorkspaceNavigation {
            case .browserBookmark(let url, let title, _)? = session.browserBookmarks[identity],
            case .object(let content) = projection.content, content["snapshotId"] == nil {
             actions.insert(.init(label: "Reopen saved page in a background tab", action: .perform(
-                tool: "browser.chrome_acquire", input: ["mode": .string("create"), "initial_url": .string(url)],
+                tool: "browser.chrome_acquire", input: ["mode": .string("create"), "url": .string(url)],
                 title: title, textField: nil, isEffect: true)), at: 0)
         }
         if let source = session.document {
@@ -535,7 +601,8 @@ actor AgentWorkspaceNavigation {
             .init(label: session.controlsExpanded ? "Hide workspace controls" : "Show workspace controls", action: .workspaceControls)
         ]
         if let current = session.path.last, let keep = Self.keepablePlace(current, session: session),
-           !session.keptPlaces.contains(where: { Self.placeIdentity($0) == Self.placeIdentity(keep) }) {
+           !session.keptPlaces.contains(where: { Self.placeIdentity($0) == Self.placeIdentity(keep) }),
+           Self.actedOn(keep, session: session) {
             actions.append(.init(label: "Keep with this work", action: .keepWorkPlace(keep)))
         }
         if session.controlsExpanded {
@@ -583,22 +650,25 @@ actor AgentWorkspaceNavigation {
                 "selected": .bool(selected), "actions": .array(buttons)])
         }
         let controls = Self.renderButtons(actions, limit: 40, session: &session)
-        let launchers = session.path.last == .home ? [] : Self.renderButtons(
-            AgentWorkspaceEnvironment.destinations.map { .init(label: $0.title, action: .open(.area($0.id))) },
-            limit: 18, session: &session)
         var path: [JSONValue] = []
         for location in session.path {
             let title = JSONValue.string(String(location.title.prefix(300)))
             if path.last != title { path.append(title) }
         }
         sessions[key] = session
-        return .object([
+        var frame: [String: JSONValue] = [
             "status": outcome, "workspace": .string(projection.title), "path": .array(path),
             "content": projection.content, "items": .array(items), "actions": .array(controls),
             "windows": .array(windows),
-            "places": .array(launchers),
             "total_items": .int(Int64(projection.items.count)), "page": .int(Int64(projection.page))
-        ])
+        ]
+        // Honest counts: a capped list says how much of it this is.
+        let total = projection.items.count, first = projection.page * 8
+        if total > 8 || projection.page > 0 {
+            frame["showing"] = .string("items \(min(total, first + 1))–\(min(total, first + 8)) of \(total)"
+                + (first + 8 < total ? "; \"More items\" shows the next" : ""))
+        }
+        return .object(frame)
     }
 
     private static func renderButtons(_ values: [AgentWorkspaceButton], limit: Int,
@@ -638,6 +708,8 @@ enum AgentWorkspace {
         let operation = try await navigation.begin(key: key, dataRoot: dataRoot, scope: scope)
         do {
             await navigation.refreshArrivals(key: key, scope: scope, dataRoot: dataRoot)
+            // Her tool list as she last read it, for User's Agent view.
+            let catalog: Catalog = { let schemas = try await catalog(); HerScreenPreview.keep(catalog: schemas, dataRoot: dataRoot); return schemas }
             var result = try await run(input: input, key: key, scope: scope, dataRoot: dataRoot, navigation: navigation, catalog: catalog, perform: perform)
             // Arrival invalidations replace unrelated conversation reads on
             // every navigation. Explicit conversation views still read owners.
@@ -679,17 +751,79 @@ enum AgentWorkspace {
         if action == nil, suppliedText != nil || suppliedFields != nil {
             throw AgentWorkspaceFailure(message: "Text belongs to an offered action. Use query to Find across your workspace.")
         }
-        var location = await navigation.current(key: key)
+        // 2026-09-23 (her screen): no arguments is her home page, never the
+        // last view replayed.
+        var location = query == nil && action == nil ? .home : await navigation.current(key: key)
         var result: JSONValue?
         var suppressSourceSelection = false
         var sharedWorkSource: AgentWorkspaceLocation?
         if let query { location = .find(query) }
         // 2026-09-22: a query that names a window or place opens it like selecting it.
+        // Her screen's stable names (desk.4, claude, crew.1…) open the same way.
         var named: AgentWorkspaceAction?
-        if let query { named = await navigation.window(named: query, key: key) }
+        func screenName(_ raw: String) async throws -> HerScreen.Target? {
+            func resolve(_ name: String) async -> HerScreen.Target? {
+                await HerScreen.resolve(name, dataRoot: dataRoot, browserPages: await navigation.browserPages(key: key),
+                                        openPlaces: await navigation.places(key: key))
+            }
+            // A draft by its lasting name (`draft.3f2a9c01`, `draft.3f2a9c01.discard`):
+            // action ids expire, a draft must still close after they do.
+            let parts = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased().split(separator: ".").map(String.init)
+            // Any prefix of four or more characters names it; one naming two
+            // drafts is refused rather than guessed.
+            if parts.first == "draft", parts.count >= 2, parts[1].count >= 4, parts[1].allSatisfy(\.isHexDigit) {
+                let matches = await navigation.drafts(key: key).filter { $0.draftID.uuidString.lowercased().hasPrefix(parts[1]) }
+                guard matches.count == 1, let form = matches.first else {
+                    throw AgentWorkspaceFailure(message: matches.isEmpty
+                        ? "No open draft is named draft.\(parts[1]). Open windows to see the drafts still open."
+                        : "draft.\(parts[1]) names \(matches.count) drafts; use the full name shown on the draft.")
+                }
+                switch parts.dropFirst(2).first {
+                case nil: return .action(.window(.open(.form(form))))
+                case "discard"?, "close"?: return .action(.discardDraft(form))
+                default: break
+                }
+            }
+            // Existing names first (a contact called "Health" is theirs); an
+            // alias or a family only for a name nothing else claims.
+            if let target = await resolve(raw) { return target }
+            let alias = HerScreen.familyAliases[raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()]
+            if let alias, let target = await resolve(alias) { return target }
+            // A family room's DO line is a call (`activity_query {}`). Named as
+            // an action (walk 3: refused as "no longer in view"), a read that
+            // needs nothing runs as that read; any other says how to call it.
+            let call = raw.trimmingCharacters(in: .whitespacesAndNewlines).replacingOccurrences(of: " {}", with: "")
+            if HerScreen.families.contains(where: { $0.tools.contains { $0 == call || (($0.hasSuffix("_") || $0.hasSuffix(".")) && call.hasPrefix($0)) } }),
+               let schema = try? await AgentWorkspaceEnvironment.schema(call, catalog: catalog) {
+                guard AgentWorkspaceEnvironment.readTools.contains(call), ToolSignature.argumentNames(schema.parametersJSON).required.isEmpty else {
+                    throw AgentWorkspaceFailure(message: "\(call) is a tool, not a workspace name: call \(call) directly with its arguments. Nothing was run.")
+                }
+                return .action(.open(.record(tool: call, input: [:], title: call)))
+            }
+            return await HerScreen.familyRoom(alias ?? raw, catalog: catalog).map(HerScreen.Target.page)
+        }
+        if let query {
+            // Her screen's names first (they open the current room), then an
+            // old window's title.
+            switch try await screenName(query) {
+            case .action(let found)?: named = found
+            case .page(let page)?: return .string(page)
+            case nil: named = await navigation.window(named: query, key: key)
+            }
+        }
         if action != nil || named != nil {
             var selected: AgentWorkspaceAction
-            if let named { selected = named } else { selected = try await navigation.claim(action!, key: key) }
+            if let named { selected = named } else {
+                // An offered action id first (old refs keep working), then a name from her screen.
+                do { selected = try await navigation.claim(action!, key: key) }
+                catch {
+                    switch try await screenName(action!) {
+                    case .action(let found)?: selected = found
+                    case .page(let page)?: return .string(page)
+                    case nil: throw error
+                    }
+                }
+            }
             if case .window(let inner) = selected {
                 await navigation.beginWindowSwitch(key: key)
                 selected = inner
@@ -905,26 +1039,11 @@ enum AgentWorkspace {
                         readback: location, value: result, key: key)
                 }
             case .searchWeb:
+                // Desk walk 3 (09-24): research.search opened a Google tab in
+                // User's Chrome. Searching is her private SearXNG read; a result
+                // opens in Chrome only when she chooses that result.
                 guard let suppliedText, suppliedText.count <= 2000 else { throw AgentWorkspaceFailure(message: "Give the web search words, up to 2000 characters.") }
-                var url = URLComponents(string: "https://www.google.com/search")!
-                url.queryItems = [.init(name: "q", value: suppliedText)]
-                guard let address = url.url?.absoluteString else { throw AgentWorkspaceFailure(message: "The search address could not be formed.") }
-                try await navigation.navigate(.receipt(tool: "browser.chrome_acquire", title: "Web search: " + suppliedText, value: .object(["status": .string("outcome_unknown")])), key: key)
-                await navigation.recordWorkAction(tool: "browser.chrome_acquire", input: [:], title: "Web search",
-                    receipt: .object(["status": .string("outcome_unknown")]), readback: location, value: nil, key: key)
-                let receipt = try await AgentWorkspaceActionReadback.dispatchEffect(tool: "browser.chrome_acquire", input: ["mode": .string("create"), "initial_url": .string(address)], perform: perform)
-                await navigation.recordWorkAction(tool: "browser.chrome_acquire", input: [:], title: "Web search", receipt: receipt,
-                    readback: location, value: nil, key: key)
-                location = .receipt(tool: "browser.chrome_acquire", title: "Web search: " + suppliedText, value: AgentWorkspaceEnvironment.retained(receipt))
-                result = receipt
-                try await navigation.navigate(location, key: key)
-                if let next = try await AgentWorkspaceActionReadback.followUp(tool: "browser.chrome_acquire",
-                    input: ["mode": .string("create"), "initial_url": .string(address)], receipt: receipt,
-                    title: "Web search: " + suppliedText, perform: perform) {
-                    location = next.location; result = next.result
-                }
-                await navigation.recordWorkAction(tool: "browser.chrome_acquire", input: [:], title: "Web search", receipt: receipt,
-                    readback: location, value: result, key: key)
+                location = .record(tool: AgentWorkspaceKnowledge.webSearchTool, input: ["query": .string(suppliedText)], title: "Web search: " + suppliedText)
             case .findWork, .findDocument:
                 guard let suppliedText, suppliedText.count <= 400 else {
                     throw AgentWorkspaceFailure(message: "Give the topic to find in text, up to 400 characters.")
@@ -1006,7 +1125,33 @@ enum AgentWorkspace {
                 location = .form(form.withSchemaIssue("This capability is currently unavailable. Your draft is preserved. " + error.localizedDescription))
             }
         }
+        if case .home = location {
+            // Her home is text: the model's picture. Earlier views' action ids stay valid.
+            await navigation.enterHome(key: key)
+            return .string(await HerScreen.home(dataRoot: dataRoot, scope: scope, browserPages: await navigation.browserPages(key: key)))
+        }
         try await navigation.navigate(location, key: key)
+        // The other rooms home names (places, conversations, arrivals, windows,
+        // work) are the owner's read, laid out as text. The frame is still
+        // presented, so its action ids are issued and keep working.
+        let place = location
+        func shown(_ projection: AgentWorkspaceProjection, key: String, outcome: JSONValue) async -> JSONValue {
+            let frame = await navigation.present(projection, key: key, outcome: outcome)
+            if let life = HerScreen.lifeRoom(place, projection: projection, frame: frame, dataRoot: dataRoot) { return .string(life) }
+            guard let room = HerScreen.textRoomName(place) else { return frame }
+            let text = HerScreen.textRoom(room, place: place, projection: projection, frame: frame, dataRoot: dataRoot)
+            // A place opened by its owner's read: User's Agent view shows this copy.
+            if case .area = place { HerScreenPreview.keep(room: room, text: text, dataRoot: dataRoot) }
+            return .string(text)
+        }
+        // Her own rooms that need no owner read first: desk, mac, helpers, people, conversations.
+        if [.area("ongoing"), .area("computer"), .area("helpers"), .area("browser"), .people(page: 0), .conversations(page: 0),
+            .area("files"), .area("code"), .area("github"), .area("x")].contains(location)
+            || { if case .conversations = location { return true }; return false }(),
+           let room = await HerScreen.room(location, dataRoot: dataRoot, scope: scope) {
+            await HerScreen.markRoomSeen(location, dataRoot: dataRoot, scope: scope)
+            return .string(room)
+        }
         if case .find(let query) = location {
             var projection = try await AgentWorkspaceFind.project(query: query, perform: perform)
             let exactName = query.lowercased().split(whereSeparator: { $0.isWhitespace }).joined(separator: "_")
@@ -1021,29 +1166,29 @@ enum AgentWorkspace {
         }
         if case .arrivals = location {
             let projection = await navigation.arrivalProjection(key: key)
-            return await navigation.present(projection, key: key, outcome: .string("ok"))
+            return await shown(projection, key: key, outcome: .string("ok"))
         }
         if case .page(.arrivals, let page) = location {
             var projection = await navigation.arrivalProjection(key: key)
             projection.page = page
-            return await navigation.present(projection, key: key, outcome: .string("ok"))
+            return await shown(projection, key: key, outcome: .string("ok"))
         }
         if case .openPlaces = location {
             let projection = await navigation.openPlaces(key: key)
-            return await navigation.present(projection, key: key, outcome: .string("ok"))
+            return await shown(projection, key: key, outcome: .string("ok"))
         }
         if case .page(.openPlaces, let page) = location {
             var projection = await navigation.openPlaces(key: key)
             projection.page = page
-            return await navigation.present(projection, key: key, outcome: .string("ok"))
+            return await shown(projection, key: key, outcome: .string("ok"))
         }
         if case .savedWorkspaces = location {
             let projection = await navigation.savedWorkspaces(key: key)
-            return await navigation.present(projection, key: key, outcome: .string("ok"))
+            return await shown(projection, key: key, outcome: .string("ok"))
         }
         if location == .workOverview {
             let projection = await navigation.workOverview(key: key)
-            return await navigation.present(projection, key: key, outcome: .string("ok"))
+            return await shown(projection, key: key, outcome: .string("ok"))
         }
         let conversationPage: Int?
         if case .conversations(let page) = location { conversationPage = page }
@@ -1052,7 +1197,7 @@ enum AgentWorkspace {
         if let page = conversationPage {
             let projection = try await AgentWorkspaceConversations.project(scope: scope, dataRoot: dataRoot,
                 page: page, observations: await navigation.observationStamps(key: key), perform: perform)
-            return await navigation.present(projection, key: key, outcome: AgentWorkspaceEnvironment.outcome(projection.content))
+            return await shown(projection, key: key, outcome: AgentWorkspaceEnvironment.outcome(projection.content))
         }
         let environment: AgentWorkspaceProjection?
         do { environment = try await AgentWorkspaceEnvironment.view(location: location, dataRoot: dataRoot, catalog: catalog, perform: perform) }
@@ -1083,17 +1228,11 @@ enum AgentWorkspace {
                     }
                 }
             }
-            if case .home = location, case .object(var content) = environment.content {
-                let overview = await navigation.workspaceHomeOverview(key: key)
-                content["continuation"] = overview.content
-                environment.content = .object(content)
-                environment.actions.insert(contentsOf: overview.actions, at: 0)
-            }
             let outcome = AgentWorkspaceEnvironment.outcome(environment.content)
             if [JSONValue.string("unavailable"), .string("failed"), .string("error")].contains(outcome), environment.actions.isEmpty {
                 environment.actions.append(.init(label: "Refresh this view", action: .open(location)))
             }
-            return await navigation.present(environment, key: key, outcome: outcome)
+            return await shown(environment, key: key, outcome: outcome)
         }
         if result == nil {
           do {
@@ -1104,7 +1243,7 @@ enum AgentWorkspace {
             case .documents(let query): result = try await perform("artifact_find", ["query": .string(query), "limit": .int(6)])
             case .people: result = try await perform("agent_contacts", [:])
             case .record(let tool, var args, _):
-                guard AgentWorkspaceEnvironment.readTools.contains(tool) else {
+                guard AgentWorkspaceEnvironment.readTools.contains(tool) || AgentWorkspaceEnvironment.isStatusReader(tool) else {
                     throw AgentWorkspaceFailure(message: "This item has no supported workspace reader.")
                 }
                 if tool == "desk_read" { args["structured"] = .bool(true) }
@@ -1186,15 +1325,33 @@ enum AgentWorkspace {
                 observations: await navigation.observationStamps(key: key))
         } else { projection = .project(location: location, result: value) }
         var recoveredProjection = projection
+        // A named session keeps the name it was opened under, not raw bridge text.
+        if case .record("chat_conversations", let args, let title) = location, args["conversation_session_id"] != nil,
+           title != "Conversation with you" { recoveredProjection.title = title }
+        await navigation.keepOpenedWorkSource(location, value: value, key: key)
+        // Rooms are text like home; the owner read above still ran, and its
+        // failure is shown in the room rather than hidden.
+        let issue: String? = if case .object(let row) = value, [JSONValue.string("failed"), .string("unavailable"), .string("error")].contains(outcome) {
+            [row["detail"], row["error"], row["message"]].compactMap { if case .string(let text)? = $0 { text } else { nil } }.first ?? "The read did not complete."
+        } else { nil }
+        if let room = await HerScreen.room(location, dataRoot: dataRoot, scope: scope, issue: issue, value: value) {
+            _ = await navigation.observe(location: location, result: value, key: key)
+            await HerScreen.markRoomSeen(location, dataRoot: dataRoot, scope: scope)
+            return .string(room)
+        }
         // A person's window holds both directions: the chats they opened with
         // her over the bridge sit beside the ones she started (2026-09-22).
+        // Only past the room: a person room never shows them, so the 512 KB
+        // transcript scans ran for nothing on every conversation read.
         if case .record("agent_read", let args, _) = location, case .string(let agent)? = args["agent"],
            ["details", "history_before", "history_exchange"].allSatisfy({ args[$0] == nil }) {
-            recoveredProjection.items += AgentWorkSession.sessions(with: agent, dataRoot: dataRoot).prefix(4).map(\.item)
+            let sessions = AgentWorkSession.sessions(with: agent, dataRoot: dataRoot)
+            recoveredProjection.items += sessions.prefix(4).map(\.item)
+            if sessions.count > 4, case .object(var content) = recoveredProjection.content {
+                content["work_sessions"] = .string("4 newest of \(sessions.count) shown; all of them are in Your conversations (open \"conversations\")")
+                recoveredProjection.content = .object(content)
+            }
         }
-        if case .record("chat_conversations", let args, let title) = location, args["conversation_session_id"] != nil,
-           title.hasPrefix("Work session with ") { recoveredProjection.title = title }
-        await navigation.keepOpenedWorkSource(location, value: value, key: key)
         if [JSONValue.string("unavailable"), .string("failed"), .string("error")].contains(outcome), recoveredProjection.actions.isEmpty {
             recoveredProjection.actions.append(.init(label: "Refresh this view", action: .open(location)))
         }
@@ -1203,6 +1360,7 @@ enum AgentWorkspace {
            let changes = await navigation.observe(location: location, result: value, key: key) {
             fields["changes"] = changes; frame = .object(fields)
         }
+        if let life = HerScreen.lifeRoom(location, projection: recoveredProjection, frame: frame, dataRoot: dataRoot) { return .string(life) }
         return frame
     }
 

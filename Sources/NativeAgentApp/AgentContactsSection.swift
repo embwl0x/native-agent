@@ -63,7 +63,9 @@ struct AgentContactRow: Identifiable {
         let discovered = candidates.filter { candidate in
             candidate.hostID == nil && !peers.contains { $0.endpoint == candidate.cardURL || $0.endpoint == candidate.endpoint }
         }.map { Self(id: $0.id, name: $0.name, contact: nil, candidate: $0) }
-        let names = [("codex", "Codex"), ("claude", "Claude Code"), ("omp", "OMP")]
+        // Each lane under its own name, the one the bridge signs its turns
+        // with ("[from: claude, via bridge]"), not the app behind it.
+        let names = [("codex", "Codex"), ("claude", "Claude"), ("omp", "OMP")]
         let liveLanes = names.filter { usable.contains($0.0) }
         let contacts = (rows(peers: peers, installed: hosts) + discovered).map { row in
             var row = row
@@ -78,6 +80,19 @@ struct AgentContactRow: Identifiable {
         return peers.map { Self(id: "peer:" + $0.id, name: $0.name, contact: $0, peers: peers) }
             + installed.filter { !configured.contains($0.id) }
                 .map { Self(id: $0.id, name: $0.displayName, contact: nil) }
+    }
+
+    /// The one word the row's pill carries; the full status stays below it.
+    var pillWord: String {
+        if builtIn { return "Available" }
+        guard contact != nil else { return "Not set up" }
+        switch state {
+        case .connected: return "Connected"
+        case .setUp: return "Set up"
+        case .listed: return "Listed"
+        case .sendOnly: return "Send only"
+        case .unavailable, nil: return "Unavailable"
+        }
     }
 
     var status: String {
@@ -225,10 +240,20 @@ struct AgentContactsSection: View {
             if !loading && (fixtureRows ?? rows).isEmpty && loadError == nil {
                 ConnectorsCard { ConnectorsNote(text: "No agent contacts or supported apps found on this Mac.") }
             }
+            // Alive glass (2026-09-23): one group card, a row per agent.
+            if !(fixtureRows ?? rows).isEmpty {
+            AliveGroupCard {
             ForEach(fixtureRows ?? rows) { row in
-                VStack(alignment: .leading, spacing: 0) {
                     VStack(alignment: .leading, spacing: 8) {
-                        Text(row.displayName).font(ShellType.bodySemibold).foregroundStyle(NativeAgentShell.text)
+                        HStack(alignment: .center, spacing: 8) {
+                            Text(row.displayName)
+                                .font(.system(size: 14, weight: .medium))
+                                .foregroundStyle(NativeAgentShell.text)
+                            Spacer(minLength: 8)
+                            ConnectorsStatusPill(
+                                text: row.pillWord,
+                                tone: row.state == .connected ? NativeAgentShell.calm : NativeAgentShell.secondary)
+                        }
                         ConnectorsNote(text: row.route)
                         ConnectorsNote(text: row.status,
                             color: row.state == .connected ? NativeAgentShell.calm : NativeAgentShell.secondary)
@@ -259,18 +284,11 @@ struct AgentContactsSection: View {
                             }
                         }
                         .font(ShellType.caption)
-                        .foregroundStyle(NativeAgentShell.tertiary)
+                        .foregroundStyle(NativeAgentShell.secondary)
                         .disabled(busy || loadError != nil)
                     }.frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .padding(16)
-                .background {
-                    RoundedRectangle(cornerRadius: TodayMetrics.cardRadius)
-                        .fill(TodayPalette.cardFill)
-                        .strokeBorder(TodayPalette.cardStroke, lineWidth: 1)
-                        .allowsHitTesting(false)
-                        .accessibilityHidden(true)
-                }
+            }
+            }
             }
             }.padding(.bottom, 32)
         }

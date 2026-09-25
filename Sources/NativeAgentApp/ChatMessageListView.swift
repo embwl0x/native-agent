@@ -795,10 +795,12 @@ struct ToolCallGroup: View {
     }
 
     var body: some View {
+        // 2026-09-25: each phase swaps in place, no crossfade — the live pill
+        // and the settled row sit on the same line and drew over each other.
         if hasPendingApproval {
-            fullList
+            fullList.transition(.identity)
         } else if isLive {
-            liveBox
+            liveBox.transition(.identity)
         } else if !classicShell {
             // ui-simplify 2026-09-02: one quiet row for the whole turn's tool
             // traffic — tools and skills together — instead of two collapsed
@@ -823,8 +825,9 @@ struct ToolCallGroup: View {
                     PersonaWriteReceiptRow(message: message, exemptTitle: exemptTitle)
                 }
             }
+            .transition(.identity)
         } else {
-            collapsedBox
+            collapsedBox.transition(.identity)
         }
     }
 
@@ -839,7 +842,7 @@ struct ToolCallGroup: View {
                         .id(latest.id)
                         .transition(.asymmetric(
                             insertion: NativeAgentMotion.reveal(anchor: .bottom),
-                            removal: NativeAgentMotion.reveal(anchor: .top)))
+                            removal: .identity))
                 }
             }
             Spacer(minLength: 0)
@@ -1591,7 +1594,7 @@ struct MessageBubble: View {
             // settled reply wraps at — so a chunk changes the height only.
             // Glyphs do not move when the box shrinks to hug at settle: the
             // text is leading-aligned and there is no bubble fill on a reply.
-            Text(displayContent)
+            StreamingParagraphText(text: displayContent)
                 .frame(maxWidth: .infinity, alignment: .leading)
         } else {
             // Item 3 (third conversation pass): a multi-round turn persists the

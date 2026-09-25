@@ -558,9 +558,16 @@ public protocol MacAXElementSource: Sendable {
     /// between the walk and this call). Default defers to `focusedElementPath()`
     /// for sources with a single tree (synthetic/test sources).
     func focusedElementPath(relativeTo root: MacAXElementRef?) -> [Int]?
+    /// Her-screen Phase 4 — the underlying element's identity, so one walk
+    /// never reads the same element twice through two parents. nil = cannot
+    /// tell (synthetic sources), which dedupes nothing.
+    func elementHash(_ ref: MacAXElementRef) -> Int?
+    func sameElement(_ lhs: MacAXElementRef, _ rhs: MacAXElementRef) -> Bool
 }
 
 public extension MacAXElementSource {
+    func elementHash(_ ref: MacAXElementRef) -> Int? { nil }
+    func sameElement(_ lhs: MacAXElementRef, _ rhs: MacAXElementRef) -> Bool { lhs == rhs }
     func documentScrollTargetIsCurrent(window: MacAXElementRef, container: MacAXElementRef, frame: MacAXFrame, pid: Int32) -> Bool {
         frontmostApp()?.processIdentifier == pid && frontmostWindowRoot() == window
             && attributes(of: container)?.frame == frame
@@ -629,6 +636,7 @@ public enum MacAccessibilityReader {
         // Explicit stack so a deep tree cannot blow the Swift stack, and so
         // the node cap is enforced BEFORE any further child enumeration.
         var stack: [(ref: MacAXElementRef, path: [Int], depth: Int)] = [(root, [], 1)]
+        var seen: [Int: [MacAXElementRef]] = [:]
 
         while let item = stack.popLast() {
             if nodes.count >= limits.maxNodes {
@@ -638,11 +646,20 @@ public enum MacAccessibilityReader {
                 reasons.insert("node_cap")
                 break
             }
+            // Her-screen Phase 4 — one element, one visit, whatever parent
+            // re-lists it: a repeated subtree is budget spent on nothing.
+            if let hash = source.elementHash(item.ref) {
+                if seen[hash]?.contains(where: { source.sameElement($0, item.ref) }) == true { continue }
+                seen[hash, default: []].append(item.ref)
+            }
             guard let attributes = source.attributes(of: item.ref) else {
                 skipped += 1
                 reasons.insert("unreadable_element")
                 continue
             }
+            // The menu bar belongs to the APP, not the window: a window read
+            // never spends its budget there (the `menu` organ reads it).
+            if attributes.role == "AXMenuBar", !item.path.isEmpty { continue }
             nodes.append(MacAXNode(attributes: attributes, path: item.path))
 
             if item.depth >= limits.maxDepth {
@@ -898,6 +915,24 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
         return table[ref.id]
     }
 
+    /// Roles an app's window slot may legitimately answer with: windows (incl.
+    /// dialog / system-dialog subroles), sheets, drawers, popovers, dialogs,
+    /// and an open menu that is the app's only surface. Never the menu bar or
+    /// the application element — walking those spent the whole budget on menus.
+    static func isWindow(_ element: AXUIElement) -> Bool {
+        ["AXWindow", "AXSheet", "AXDrawer", "AXPopover", "AXDialog", "AXSystemDialog", "AXMenu"]
+            .contains(MacAXAttributeRead.copyString(element, kAXRoleAttribute) ?? "")
+    }
+
+    public func elementHash(_ ref: MacAXElementRef) -> Int? {
+        element(ref).map { Int(bitPattern: UInt(CFHash($0))) }
+    }
+
+    public func sameElement(_ lhs: MacAXElementRef, _ rhs: MacAXElementRef) -> Bool {
+        guard let left = element(lhs), let right = element(rhs) else { return false }
+        return CFEqual(left, right)
+    }
+
     public func isTrusted() -> Bool {
         // Read-only probe. Deliberately NOT AXIsProcessTrustedWithOptions(
         // kAXTrustedCheckOptionPrompt: true) — the TCC grant is User's click in
@@ -1057,13 +1092,19 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
         guard pid != getpid() else { return nil }
         guard NSRunningApplication(processIdentifier: pid) != nil else { return nil }
         let appElement = AXUIElementCreateApplication(pid)
-        if let focused = MacAXAttributeRead.copyElement(appElement, kAXFocusedWindowAttribute) {
+        // Her-screen Phase 4 — the root must BE a window. A background app can
+        // answer these attributes with a non-window element, and walking that
+        // spent the whole budget on the menu bar (Calculator, TextEdit 09-23).
+        if let focused = MacAXAttributeRead.copyElement(appElement, kAXFocusedWindowAttribute),
+           Self.isWindow(focused) {
             return mint(focused)
         }
-        if let main = MacAXAttributeRead.copyElement(appElement, kAXMainWindowAttribute) {
+        if let main = MacAXAttributeRead.copyElement(appElement, kAXMainWindowAttribute),
+           Self.isWindow(main) {
             return mint(main)
         }
-        if let first = MacAXAttributeRead.copyElementArray(appElement, kAXWindowsAttribute).first {
+        if let first = MacAXAttributeRead.copyElementArray(appElement, kAXWindowsAttribute)
+            .first(where: Self.isWindow) {
             return mint(first)
         }
         return nil
@@ -1091,7 +1132,7 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
             focused: MacAXAttributeRead.copyElement(appElement, kAXFocusedWindowAttribute),
             main: MacAXAttributeRead.copyElement(appElement, kAXMainWindowAttribute),
             equal: { CFEqual($0, $1) }
-        )
+        ).filter(Self.isWindow)
         return windows.enumerated().map { index, window in
             MacAXWindowHandle(
                 ref: mint(window),
@@ -1186,8 +1227,9 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
         return MacAXAttributes(
             role: role,
             subrole: MacAXAttributeRead.copyString(element, kAXSubroleAttribute),
-            title: MacAXAttributeRead.copyString(element, kAXTitleAttribute)
-                ?? MacAXAttributeRead.copyString(element, kAXDescriptionAttribute),
+            // A field or popup named by a separate label ("Save As:") takes
+            // that label's text — the same rule the act-side drift check reads.
+            title: MacAXAttributeRead.copyLabel(element, role: role),
             value: copyStringifiedValue(element, kAXValueAttribute),
             enabled: MacAXAttributeRead.copyBool(element, kAXEnabledAttribute) ?? true,
             selected: MacAXAttributeRead.copyBool(element, kAXSelectedAttribute),

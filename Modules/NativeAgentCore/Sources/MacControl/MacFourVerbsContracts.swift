@@ -126,9 +126,13 @@ public struct MacFourVerbsSupplement: Sendable, Equatable {
 public protocol MacFourVerbsSupplementalPerceptionSource: Sendable {
     func observe() async -> MacFourVerbsSupplement?
     func observe(app: String?) async -> MacFourVerbsSupplement?
+    /// The last observed supplement was not this look's own window and was
+    /// discarded; a source must drop anything it kept from that capture.
+    func rejected()
 }
 
 public extension MacFourVerbsSupplementalPerceptionSource {
+    func rejected() {}
     func observe(app: String?) async -> MacFourVerbsSupplement? {
         guard app == nil else { return nil }
         return await observe()
@@ -150,6 +154,20 @@ public struct SystemMacFourVerbsClock: MacFourVerbsClock {
     public func sleep(seconds: Double) async {
         guard seconds > 0 else { return }
         try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+    }
+}
+
+/// Her-screen Phase 5 — one step of a batched `act`: a semantic or key verb,
+/// a name, and text for `type`. No repeat, hold or button inside a step.
+public struct MacActStep: Sendable, Equatable {
+    public let verb: String
+    public let target: String
+    public let text: String?
+
+    public init(verb: String, target: String, text: String? = nil) {
+        self.verb = verb
+        self.target = target
+        self.text = text
     }
 }
 

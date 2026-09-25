@@ -32,6 +32,7 @@ struct SelfImprovementView: View {
                     }
                 }
                 .toggleStyle(.switch)
+                .hazeTinted()
                 .padding(14)
                 .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: NativeAgentRadius.panel))
 

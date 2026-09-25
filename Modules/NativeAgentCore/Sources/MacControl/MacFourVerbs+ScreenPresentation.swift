@@ -166,7 +166,9 @@ extension MacFourVerbs {
 
     static func parseVerb(_ raw: String) -> (String, ScrollDirection) {
         let words = normalize(raw).split(separator: " ").map(String.init)
-        let head = words.first ?? ""
+        // The words an agent naturally reaches for name the same verbs.
+        let synonyms = ["set": "type", "fill": "type", "enter": "type", "choose": "select", "pick": "select", "tap": "click", "chord": "key", "shortcut": "key", "keys": "key"]
+        let head = words.first.map { synonyms[$0] ?? $0 } ?? ""
         let direction: ScrollDirection = words.contains("up") ? .up
             : words.contains("left") ? .left : words.contains("right") ? .right : .down
         return (head, direction)

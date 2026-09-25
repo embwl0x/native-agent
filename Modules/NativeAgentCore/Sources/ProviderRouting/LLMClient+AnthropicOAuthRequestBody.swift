@@ -451,8 +451,11 @@ extension AnthropicOAuthDirectAdapter {
     /// 65,536-token cap (turn 37802ab2). Stop where a real call would —
     /// chat calls carrying the text-lane protocol only, never side calls.
     /// Every transport (messages and the legacy prompt stream) reads it.
-    /// `</tool_use>` is deliberately NOT a stop: bare `<tool_use>` markers
-    /// have no outer block, so stopping at the first would drop parallel calls.
+    /// `</tool_use>`/`</invoke>` are deliberately NOT stops: bare markers have
+    /// no outer block, so stopping at the first would drop parallel calls (up
+    /// to 4 per reply). A bare-block runaway (the same call again, or a 5th)
+    /// is ended client-side at the last good block's closing tag instead —
+    /// `RunawayOutputDetector(endsAtToolBoundary:)`, 2026-09-23.
     static func applyTextLaneStops(to body: inout [String: Any], system: String?) {
         if system?.contains(textToolProtocolHeader) == true {
             body["stop_sequences"] = ["</function_calls>", "<function_results>", "\n<tool_result", "\nNativeAgent tool result #"]

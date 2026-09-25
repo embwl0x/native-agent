@@ -121,24 +121,28 @@ public actor SwiftNativeSecurityCenter {
         let auditEnabled = Self.bool(security["auditReceiptsEnabled"], default: true)
         let flags = [
             SecurityStatusFlag(
+                // What this row reads is `killSwitchEnabled`, so it is named
+                // and switched by that. (It was titled "Security Center" and
+                // claimed the per-action check, which `capability_policy`
+                // below also claims.)
                 id: "security_center",
-                title: "Security Center",
-                status: killSwitch ? "blocked" : "ready",
-                detail: killSwitch ? "Everything is paused — the agent cannot take any action right now." : "Every action the agent takes is checked before it runs.",
+                title: "Kill Switch",
+                status: killSwitch ? "blocked" : "off",
+                detail: killSwitch ? "Everything is paused — I cannot take any action right now." : "Off, so nothing is paused.",
                 enabled: true
             ),
             SecurityStatusFlag(
                 id: "capability_policy",
                 title: "Capability Policy",
                 status: "ready",
-                detail: "How risky each action is gets worked out before it is allowed to run.",
+                detail: "I check how risky each action is before it runs.",
                 enabled: Self.bool(security["capabilityPolicyEnabled"], default: true)
             ),
             SecurityStatusFlag(
                 id: "origin_trust",
                 title: "Origin Trust",
                 status: trustedOrigins > 0 ? "ready" : "limited",
-                detail: trustedOrigins > 0 ? "\(trustedOrigins) device(s) you have approved can send requests." : "Requests from other devices need extra proof before anything risky runs.",
+                detail: trustedOrigins > 0 ? "\(trustedOrigins) \(trustedOrigins == 1 ? "device" : "devices") you have approved can send requests." : "Requests from other devices need extra proof before anything risky runs.",
                 enabled: Self.bool(security["originTrustEnabled"], default: true)
             ),
             SecurityStatusFlag(
@@ -152,7 +156,7 @@ public actor SwiftNativeSecurityCenter {
                 id: "prompt_injection_shield",
                 title: "Prompt-Injection Shield",
                 status: "ready",
-                detail: "Text the agent reads from files, pages, and messages is checked for hidden instructions trying to redirect it.",
+                detail: "Text I read from files, pages, and messages is checked for hidden instructions trying to redirect me.",
                 enabled: Self.bool(security["promptInjectionShieldEnabled"], default: true)
             ),
             SecurityStatusFlag(
@@ -160,7 +164,7 @@ public actor SwiftNativeSecurityCenter {
                 title: "Danger Gates",
                 status: (developerMode || fullMac) ? "armed" : "ready",
                 detail: developerMode
-                    ? "Developer Mode is on, so the agent is allowed to take destructive actions on this Mac."
+                    ? "Developer Mode is on, so I am allowed to take destructive actions on this Mac."
                     : (fullMac
                         ? "Full Mac is on: broad file and app access is "
                           + "allowed until you turn it off. The most "

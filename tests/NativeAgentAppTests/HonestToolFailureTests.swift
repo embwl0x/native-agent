@@ -16,7 +16,7 @@ func honestFailureChromeLeaseEnded() {
     #expect(result["failure_code"] == .string("dispatch_error"))
     #expect(result["reason"] == .string(error.localizedDescription))
     #expect(result["message"] == .string(error.localizedDescription))
-    #expect(error.localizedDescription.contains("Acquire a fresh lease"))
+    #expect(error.localizedDescription.contains("Open the page again with browser.chrome_navigate"))
 }
 
 @Test

@@ -138,8 +138,7 @@ extension SwiftNativeTurnEngine {
     /// runner reads exactly what the loops read.
     nonisolated static func dispatchCancelSignalled(_ cancelFlagPath: URL?) -> Bool {
         if Task.isCancelled { return true }
-        if let flag = cancelFlagPath,
-           FileManager.default.fileExists(atPath: flag.path) { return true }
+        if ChatCancelFlag.isRaised(cancelFlagPath) { return true }
         return false
     }
 
@@ -260,11 +259,14 @@ extension SwiftNativeTurnEngine {
         slots.reserveCapacity(prepared.count)
         // Only the named pixel-capable tools can mint pixels — the file reader,
         // the tools that MAKE an image, and the agent's own page screenshot.
-        // Bound each iteration to four such calls, including parallel dispatches.
+        // Bound each iteration to eight such calls, including parallel
+        // dispatches — the same eight `boundConversation` keeps (was four: a
+        // fifth read_file in one batch came back without pixels, 2026-09-23).
+        // Every `screen` gets a sink (her-screen Phase 6): it attaches pixels
+        // only for a thin-AX window or on pixels:true, and never otherwise.
         let imageIndices = Set(prepared.indices.filter {
             imagesEnabled && LocalToolImage.pixelCapableTools.contains(prepared[$0].internalName)
-                && (prepared[$0].internalName != "screen" || prepared[$0].dispatchInput["pixels"] == .bool(true))
-        }.prefix(4))
+        }.prefix(8))
 
         for group in groups {
             switch group {

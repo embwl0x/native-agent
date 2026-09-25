@@ -283,7 +283,7 @@ struct ChromeControlRuntimeTests {
 @Suite("Chrome activity lease continuity")
 struct ChromeActivityLeaseTests {
     @Test("Active work renews near expiry; expired or comfortable leases are never auto-renewed",
-          arguments: [50, -10, 200])
+          arguments: [50, -10, 285])
     func renewOnlyLiveNearExpiry(remainingSeconds: Int) async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("chrome-activity-\(UUID())")
         defer { try? FileManager.default.removeItem(at: directory) }

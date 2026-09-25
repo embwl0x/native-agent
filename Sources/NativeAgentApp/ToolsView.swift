@@ -590,7 +590,12 @@ private struct ChatToolCatalogSection: View {
                     .kerning(0.6)
                     .foregroundStyle(NativeAgentShell.secondary)
                 Spacer(minLength: 8)
-                Text("\(bucketResult.visibleToolCount) usable of \(catalog.tools.count) tools · permission \(catalog.permissionLevel.isEmpty ? "unknown" : catalog.permissionLevel)")
+                // "Chat tools" are the chat catalog, not the Capabilities
+                // records; say so in the count itself. Rows withheld for a
+                // blank or duplicate name are the only difference.
+                Text(bucketResult.visibleToolCount == catalog.tools.count
+                    ? "\(catalog.tools.count) chat tools"
+                    : "\(bucketResult.visibleToolCount) of \(catalog.tools.count) chat tools shown")
                     .font(ShellType.caption)
                     .foregroundStyle(NativeAgentShell.secondary)
             }
@@ -633,7 +638,10 @@ private struct ChatToolCatalogSection: View {
             }
 
             if let unclassifiedNotice = bucketResult.unclassifiedNotice {
-                catalogWarning(unclassifiedNotice)
+                Text(unclassifiedNotice)
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
 
             if let banner = ToolsFullMacBannerPresentation.state(
@@ -726,7 +734,7 @@ private struct ChatToolCatalogSection: View {
                     .foregroundStyle(NativeAgentShell.text)
                 Text("\(bucket.tools.count)")
                     .font(ShellType.caption)
-                    .foregroundStyle(NativeAgentShell.tertiary)
+                    .foregroundStyle(NativeAgentShell.secondary)
             }
         } content: {
             VStack(alignment: .leading, spacing: 12) {
@@ -777,13 +785,13 @@ private struct ChatToolCatalogSection: View {
                 if let params = tool.parametersPreview {
                     Text("Takes \(params)")
                         .font(ShellType.caption)
-                        .foregroundStyle(NativeAgentShell.tertiary)
+                        .foregroundStyle(NativeAgentShell.secondary)
                         .textSelection(.enabled)
                 }
                 if let via = tool.dispatchableVia {
                     Text("Runs through \(via)")
                         .font(ShellType.caption)
-                        .foregroundStyle(NativeAgentShell.tertiary)
+                        .foregroundStyle(NativeAgentShell.secondary)
                         .textSelection(.enabled)
                 }
             }
@@ -875,7 +883,7 @@ enum AuthoredToolPresentation {
             isEnabled: canQuarantine(tool),
             accessibilityIdentifier: nil,
             help: canQuarantine(tool)
-                ? "Quarantine this tool so the agent stops using it."
+                ? "Quarantine this tool so I stop using it."
                 : "This tool is already quarantined.",
             refusal: nil
         ))
@@ -891,7 +899,7 @@ private struct AuthoredToolsSection: View {
     @State private var quarantineCandidate: ToolRecord?
 
     var body: some View {
-        ToolsSection(title: "Tools the agent wrote") {
+        ToolsSection(title: "Tools I wrote") {
             ForEach(tools) { tool in
                 authoredRow(tool)
             }
@@ -941,7 +949,7 @@ private struct AuthoredToolsSection: View {
             }
             HStack(spacing: 8) {
                 if tool.autoCreated == true {
-                    Text("Written by the agent")
+                    Text("Written by me")
                 }
                 if tool.autoRun == true {
                     Text("Runs on its own")
@@ -950,7 +958,7 @@ private struct AuthoredToolsSection: View {
                 Text("Used \(tool.useCount ?? 0) times")
             }
             .font(ShellType.caption)
-            .foregroundStyle(NativeAgentShell.tertiary)
+            .foregroundStyle(NativeAgentShell.secondary)
 
             if let permissions = tool.permissions, !permissions.isEmpty {
                 Text("Permissions: \(permissions.joined(separator: ", "))")
@@ -969,7 +977,7 @@ private struct AuthoredToolsSection: View {
             if let path = tool.activePath ?? tool.proposalPath ?? tool.quarantinePath {
                 Text(UserDisplayFormatters.tildifyPath(path))
                     .font(ShellType.code)
-                    .foregroundStyle(NativeAgentShell.tertiary)
+                    .foregroundStyle(NativeAgentShell.secondary)
                     .lineLimit(1)
                     .truncationMode(.middle)
                     .textSelection(.enabled)
@@ -1044,7 +1052,7 @@ private struct ToolsFold<Label: View, Content: View>: View {
                 HStack(spacing: 8) {
                     Image(systemName: "chevron.right")
                         .font(ShellType.captionSemibold)
-                        .foregroundStyle(NativeAgentShell.tertiary)
+                        .foregroundStyle(NativeAgentShell.secondary)
                         .rotationEffect(.degrees(isExpanded ? 90 : 0))
                     label
                     Spacer(minLength: 8)

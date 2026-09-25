@@ -1116,6 +1116,11 @@ private struct DoneStep: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
             Button("Start") {
+                // User, 2026-09-25: a fresh setup lands in Simple view; a name
+                // repair leaves the saved choice alone.
+                if !state.profileRepairOnly {
+                    UserDefaults.standard.set(SimpleViewMode.simple, forKey: SimpleViewMode.key)
+                }
                 onComplete()
             }
             .buttonStyle(.borderedProminent)
@@ -1337,7 +1342,10 @@ struct ResetPersonaView: View {
     @State private var resetResult: String?
 
     var body: some View {
-        NativePanel(title: "Reset identity", systemImage: "arrow.triangle.2.circlepath") {
+        // Alive glass (2026-09-23): its one home is the Personality page, so
+        // it wears that page's eyebrow and card.
+        VStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
+            AliveEyebrow("Reset identity")
             VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
                 Text("Reset the agent's identity documents.")
                     .font(NativeAgentFont.body)
@@ -1355,7 +1363,12 @@ struct ResetPersonaView: View {
                 .buttonStyle(.bordered)
                 .disabled(isResetting)
             }
+            .padding(.horizontal, AliveMetrics.rowInsetH)
+            .padding(.vertical, 16)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .aliveCard()
         }
+        .accessibilityElement(children: .contain)
         .alert("Reset identity?", isPresented: $showConfirmAlert) {
             Button("Reset", role: .destructive) {
                 Task { await performReset() }

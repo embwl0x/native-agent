@@ -38,6 +38,12 @@
 // NOTHING is deleted from the classic Desk: DeskHubView still renders the old
 // page in the classic shell, and this page opens it in a sheet for every action
 // that has no home here yet.
+//
+// Alive glass (User approved the mockup, 2026-09-23): the same lanes, drawn from
+// AlivePageKit — a serif "Desk" with one counts sentence, what's waiting in one
+// group card, what I'm working on as a two-column grid of rings, projects as
+// one group card with a bar each, and every remaining fold as one quiet line
+// of counts. Each count still opens its own fold.
 
 import SwiftUI
 import AppKit
@@ -65,7 +71,7 @@ enum DeskPageWords {
     /// Mid-sentence: "twenty-one", "a hundred and twenty-one".
     static func spelledLower(_ count: Int) -> String {
         guard count >= 0 else { return String(count) }
-        if count <= 10 { return TodayWords.spelledLower(count) }
+        if (1...10).contains(count) { return TodayWords.spelledLower(count) }
         return lower(count)
     }
 
@@ -391,6 +397,7 @@ enum DeskPageContent {
 struct DeskPageView: View {
     @Environment(AppModel.self) private var appModel
     @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     let rootRouteVersion: Int
 
@@ -421,9 +428,20 @@ struct DeskPageView: View {
     var body: some View {
         ScrollViewReader { scroller in
         ScrollView {
-            LazyVStack(alignment: .leading, spacing: TodayMetrics.sectionSpacing) {
-                Text("Desk")
-                    .font(ShellType.display)
+            LazyVStack(alignment: .leading, spacing: AliveMetrics.sectionSpacing) {
+                // Looking something up is an action, not a count: a quiet
+                // button on the header's baseline, not an item in the line.
+                HStack(alignment: .firstTextBaseline) {
+                    AlivePageHeader(title: "Desk", line: headerLine)
+                    Spacer(minLength: 12)
+                    Button { sheet = .research } label: {
+                        Label("Look something up", systemImage: "magnifyingglass")
+                            .font(.system(size: 13))
+                            .foregroundStyle(NativeAgentShell.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityIdentifier("desk.open-research")
+                }
 
                 ForEach(laneTrouble, id: \.self) { trouble in
                     Text(trouble)
@@ -436,44 +454,67 @@ struct DeskPageView: View {
                 if hasWaiting { waitingCard }
 
                 if !workingRows.isEmpty {
-                    DeskPageSectionLabel("What I'm working on")
-                    ForEach(workingRows) { row in
-                        DeskPageRowCard(title: row.title, line: row.line, meta: row.meta)
-                            .motionArrival()
+                    VStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
+                        AliveEyebrow("What I'm working on")
+                        LazyVGrid(
+                            columns: [GridItem(.flexible(), spacing: 12), GridItem(.flexible(), spacing: 12)],
+                            alignment: .leading,
+                            spacing: 12
+                        ) {
+                            ForEach(workingRows) { row in
+                                DeskWorkingCard(title: row.title, detail: row.detail, fraction: row.fraction)
+                            }
+                        }
                     }
                 }
 
                 if !projectRows.isEmpty {
-                    DeskPageSectionLabel("Projects")
-                    ForEach(projectRows) { row in
-                        DeskPageRowCard(
-                            title: row.title,
-                            line: row.line,
-                            meta: row.meta,
-                            onOpenTitle: { askAbout(row.draft) })
-                            .id("desk:\(row.id)")
-                            .motionArrival()
+                    VStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
+                        AliveEyebrow("Projects")
+                        let parked = projectRows.filter(\.parked)
+                        let parkedOpen = openFolds.contains(Fold.parked)
+                        AliveGroupCard {
+                            ForEach(projectRows.filter { !$0.parked }) { row in projectRow(row) }
+                            if !parked.isEmpty {
+                                Button { toggleFold(Fold.parked) } label: {
+                                    HStack(spacing: 6) {
+                                        Text("Parked (\(parked.count))")
+                                            .font(.system(size: 13, weight: .medium))
+                                            .foregroundStyle(NativeAgentShell.secondary)
+                                        Image(systemName: "chevron.right")
+                                            .font(ShellType.captionSemibold)
+                                            .foregroundStyle(NativeAgentShell.secondary)
+                                            .rotationEffect(.degrees(parkedOpen ? 90 : 0))
+                                            .accessibilityHidden(true)
+                                        Spacer(minLength: 0)
+                                    }
+                                    .contentShape(Rectangle())
+                                }
+                                .buttonStyle(.plain)
+                                .accessibilityValue(parkedOpen ? "Open" : "Folded")
+                                .accessibilityIdentifier("desk.fold.parked")
+                            }
+                            if parkedOpen {
+                                ForEach(parked) { row in projectRow(row) }
+                            }
+                        }
                     }
                 }
 
-                finishedFold
-                boardFolds
+                foldsSection
 
                 if let notice = actionNotice {
                     Text(notice)
                         .font(.system(size: DeskPageMetrics.metaSize))
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(NativeAgentShell.secondary)
                         .accessibilityIdentifier("desk.action-notice")
                 }
-
-                staleLine
-                ideasFold
 
                 if snapshot.loaded, laneTrouble.isEmpty, !hasWaiting, workingRows.isEmpty,
                    projectRows.isEmpty, finishedRows.isEmpty, boardIsEmpty {
                     Text("Nothing on the board right now. I'll keep watching.")
-                        .font(ShellType.body)
-                        .foregroundStyle(.secondary)
+                        .font(.system(size: 15))
+                        .foregroundStyle(NativeAgentShell.secondary)
                         .padding(.top, 8)
                 }
             }
@@ -551,66 +592,79 @@ struct DeskPageView: View {
         !ownerItems.isEmpty || !approvalExecutions.isEmpty || !githubNeedsOwner.isEmpty
     }
 
+    /// One sentence of counts the page already holds. Nothing is said before
+    /// the board is read, or while a lane is unreadable: a short board must
+    /// not claim "nothing in motion".
+    private var headerLine: String? {
+        guard snapshot.loaded, laneTrouble.isEmpty else { return nil }
+        let moving = workingRows.count
+        let projects = projectRows.filter { !$0.parked }.count
+        // The one shared definition Today's header counts too.
+        let waiting = WaitingOnYou.count(appModel, deskItems: items)
+        var parts: [String] = []
+        parts.append(moving == 0
+            ? "nothing in motion"
+            : "\(DeskPageWords.spelledLower(moving)) \(DeskPageWords.plural(moving, "thing", "things")) in motion")
+        if projects > 0 {
+            parts.append("\(DeskPageWords.spelledLower(projects)) \(DeskPageWords.plural(projects, "project", "projects"))")
+        }
+        parts.append(waiting == 0 ? "nothing waiting on you" : "\(DeskPageWords.spelledLower(waiting)) waiting on you")
+        return TodayWords.capitalizedFirst(parts.joined(separator: ", ")) + "."
+    }
+
     private var waitingCard: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("Waiting on you")
-                .font(.system(size: DeskPageMetrics.metaSize, weight: .semibold))
-                .textCase(.uppercase)
-                .kerning(0.6)
-                .foregroundStyle(NativeAgentShell.needsYou)
-
-            ForEach(approvalExecutions, id: \.id) { execution in
-                DeskPageWaitingRow(
-                    title: TodayWords.line(execution.title, limit: 110),
-                    line: "It's parked until you say yes.",
-                    actionTitle: "Take a look",
-                    isBusy: false
-                ) {
-                    _ = NativeAgentAppCoordinator.shared.request(.activity(.approvals))
-                }
+        VStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
+            // Narrower than the header's "waiting on you" (no approvals or
+            // memories; parked runs and GitHub calls instead), so named apart.
+            AliveEyebrow("On the desk for you")
+            AliveGroupCard(waiting: true) {
+                waitingRows
             }
+            .accessibilityIdentifier("desk.waiting-on-you")
+        }
+    }
 
-            // She asked a question; the answer is a reply, not a verdict on the
-            // whole project. "Mark it done" closed the item — the one control
-            // on the row did the one thing an answer is not — so it is gone,
-            // and the row's action is the draft handoff that already existed
-            // on its title. An item he handled elsewhere still closes, on the
-            // row's own menu, which adds no chrome to the page.
-            ForEach(ownerItems, id: \.handle) { item in
-                DeskPageWaitingRow(
-                    title: DeskPageContent.title(item),
-                    line: DeskPageContent.stuckReason(item),
-                    actionTitle: "Reply",
-                    isBusy: actionInFlight == item.handle,
-                    action: { askAbout(Self.draft(about: item)) },
-                    alreadyHandled: { close(item) }
-                )
-                .id("desk:\(item.handle)")
-            }
-
-            ForEach(githubNeedsOwner, id: \.itemId) { item in
-                DeskPageWaitingRow(
-                    title: DeskPageContent.githubTitle(item),
-                    line: "\(item.repository) #\(item.number) needs your call.",
-                    actionTitle: "Show me",
-                    isBusy: false
-                ) {
-                    openFolds.insert(Fold.github)
-                }
+    @ViewBuilder
+    private var waitingRows: some View {
+        ForEach(approvalExecutions, id: \.id) { execution in
+            DeskPageWaitingRow(
+                title: TodayWords.line(execution.title, limit: 110),
+                line: "It's parked until you say yes.",
+                actionTitle: "Take a look",
+                isBusy: false
+            ) {
+                _ = NativeAgentAppCoordinator.shared.request(.activity(.approvals))
             }
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.vertical, 16)
-        .padding(.horizontal, 18)
-        .background(
-            RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
-                .fill(NativeAgentShell.needsYou.opacity(0.08))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
-                .strokeBorder(NativeAgentShell.needsYou.opacity(0.18), lineWidth: 1)
-        )
-        .accessibilityIdentifier("desk.waiting-on-you")
+
+        // She asked a question; the answer is a reply, not a verdict on the
+        // whole project. "Mark it done" closed the item — the one control
+        // on the row did the one thing an answer is not — so it is gone,
+        // and the row's action is the draft handoff that already existed
+        // on its title. An item he handled elsewhere still closes, on the
+        // row's own menu, which adds no chrome to the page.
+        ForEach(ownerItems, id: \.handle) { item in
+            DeskPageWaitingRow(
+                title: DeskPageContent.title(item),
+                line: DeskPageContent.stuckReason(item),
+                actionTitle: "Reply",
+                isBusy: actionInFlight == item.handle,
+                action: { askAbout(Self.draft(about: item)) },
+                alreadyHandled: { close(item) }
+            )
+            .id("desk:\(item.handle)")
+        }
+
+        ForEach(githubNeedsOwner, id: \.itemId) { item in
+            DeskPageWaitingRow(
+                title: DeskPageContent.githubTitle(item),
+                line: "\(item.repository) #\(item.number) needs your call.",
+                actionTitle: "Show me",
+                isBusy: false
+            ) {
+                openFolds.insert(Fold.github)
+            }
+        }
     }
 
     // MARK: what I'm working on
@@ -618,8 +672,19 @@ struct DeskPageView: View {
     private struct WorkingRow: Identifiable {
         let id: String
         let title: String
-        let line: String
-        let meta: String
+        let detail: String
+        /// Parts done over parts, or steps done over the plan. Nil when the
+        /// row carries no count at all — the ring then shows no arc.
+        let fraction: Double?
+    }
+
+    /// "Running, step two of five." + "3m ago" → "Running, step two of five · 3m ago".
+    private static func detail(_ parts: String...) -> String {
+        parts
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .map { $0.hasSuffix(".") ? String($0.dropLast()) : $0 }
+            .filter { !$0.isEmpty }
+            .joined(separator: " · ")
     }
 
     /// The classic "In progress" lane, in sentences: delegation families first
@@ -628,26 +693,36 @@ struct DeskPageView: View {
     private var workingRows: [WorkingRow] {
         var rows: [WorkingRow] = []
         for family in DeskProgramFamilyPresentation.families(from: laneOfItems) {
+            // The ring and the words read the SAME two numbers; the subtitle
+            // carries progress and the next step, never the title again.
             let lanes = family.lanes.count
+            let done = family.lanes.filter { $0.status == .done }.count
+            let next = family.lanes.first { $0.status == .now }
+                ?? family.lanes.first { !$0.status.isTerminal }
             rows.append(WorkingRow(
                 id: "family:\(family.id)",
                 title: TodayWords.line(family.parentTitle, limit: 110),
-                line: TodayWords.line(family.parentSummary, limit: 120),
-                meta: "\(DeskPageWords.spelledLower(lanes)) \(DeskPageWords.plural(lanes, "part", "parts"))"
+                detail: Self.detail(
+                    "\(done) of \(lanes) \(DeskPageWords.plural(lanes, "part", "parts")) done",
+                    next.map { "Next: \(TodayWords.line($0.title, limit: 60))" } ?? ""),
+                fraction: lanes > 0 ? Double(done) / Double(lanes) : nil
             ))
         }
         let benchIDs = Set(DeskExecutionPresentation.slice(snapshot.executions.items).benchIDs)
         for execution in snapshot.executions.items where benchIDs.contains(execution.id) {
             let state = DeskExecutionPresentation.pill(for: execution.status).label
-            let step = DeskExecutionPresentation.progress(
-                status: execution.status,
-                planCount: execution.plan.count,
-                completedCount: execution.stepsCompleted.count)
+            let planned = execution.plan.count
+            let done = min(execution.stepsCompleted.count, planned)
+            let next = done < planned ? TodayWords.line(execution.plan[done].description, limit: 60) : ""
             rows.append(WorkingRow(
                 id: "execution:\(execution.id)",
                 title: TodayWords.line(execution.title, limit: 110),
-                line: TodayWords.capitalizedFirst(step.map { "\(state), \($0)." } ?? "\(state)."),
-                meta: DeskRelativeTimePresentation.text(forISO: execution.updatedAt, now: now)
+                detail: Self.detail(
+                    TodayWords.capitalizedFirst(planned > 0 ? "\(state), \(done) of \(planned) steps done" : state),
+                    next.isEmpty
+                        ? DeskRelativeTimePresentation.text(forISO: execution.updatedAt, now: now)
+                        : "Next: \(next)"),
+                fraction: planned > 0 ? Double(done) / Double(planned) : nil
             ))
         }
         return rows
@@ -660,10 +735,28 @@ struct DeskPageView: View {
         let title: String
         let line: String
         let meta: String
+        /// The plan's "x of y done", when the board has one; the row then
+        /// shows a bar instead of `meta`.
+        var done: Int? = nil
+        var total: Int? = nil
         let draft: String
+        /// Untouched for two weeks, or a 0-of-N plan nobody has moved in a
+        /// week: it sits in the folded "Parked" group, not with the live work.
+        var parked = false
     }
 
     private var deskState: DeskState { DeskState(items: items, generatedTs: "") }
+
+    private func projectRow(_ row: ProjectRow) -> some View {
+        DeskProjectRow(
+            title: row.title,
+            line: row.line,
+            meta: row.meta,
+            done: row.done,
+            total: row.total,
+            onOpenTitle: { askAbout(row.draft) })
+            .id("desk:\(row.id)")
+    }
 
     /// The ordinary projects, each with its next step and — when something is
     /// actually executing for it — that execution's progress on the SAME row.
@@ -680,10 +773,11 @@ struct DeskPageView: View {
             let handles = Set([item.handle] + state.children(of: item.handle).map(\.handle))
             let live = snapshot.executions.items
                 .filter { $0.deskHandle.map(handles.contains) ?? false }
-                .filter { !["completed", "failed", "cancelled"].contains($0.status) }
+                .filter { DeskParking.executionIsLive(status: $0.status) }
                 .sorted { $0.updatedAt > $1.updatedAt }
                 .first
             var meta = DeskRelativeTimePresentation.text(forISO: item.updatedAt, now: now)
+            var counts: (done: Int, total: Int)?
             if let live {
                 let label = DeskExecutionPresentation.pill(for: live.status).label
                 let step = DeskExecutionPresentation.progress(
@@ -693,13 +787,19 @@ struct DeskPageView: View {
                 meta = step.map { "\(label), \($0)" } ?? label
             } else if let itemPlan = plan.byHandle[item.handle], itemPlan.totalCount > 0 {
                 meta = "\(itemPlan.doneCount) of \(itemPlan.totalCount) done"
+                counts = (itemPlan.doneCount, itemPlan.totalCount)
             }
+            // One Parked rule, shared with the agent's home (DeskParking).
+            let parked = DeskParking.isParked(item, in: state, plan: plan, live: live != nil, now: now)
             return ProjectRow(
                 id: item.handle,
                 title: DeskPageContent.title(item),
                 line: DeskPageContent.projectLine(item, in: state, plan: plan),
                 meta: meta,
-                draft: Self.draft(about: item))
+                done: counts?.done,
+                total: counts?.total,
+                draft: Self.draft(about: item),
+                parked: parked)
         }
     }
 
@@ -719,7 +819,7 @@ struct DeskPageView: View {
         static let github = "github"
         static let githubRest = "github-rest"
         static let schedule = "schedule"
-        static let research = "research"
+        static let parked = "parked"
         static let stale = "stale"
         static let ideas = "ideas"
     }
@@ -792,202 +892,299 @@ struct DeskPageView: View {
         }
     }
 
-    @ViewBuilder
-    private var finishedFold: some View {
-        let rows = finishedRows
-        if !rows.isEmpty {
-            DeskPageFoldRow(
-                title: "\(DeskPageWords.spelled(rows.count)) \(DeskPageWords.plural(rows.count, "thing is", "things are")) ready to look at",
-                meta: nil,
-                isOpen: binding(Fold.finished)
-            ) {
-                ForEach(rows) { row in
-                    VStack(alignment: .leading, spacing: 3) {
-                        Button { askAbout(row.draft) } label: {
-                            Text(row.title)
-                                .font(.system(size: DeskPageMetrics.titleSize, weight: .semibold))
-                                .fixedSize(horizontal: false, vertical: true)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .contentShape(Rectangle())
-                        }
-                        .buttonStyle(.plain)
-                        Text(row.result)
-                            .font(.system(size: DeskPageMetrics.lineSize, weight: .medium))
-                            .foregroundStyle(.secondary)
-                            .lineLimit(4)
-                            .fixedSize(horizontal: false, vertical: true)
-                        Text(row.meta)
-                            .font(.system(size: DeskPageMetrics.metaSize))
-                            .foregroundStyle(.tertiary)
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .accessibilityIdentifier("desk.finished-row")
-                }
-            }
-            .accessibilityIdentifier("desk.finished")
-        }
+    // MARK: the rest of the board — one quiet line of counts
+
+    private struct FoldCount: Identifiable {
+        let id: String
+        /// The short count on the line.
+        let label: String
+        /// The fold's own sentence: its header when open, and its spoken name.
+        let title: String
     }
 
-    @ViewBuilder
-    private var boardFolds: some View {
-        if !boardIsEmpty {
-            DeskPageSectionLabel(workingRows.isEmpty && projectRows.isEmpty && finishedRows.isEmpty ? "On the board" : "Also on the board")
-
-            if !blockedItems.isEmpty {
-                let count = blockedItems.count
-                DeskPageFoldRow(
-                    title: "\(DeskPageWords.spelled(count)) \(DeskPageWords.plural(count, "thing is", "things are")) blocked",
-                    meta: nil,
-                    isOpen: binding(Fold.blocked)
-                ) {
-                    ForEach(cap(blockedItems), id: \.handle) { item in
-                        DeskPageDetailRow(
-                            title: DeskPageContent.title(item),
-                            line: DeskPageContent.stuckReason(item),
-                            meta: DeskRelativeTimePresentation.text(forISO: item.updatedAt, now: now))
-                            .id("desk:\(item.handle)")
-                    }
-                    overflowLine(blockedItems.count)
-                }
-            }
-
-            if !watchItems.isEmpty {
-                let count = watchItems.count
-                DeskPageFoldRow(
-                    title: "I'm keeping an eye on \(DeskPageWords.spelledLower(count)) \(DeskPageWords.plural(count, "thing", "things"))",
-                    meta: nil,
-                    isOpen: binding(Fold.watching)
-                ) {
-                    ForEach(cap(watchItems), id: \.handle) { item in
-                        DeskPageDetailRow(
-                            title: DeskPageContent.title(item),
-                            line: TodayWords.line(item.summary ?? item.project, limit: 96),
-                            meta: DeskRelativeTimePresentation.text(forISO: item.updatedAt, now: now))
-                            .id("desk:\(item.handle)")
-                    }
-                    overflowLine(watchItems.count)
-                }
-            }
-
-            if !githubItems.isEmpty {
-                DeskPageFoldRow(
-                    title: DeskPageContent.githubHeadline(githubItems),
-                    meta: nil,
-                    isOpen: binding(Fold.github)
-                ) {
-                    let hands = DeskPageContent.githubNeedsOwner(githubItems)
-                        + DeskPageContent.githubNeedingAHand(githubItems)
-                    ForEach(cap(hands), id: \.itemId) { item in
-                        DeskPageDetailRow(
-                            title: DeskPageContent.githubTitle(item),
-                            line: "",
-                            meta: DeskPageContent.githubMeta(item, now: now))
-                    }
-                    overflowLine(hands.count)
-                    let rest = DeskPageContent.githubRest(githubItems)
-                    if !rest.isEmpty {
-                        DeskPageFoldRow(
-                            title: DeskPageContent.githubRestTitle(rest),
-                            meta: nil,
-                            isOpen: binding(Fold.githubRest)
-                        ) {
-                            ForEach(cap(rest), id: \.itemId) { item in
-                                DeskPageDetailRow(
-                                    title: DeskPageContent.githubTitle(item),
-                                    line: "",
-                                    meta: DeskPageContent.githubMeta(item, now: now))
-                            }
-                            overflowLine(rest.count)
-                        }
-                    }
-                }
-            }
-
+    /// Every fold the page keeps, as one count each: only the ones with
+    /// something in them, except the timer fold, which stays reachable on an
+    /// empty board. Numerals on this line: it is scanned, not read.
+    private var foldCounts: [FoldCount] {
+        var out: [FoldCount] = []
+        let finished = finishedRows.count
+        if finished > 0 {
+            out.append(FoldCount(
+                id: Fold.finished,
+                label: "\(finished) ready to look at",
+                title: "\(DeskPageWords.spelled(finished)) \(DeskPageWords.plural(finished, "thing is", "things are")) ready to look at"))
         }
-        // Reachable even on an empty board.
-        scheduleFold
-        researchFold
-    }
-
-    @ViewBuilder
-    private var scheduleFold: some View {
+        if !blockedItems.isEmpty {
+            let count = blockedItems.count
+            out.append(FoldCount(
+                id: Fold.blocked,
+                label: "\(count) blocked",
+                title: "\(DeskPageWords.spelled(count)) \(DeskPageWords.plural(count, "thing is", "things are")) blocked"))
+        }
+        if !watchItems.isEmpty {
+            let count = watchItems.count
+            out.append(FoldCount(
+                id: Fold.watching,
+                label: "\(count) on watch",
+                title: "I'm keeping an eye on \(DeskPageWords.spelledLower(count)) \(DeskPageWords.plural(count, "thing", "things"))"))
+        }
+        if !githubItems.isEmpty {
+            let count = githubItems.count
+            let noun = githubItems.allSatisfy { $0.kind == .pullRequest }
+                ? DeskPageWords.plural(count, "pull request", "pull requests")
+                : "pull requests and issues"
+            out.append(FoldCount(
+                id: Fold.github,
+                label: "\(count) \(noun)",
+                title: DeskPageContent.githubHeadline(githubItems)))
+        }
         let jobs = appModel.jobs
-        DeskPageFoldRow(
-            title: DeskPageContent.scheduleHeadline(jobs, missed: missedBots.count, bots: timedBots.count),
-            meta: nil,
-            isOpen: binding(Fold.schedule)
-        ) {
-            ForEach(timedBots) { bot in
-                DeskPageDetailRow(
-                    title: TodayWords.line(bot.name, limit: 110),
-                    line: bot.line,
-                    meta: bot.nextRun.map { DeskRelativeTimePresentation.text(for: $0, now: now) } ?? "")
-            }
-            ForEach(missedBots) { bot in
-                DeskPageDetailRow(
-                    title: TodayWords.line(bot.name, limit: 110),
-                    line: bot.line,
-                    meta: BotsShelfRecord.shortDate(bot.dueAt))
-            }
-            ForEach(jobs) { job in
-                DeskPageDetailRow(
-                    title: TodayWords.line(job.name, limit: 110),
-                    line: DeskPageContent.scheduleLine(job),
-                    meta: job.nextRunAt.map {
-                        DeskRelativeTimePresentation.text(forISO: $0, now: now)
-                    } ?? "")
-            }
-            Button("Open the schedule") { sheet = .schedule }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .accessibilityIdentifier("desk.open-schedule")
+        let running = jobs.filter(\.enabled).count + timedBots.count
+        var timer = running == 0 ? "nothing on a timer" : "\(running) on a timer"
+        if !missedBots.isEmpty {
+            timer += ", \(missedBots.count) \(DeskPageWords.plural(missedBots.count, "missed run", "missed runs"))"
         }
-    }
-
-    @ViewBuilder
-    private var researchFold: some View {
-        DeskPageFoldRow(
-            title: "Looking things up",
-            meta: nil,
-            isOpen: binding(Fold.research)
-        ) {
-            Text("I search the web when you ask me to. Nothing is queued.")
-                .font(.system(size: DeskPageMetrics.lineSize, weight: .medium))
-                .foregroundStyle(.secondary)
-            Button("Search with me") { sheet = .research }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .accessibilityIdentifier("desk.open-research")
-        }
-    }
-
-    // MARK: the one grey line
-
-    @ViewBuilder
-    private var staleLine: some View {
-        let count = staleItems.count
-        if count > 0 {
+        out.append(FoldCount(
+            id: Fold.schedule,
+            label: timer,
+            title: DeskPageContent.scheduleHeadline(jobs, missed: missedBots.count, bots: timedBots.count)))
+        let stale = staleItems.count
+        if stale > 0 {
             // Quiet for a while, and quiet on its own: these rows have already
-            // left "I'm keeping an eye on…" above, and one update puts them
-            // back there. Nothing to clear, so nothing asks him to clear it —
-            // the fold opens onto the rows, each still carrying its own status.
-            DeskPageFoldRow(
-                title: "\(DeskPageWords.spelled(count)) \(DeskPageWords.plural(count, "item hasn't", "items haven't")) moved in a week",
-                meta: nil,
-                isOpen: binding(Fold.stale)
-            ) {
-                ForEach(cap(staleItems), id: \.handle) { item in
-                    DeskPageDetailRow(
-                        title: DeskPageContent.title(item),
-                        line: TodayWords.line(item.summary ?? item.project, limit: 96),
-                        meta: DeskRelativeTimePresentation.text(forISO: item.updatedAt, now: now))
-                        .id("desk:\(item.handle)")
-                }
-                overflowLine(staleItems.count)
-            }
-            .padding(.top, 4)
-            .accessibilityIdentifier("desk.stale-line")
+            // left "on watch", and one update puts them back there. Nothing to
+            // clear, so nothing asks him to clear it.
+            out.append(FoldCount(
+                id: Fold.stale,
+                label: "\(stale) quiet for a week",
+                title: "\(DeskPageWords.spelled(stale)) \(DeskPageWords.plural(stale, "item hasn't", "items haven't")) moved in a week"))
         }
+        // Evolution proposals filed as prose that nobody has turned into a diff.
+        if !ideas.isEmpty {
+            out.append(FoldCount(
+                id: Fold.ideas,
+                label: "\(ideas.count) \(DeskPageWords.plural(ideas.count, "idea", "ideas")) waiting for a diff",
+                title: "\(DeskPageWords.spelled(ideas.count)) \(DeskPageWords.plural(ideas.count, "idea is", "ideas are")) waiting for a diff"))
+        }
+        return out
+    }
+
+    @ViewBuilder
+    private var foldsSection: some View {
+        let counts = foldCounts
+        VStack(alignment: .leading, spacing: 12) {
+            // Each count its own item in the flow, spaced apart rather than
+            // joined with "·", so a wrapped line never starts on a separator.
+            AliveFlow(spacing: 18, lineSpacing: 6) {
+                ForEach(Array(counts.enumerated()), id: \.element.id) { index, count in
+                    foldCountButton(count, first: index == 0)
+                }
+            }
+            // Each open fold opens under the line, in the line's order.
+            ForEach(counts.filter { openFolds.contains($0.id) }) { count in
+                openFold(count)
+            }
+        }
+    }
+
+    private func foldCountButton(_ count: FoldCount, first: Bool) -> some View {
+        let isOpen = openFolds.contains(count.id)
+        return Button { toggleFold(count.id) } label: {
+            Text(first ? TodayWords.capitalizedFirst(count.label) : count.label)
+                .foregroundStyle(isOpen ? NativeAgentShell.text : NativeAgentShell.secondary)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(count.title)
+        .accessibilityValue(isOpen ? "Open" : "Folded")
+        .accessibilityIdentifier(foldIdentifier(count.id))
+        .font(.system(size: 13))
+    }
+
+    private func foldIdentifier(_ key: String) -> String {
+        switch key {
+        case Fold.finished: "desk.finished"
+        case Fold.stale: "desk.stale-line"
+        default: "desk.fold.\(key)"
+        }
+    }
+
+    private func toggleFold(_ key: String) {
+        withAnimation(NativeAgentMotion.respecting(NativeAgentMotion.quick, reduceMotion: reduceMotion)) {
+            if openFolds.contains(key) { openFolds.remove(key) } else { openFolds.insert(key) }
+        }
+    }
+
+    /// An open fold: its own sentence as a header that folds it again, then
+    /// exactly the rows the fold always held.
+    private func openFold(_ count: FoldCount) -> some View {
+        AliveGroupCard {
+            Button { toggleFold(count.id) } label: {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text(count.title)
+                        .font(.system(size: 15, weight: .medium))
+                        .foregroundStyle(NativeAgentShell.text)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 8)
+                    Image(systemName: "chevron.down")
+                        .font(ShellType.captionSemibold)
+                        .foregroundStyle(NativeAgentShell.secondary)
+                        .accessibilityHidden(true)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityHint("Folds this away")
+            .accessibilityIdentifier("desk.fold")
+            foldContent(count.id)
+        }
+        .transition(NativeAgentMotion.reveal(reduceMotion: reduceMotion))
+    }
+
+    @ViewBuilder
+    private func foldContent(_ key: String) -> some View {
+        switch key {
+        case Fold.finished:
+            finishedContent
+        case Fold.blocked:
+            ForEach(cap(blockedItems), id: \.handle) { item in
+                DeskPageDetailRow(
+                    title: DeskPageContent.title(item),
+                    line: DeskPageContent.stuckReason(item),
+                    meta: DeskRelativeTimePresentation.text(forISO: item.updatedAt, now: now))
+                    .id("desk:\(item.handle)")
+            }
+            overflowLine(blockedItems.count)
+        case Fold.watching:
+            ForEach(cap(watchItems), id: \.handle) { item in
+                DeskPageDetailRow(
+                    title: DeskPageContent.title(item),
+                    line: TodayWords.line(item.summary ?? item.project, limit: 96),
+                    meta: DeskRelativeTimePresentation.text(forISO: item.updatedAt, now: now))
+                    .id("desk:\(item.handle)")
+            }
+            overflowLine(watchItems.count)
+        case Fold.github:
+            githubContent
+        case Fold.schedule:
+            scheduleContent
+        case Fold.stale:
+            ForEach(cap(staleItems), id: \.handle) { item in
+                DeskPageDetailRow(
+                    title: DeskPageContent.title(item),
+                    line: TodayWords.line(item.summary ?? item.project, limit: 96),
+                    meta: DeskRelativeTimePresentation.text(forISO: item.updatedAt, now: now))
+                    .id("desk:\(item.handle)")
+            }
+            overflowLine(staleItems.count)
+        case Fold.ideas:
+            ForEach(cap(ideas), id: \.id) { idea in
+                DeskPageDetailRow(
+                    title: TodayWords.line(idea.title, limit: 96),
+                    line: "",
+                    meta: UserDisplayFormatters.relativeISOTimestamp(idea.createdAt, unitsStyle: .abbreviated, fallback: ""))
+            }
+            overflowLine(ideas.count)
+        default:
+            EmptyView()
+        }
+    }
+
+    @ViewBuilder
+    private var finishedContent: some View {
+        ForEach(finishedRows) { row in
+            VStack(alignment: .leading, spacing: 3) {
+                Button { askAbout(row.draft) } label: {
+                    Text(row.title)
+                        .font(.system(size: DeskPageMetrics.titleSize, weight: .semibold))
+                        .foregroundStyle(NativeAgentShell.text)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                Text(row.result)
+                    .font(.system(size: DeskPageMetrics.lineSize, weight: .medium))
+                    .foregroundStyle(NativeAgentShell.secondary)
+                    .lineLimit(4)
+                    .fixedSize(horizontal: false, vertical: true)
+                Text(row.meta)
+                    .font(.system(size: DeskPageMetrics.metaSize))
+                    .foregroundStyle(NativeAgentShell.secondary)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .accessibilityIdentifier("desk.finished-row")
+        }
+    }
+
+    @ViewBuilder
+    private var githubContent: some View {
+        let hands = DeskPageContent.githubNeedsOwner(githubItems)
+            + DeskPageContent.githubNeedingAHand(githubItems)
+        ForEach(cap(hands), id: \.itemId) { item in
+            DeskPageDetailRow(
+                title: DeskPageContent.githubTitle(item),
+                line: "",
+                meta: DeskPageContent.githubMeta(item, now: now))
+        }
+        overflowLine(hands.count)
+        let rest = DeskPageContent.githubRest(githubItems)
+        if !rest.isEmpty {
+            let restOpen = openFolds.contains(Fold.githubRest)
+            Button { toggleFold(Fold.githubRest) } label: {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text(DeskPageContent.githubRestTitle(rest))
+                        .font(.system(size: DeskPageMetrics.lineSize, weight: .medium))
+                        .foregroundStyle(NativeAgentShell.secondary)
+                    Image(systemName: "chevron.right")
+                        .font(ShellType.captionSemibold)
+                        .foregroundStyle(NativeAgentShell.secondary)
+                        .rotationEffect(.degrees(restOpen ? 90 : 0))
+                        .accessibilityHidden(true)
+                    Spacer(minLength: 0)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityValue(restOpen ? "Open" : "Folded")
+            .accessibilityIdentifier("desk.fold.github-rest")
+            if restOpen {
+                ForEach(cap(rest), id: \.itemId) { item in
+                    DeskPageDetailRow(
+                        title: DeskPageContent.githubTitle(item),
+                        line: "",
+                        meta: DeskPageContent.githubMeta(item, now: now))
+                }
+                overflowLine(rest.count)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var scheduleContent: some View {
+        ForEach(timedBots) { bot in
+            DeskPageDetailRow(
+                title: TodayWords.line(bot.name, limit: 110),
+                line: bot.line,
+                meta: bot.nextRun.map { DeskRelativeTimePresentation.text(for: $0, now: now) } ?? "")
+        }
+        ForEach(missedBots) { bot in
+            DeskPageDetailRow(
+                title: TodayWords.line(bot.name, limit: 110),
+                line: bot.line,
+                meta: BotsShelfRecord.shortDate(bot.dueAt))
+        }
+        ForEach(appModel.jobs) { job in
+            DeskPageDetailRow(
+                title: TodayWords.line(job.name, limit: 110),
+                line: DeskPageContent.scheduleLine(job),
+                meta: job.nextRunAt.map {
+                    DeskRelativeTimePresentation.text(forISO: $0, now: now)
+                } ?? "")
+        }
+        Button("Open the schedule") { sheet = .schedule }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .accessibilityIdentifier("desk.open-schedule")
     }
 
     // MARK: lane honesty
@@ -1102,6 +1299,7 @@ struct DeskPageView: View {
         // lives in first.
         if blockedItems.contains(where: { $0.handle == handle }) { openFolds.insert(Fold.blocked) }
         if watchItems.contains(where: { $0.handle == handle }) { openFolds.insert(Fold.watching) }
+        if projectRows.contains(where: { $0.parked && $0.id == handle }) { openFolds.insert(Fold.parked) }
         withAnimation(NativeAgentMotion.standard) { scroller.scrollTo("desk:\(handle)", anchor: .center) }
     }
 
@@ -1153,27 +1351,6 @@ struct DeskPageView: View {
     @State private var missedBots: [DeskMissedBot] = []
     /// Unpaused bots on a schedule, counted with the timers.
     @State private var timedBots: [DeskTimedBot] = []
-
-    /// Evolution proposals filed as prose that nobody has turned into a diff.
-    @ViewBuilder
-    private var ideasFold: some View {
-        if !ideas.isEmpty {
-            DeskPageFoldRow(
-                title: "\(DeskPageWords.spelled(ideas.count)) \(DeskPageWords.plural(ideas.count, "idea is", "ideas are")) waiting for a diff",
-                meta: nil,
-                isOpen: binding(Fold.ideas)
-            ) {
-                ForEach(cap(ideas), id: \.id) { idea in
-                    DeskPageDetailRow(
-                        title: TodayWords.line(idea.title, limit: 96),
-                        line: "",
-                        meta: UserDisplayFormatters.relativeISOTimestamp(idea.createdAt, unitsStyle: .abbreviated, fallback: ""))
-                }
-                overflowLine(ideas.count)
-            }
-            .padding(.top, 4)
-        }
-    }
 }
 
 // MARK: - Sheets
@@ -1239,68 +1416,90 @@ struct DeskPageSectionLabel: View {
             .font(.system(size: DeskPageMetrics.metaSize, weight: .semibold))
             .textCase(.uppercase)
             .kerning(0.6)
-            .foregroundStyle(.secondary)
+            .foregroundStyle(NativeAgentShell.secondary)
     }
 }
 
-/// A quiet row: one title line, one plain line, one meta line. Uniform height
-/// by construction — nothing here grows a badge, a pill or a progress bar.
-struct DeskPageRowCard: View {
+/// One thing in motion: a ring, the name, one line. Fixed height, so the grid
+/// reads as a grid.
+struct DeskWorkingCard: View {
+    let title: String
+    let detail: String
+    let fraction: Double?
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 14) {
+            AliveProgressRing(fraction: fraction)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(TodayWords.bounded(title, limit: 48))
+                    .font(.system(size: 15, weight: .medium))
+                    .foregroundStyle(NativeAgentShell.text)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                if !detail.isEmpty {
+                    Text(TodayWords.bounded(detail, limit: 64))
+                        .font(.system(size: 12))
+                        .foregroundStyle(NativeAgentShell.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .frame(height: 74)
+        .aliveCard()
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier("desk.row")
+    }
+}
+
+/// One project inside the Projects card: the name (the way into Chat about
+/// it), its next step, and a bar when the board counts its parts.
+struct DeskProjectRow: View {
     let title: String
     let line: String
     let meta: String
-    /// When set, the title is how he says something about this piece of work:
-    /// it opens Chat with the item's handle attached. No extra control — the
-    /// name of the thing IS the way in.
-    var onOpenTitle: (() -> Void)? = nil
+    var done: Int? = nil
+    var total: Int? = nil
+    /// The title is how he says something about this piece of work: it opens
+    /// Chat with the item's handle attached. The name of the thing IS the way in.
+    let onOpenTitle: () -> Void
 
     var body: some View {
-        HStack(alignment: .top, spacing: 12) {
+        HStack(alignment: .center, spacing: 16) {
             VStack(alignment: .leading, spacing: 3) {
-                let named = Text(title)
-                    .font(.system(size: DeskPageMetrics.titleSize, weight: .semibold))
-                if let onOpenTitle {
-                    Button(action: onOpenTitle) {
-                        named
-                            .lineLimit(1)
-                            .truncationMode(.tail)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityIdentifier("desk.row.open")
-                } else {
-                    named
+                Button(action: onOpenTitle) {
+                    Text(TodayWords.bounded(title, limit: 64))
+                        .font(.system(size: 14, weight: .medium))
+                        .foregroundStyle(NativeAgentShell.text)
                         .lineLimit(1)
                         .truncationMode(.tail)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .contentShape(Rectangle())
                 }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("desk.row.open")
                 if !line.isEmpty {
-                    Text(line)
-                        .font(.system(size: DeskPageMetrics.lineSize, weight: .medium))
-                        .foregroundStyle(.secondary)
+                    Text(TodayWords.bounded(line, limit: 90))
+                        .font(.system(size: 12))
+                        .foregroundStyle(NativeAgentShell.secondary)
                         .lineLimit(1)
                         .truncationMode(.tail)
                 }
             }
-            Spacer(minLength: 8)
-            if !meta.isEmpty {
+            .frame(height: line.isEmpty ? TodayMetrics.rowContentHeightSingle : 34, alignment: .leading)
+            Spacer(minLength: 12)
+            if let done, let total, total > 0 {
+                AliveProgressBar(done: done, total: total)
+            } else if !meta.isEmpty {
                 Text(meta)
-                    .font(.system(size: DeskPageMetrics.metaSize))
-                    .foregroundStyle(.tertiary)
-                    .padding(.top, 1)
+                    .font(.system(size: 12))
+                    .foregroundStyle(NativeAgentShell.secondary)
+                    .lineLimit(1)
             }
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.vertical, 12)
-        .padding(.horizontal, 14)
-        .background(
-            RoundedRectangle(cornerRadius: DeskPageMetrics.rowRadius, style: .continuous)
-                .fill(NativeAgentShell.quietFill)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: DeskPageMetrics.rowRadius, style: .continuous)
-                .strokeBorder(NativeAgentShell.hairline, lineWidth: 1)
-        )
         .accessibilityIdentifier("desk.row")
     }
 }
@@ -1316,19 +1515,20 @@ struct DeskPageDetailRow: View {
         VStack(alignment: .leading, spacing: 2) {
             Text(title)
                 .font(.system(size: DeskPageMetrics.titleSize, weight: .semibold))
+                .foregroundStyle(NativeAgentShell.text)
                 .lineLimit(1)
                 .truncationMode(.tail)
             if !line.isEmpty {
                 Text(line)
                     .font(.system(size: DeskPageMetrics.lineSize, weight: .medium))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(NativeAgentShell.secondary)
                     .lineLimit(1)
                     .truncationMode(.tail)
             }
             if !meta.isEmpty {
                 Text(meta)
                     .font(.system(size: DeskPageMetrics.metaSize))
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(NativeAgentShell.secondary)
                     .lineLimit(1)
                     .truncationMode(.tail)
             }
@@ -1352,16 +1552,17 @@ struct DeskPageFoldRow<Content: View>: View {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
                 Text(title)
                     .font(.system(size: DeskPageMetrics.titleSize, weight: .semibold))
+                    .foregroundStyle(NativeAgentShell.text)
                     .fixedSize(horizontal: false, vertical: true)
                 Image(systemName: "chevron.right")
                     .font(ShellType.captionSemibold)
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(NativeAgentShell.tertiary)
                     .rotationEffect(.degrees(isOpen ? 90 : 0))
                 Spacer(minLength: 8)
                 if let meta, !meta.isEmpty {
                     Text(meta)
                         .font(.system(size: DeskPageMetrics.metaSize))
-                        .foregroundStyle(.tertiary)
+                        .foregroundStyle(NativeAgentShell.tertiary)
                 }
             }
             // The gesture belongs to the HEADER, not the card: with sixty rows
@@ -1409,26 +1610,32 @@ struct DeskPageWaitingRow: View {
     var alreadyHandled: (() -> Void)? = nil
 
     var body: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 12) {
+        HStack(alignment: .center, spacing: 12) {
+            AliveWaitingDot()
             VStack(alignment: .leading, spacing: 3) {
-                Text(title.isEmpty ? "Something needs you" : title)
-                    .font(.system(size: DeskPageMetrics.titleSize, weight: .semibold))
-                    .fixedSize(horizontal: false, vertical: true)
+                Text(title.isEmpty ? "Something needs you" : TodayWords.bounded(title, limit: 80))
+                    .font(.system(size: 15, weight: .medium))
+                    .foregroundStyle(NativeAgentShell.text)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
                 if !line.isEmpty {
-                    Text(line)
-                        .font(.system(size: DeskPageMetrics.lineSize, weight: .medium))
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
+                    Text(TodayWords.bounded(line, limit: 100))
+                        .font(.system(size: 13))
+                        .foregroundStyle(NativeAgentShell.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
                 }
             }
-            Spacer(minLength: 8)
+            .frame(height: line.isEmpty ? TodayMetrics.rowContentHeightSingle : TodayMetrics.rowContentHeight,
+                   alignment: .leading)
+            Spacer(minLength: 12)
             if isBusy {
                 ProgressView().controlSize(.small)
             } else {
                 Button(actionTitle, action: action)
                     .buttonStyle(.borderedProminent)
                     .controlSize(.small)
-                    .tint(NativeAgentShell.needsYou)
+                    .hazeTinted(.button)
                     .accessibilityIdentifier("desk.waiting.action")
             }
         }

@@ -79,14 +79,28 @@ public enum ContextBudgetPolicy {
     /// starts buying latency and cost.
     static let maximumHistoryCharacters = 96_000
 
-    /// User 2026-09-23: history follows each model's own compaction point. The
-    /// session compacts at min(configured threshold, 60% of the window), so
-    /// replaying up to that point already fits the window it was sized for.
+    /// Everything in one request that is NOT history, at its maximum, in
+    /// tokens at 3.2 chars/token: persona + tool schemas (~126k chars measured
+    /// 2026-09-24 → 39.4k), the other block ceilings (memory 24k + relevant 24k
+    /// + capsule 8k + expanded packet 48k + continuity/user ~16k chars → 37.5k),
+    /// one tool round plus a working note (~52k chars → 16.3k), and 32,768
+    /// output tokens. ≈126k, rounded up.
+    static let requestReserveTokens = 128_000
+    /// The whole request, output included, stays inside this share of the
+    /// model's own window (User: never error her out on a 272k GPT).
+    static let requestWindowFraction = 0.90
+
+    /// User 2026-09-23: history follows her compaction point. `windowTokens` is
+    /// already her effective window (see `windowTokens(forModel:)`), where the
+    /// session compacts — but on a small model replaying ALL of it plus the
+    /// reserve above could overrun the model. Her window is at most 60% of the
+    /// model's, so the model holds at least window ÷ 0.6; history gets what is
+    /// left of 90% of that after the reserve. Binds only below a ~256k window
+    /// (a 272k GPT: 116.8k of 163.2k); 1M at 300k replays the whole 300k.
     static func compactionHistoryCharacters(windowTokens: Int) -> Int {
-        let config = ChatSessionAutocompactionConfig.productionDefault()
-        let tokens = min(config.thresholdTokens,
-                         Int(Double(windowTokens) * ChatSessionAutocompactionConfig.maximumContextWindowFraction))
-        return Int(Double(tokens) * charactersPerToken)
+        let modelFloor = Double(windowTokens) / ChatSessionAutocompactionConfig.maximumContextWindowFraction
+        let room = Int(modelFloor * requestWindowFraction) - requestReserveTokens
+        return Int(Double(min(windowTokens, room)) * charactersPerToken)
     }
 
     static let maximumMemoryBlockCharacters = 24_000
@@ -103,7 +117,7 @@ public enum ContextBudgetPolicy {
     /// row from eating the block.
     static let maximumRowScale = 4.0
 
-    /// Recall breadth. Widens once the window is genuinely large — 200k counts
+    /// Recall breadth. Widens once the window is genuinely large — 120k counts
     /// (see `resolve`), so the models we actually route to get the wide limit
     /// rather than only the 1M tier.
     /// Non-content characters a rendered memory row carries: the `- ` bullet,
@@ -116,7 +130,10 @@ public enum ContextBudgetPolicy {
 
     static let baseRecallRowLimit = 5
     static let wideRecallRowLimit = 12
-    static let wideRecallWindowTokens = 200_000
+    /// In HER-window terms (2026-09-24): 60% of the 200k models that always
+    /// qualified, so every model that got wide recall from its raw window
+    /// still gets it — a 272k GPT's 163k window keeps 12 rows, not 5.
+    static let wideRecallWindowTokens = 120_000
 
     // MARK: - Packet atom rendering (NORTHSTAR clause 6: reach, not weight)
 
@@ -268,10 +285,12 @@ public enum ContextBudgetPolicy {
         Int(Double(windowTokens) * charactersPerToken * combinedUtilizationFraction)
     }
 
-    /// Window for a model id, or nil when the id is blank or NOT a model this
-    /// build knows. `ProviderRouting.contextLength(forModel:)` answers 128,000
-    /// for anything unrecognized — a deliberately pessimistic gauge default,
-    /// not a measurement — so an unknown id must land in the floor regime
+    /// HER window for a model id — `ChatSessionAutocompactionConfig
+    /// .effectiveWindowTokens`, never the model's raw window (User 2026-09-24:
+    /// sizing from a 1M window burns tokens for nothing). nil when the id is
+    /// blank or NOT a model this build knows: `ProviderRouting.contextLength`
+    /// answers 128,000 for anything unrecognized — a pessimistic gauge
+    /// default, not a measurement — so an unknown id lands in the floor regime
     /// rather than be scaled against a guess.
     public static func windowTokens(
         forModel modelID: String?,
@@ -280,7 +299,7 @@ public enum ContextBudgetPolicy {
     ) -> Int? {
         guard let raw = modelID?.trimmingCharacters(in: .whitespacesAndNewlines),
               !raw.isEmpty else { return nil }
-        return ProviderRouting.verifiedContextLength(
+        return ChatSessionAutocompactionConfig.productionDefault().effectiveWindowTokens(
             forModel: raw, providerID: providerID, dataRoot: dataRoot
         )
     }

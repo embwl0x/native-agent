@@ -52,6 +52,7 @@ public struct ChatCompletionsStreamDecoder {
     private var sawSemanticOutput = false
     private var reachedLengthLimit = false
     private var content = ""
+    private var runaway = RunawayOutputDetector()
 
     public init(providerLabel: String) {
         self.providerLabel = providerLabel
@@ -82,6 +83,13 @@ public struct ChatCompletionsStreamDecoder {
     /// accumulators.
     public mutating func consume(payload: String) throws -> DecodedFrame {
         var frame = DecodedFrame()
+        // After a loop trip the next frame reads as done: the adapter leaves
+        // its loop and finalize throws the length limit AFTER telemetry records
+        // the call as incomplete (a throw from here skipped the record).
+        if runaway.loopStart != nil {
+            frame.isDone = true
+            return frame
+        }
         if payload.isEmpty { return frame }
         if payload == "[DONE]" {
             sawDone = true
@@ -132,6 +140,16 @@ public struct ChatCompletionsStreamDecoder {
         if let content = delta["content"] as? String, !content.isEmpty {
             self.content += content
             frame.content = content
+            // Tripped here: this frame still yields the prose before the loop
+            // start (none when the loop began in an earlier frame; the offset
+            // is a line start, so the cut never splits a character). The next
+            // frame reads as done.
+            if runaway.feed(content), let loopStart = runaway.loopStart {
+                reachedLengthLimit = true
+                let start = runaway.text.utf8.count - content.utf8.count
+                let kept = String(decoding: content.utf8.prefix(max(0, loopStart - start)), as: UTF8.self)
+                frame.content = kept.isEmpty ? nil : kept
+            }
             sawSemanticOutput = true
         }
         if let calls = delta["tool_calls"] as? [[String: Any]] {

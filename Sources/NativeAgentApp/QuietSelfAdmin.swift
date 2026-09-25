@@ -113,6 +113,15 @@ enum QuietPages {
 
     static var ids: [String] { all.map(\.id) }
 
+    /// Pages only app_page_screenshot draws: the Simple shell, and the same
+    /// with its settings menu drawn open. Not rail pages, so not in `all`.
+    static let drawOnly: [QuietPage] = [
+        QuietPage(id: "simple", title: "Simple view", item: .chat,
+                  summary: "The Simple shell: the sidebar with its pinned person row, and the chat."),
+        QuietPage(id: "simple_settings_menu", title: "Simple view settings menu", item: .chat,
+                  summary: "The Simple shell with the person row's settings menu drawn open."),
+    ]
+
     /// Forgiving on the way in: the rail word, the enum's raw value, and the
     /// obvious synonyms all resolve, because a model that has read the screen
     /// will call the page what the screen calls it.

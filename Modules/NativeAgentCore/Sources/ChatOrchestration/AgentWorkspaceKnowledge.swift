@@ -6,17 +6,21 @@ import PersistenceCore
 enum AgentWorkspaceKnowledge {
     static let destinations: [AgentWorkspaceDestination] = [
         .init(id: "memory", title: "Memory", summary: "Recall something, inspect its evidence, or record a memory.",
-              tool: "recall_memory", searchField: "query", tools: ["recall_memory", "commit_memory"]),
+              tool: "recall_memory", searchField: "query", tools: ["recall_memory", "commit_memory"], searchLabel: "Recall something"),
         .init(id: "research", title: "Research", summary: "Search the web, read a source, or investigate in the browser.",
-              tool: nil, tools: ["read_page", "browser.chrome_acquire", "browser.chrome_snapshot"]),
+              tool: nil, tools: ["read_page", "browser.chrome_acquire"]),
         .init(id: "skills", title: "Skills", summary: "Open installed guidance or write a new skill.",
               tool: "list_skills", tools: ["list_skills", "read_skill", "save_skill"]),
     ]
 
-    static let readTools: Set<String> = ["recall_memory", "recall_search", "list_skills", "read_skill", "read_page"]
+    /// Her private web search (the built-in SearXNG server), never a tab.
+    static let webSearchTool = "mcp__searxng-local__search"
+
+    static let readTools: Set<String> = ["recall_memory", "recall_search", "list_skills", "read_skill", "read_page", webSearchTool]
 
     static func project(tool: String, input: [String: JSONValue], result: JSONValue) -> AgentWorkspaceProjection? {
         switch tool {
+        case webSearchTool: return webSearch(input: input, result: result)
         case "recall_memory", "recall_search": return memory(input: input, result: result)
         case "list_skills": return skills(result)
         case "read_skill":
@@ -33,12 +37,46 @@ enum AgentWorkspaceKnowledge {
             ]
             if let url = validWebURL(input["url"]) {
                 actions.append(.init(label: "Open in browser", action: .perform(tool: "browser.chrome_acquire",
-                    input: ["mode": .string("create"), "initial_url": .string(url)],
+                    input: ["mode": .string("create"), "url": .string(url)],
                     title: "Background browser", textField: nil, isEffect: true)))
             }
             return .init(title: "Web source", content: result, items: [], actions: actions)
         default: return nil
         }
+    }
+
+    /// Search results as rows: each one reads privately (read_page) or,
+    /// only when she picks it, opens in a background Chrome tab.
+    private static func webSearch(input: [String: JSONValue], result: JSONValue) -> AgentWorkspaceProjection {
+        var content = object(result)
+        var inner = object(content.removeValue(forKey: "result") ?? .null)
+        let rows: [JSONValue] = if case .array(let list)? = inner.removeValue(forKey: "results") ?? content.removeValue(forKey: "results") { list } else { [] }
+        content.merge(inner) { old, _ in old }
+        let items = rows.compactMap { value -> AgentWorkspaceItem? in
+            let row = object(value)
+            guard let url = validWebURL(row["url"]) else { return nil }
+            let title = text(row["title"]).flatMap { $0.isEmpty ? nil : $0 } ?? url
+            // A row reads as title · site · snippet (desk walk 4 got raw JSON);
+            // Bing's "…Read more" tail says nothing.
+            let site = URL(string: url)?.host?.replacingOccurrences(of: #"^www\."#, with: "", options: .regularExpression) ?? url
+            let snippet = text(row["snippet"])?.replacingOccurrences(of: #"\s*(…|\.\.\.)?\s*Read more$"#, with: "…", options: .regularExpression)
+            return .init(title: String(title.prefix(200)), content: .object(["site": .string(site), "snippet": snippet.map(JSONValue.string) ?? .null]), actions: [
+                .init(label: "Read this page", action: .open(.record(tool: "read_page", input: ["url": .string(url)], title: String(title.prefix(100))))),
+                // `url`, not initial_url: a background tab, never the visible window.
+                .init(label: "Chrome: open it in a background tab", action: .perform(tool: "browser.chrome_acquire",
+                    input: ["mode": .string("create"), "url": .string(url)], title: "Background browser", textField: nil, isEffect: true)),
+            ])
+        }
+        // A failed search reads as its error, never as "no results".
+        let failed = content["ok"] == .bool(false) || content["error"] != nil
+        if !failed, content["status"] == nil || content["status"] == .string("ok") {
+            content["status"] = .string("ok")
+            if items.isEmpty { content["message"] = .string("No results. Try other words.") }
+            if let query = text(input["query"]) { content["about"] = .string("Private search for \"\(query.prefix(80))\"; no browser tab was opened.") }
+        }
+        return .init(title: "Web search", content: .object(content), items: items, actions: [
+            .init(label: "Search again", action: .perform(tool: webSearchTool, input: [:], title: "Web search", textField: "query", isEffect: false), needsText: true),
+        ])
     }
 
     private static func memory(input: [String: JSONValue], result: JSONValue) -> AgentWorkspaceProjection {

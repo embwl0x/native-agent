@@ -113,8 +113,9 @@ public struct BotRunQueue: Sendable {
         try disk.locked { try readRequests() }
     }
 
-    public func activeOrQueuedIDs() throws -> Set<UUID> {
-        let queued = try pending()
+    public func activeOrQueuedIDs(locked: Bool = true) throws -> Set<UUID> {
+        // Unlocked: a read-only look at the queue file for a glance that must not wait.
+        let queued = locked ? try pending() : try readRequests()
         Self.admission.lock.lock()
         defer { Self.admission.lock.unlock() }
         return Set(queued.keys).union(Self.admission.active[rootKey]?.keys.map { $0 } ?? [])

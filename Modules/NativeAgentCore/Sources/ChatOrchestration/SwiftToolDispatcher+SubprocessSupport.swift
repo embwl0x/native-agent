@@ -34,8 +34,8 @@ extension SwiftToolDispatcher {
             stopReading()
             SwiftToolDispatcher.drainPipeNonBlocking(stdout.fileHandleForReading, into: stdoutBuffer)
             SwiftToolDispatcher.drainPipeNonBlocking(stderr.fileHandleForReading, into: stderrBuffer)
-            var stdoutText = String(data: stdoutBuffer.data, encoding: .utf8) ?? ""
-            var stderrText = String(data: stderrBuffer.data, encoding: .utf8) ?? ""
+            var stdoutText = String(decoding: stdoutBuffer.data, as: UTF8.self)
+            var stderrText = String(decoding: stderrBuffer.data, as: UTF8.self)
             if stdoutBuffer.truncated {
                 stdoutText += "\n[stdout truncated]"
             }

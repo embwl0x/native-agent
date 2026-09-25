@@ -56,6 +56,8 @@ public enum InlineInteractionRegistry {
         case "email": return "gmail"
         case "calendar", "google_calendar": return "gcal"
         case "twitter": return "x"
+        case "google_chrome", "chrome_extension": return "chrome"
+        case "ipad", "phone", "ios": return "iphone"
         case let other: return other
         }
     }
@@ -76,6 +78,12 @@ public enum InlineInteractionRegistry {
             if id == "mail" {
                 return InlineInteractionDescriptor(kind: .connector, target: id, displayName: "Mail",
                     icon: "envelope", control: .internetAccounts, location: .macRequired)
+            }
+            if id == "chrome" || id == "iphone" {
+                return InlineInteractionDescriptor(kind: .connector, target: id,
+                    displayName: connectorDisplayName(id, dataRoot: dataRoot),
+                    icon: id == "chrome" ? "globe" : "iphone",
+                    control: id == "chrome" ? .chromeSetup : .pairDevice, location: .macRequired)
             }
             let setup = connectorSetup(for: id)
             return InlineInteractionDescriptor(
@@ -143,12 +151,13 @@ public enum InlineInteractionRegistry {
             )
 
         case .apiKey:
+            let providerID = canonicalProviderID(target)
             return InlineInteractionDescriptor(
                 kind: .apiKey,
-                target: target,
-                displayName: providerDisplayName(target),
+                target: providerID,
+                displayName: providerDisplayName(providerID),
                 icon: "key",
-                control: target.isEmpty ? .unavailable : .providerAPIKey,
+                control: providerID.isEmpty ? .unavailable : .providerAPIKey,
                 // A key is typed by the person, on the Mac. The phone API
                 // refuses keys through iCloud on purpose.
                 location: .macRequired,
@@ -222,6 +231,8 @@ public enum InlineInteractionRegistry {
         "notion": "Notion",
         "telegram": "Telegram",
         "x": "X",
+        "chrome": "Chrome",
+        "iphone": "iPhone",
     ]
 
     private static func connectorRegistryNames(dataRoot: URL) -> [String: String] {
@@ -339,7 +350,67 @@ public enum InlineInteractionRegistry {
     }
 
     public static func providerDisplayName(_ id: String) -> String {
-        titleCased(id)
+        let canonical = canonicalProviderID(id)
+        return providerDisplayNames[canonical] ?? titleCased(canonical)
+    }
+
+    static let providerDisplayNames: [String: String] = [
+        "openai": "OpenAI",
+        "openai_oauth_direct": "ChatGPT",
+        "codex": "Codex",
+        "anthropic": "Anthropic",
+        "anthropic_oauth_direct": "Claude",
+        "xai_oauth_direct": "xAI Grok",
+        "openrouter": "OpenRouter",
+        "moonshot": "Moonshot",
+        "kimi-code": "Kimi Code",
+    ]
+
+    // MARK: - Providers you sign into
+
+    /// The spellings an agent reaches for, folded onto the ids Providers and
+    /// ProviderRouting use. xAI has no API-key provider on this build, so
+    /// `xai` IS the sign-in one.
+    public static func canonicalProviderID(_ rawID: String) -> String {
+        switch rawID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "chatgpt", "openai_codex_oauth", "openai_oauth", "codex_oauth": return "openai_oauth_direct"
+        case "claude", "anthropic_oauth", "claude_oauth": return "anthropic_oauth_direct"
+        case "xai", "grok", "xai_oauth", "xai-oauth", "grok-oauth": return "xai_oauth_direct"
+        case let other: return other
+        }
+    }
+
+    /// A provider with a "Sign in with …" flow — the one onboarding's buttons
+    /// run. `oauthProviderID` is what `NativeOAuthFlow` signs into;
+    /// `pasteLabel` names what the card's field takes instead, or nil when
+    /// signing in is the only way in.
+    public struct ProviderSignIn: Sendable, Equatable {
+        public var oauthProviderID: String
+        public var displayShort: String
+        public var pasteLabel: String?
+    }
+
+    public static func providerSignIn(for rawID: String) -> ProviderSignIn? {
+        switch canonicalProviderID(rawID) {
+        case "openai":
+            return ProviderSignIn(oauthProviderID: "openai_oauth_direct", displayShort: "ChatGPT",
+                                  pasteLabel: "or paste an API key")
+        case "openai_oauth_direct", "codex":
+            return ProviderSignIn(oauthProviderID: "openai_oauth_direct", displayShort: "ChatGPT",
+                                  pasteLabel: nil)
+        case "anthropic":
+            return ProviderSignIn(oauthProviderID: "anthropic_oauth_direct", displayShort: "Claude",
+                                  pasteLabel: "or paste an API key")
+        case "anthropic_oauth_direct":
+            // Claude's other way in is a `claude setup-token` paste.
+            return ProviderSignIn(oauthProviderID: "anthropic_oauth_direct", displayShort: "Claude",
+                                  pasteLabel: "or paste a setup token (claude setup-token)")
+        case "xai_oauth_direct":
+            return ProviderSignIn(oauthProviderID: "xai_oauth_direct", displayShort: "xAI Grok",
+                                  pasteLabel: nil)
+        default:
+            return nil
+        }
     }
 
     // MARK: - Capability catalog
@@ -415,7 +486,9 @@ public enum InlineInteractionRegistry {
             primaryActionLabel: "Connect \(name)",
             declineConsequence: declineConsequence
                 ?? "Without \(name) I can't do this part, and " + InlineInteraction.ConsequenceCopy.connectorCarryOn,
-            persistenceNote: "Stays connected until you disconnect it in Connectors.",
+            persistenceNote: id == "chrome"
+                ? "Stays on until you turn Chrome control off in Trust."
+                : "Stays connected until you disconnect it in Connectors.",
             cardProse: "I need \(name) for this \u{2014} connect it below, "
                 + InlineInteraction.ConsequenceCopy.keepGoingSuffix
         )
@@ -582,22 +655,25 @@ public enum InlineInteractionRegistry {
     }
 
     public static func apiKey(
-        provider: String,
+        provider rawProvider: String,
         why: String,
         declineConsequence: String? = nil
     ) -> InlineInteraction {
+        let provider = canonicalProviderID(rawProvider)
         let name = providerDisplayName(provider)
         return InlineInteraction(
             kind: .apiKey,
             target: provider,
-            title: "Add your \(name) key",
+            title: providerSignIn(for: provider) == nil ? "Add your \(name) key" : "Connect \(name)",
             why: why,
             // The outcome of pasting a key is \(name), reachable.
             primaryActionLabel: "Connect \(name)",
             declineConsequence: declineConsequence
                 ?? "Without a key I can't reach \(name)" + InlineInteraction.ConsequenceCopy.apiKeyNothingChanges,
-            persistenceNote: "Stored in your Mac's Keychain until you remove it.",
-            cardProse: "I need a key for \(name) \u{2014} add it below, "
+            persistenceNote: "Saved on this Mac until you remove it.",
+            cardProse: (providerSignIn(for: provider) == nil
+                ? "I need a key for \(name)" : "I need \(name) connected")
+                + " \u{2014} add it below, "
                 + InlineInteraction.ConsequenceCopy.keepGoingSuffix
         )
     }

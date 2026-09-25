@@ -12,16 +12,18 @@ public struct AgentConversationExchange: Codable, Sendable {
     public var replyTruncated: Bool
     public var phase: String
     public var status: String
+    /// Typed by the person in the contact's thread, not sent by the agent.
+    public var byPerson: Bool?
 
     static let textLimit = 8 * 1024
     static let byteLimit = 64 * 1024
     static let countLimit = 32
 
-    static func started(operationID: String, at date: Date, message: String?) -> Self {
+    static func started(operationID: String, at date: Date, message: String?, byPerson: Bool = false) -> Self {
         let text = message.map { clipped($0, limit: textLimit) }
         return .init(id: operationID, sentAt: date, prompt: text?.text, reply: nil,
                      promptTruncated: text?.truncated ?? false, replyTruncated: false,
-                     phase: "sending", status: "outcome_unknown")
+                     phase: "sending", status: "outcome_unknown", byPerson: byPerson ? true : nil)
     }
 
     mutating func absorb(_ row: AgentConversationRecord) {

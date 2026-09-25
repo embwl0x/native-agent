@@ -6,7 +6,7 @@ import Testing
 
 @Suite("Model-aware chat autocompaction")
 struct ModelAwareAutocompactionTests {
-    @Test("global threshold is clamped to forty percent of model window")
+    @Test("global threshold is clamped to sixty percent of model window")
     func thresholdClamp() {
         let config = ChatSessionAutocompactionConfig(thresholdTokens: 200_000)
 
@@ -17,17 +17,25 @@ struct ModelAwareAutocompactionTests {
         #expect(config.effectiveThresholdTokens(
             forModel: "gpt-5.6-sol",
             providerID: "openai_oauth_direct"
-        ) == 148_800)
+        ) == 223_200)
         // `gpt-5.4` (128k) was retired on 2026-09-13; Claude Haiku 4.5 is the
-        // carried small-window model, and 40% of its 200k window is 80_000.
+        // carried small-window model, and 60% of its 200k window is 120_000.
         #expect(config.effectiveThresholdTokens(
             forModel: "claude-haiku-4-5",
             providerID: "anthropic"
-        ) == 80_000)
+        ) == 120_000)
         #expect(config.effectiveThresholdTokens(
             forModel: "unverified-model",
             providerID: "unverified-provider"
         ) == 200_000)
+        // Model's default window ignores the custom size: 60% of the window.
+        let modelDefault = ChatSessionAutocompactionConfig(
+            thresholdTokens: 200_000, contextWindowMode: .modelDefault
+        )
+        #expect(modelDefault.effectiveThresholdTokens(
+            forModel: "claude-fable-5",
+            providerID: "anthropic_oauth_direct"
+        ) == 600_000)
     }
 
     @Test("small-window model compacts before a global threshold can exceed its window")
@@ -72,7 +80,7 @@ struct ModelAwareAutocompactionTests {
         )
 
         #expect(outcome.compacted)
-        #expect(outcome.thresholdTokens == 80_000)
+        #expect(outcome.thresholdTokens == 120_000)
         #expect(outcome.estimatedTokensBefore > outcome.thresholdTokens)
         #expect(outcome.messagesAfter < outcome.messagesBefore)
     }

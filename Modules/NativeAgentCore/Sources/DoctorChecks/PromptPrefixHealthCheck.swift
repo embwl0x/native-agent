@@ -64,6 +64,8 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
     private let minimumHitRateTurns = 10
     // Headroom above the provider's 1,024-token caching minimum.
     private let minimumCacheInputTokens = 2_048
+    /// The longest cache breakpoint TTL (the stable block's 1h).
+    private let cacheTTLSeconds: TimeInterval = 3_600
 
     public init(
         root: URL = defaultDataRoot(),
@@ -304,6 +306,11 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
         var unjudgedFirstCalls = 0
         var exemptSlid = 0
         var exemptToolChange = 0
+        // 2026-09-24 (desk walk): cold turns after the cache had expired (her
+        // live 05652ED6 read 0 after 14h away) or after the previous turn
+        // shipped a different stable system block were graded as drift.
+        var exemptExpired = 0
+        var exemptStableChange = 0
         // (sessionId, calendar day) → violations, for the tolerance.
         var violationsPerSessionDay: [String: Int] = [:]
         let dayFormatter = DateFormatter()
@@ -327,6 +334,18 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
                 }()
                 let bucket = "\(sessionId)|\(dayFormatter.string(from: turn.at))"
                 var violated = false
+                // The previous turn's LAST request is what this one could read.
+                let previousLast = (callsByTurn[previous.turnId] ?? [previous]).max { $0.at < $1.at } ?? previous
+                let rebuilt = turn.cacheRead == 0 || (turn.cacheCreation ?? 0) > creationBreakTokens
+                // The longest breakpoint TTL is 1h; past it nothing is left to read.
+                if rebuilt, turn.at.timeIntervalSince(previousLast.at) > cacheTTLSeconds {
+                    exemptExpired += 1
+                    continue
+                }
+                if rebuilt, let now = turn.stableFingerprint, let before = previousLast.stableFingerprint, now != before {
+                    exemptStableChange += 1
+                    continue
+                }
 
                 // (a) cross-turn cache read.
                 if turn.windowSlid {
@@ -443,10 +462,11 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
                         : "")
             )
         }
-        if exemptSlid > 0 || exemptToolChange > 0 || driftExplainedByTools > 0 {
+        if exemptSlid > 0 || exemptToolChange > 0 || driftExplainedByTools > 0 || exemptExpired > 0 || exemptStableChange > 0 {
             parts.append(
                 "exempt: \(exemptSlid) windowSlid, \(exemptToolChange) tool-array change,"
-                    + " \(driftExplainedByTools) fingerprint change explained by a tool-array change"
+                    + " \(driftExplainedByTools) fingerprint change explained by a tool-array change,"
+                    + " \(exemptExpired) after the 1h cache expired, \(exemptStableChange) after a changed stable system block"
             )
         }
         if unjudgedFirstCalls > 0 {

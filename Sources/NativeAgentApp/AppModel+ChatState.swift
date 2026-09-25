@@ -122,6 +122,18 @@ extension AppModel {
     /// `agentDisplayName` (and AgentVoice) kept showing the fallback name until
     /// a screen that loads the profile was visited. A failed read leaves the
     /// previous value rather than blanking the header.
+    /// User, 2026-09-25: the agent's name is read from THIS root's profile, at
+    /// launch in every view and again once onboarding writes it. Simple view
+    /// never loaded it, so after a relaunch the header fell back to the
+    /// defaults cache — which is shared by every root this bundle runs against
+    /// and, when the profile had been read before onboarding, held the seed's
+    /// fallback "NativeAgent". A failed read keeps the current value.
+    func reloadPersonality() async {
+        guard let profile = try? await client.getPersonality() else { return }
+        personality = profile
+        teachMemoryHygieneName()
+    }
+
     private func applyProfileRepairToResidentMind() async {
         if let repaired = try? await client.getPersonality() {
             personality = repaired
@@ -784,6 +796,7 @@ extension AppModel {
         streamingBubbleIds[sessionId] = nil
         streamingUserTurnIds[sessionId] = nil
         streamingUserTurnTexts[sessionId] = nil
+        replyingSessions.remove(sessionId)
     }
 
     /// True iff the active chat session has work in flight.

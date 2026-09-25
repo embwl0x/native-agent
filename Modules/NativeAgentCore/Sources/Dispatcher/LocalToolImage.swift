@@ -18,10 +18,10 @@ public enum LocalToolImage {
     // the thing, through this same sink: a bounded thumbnail rides back on the
     // SAME tool result, the full-size file path stays in the JSON.
 
-    /// Images ONE tool result may deliver. Four: a generate call with n=4, a
-    /// before/after pair, a contact sheet — more than that is a file to read,
-    /// not a turn to look at.
-    public static let maximumImagesPerResult = 4
+    /// Images ONE tool result may deliver. Eight: a folder read_file with
+    /// `match` (2026-09-24), a generate call with n=4, a before/after pair —
+    /// the same eight `boundConversation` keeps.
+    public static let maximumImagesPerResult = 8
     /// Long edge of a produced-image thumbnail. Half `readAuthorizedFile`'s
     /// 2048: a produced image is shown so the model can CHECK it (did it come
     /// out, is it the right shape, is the text right), and 1024 JPEG is a
@@ -195,7 +195,7 @@ public enum LocalToolImage {
     /// authorize and no file to resolve. The size ceiling is the delivery
     /// ceiling and is checked here rather than trusted from the caller.
     public static func deliverPNG(
-        _ data: Data, name: String, width: Int, height: Int
+        _ data: Data, name: String, width: Int, height: Int, mediaType: String = "image/png"
     ) -> JSONValue {
         func failure(_ reason: String) -> JSONValue {
             .object(["status": .string("failed"), "error": .string(reason)])
@@ -207,7 +207,7 @@ public enum LocalToolImage {
             return failure("Image pixels require a model tool turn; this direct text-only call cannot display an image.")
         }
         guard !Task.isCancelled, sink.accept(.image(
-            mediaType: "image/png", base64: data.base64EncodedString(),
+            mediaType: mediaType, base64: data.base64EncodedString(),
             name: name, byteSize: data.count
         )) else {
             return failure("Image delivery was cancelled or this tool call already supplied an image.")

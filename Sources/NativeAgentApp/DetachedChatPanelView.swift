@@ -305,6 +305,7 @@ struct DetachedChatPanelView: View {
             guard (note.object as? DetachedChatPanel)?.sessionId == sessionId else { return }
             Task { await inlineCards.verifyOnReturn() }
         }
+        .inlineCardSetup(inlineCards)
         .onReceive(NotificationCenter.default.publisher(for: .chatTurnCompleted)) { note in
             guard let completedSessionId = note.object as? String,
                   completedSessionId == sessionId
@@ -399,15 +400,6 @@ struct DetachedChatPanelView: View {
                         }
                         .environment(\.inlineCardAction) { [inlineCards, appModel] card, action in
                             inlineCards.handle(card: card, action: action, appModel: appModel)
-                        }
-                        .sheet(item: Binding(
-                            get: { inlineCards.connectorSheet },
-                            set: { if $0 == nil { Task { await inlineCards.connectorSheetClosed() } } }
-                        )) { request in
-                            ConnectorWizardView(provider: request.provider) {
-                                Task { await inlineCards.connectorSheetClosed() }
-                            }
-                            .environment(appModel)
                         }
                     }
                     // Desk 658.11: the detached typing chip is retired. Turn

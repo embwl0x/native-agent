@@ -66,16 +66,14 @@ extension NativeClient {
         let impl = makeDreamREMCycle(root: root)
         let moduleEntries = try await impl.listDreamDiary(limit: limit)
         let entries = try Self.decodeDreamEntries(moduleEntries)
-        let diaryNames = isDirectory.boolValue
-            ? try FileManager.default.contentsOfDirectory(atPath: diary.path)
-                .filter { $0.hasSuffix(".md") }
-                .sorted(by: >)
-            : []
+        // Same file set the listing reads (top level + archive/<year>), so the
+        // header's count and the list agree after REM archives older nights.
+        let diaryNames = FileBackedDreamDiary(dataRoot: root).entryFileNames()
         let totalEntries: Int? = diaryNames.count
         // FileBackedDreamDiary intentionally skips individual unreadable files
         // so one damaged entry does not hide readable ones. Carry that evidence
         // forward: an all-unreadable window must not become "No dreams yet."
-        let boundedCount = min(max(1, min(limit, 365)), diaryNames.count)
+        let boundedCount = min(max(1, limit), diaryNames.count)
         let visibleNames = Set(entries.compactMap(\.filename))
         let unreadableEntries = diaryNames.prefix(boundedCount).count {
             !visibleNames.contains($0)

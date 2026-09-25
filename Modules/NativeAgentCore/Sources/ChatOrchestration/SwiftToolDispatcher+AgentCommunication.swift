@@ -61,8 +61,17 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
         let store = AgentPeerStore(dataRoot: dataRoot)
         if tool == "agent_contacts" {
             try Self.peerKeys(args, allowed: ["discover"])
-            if let discover = args["discover"], case .bool = discover {} else if args["discover"] != nil {
-                throw AgentCommunicationError.invalid("discover must be a boolean")
+            // A name in discover ("Grok Bot") means "find this one": filter to it.
+            var named: String?
+            var refresh = false
+            switch args["discover"] {
+            case nil, .bool(false)?: break
+            case .bool(true)?: refresh = true
+            case .string(let text)?:
+                let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                if text.lowercased() == "true" { refresh = true }
+                else if !text.isEmpty, text.lowercased() != "false" { named = text; refresh = true }
+            default: throw AgentCommunicationError.invalid("discover must be true, false, or a contact name")
             }
             let peers = try store.list()
             let usable = Set(["codex", "claude", "omp"].filter { builtInAgentLaneUsable($0) })
@@ -76,17 +85,24 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
             // yet. Saying so is how `agent_connect` by name becomes findable
             // without the agent having to guess a name.
             let connected = Set(peers.compactMap { AgentPeerStore.hostRowID($0.endpoint) })
-            let found = await AgentDiscoverySession.shared.candidates(refresh: args["discover"] == .bool(true))
+            let found = await AgentDiscoverySession.shared.candidates(refresh: refresh)
             contacts += found.filter { candidate in
                 if let host = candidate.hostID {
                     return AgentHostDirectory.rows.first { $0.id == host }?.requiresWorkspace == true || !connected.contains(host)
                 }
                 return !peers.contains { $0.endpoint == candidate.cardURL || $0.endpoint == candidate.endpoint }
             }.map(\.projection)
-            return .object(["status": .string("ok"), "contacts": .array(contacts),
+            var note: String?
+            if let named {
+                let hits = contacts.filter { if case .object(let row) = $0, case .string(let name)? = row["name"] { return name.localizedCaseInsensitiveContains(named) }; return false }
+                if hits.isEmpty { note = "No contact matches '\(named)'; all \(contacts.count) below." } else { contacts = hits }
+            }
+            var listed: [String: JSONValue] = ["status": .string("ok"), "contacts": .array(contacts),
                             "states": .array([AgentPeerContactState.listed, .setUp, .connected, .sendOnly]
                                 .map { .string($0.rawValue + " — " + $0.detail) }),
-                            "detail": .string("Configuration is not evidence of availability or permission to send. Connected means a real message arrived through the connection, or a message and reply crossed it. Each route shows its own proof.")])
+                            "detail": .string("Configuration is not evidence of availability or permission to send. Connected means a real message arrived through the connection, or a message and reply crossed it. Each route shows its own proof.")]
+            if let note { listed["note"] = .string(note) }
+            return .object(listed)
         }
         if tool == "agent_connect" {
             try Self.peerKeys(args, allowed: ["name", "endpoint", "transport", "bearer_token", "app_bundle_id", "conversation_label", "disconnect", "working_directory", "workspace", "executable_path"])

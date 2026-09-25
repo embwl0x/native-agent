@@ -137,14 +137,18 @@ and retained long-result continuation. These compose existing owners and
 preserve current/history, approval/version and execution/delivery distinctions.
 See the latest handoff for installed validation; this is not a public release.
 
-Version 0.4.17 is the current release (`VERSION` = 0.4.17, cut 2026-09-23). The
+Version 0.4.18 is the current release (`VERSION` = 0.4.18, cut 2026-09-25). The
 [public Releases page](https://github.com/embwl0x/native-agent/releases)
 is authoritative for available installers; a version in this checkout is not
 publication proof. Published artifacts carry their exact-source test receipt
 and release attestation; this status document is not a release receipt.
 Source and live behavior remain authoritative over older release prose below.
 
-### Current shipped state (0.4.17)
+### Current shipped state (0.4.18)
+
+- **The agent's own desktop.** Every capability opens by name as a short text room; the Agent view shows what it sees. One call does a whole Mac or browser flow.
+- **First run.** Opens in Simple view; the agent asks what to be and how to sound, and sets things up by talking with cards in the chat.
+- **Context window.** One setting (min of the custom size and 60% of the model's window) drives compaction, budgets and the meter, which shows real tokens.
 
 - **Composer.** Model, thinking and Trust open anchored cards; the context ring shows usage and hover token counts.
 - **Inline cards.** The first conversation's saved role has a visible receipt; peer approval cards name the requester.

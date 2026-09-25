@@ -267,27 +267,33 @@ struct TrustCenterView: View {
                 // switches underneath it. Read-only: it renders no controls.
                 accessAndPolicyPanel
 
-                featureGroup(title: "Chrome control") {
-                    ChromeControlPermissionsView()
+                // Alive glass (2026-09-23): an eyebrow and one group card.
+                TrustSection(title: "Chrome control", carded: false) {
+                    AliveGroupCard {
+                        ChromeControlPermissionsView()
+                    }
                 }
 
                 TrustGuardrailSummaryPanel(accessMode: appModel.trustPolicy.map { accessMode(from: $0) } ?? "auto")
 
-                NativeSecurityCenterPanel(loadsOnAppear: loadsSecurityStatus)
+                NativeSecurityCenterPanel(loadsOnAppear: loadsSecurityStatus, modeTitle: activePreset?.title)
 
-                TrustSection(title: "Feature permissions", carded: false) {
-                    // Taste pass 2026-07-24: alignment .top — default cell
-                    // alignment vertically centers each card against the
-                    // tallest in its row, so the four cards floated at four
-                    // different heights.
-                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 380), spacing: 16, alignment: .top)], alignment: .leading, spacing: 16) {
-                        ForEach(TrustFeaturePermissionCards.all.filter { $0.id != .chromeControl }) { card in
-                            featureGroup(title: card.title) {
-                                card.content()
-                            }
-                        }
+                // Alive glass (2026-09-23): the feature permissions grid is
+                // an eyebrow over one group card per feature, and the old
+                // per-row timing pills are one footnote. Every "restart" pill
+                // was stale: the unattended gate is read fresh on every tick
+                // (BackgroundLoopsAssembly.unattendedWorkAllowed), so nothing
+                // here waits for a restart.
+                ForEach(TrustFeaturePermissionCards.all.filter { $0.id != .chromeControl }) { card in
+                    TrustSection(title: card.title, carded: false) {
+                        card.content()
                     }
                 }
+                Text("Working unattended, Desk tasks, practice runs, the dream cycle, automatic review, memory consolidation, recurring facts and memory hygiene change the next time that work runs. Nothing here needs a restart. Everything else applies right away.")
+                    .font(.system(size: 12))
+                    .foregroundStyle(NativeAgentShell.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
 
                 // PATCH-2026-05-07: mac-control-ui-1 Mac Control permissions panel
                 // 2026-07-23 B2.5a: this tab is the one home for Mac Control
@@ -383,9 +389,11 @@ struct TrustCenterView: View {
     // disclosure — it documents the modes rather than controlling anything).
 
     private var accessAndPolicyPanel: some View {
-        TrustSection(title: "Access and policy") {
+        // The four presets are themselves cards (a 2×2 grid), so the section
+        // carries no card of its own — a card inside a card is a plate.
+        TrustSection(title: "Access and policy", carded: false) {
             VStack(alignment: .leading, spacing: 12) {
-                LazyVGrid(columns: [GridItem(.flexible(), spacing: 8), GridItem(.flexible())], spacing: 8) {
+                LazyVGrid(columns: [GridItem(.flexible(), spacing: 10, alignment: .top), GridItem(.flexible(), alignment: .top)], spacing: 10) {
                     TrustPresetButton(title: TrustPolicyPreset.safe.title, subtitle: TrustPolicyPreset.safe.summary, isSelected: activePreset == .safe) {
                         applyTrustPreset(.safe)
                     }
@@ -403,9 +411,8 @@ struct TrustCenterView: View {
                     .font(ShellType.labelSemibold)
                     .foregroundStyle(NativeAgentShell.text)
                     .fixedSize(horizontal: false, vertical: true)
-                Button("Create backup now") {
-                    Task { await appModel.createBackup(reason: "manual Trust Center backup") }
-                }
+                // "Back up now" lives on the "If I get something wrong" row of
+                // What I can do right now, where it says what it copies.
             }
             .alert(
                 "Enable Full Mac access?",
@@ -419,7 +426,7 @@ struct TrustCenterView: View {
                 }
             } message: {
                 Text("""
-                The agent will be able to read and modify files anywhere, run shell commands, control the system, and move or trash files across app surfaces.
+                I will be able to read and modify files anywhere, run shell commands, control the system, and move or trash files across app surfaces.
 
                 Workspace actions run autonomously, and access outside workspaces is allowed. Pre-write backups stay on.
 
@@ -453,21 +460,6 @@ struct TrustCenterView: View {
 
     // MARK: - Feature permission grouping (2026-07-22 trust-tighten)
 
-    private func featureGroup<Content: View>(
-        title: String,
-        @ViewBuilder content: () -> Content
-    ) -> some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text(title)
-                .font(ShellType.bodySemibold)
-                .foregroundStyle(NativeAgentShell.text)
-            content()
-        }
-        .padding(16)
-        .frame(maxWidth: .infinity, alignment: .topLeading)
-        .trustCard()
-    }
-
     // MARK: - Advanced group (2026-07-22 trust-tighten: power-user panels
     // collapsed by default; styling mirrors the Advanced Mac Control
     // disclosure in MacControlPermissionsView for consistency).
@@ -485,24 +477,23 @@ struct TrustCenterView: View {
     }
 
     private var advancedSection: some View {
-        TrustFold(isExpanded: $showAdvancedTrust) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Advanced")
-                    .font(ShellType.bodySemibold)
+        // An eyebrow like its sibling sections; the fold row is a row.
+        VStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
+            AliveEyebrow("Advanced")
+            TrustFold(isExpanded: $showAdvancedTrust) {
+                Text("Safety boundaries, privacy map and backups")
+                    .font(.system(size: 14, weight: .medium))
                     .foregroundStyle(NativeAgentShell.text)
-                Text("Safety boundaries, privacy map, and backups.")
-                    .font(ShellType.label)
-                    .foregroundStyle(NativeAgentShell.secondary)
-            }
-        } trailing: {
-            if !showAdvancedTrust, let badge = advancedPresentation.collapsedBadge {
-                TrustStatusChip(text: badge.text, tone: TrustTone.named(badge.status))
-            }
-        } content: {
-            VStack(alignment: .leading, spacing: 24) {
-                safetyBoundariesPanel
-                privacyMapPanel
-                backupsPanel
+            } trailing: {
+                if !showAdvancedTrust, let badge = advancedPresentation.collapsedBadge {
+                    TrustStatusChip(text: badge.text, tone: TrustTone.named(badge.status))
+                }
+            } content: {
+                VStack(alignment: .leading, spacing: 24) {
+                    safetyBoundariesPanel
+                    privacyMapPanel
+                    backupsPanel
+                }
             }
         }
     }
@@ -787,7 +778,7 @@ struct PrivacyMapPanel: View {
         TrustSection(title: "Privacy map") {
             switch presentation {
             case .pending:
-                Text("The privacy map has not loaded yet. It lists what the agent keeps on this Mac and which of it can leave.")
+                Text("The privacy map has not loaded yet. It lists what I keep on this Mac and which of it can leave.")
                     .font(ShellType.label)
                     .foregroundStyle(NativeAgentShell.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -978,34 +969,48 @@ enum TrustPolicyPresetActionPresentation {
     }
 }
 
+/// One of the four presets, as a selectable card (Alive glass, 2026-09-23).
+/// The selected one wears a ring in the haze; the others stay quiet cards.
 private struct TrustPresetButton: View {
     var title: String
     var subtitle: String
     var isSelected: Bool
     var action: () -> Void
+    @AppStorage(HazeColor.key) private var colorRaw = HazeColor.defaultValue.rawValue
 
     var body: some View {
+        let haze = HazeColor(stored: colorRaw).base
+        let shape = RoundedRectangle(cornerRadius: AliveMetrics.cardRadius, style: .continuous)
         Button(action: action) {
-            VStack(alignment: .leading, spacing: 2) {
-                Label(title, systemImage: isSelected ? "checkmark.circle.fill" : "circle")
-                    .font(ShellType.labelSemibold)
-                    .foregroundStyle(NativeAgentShell.text)
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 6) {
+                    Text(title)
+                        .font(.system(size: 14, weight: .medium))
+                        .foregroundStyle(NativeAgentShell.text)
+                    Spacer(minLength: 4)
+                    // Not colour alone: the chosen one also carries a mark.
+                    if isSelected {
+                        Image(systemName: "checkmark.circle.fill")
+                            .font(.system(size: 13))
+                            .foregroundStyle(haze)
+                            .accessibilityHidden(true)
+                    }
+                }
                 Text(subtitle)
-                    .font(ShellType.caption)
-                    .foregroundStyle(TrustPalette.secondary)
+                    .font(.system(size: 12))
+                    .foregroundStyle(NativeAgentShell.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
-            .frame(maxWidth: .infinity, minHeight: 64, alignment: .leading)
-            .background(
-                RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
-                    .fill(TrustPalette.card)
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
-                    .strokeBorder(isSelected ? NativeAgentShell.text : TrustPalette.border, lineWidth: isSelected ? 2 : 1)
-            )
+            .padding(.horizontal, 16)
+            .padding(.vertical, 14)
+            .frame(maxWidth: .infinity, minHeight: 76, alignment: .topLeading)
+            .aliveCard()
+            .overlay {
+                if isSelected {
+                    shape.strokeBorder(haze, lineWidth: 2)
+                }
+            }
+            .contentShape(shape)
         }
         .buttonStyle(.naFeel)
         .accessibilityAddTraits(isSelected ? [.isSelected] : [])
@@ -1061,16 +1066,8 @@ private struct TrustSection<Content: View>: View {
     @ViewBuilder var content: Content
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text(title)
-                .font(ShellType.labelSemibold)
-                .textCase(.uppercase)
-                .kerning(0.6)
-                .foregroundStyle(TrustPalette.secondary)
-                .padding(.horizontal, 6)
-                .padding(.vertical, 4)
-                .background(TrustPalette.card, in: RoundedRectangle(cornerRadius: 4))
-                .padding(.horizontal, 2)
+        VStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
+            AliveEyebrow(title)
             if carded {
                 VStack(alignment: .leading, spacing: 12) { content }
                     .padding(16)
@@ -1102,7 +1099,7 @@ private struct TrustStatusChip: View {
 
 /// A bare fold: a chevron, the words, and one gesture. No plate, no material,
 /// and the shell's one fold animation with Reduce Motion honoured.
-private struct TrustFold<Label: View, Trailing: View, Content: View>: View {
+struct TrustFold<Label: View, Trailing: View, Content: View>: View {
     @Binding var isExpanded: Bool
     @ViewBuilder var label: Label
     @ViewBuilder var trailing: Trailing
@@ -1117,10 +1114,13 @@ private struct TrustFold<Label: View, Trailing: View, Content: View>: View {
                     isExpanded.toggle()
                 }
             } label: {
-                HStack(spacing: 8) {
+                // First baseline: with a title and a subtitle, centring put
+                // the chevron between the two lines instead of beside the title.
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
                     Image(systemName: "chevron.right")
                         .font(ShellType.captionSemibold)
-                        .foregroundStyle(NativeAgentShell.tertiary)
+                        // Secondary: tertiary fails where the haze peaks.
+                        .foregroundStyle(NativeAgentShell.secondary)
                         .rotationEffect(.degrees(isExpanded ? 90 : 0))
                     label
                     Spacer(minLength: 8)
@@ -1150,17 +1150,11 @@ extension TrustFold where Trailing == EmptyView {
 }
 
 private extension View {
-    /// The room's one content card: a quiet fill, one hairline, radius 12.
+    /// The room's one content card — since Alive glass (2026-09-23), the
+    /// same card Today and the Desk wear.
     func trustCard() -> some View {
         self
-            .background(
-                RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
-                    .fill(TrustPalette.card)
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
-                    .strokeBorder(TrustPalette.border, lineWidth: 1)
-            )
+            .aliveCard()
             .accessibilityElement(children: .contain)
     }
 }
@@ -1203,42 +1197,63 @@ struct AgentPeerTrustView: View {
     private var store: AgentPeerStore { AgentPeerStore(dataRoot: NativeAgentPaths.dataRoot) }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text("Connected agents")
-                .font(ShellType.labelSemibold)
-                .textCase(.uppercase)
-                .kerning(0.6)
-                .foregroundStyle(TrustPalette.secondary)
-            Text("Other agents can ask the agent for help. Actions that need your permission appear as approval requests. Turning on a connected agent lets those requests use your existing permissions. Agents that connect over the network each need their own credential.")
-                .font(ShellType.caption)
-                .foregroundStyle(TrustPalette.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-            if peers.isEmpty {
-                Text("No agents are connected.")
-                    .font(ShellType.caption)
-                    .foregroundStyle(TrustPalette.secondary)
-            } else {
-                ForEach(peers, id: \.id) { peer in
-                    Toggle(isOn: binding(for: peer)) {
-                        VStack(alignment: .leading, spacing: 1) {
-                            Text(peer.name).font(ShellType.bodyMedium)
-                            Text("\(peer.transport.rawValue) · \(peer.credentialKey == nil ? "no credential — cannot be turned on" : "has its own credential")")
-                                .font(ShellType.caption)
-                                .foregroundStyle(TrustPalette.secondary)
+        // Alive glass: an eyebrow over one group card, a hairline per peer.
+        VStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
+            AliveEyebrow("Connected agents")
+            AliveGroupCard {
+                Text("Other agents can ask me for help. Anything that needs your permission comes to you as an approval request. Turning an agent on lets its requests use your existing permissions. Agents that connect over the network each need their own credential.")
+                    .font(.system(size: 12))
+                    .foregroundStyle(NativeAgentShell.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                if peers.isEmpty {
+                    Text("No agents are connected.")
+                        .font(.system(size: 13))
+                        .foregroundStyle(NativeAgentShell.secondary)
+                } else {
+                    ForEach(peers, id: \.id) { peer in
+                        HStack(alignment: .center, spacing: 12) {
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(peer.name)
+                                    .font(.system(size: 14, weight: .medium))
+                                    .foregroundStyle(NativeAgentShell.text)
+                                Text("\(Self.via(peer.transport)) · \(peer.credentialKey == nil ? "no credential, so it can't be turned on" : "has its own credential")")
+                                    .font(.system(size: 12))
+                                    .foregroundStyle(NativeAgentShell.secondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                            Spacer(minLength: 12)
+                            Toggle(peer.name, isOn: binding(for: peer))
+                                .labelsHidden()
+                                .toggleStyle(.switch)
+                                .hazeTinted()
+                                .disabled(peer.credentialKey == nil)
+                                .accessibilityIdentifier("trust.agent-peer.\(peer.id)")
                         }
                     }
-                    .disabled(peer.credentialKey == nil)
-                    .accessibilityIdentifier("trust.agent-peer.\(peer.id)")
+                }
+                if let failure {
+                    Text(failure)
+                        .font(.system(size: 12))
+                        .foregroundStyle(TrustTone.trouble.color)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
-            if let failure {
-                Text(failure).font(ShellType.caption).foregroundStyle(TrustTone.trouble.color)
-            }
         }
-        .padding(16)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .trustCard()
+        .accessibilityElement(children: .contain)
         .onAppear(perform: reload)
+    }
+
+    /// How a peer reaches me, in words a person uses (the Simple view's words).
+    private static func via(_ transport: AgentPeerTransport) -> String {
+        switch transport {
+        case .a2a: "Over the network (A2A)"
+        case .nativeAgent: "Another NativeAgent"
+        case .desktop: "Desktop app on this Mac"
+        case .desktopChat: "Desktop app, through its chat window"
+        case .mcpHost: "Through its settings on this Mac (MCP)"
+        case .acp: "Runs on this Mac"
+        case .grokBot: "Routine, replies come back here"
+        }
     }
 
     private func binding(for peer: AgentPeerContact) -> Binding<Bool> {

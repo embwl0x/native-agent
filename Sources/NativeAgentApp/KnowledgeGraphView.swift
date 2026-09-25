@@ -201,13 +201,30 @@ struct KnowledgeGraphView: View {
         )
     }
 
+    /// Alive glass (2026-09-23) is the Advanced shell's; the classic shell
+    /// keeps its material strip and settings cards.
+    @AppStorage(NativeAgentShellPreference.classicShellKey) private var classicShell = false
+
+    /// The page's card: the settings card in the classic shell, one alive
+    /// group card (rows split by hairlines) in the Advanced shell.
+    @ViewBuilder
+    private func kgCard<C: View>(@ViewBuilder _ content: () -> C) -> some View {
+        if classicShell {
+            AdvancedCard { content() }
+        } else {
+            AliveGroupCard { content() }
+        }
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            KGNativeStackHeader(
-                status: nativeStack,
-                totalEntities: totalEntities,
-                totalEdges: totalEdges ?? 0
-            )
+            if classicShell {
+                KGNativeStackHeader(
+                    status: nativeStack,
+                    totalEntities: totalEntities,
+                    totalEdges: totalEdges ?? 0
+                )
+            }
 
             if knowledgeGraphEnabled == true {
                 Button {
@@ -220,7 +237,16 @@ struct KnowledgeGraphView: View {
 
             // 2026-06-06: filter row — kind multi-select + time-window picker.
             // Sits above the search bar and view-mode toggle; applies to both.
-            AdvancedCard {
+            // In the Advanced shell the counts strip is this card's first row.
+            kgCard {
+                if !classicShell {
+                    KGNativeStackHeader(
+                        status: nativeStack,
+                        totalEntities: totalEntities,
+                        totalEdges: totalEdges ?? 0,
+                        plain: true
+                    )
+                }
                 HStack(spacing: 8) {
                     Menu {
                         Button(selectedKinds.isEmpty ? "✓ All kinds" : "All kinds") {
@@ -269,6 +295,7 @@ struct KnowledgeGraphView: View {
                         }
                     }
                     .pickerStyle(.segmented)
+                    .hazeTinted(.segments)
                     .fixedSize()
                     .accessibilityLabel("Knowledge Graph view mode")
                     .accessibilityValue(viewMode.rawValue)
@@ -343,7 +370,7 @@ struct KnowledgeGraphView: View {
                 entityCount: entities.count,
                 errorOrigin: errorOrigin
             ) {
-                AdvancedCard(spacing: 8) {
+                kgCard {
                     HStack(alignment: .firstTextBaseline, spacing: 8) {
                         VStack(alignment: .leading, spacing: 2) {
                             Text(err)

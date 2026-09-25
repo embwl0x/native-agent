@@ -32,11 +32,26 @@ struct BotsShelfView: View {
     /// One shelf read in flight, one pending refresh behind it.
     @State private var reloadInFlight = false
     @State private var reloadPending = false
+    /// Alive glass (2026-09-23) is the Advanced shell's list; the classic
+    /// shell and every bot's detail keep the cards they had.
+    @AppStorage(NativeAgentShellPreference.classicShellKey) private var classicShell = false
     private var root: URL { appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot() }
     private var selected: BotsShelfRecord? { records.first { $0.id == selectedID } }
+    private var aliveList: Bool { !classicShell && selected == nil }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
+            if aliveList {
+                HStack(alignment: .top) {
+                    AlivePageHeader(title: "Helpers", line: headerLine)
+                    Spacer()
+                    Button("New helper", systemImage: "plus") { editedBot = nil; editing = true }
+                        .buttonStyle(.borderedProminent)
+                        .hazeTinted(.button)
+                        .padding(.top, 14)
+                }
+                .padding(.bottom, AliveMetrics.sectionSpacing - 14)
+            } else {
             HStack(alignment: .firstTextBaseline) {
                 if let selected {
                     Button {
@@ -46,12 +61,12 @@ struct BotsShelfView: View {
                         messagesLoading = true
                         messagesError = nil
                     } label: {
-                        Label("Bots", systemImage: "chevron.left")
+                        Label("Helpers", systemImage: "chevron.left")
                     }.buttonStyle(.plain)
                     Text(selected.definition.name).font(ShellType.title).fixedSize(horizontal: false, vertical: true)
                 } else {
                     VStack(alignment: .leading, spacing: 4) {
-                        Text("Bots").font(ShellType.display)
+                        Text("Helpers").font(ShellType.display)
                         if let subtitle = SidebarItem.bots.shellPageSubtitle {
                             Text(subtitle)
                                 .font(ShellType.labelMedium)
@@ -62,15 +77,20 @@ struct BotsShelfView: View {
                 }
                 Spacer()
                 if selected == nil {
-                    Button("New bot", systemImage: "plus") { editedBot = nil; editing = true }
+                    Button("New helper", systemImage: "plus") { editedBot = nil; editing = true }
                 }
+            }
             }
             if let notice { Text(notice).font(ShellType.label).foregroundStyle(NativeAgentShell.secondary) }
             if let shelfError { Text(shelfError).font(ShellType.label).foregroundStyle(NativeAgentShell.trouble) }
-            if let selected { detail(selected) } else { list }
+            if let selected { detail(selected) } else if aliveList { groupList } else { list }
         }
         .foregroundStyle(NativeAgentShell.text)
-        .padding(20).frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .padding(.horizontal, 20)
+        .padding(.bottom, 20)
+        .padding(.top, aliveList ? TodayMetrics.topPadding : 20)
+        .frame(maxWidth: aliveList ? TodayMetrics.contentWidth : .infinity, alignment: .leading)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: aliveList ? .top : .topLeading)
         .background { ShellRoomBackdrop() }
         .sheet(isPresented: $editing) {
             BotsEditorSheet(definition: editedBot) { bot in
@@ -127,13 +147,59 @@ struct BotsShelfView: View {
                         BotCard(record: record, state: state(record), allowsMotion: isVisible)
                     }.buttonStyle(.plain)
                 }
+                listFooter
+            }
+            .frame(maxWidth: 720, alignment: .leading).padding(.bottom, 20)
+        }
+    }
+
+    /// The Advanced shell's list: every helper a row in ONE group card, rows
+    /// split by hairlines, the status as a pill on the right.
+    private var groupList: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: AliveMetrics.sectionSpacing) {
+                if !records.isEmpty {
+                    AliveGroupCard {
+                        ForEach(records) { record in
+                            Button { selectedID = record.id; notice = nil } label: {
+                                BotRow(record: record, state: state(record))
+                            }.buttonStyle(.plain)
+                        }
+                    }
+                }
+                listFooter
+            }
+            .padding(.bottom, 20)
+        }
+    }
+
+    /// The header's one sentence, in numerals: how many helpers, and when the
+    /// soonest real run is. Nil until the shelf has been read.
+    private var headerLine: String? {
+        guard shelfLoaded else { return nil }
+        let count = records.count
+        guard count > 0 else { return "No helpers yet." }
+        let helpers = "\(count) \(count == 1 ? "helper" : "helpers")"
+        // Only a time the scheduler will actually keep (the card's own rule).
+        let next = records.compactMap { record -> Date? in
+            guard !record.definition.paused, !record.needsModelChoice,
+                  record.unattendedAllowed || record.runsWithUnattendedOff else { return nil }
+            return record.nextRun
+        }.min()
+        if let next { return "\(helpers), the next runs \(BotRow.when(next))." }
+        if !unattended { return "\(helpers). Scheduled runs are off." }
+        return "\(helpers), none on a timer."
+    }
+
+    @ViewBuilder
+    private var listFooter: some View {
                 if !unattended {
                     Text(BotsShelfUnattended.pageLine)
                         .font(ShellType.label).foregroundStyle(NativeAgentShell.secondary)
                         .fixedSize(horizontal: false, vertical: true).padding(.bottom, 4)
                 }
                 if records.isEmpty, shelfError == nil, !shelfLoaded {
-                    ProgressView("Loading bots…")
+                    ProgressView("Loading helpers…")
                 }
                 if records.isEmpty, shelfError == nil, shelfLoaded {
                     // The first bot is a conversation, not a form: the agent
@@ -142,17 +208,15 @@ struct BotsShelfView: View {
                     // bot through the ordinary bot_create path. "New bot" stays
                     // in the header for anyone who would rather fill it in.
                     VStack(alignment: .leading, spacing: 8) {
-                        Text("No bots yet.").font(ShellType.label).foregroundStyle(NativeAgentShell.secondary)
+                        Text("No helpers yet.").font(ShellType.label).foregroundStyle(NativeAgentShell.secondary)
                         Button("Make one in chat", systemImage: "bubble.left.and.bubble.right") {
                             NotificationCenter.default.post(name: .openChatDraftRequest,
                                                             object: BotsShelfView.makeABotDraft)
                         }
                         .buttonStyle(.borderedProminent)
+                        .hazeTinted(.button)
                     }.padding(.vertical, 16)
                 }
-            }
-            .frame(maxWidth: 720, alignment: .leading).padding(.bottom, 20)
-        }
     }
 
     private func detail(_ record: BotsShelfRecord) -> some View {
@@ -298,7 +362,7 @@ struct BotsShelfView: View {
             if activeIDs != loaded.active { activeIDs = loaded.active }
             shelfLoaded = true
             shelfError = nil
-        } catch { shelfError = "Bots could not be loaded. Reopen Bots to try again. \(error.localizedDescription)" }
+        } catch { shelfError = "Helpers could not be loaded. Reopen Bots to try again. \(error.localizedDescription)" }
     }
     nonisolated static func readRecords(root: URL, unattended: Bool = true) throws -> [BotsShelfRecord] {
         let shelf = ShelfStore(dataRoot: root)
@@ -315,7 +379,8 @@ struct BotsShelfView: View {
             // iPhone settles the entry wherever it is read next, not only here.
             let entries = shelf.reconciling(stored[bot.id] ?? [])
             return BotsShelfRecord(definition: bot, entries: entries, unreadIDs: [],
-                                   nextRun: bot.paused ? nil : dates[bot.id], missed: missed[bot.id], lastEvent: events[bot.id],
+                                   nextRun: bot.paused ? nil : dates[bot.id],
+                                   missed: bot.cadence == .manual ? nil : missed[bot.id], lastEvent: events[bot.id],
                                    unattendedAllowed: unattended)
         }.sorted { $0.definition.createdAt < $1.definition.createdAt }
     }
@@ -649,13 +714,15 @@ struct BotCard: View {
     /// The card is one thing to a reader: this bot. SwiftUI publishes nothing
     /// for a stack of styled Texts asked offscreen, so the words are stated
     /// here — VoiceOver and the quiet page read get the same line.
-    private var spokenName: String {
+    private var spokenName: String { Self.spokenName(record) }
+    private var spokenState: String { Self.spokenState(record, state: state) }
+    static func spokenName(_ record: BotsShelfRecord) -> String {
         record.definition.brief.isEmpty
             ? record.definition.name
             : "\(record.definition.name). \(record.definition.brief)"
     }
     /// State word, what it last said, when it runs next, and a run it missed.
-    private var spokenState: String {
+    static func spokenState(_ record: BotsShelfRecord, state: BotState) -> String {
         [state.word, record.lastOutcomeLine, record.scheduleLine, record.missedLine]
             .compactMap { $0 }
             .filter { !$0.isEmpty }
@@ -686,6 +753,123 @@ struct BotCard: View {
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(spokenName)
         .accessibilityValue(spokenState)
+    }
+}
+
+/// One helper in the Advanced shell's group card: a glyph tile, the name, its
+/// timing and last run in plain words, and a status pill. The tile never
+/// animates; a helper waiting on him wears the waiting dot, the one teal.
+struct BotRow: View {
+    let record: BotsShelfRecord
+    let state: BotState
+
+    private var isManual: Bool {
+        if case .manual = record.definition.cadence, record.definition.eventTrigger == nil { return true }
+        return false
+    }
+
+    /// The state, never the timing: Scheduled, On event, Paused or Manual.
+    private var status: String {
+        if record.definition.paused { return "Paused" }
+        if isManual { return "Manual" }
+        return record.definition.eventTrigger != nil ? "On event" : "Scheduled"
+    }
+
+    /// Clock for a schedule, bolt for an event, a plain tool for run-by-hand.
+    /// Not "play": the tile is decoration (the row opens the helper), and a
+    /// play glyph read as a Run button.
+    private var glyph: String {
+        if record.definition.eventTrigger != nil { return "bolt" }
+        return isManual ? "wrench.and.screwdriver" : "clock"
+    }
+
+    /// When it runs, in the words the card already uses — never a time the
+    /// scheduler will not keep. Nil for a manual helper: the pill says it.
+    private var timing: String? {
+        if record.needsModelChoice { return "Choose a model" }
+        if !record.definition.paused, !record.unattendedAllowed, !record.runsWithUnattendedOff {
+            return BotsShelfUnattended.cardLine
+        }
+        if let trigger = record.definition.eventTrigger { return "Wakes on \(trigger.label)" }
+        if isManual { return nil }
+        return record.cadence
+    }
+
+    /// How its last run went, and a run it missed.
+    private var last: String {
+        var parts: [String] = []
+        if state.running {
+            parts.append("running now")
+        } else if let latest = record.sortedEntries.first {
+            let when = BotsShelfRecord.shortDate(latest.runAt)
+            switch latest.runtimeStatus {
+            case .completed: parts.append("last ran \(when)")
+            case .waitingForApproval: parts.append("waiting for approval")
+            case .waitingOnPerson: parts.append("waiting on you")
+            case .failed: parts.append("last run failed \(when)")
+            case .interrupted: parts.append("last run stopped \(when)")
+            }
+        } else {
+            parts.append("no runs yet")
+        }
+        if let missed = record.missed { parts.append("missed \(BotsShelfRecord.shortDate(missed.dueAt))") }
+        return parts.joined(separator: " · ")
+    }
+
+    private var waitingOnHim: Bool {
+        guard !state.running, let latest = record.sortedEntries.first else { return false }
+        return latest.runtimeStatus == .waitingForApproval || latest.runtimeStatus == .waitingOnPerson
+    }
+
+    /// "at 8:30 AM" today, "tomorrow at 8:30 AM", else "on Sep 25 at 8:30 AM".
+    static func when(_ date: Date, now: Date = Date()) -> String {
+        var calendar = Calendar.current
+        calendar.timeZone = DisplayTimeZone.current
+        let time = DateFormatter()
+        time.setLocalizedDateFormatFromTemplate("jm")
+        time.timeZone = DisplayTimeZone.current
+        if calendar.isDate(date, inSameDayAs: now) { return "at \(time.string(from: date))" }
+        if let tomorrow = calendar.date(byAdding: .day, value: 1, to: now),
+           calendar.isDate(date, inSameDayAs: tomorrow) {
+            return "tomorrow at \(time.string(from: date))"
+        }
+        return "on \(BotsShelfRecord.shortDate(date))"
+    }
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 14) {
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(NativeAgentShell.softFill)
+                .overlay {
+                    Image(systemName: glyph)
+                        .font(.system(size: 15, weight: .medium))
+                        .foregroundStyle(NativeAgentShell.secondary)
+                }
+                .overlay(alignment: .topTrailing) {
+                    if waitingOnHim { AliveWaitingDot().offset(x: 3, y: -3) }
+                }
+                .frame(width: 36, height: 36)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(record.definition.name)
+                    .font(.system(size: 15, weight: .medium))
+                    .foregroundStyle(NativeAgentShell.text)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                Text([timing, last].compactMap { $0 }.joined(separator: " · "))
+                    .font(.system(size: 13))
+                    .foregroundStyle(NativeAgentShell.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+            .frame(height: TodayMetrics.rowContentHeight, alignment: .leading)
+            Spacer(minLength: 12)
+            AlivePill(status)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(BotCard.spokenName(record))
+        .accessibilityValue(BotCard.spokenState(record, state: state))
     }
 }
 
@@ -721,6 +905,6 @@ struct BotsShelfPreviewPage: View {
     var isVisible = true
     var body: some View {
         if enabled { BotsShelfView(onContinue: onContinue, isVisible: isVisible) }
-        else { ShellRailPage(title: "Bots", subtitle: SidebarItem.bots.shellPageSubtitle) { Text("Bots preview is turned off.") } }
+        else { ShellRailPage(title: "Helpers", subtitle: SidebarItem.bots.shellPageSubtitle) { Text("Helpers preview is turned off.") } }
     }
 }

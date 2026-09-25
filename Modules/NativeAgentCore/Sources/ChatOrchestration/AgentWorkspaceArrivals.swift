@@ -264,7 +264,7 @@ extension AgentWorkspaceNavigation {
             do { state.accept(try AgentWorkspaceArrivals.conversations(dataRoot: dataRoot, scope: scope), owner: "agents") }
             catch { state.unavailable.insert("agents") }
         }
-        let places = sessions[key]?.places ?? []
+        let places = (sessions[key]?.places ?? []) + (sessions[key]?.watched ?? [])
         let humanIDs = Set(places.compactMap { place -> String? in
             guard case .record("chat_conversations", let args, _) = place else { return nil }
             return AgentWorkspaceArrivals.text(args["conversation_session_id"])

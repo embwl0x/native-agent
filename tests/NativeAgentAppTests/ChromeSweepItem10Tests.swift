@@ -95,7 +95,7 @@ struct ChromeSweepItem10Tests {
             #expect(reason == "user_click")
             let words = error.localizedDescription
             #expect(words.contains("user touched the page"), "\(words)")
-            #expect(words.contains("Acquire a fresh lease"), "\(words)")
+            #expect(words.contains("Open the page again with browser.chrome_navigate"), "\(words)")
         }
         await runtime.stop()
         _ = try? await fixture.value

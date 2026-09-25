@@ -37,7 +37,7 @@ enum SkillLifecycleSearchPresentation {
             emptyTitle: isFiltering ? "No matches" : "No skills yet",
             emptyDetail: isFiltering
                 ? "Nothing matches \u{201C}\(query)\u{201D}."
-                : "Ask the agent to build a skill — a draft lands here for your review, and once you approve it the agent can use it."
+                : "Ask me to build a skill — a draft lands here for your review, and once you approve it I can use it."
         )
     }
 
@@ -261,7 +261,7 @@ enum SkillPointerSyncReceiptPresentation {
         case .loading:
             return "Checking that memory knows about every skill…"
         case .current(let receipt):
-            return "\(receipt.reconciledPointerCount) skills the agent can find · checked \(friendlyTime(receipt.at))"
+            return "\(receipt.reconciledPointerCount) skills I can find · checked \(friendlyTime(receipt.at))"
         case .failed(let detail):
             return "The memory check failed · \(boundedDetail(detail))"
         case .unavailable(let detail):
@@ -303,7 +303,7 @@ struct SkillPointerSyncReceiptLine: View {
             .font(ShellType.caption)
             .foregroundStyle(color)
             .lineLimit(1)
-            .help("Every skill gets a one-line note in memory so the agent can find it. Checked at launch and whenever skills change.")
+            .help("Every skill gets a one-line note in memory so I can find it. Checked at launch and whenever skills change.")
     }
 
     private var color: Color {
@@ -338,7 +338,7 @@ struct SkillLifecycleView: View {
         // what skills are, the controls, and the rows.
         VStack(alignment: .leading, spacing: 16) {
             HStack(spacing: 8) {
-                Text("\(appModel.skillManifests.count) skills · the agent pulls up the right one when a conversation calls for it; the full text loads only when it is needed.")
+                Text("\(appModel.skillManifests.count) skills · I pull up the right one when a conversation calls for it; the full text loads only when it is needed.")
                     .font(ShellType.label)
                     .foregroundStyle(NativeAgentShell.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -414,7 +414,6 @@ struct SkillLifecycleView: View {
                             RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
                                 .fill(NativeAgentShell.quietFill)
                                 .frame(height: 58)
-                                .appShimmer()
                         }
                     }
                 }
@@ -535,7 +534,7 @@ private struct SkillRow: View {
             }
             Image(systemName: "chevron.right")
                 .font(ShellType.captionSemibold)
-                .foregroundStyle(NativeAgentShell.tertiary)
+                .foregroundStyle(NativeAgentShell.secondary)
         }
         .padding(.vertical, 12).padding(.horizontal, 16)
         .frame(minHeight: 48)
@@ -684,7 +683,7 @@ struct SkillBodySheet: View {
             }
             Text(UserDisplayFormatters.tildifyPath(info.registry.path))
                 .font(ShellType.code)
-                .foregroundStyle(NativeAgentShell.tertiary)
+                .foregroundStyle(NativeAgentShell.secondary)
                 .lineLimit(1)
                 .truncationMode(.middle)
                 .textSelection(.enabled)
@@ -815,7 +814,7 @@ struct SkillReviewSheet: View {
                                 if tools.count > toolPreviewLimit {
                                     Text("\(tools.count - toolPreviewLimit) more tools not shown here.")
                                         .font(ShellType.caption)
-                                        .foregroundStyle(NativeAgentShell.tertiary)
+                                        .foregroundStyle(NativeAgentShell.secondary)
                                 }
                             }
                         }
@@ -859,7 +858,7 @@ struct SkillReviewSheet: View {
                                 // reserved without triggering text layout.
                                 Text("Loading preview…")
                                     .font(ShellType.caption)
-                                    .foregroundStyle(NativeAgentShell.tertiary)
+                                    .foregroundStyle(NativeAgentShell.secondary)
                                     .frame(maxWidth: .infinity, alignment: .leading)
                             }
                         }
@@ -1012,7 +1011,7 @@ private struct BoundedSkillText: View {
                 .buttonStyle(.naFeel)
                 Text("\(text.count - visibleText.count) more characters not shown, to keep this page quick.")
                     .font(ShellType.caption)
-                    .foregroundStyle(NativeAgentShell.tertiary)
+                    .foregroundStyle(NativeAgentShell.secondary)
             }
         }
     }

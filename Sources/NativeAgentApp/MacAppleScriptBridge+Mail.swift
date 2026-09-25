@@ -92,57 +92,22 @@ extension MacAppleScriptBridge {
 
     // MARK: MAIL MANAGE
 
-    /// Mark an inbox message as read. Required: "subject" (exact match from a
-    /// prior mail_list_recent / mail_search result). Optional: "sender" for
-    /// disambiguation when multiple messages share a subject.
-    /// Returns: {status, action: "marked_read", matched_count}.
+    /// Mark read, archive or delete: the exact message (message_id +
+    /// expected_message_id from mail_list_recent), or by subject (and optional
+    /// sender). Archive and delete act on one message only: several subject
+    /// matches are refused, never all moved (2026-09-24).
+    /// Returns: {status, action, matched_count, subject}.
     public static func mailMarkRead(input: [String: JSONValue]) async throws -> JSONValue {
-        guard let subject = inputString(input["subject"]), !subject.isEmpty else {
-            return failedEnvelope(integration: "mail", reason: "missing_subject")
-        }
-        let sender = inputString(input["sender"])
-        let subjectAS = escapeForAppleScript(subject)
-        let whereClause = Self.mailMatchWhereClause(subjectAS: subjectAS, sender: sender)
-        let source = """
-        tell application "Mail"
-            set hits to (messages of inbox whose \(whereClause))
-            set n to count of hits
+        await mailManage(input: input, action: "marked_read", single: false, body: """
             repeat with msg in hits
                 set read status of msg to true
             end repeat
-            return n as string
-        end tell
-        """
-        do {
-            let raw = try await runAppleScript(source)
-            return mailMutationResult(raw, action: "marked_read")
-        } catch let AppleScriptError.permissionDenied(app) {
-            return deniedEnvelope(integration: "mail", app: app)
-        } catch {
-            return failedEnvelope(integration: "mail", error: error)
-        }
+            """)
     }
 
-    /// Archive an inbox message (move to the Archive mailbox). Same input shape
-    /// as `mailMarkRead`. If no Archive mailbox exists on any account, returns
-    /// a failed envelope with reason "no_archive_mailbox".
-    /// Returns: {status, action: "archived", matched_count}.
+    /// Archive one inbox message (move to the Archive mailbox); "no_archive_mailbox" when none exists.
     public static func mailArchive(input: [String: JSONValue]) async throws -> JSONValue {
-        guard let subject = inputString(input["subject"]), !subject.isEmpty else {
-            return failedEnvelope(integration: "mail", reason: "missing_subject")
-        }
-        let sender = inputString(input["sender"])
-        let subjectAS = escapeForAppleScript(subject)
-        let whereClause = Self.mailMatchWhereClause(subjectAS: subjectAS, sender: sender)
-        // Try the top-level "Archive" mailbox first; fall back to scanning
-        // accounts for an Archive mailbox. If neither exists, return a
-        // distinguishable sentinel ("__NO_ARCHIVE__") so the caller can emit
-        // the dedicated failure envelope.
-        let source = """
-        tell application "Mail"
-            set hits to (messages of inbox whose \(whereClause))
-            set n to count of hits
-            if n is 0 then return "0"
+        await mailManage(input: input, action: "archived", single: true, body: """
             set archiveBox to missing value
             try
                 set archiveBox to mailbox "Archive"
@@ -159,46 +124,46 @@ extension MacAppleScriptBridge {
             repeat with msg in hits
                 move msg to archiveBox
             end repeat
-            return n as string
-        end tell
-        """
-        do {
-            let raw = try await runAppleScript(source)
-            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-            if trimmed == "__NO_ARCHIVE__" {
-                return failedEnvelope(integration: "mail", reason: "no_archive_mailbox")
-            }
-            return mailMutationResult(trimmed, action: "archived")
-        } catch let AppleScriptError.permissionDenied(app) {
-            return deniedEnvelope(integration: "mail", app: app)
-        } catch {
-            return failedEnvelope(integration: "mail", error: error)
-        }
+            """)
     }
 
-    /// Delete an inbox message (Mail's `delete` moves to trash). Same input
-    /// shape as `mailMarkRead`.
-    /// Returns: {status, action: "deleted", matched_count}.
+    /// Delete one inbox message (Mail's `delete` moves it to Trash).
     public static func mailDelete(input: [String: JSONValue]) async throws -> JSONValue {
-        guard let subject = inputString(input["subject"]), !subject.isEmpty else {
-            return failedEnvelope(integration: "mail", reason: "missing_subject")
-        }
-        let sender = inputString(input["sender"])
-        let subjectAS = escapeForAppleScript(subject)
-        let whereClause = Self.mailMatchWhereClause(subjectAS: subjectAS, sender: sender)
-        let source = """
-        tell application "Mail"
-            set hits to (messages of inbox whose \(whereClause))
-            set n to count of hits
+        await mailManage(input: input, action: "deleted", single: true, body: """
             repeat with msg in hits
                 delete msg
             end repeat
-            return n as string
+            """)
+    }
+
+    private static func mailManage(input: [String: JSONValue], action: String, single: Bool, body: String) async -> JSONValue {
+        let exact = mailExactLocator(input)
+        if input["message_id"] != nil && exact == nil { return failedEnvelope(integration: "mail", reason: "invalid_message_locator") }
+        let subject = inputString(input["subject"]) ?? ""
+        guard exact != nil || !subject.isEmpty else { return failedEnvelope(integration: "mail", reason: "missing_subject") }
+        let whereClause = exact.map { "id is \($0.id)" }
+            ?? Self.mailMatchWhereClause(subjectAS: escapeForAppleScript(subject), sender: inputString(input["sender"]))
+        let check = exact.map { mailIdentityCheck($0, list: "hits", fail: "-2") }
+            ?? (single ? "if n > 1 then return \"-3|\" & (n as text)" : "")
+        // The lookup is bounded (a whose-scan of a huge inbox otherwise runs on
+        // Mail's ~120s default, holding the one AppleScript queue after the 15s
+        // gate gave up). It runs before any change, so a timeout changed nothing.
+        let source = """
+        tell application "Mail"
+            \(mailAccountScope(exact?.account))
+            with timeout of 8 seconds
+                \(exact.map { mailExactLookup($0, into: "hits") } ?? "set hits to (messages of targetBox whose \(whereClause))")
+            end timeout
+            set n to count of hits
+            if n is 0 then return "0"
+            \(check)
+            set firstSubject to (subject of item 1 of hits) as text
+            \(body)
+            return (n as text) & "|" & firstSubject
         end tell
         """
         do {
-            let raw = try await runAppleScript(source)
-            return mailMutationResult(raw, action: "deleted")
+            return mailMutationResult(try await runAppleScript(source), action: action)
         } catch let AppleScriptError.permissionDenied(app) {
             return deniedEnvelope(integration: "mail", app: app)
         } catch {
@@ -207,18 +172,26 @@ extension MacAppleScriptBridge {
     }
 
     static func mailMutationResult(_ raw: String, action: String) -> JSONValue {
-        guard let count = Int64(raw.trimmingCharacters(in: .whitespacesAndNewlines)), count >= 0 else {
+        let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        switch text {
+        case "0": return failedEnvelope(integration: "mail", reason: "no_matching_message")
+        case "-2": return failedEnvelope(integration: "mail", reason: "message_changed_or_moved_refresh_inbox")
+        case "__NO_ARCHIVE__": return failedEnvelope(integration: "mail", reason: "no_archive_mailbox")
+        default: break
+        }
+        let parts = text.split(separator: "|", maxSplits: 1, omittingEmptySubsequences: false)
+        if parts.first == "-3", parts.count == 2 {
+            return .object(["status": .string("failed"), "integration": .string("mail"), "reason": .string("several_messages_match"),
+                "message": .string("\(parts[1]) inbox messages have that subject, so nothing changed. Pass the message_id and expected_message_id from mail_list_recent, or add sender.")])
+        }
+        guard let count = Int64(parts.first ?? ""), count > 0 else {
             return .object([
                 "status": .string("outcome_unknown"), "action": .string(action),
                 "message": .string("I couldn't confirm what changed. Check Mail before trying again."),
             ])
         }
-        var result: [String: JSONValue] = [
-            "status": .string(count > 0 ? "completed" : "failed"),
-            "action": .string(action), "matched_count": .int(count),
-        ]
-        if count == 0 { result["message"] = .string("I couldn't find a matching message. Nothing changed.") }
-        return .object(result)
+        return .object(["status": .string("completed"), "action": .string(action), "matched_count": .int(count),
+                        "subject": .string(parts.count == 2 ? String(parts[1]) : "")])
     }
 
     /// Reply by exact inbox/message identity, or a unique subject/sender.
@@ -246,11 +219,14 @@ extension MacAppleScriptBridge {
         let subjectAS = escapeForAppleScript(subject)
         let bodyAS = escapeForAppleScript(body)
         let whereClause = exact.map { "id is \($0.id)" } ?? Self.mailMatchWhereClause(subjectAS: subjectAS, sender: sender)
-        let identityCheck = exact.map { "if ((message id of originalMsg) as text) is not \"\(escapeForAppleScript($0.messageID))\" then return \"-2\"" } ?? ""
+        let identityCheck = exact.map { mailIdentityCheck($0, list: "hits", fail: "-2") } ?? ""
         let replyAllPhrase = replyAll ? "with reply to all" : "without reply to all"
         let source = """
         tell application "Mail"
-            set hits to (messages of inbox whose \(whereClause))
+            \(mailAccountScope(exact?.account))
+            with timeout of 8 seconds
+                \(exact.map { mailExactLookup($0, into: "hits") } ?? "set hits to (messages of targetBox whose \(whereClause))")
+            end timeout
             if (count of hits) is 0 then return "0"
             if (count of hits) is not 1 then return "-2"
             set originalMsg to first item of hits

@@ -74,11 +74,15 @@ extension SwiftToolDispatcher {
         // means "no relevance filter" — every row is admitted at score 0 and
         // the sort falls through to recency, i.e. the tail of that session.
         let wholeSession = scope == "previous_session"
-        let rawQuery = wholeSession
+        // Likewise a session or time window with no query lists that window.
+        let window = wholeSession || ["session_id", "after", "before"].contains {
+            !(jsonString(input[$0]) ?? "").trimmingCharacters(in: .whitespaces).isEmpty
+        }
+        let rawQuery = window
             ? (jsonString(input["query"]) ?? "")
             : try requireString(input, "query")
         let query = rawQuery.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !query.isEmpty || wholeSession else {
+        guard !query.isEmpty || window else {
             throw AutonomyGateError.toolDenied(reason: "SwiftToolDispatcher: empty chat-history search query")
         }
         let requestedLimit = optionalInt(input, "limit") ?? 8
@@ -120,7 +124,11 @@ extension SwiftToolDispatcher {
             }
             let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !text.isEmpty else { return nil }
-            guard let date = fractionalTimestamp.date(from: text) ?? wholeTimestamp.date(from: text) else {
+            // A bare day ("2026-09-22") means its local midnight.
+            let day = ISO8601DateFormatter()
+            day.formatOptions = [.withFullDate]
+            day.timeZone = .current
+            guard let date = fractionalTimestamp.date(from: text) ?? wholeTimestamp.date(from: text) ?? day.date(from: text) else {
                 throw AutonomyGateError.toolDenied(reason: "Chat history '\(key)' must be an ISO8601 timestamp with a timezone.")
             }
             return date

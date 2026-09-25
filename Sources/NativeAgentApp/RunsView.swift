@@ -346,7 +346,7 @@ private struct RunRow: View {
                     }
                 }
                 .font(.caption)
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(NativeAgentShell.secondary)
             }
         }
         .padding(.vertical, 4)

@@ -504,7 +504,13 @@ enum FileSystemActions {
         var isDir: ObjCBool = false
         let exists = FileManager.default.fileExists(atPath: resolved.path, isDirectory: &isDir)
         if !exists { return errResult("File not found: \(resolved.path)", code: "file_not_found") }
-        if isDir.boolValue { return errResult("Not a file: \(resolved.path)", code: "file_not_found") }
+        if isDir.boolValue {
+            let pattern = stringField(input, "match")
+            guard !pattern.isEmpty else {
+                return errResult("Not a file: \(resolved.path). Pass match (e.g. \"*.png\") to read files in this folder.", code: "bad_input")
+            }
+            return readMatching(in: resolved, pattern: pattern, input: input, ctx)
+        }
 
         // Nonblocking open plus fstat precedes image decoding too: a FIFO
         // with an image extension must not block inside the pixel loader.
@@ -558,6 +564,40 @@ enum FileSystemActions {
             }
         } else if hasMore {
             result["continuation_note"] = .string("Nonregular source: stable byte continuation unavailable.")
+        }
+        return .object(result)
+    }
+
+    /// read_file on a folder with a glob: the first eight matching files by
+    /// name in one call, each through the ordinary single-file read (same
+    /// gates; images as pixels). Agent read UI frames one call per PNG.
+    static let folderReadLimit = 8
+
+    private static func readMatching(
+        in folder: URL, pattern: String, input: [String: JSONValue], _ ctx: ConnectorActionContext
+    ) -> JSONValue {
+        let names = ((try? FileManager.default.contentsOfDirectory(atPath: folder.path)) ?? [])
+            .filter { name in
+                var isDir: ObjCBool = false
+                return (!name.hasPrefix(".") || pattern.hasPrefix("."))
+                    && fnmatch(pattern, name, FNM_CASEFOLD) == 0
+                    && FileManager.default.fileExists(atPath: folder.appendingPathComponent(name).path, isDirectory: &isDir)
+                    && !isDir.boolValue
+            }
+            .sorted { $0.localizedStandardCompare($1) == .orderedAscending }
+        var single = input
+        single["match"] = nil; single["offset"] = nil; single["version"] = nil
+        let files: [JSONValue] = names.prefix(folderReadLimit).map { name in
+            single["path"] = .string(folder.appendingPathComponent(name).path)
+            return .object(["name": .string(name), "result": readFile(single, ctx)])
+        }
+        var result: [String: JSONValue] = [
+            "status": .string("ok"), "path": .string(folder.path), "match": .string(pattern),
+            "matched": .int(Int64(names.count)), "files": .array(files),
+        ]
+        if names.count > folderReadLimit {
+            result["omitted"] = .int(Int64(names.count - folderReadLimit))
+            result["note"] = .string("\(names.count - folderReadLimit) more matched; narrow match to read them.")
         }
         return .object(result)
     }

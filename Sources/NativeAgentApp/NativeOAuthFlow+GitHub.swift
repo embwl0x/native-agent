@@ -68,31 +68,65 @@ extension NativeOAuthFlow {
 
         do {
             try await credentialStore.saveToken(token, metadata: metadata, dataRoot: dataRoot)
-
-            _ = try await NativeClient.mutateConnectorRegistryEntry(
-                root: dataRoot,
-                provider: "github",
-                createIfMissing: true
-            ) { entry in
-                entry["id"] = .string("github")
-                entry["name"] = .string("GitHub")
-                entry["kind"] = .string("connector")
-                entry["description"] = .string("GitHub REST API connector using a local Personal Access Token.")
-                entry["enabled"] = .bool(true)
-                entry["registered"] = .bool(true)
-                entry["client_id_present"] = .bool(true)
-                entry["authState"] = .string("connected")
-                entry["healthStatus"] = .string("ok")
-                entry["connected"] = .bool(true)
-                entry["connected_at"] = .string(now)
-                entry["connectedAt"] = .string(now)
-            }
+            try await markGitHubConnected(
+                description: "GitHub REST API connector using a local Personal Access Token.",
+                at: now, dataRoot: dataRoot
+            )
         } catch {
             return OAuthFlowResult(ok: false,
                 error: "Could not save GitHub token: \(redact(error.localizedDescription))")
         }
 
         return OAuthFlowResult(ok: true, error: nil)
+    }
+
+    /// The device-flow half after the code is shown: wait for approval, check
+    /// the token with GitHub /user, save it to the Keychain, mark connected.
+    /// Returns the login on success. Token text never reaches the error.
+    static func completeGitHubDeviceFlow(
+        _ code: GitHubOAuthDeviceFlow.DeviceCode,
+        dataRoot: URL = PersistenceCore.defaultDataRoot(),
+        credentialStore: GitHubCredentialStore = .shared
+    ) async -> (result: OAuthFlowResult, login: String?) {
+        do {
+            let token = try await GitHubOAuthDeviceFlow.pollForToken(code)
+            let user = GitHubSavedUserFields(try await GitHubConnectorActions.validateToken(token.accessToken))
+            let now = isoBasic(Date())
+            try await credentialStore.saveOAuthToken(token, metadata: GitHubCredentialMetadata(
+                savedAt: now, validatedAt: now, login: user.login, name: user.name,
+                htmlURL: user.htmlURL, type: user.type, userID: user.userID
+            ), dataRoot: dataRoot)
+            try await markGitHubConnected(
+                description: "GitHub connector signed in with GitHub (OAuth device flow).",
+                at: now, dataRoot: dataRoot
+            )
+            return (OAuthFlowResult(ok: true, error: nil), user.login)
+        } catch is CancellationError {
+            return (OAuthFlowResult(ok: false, error: nil), nil)
+        } catch {
+            return (OAuthFlowResult(ok: false, error: redact(error.localizedDescription)), nil)
+        }
+    }
+
+    private static func markGitHubConnected(description: String, at now: String, dataRoot: URL) async throws {
+        _ = try await NativeClient.mutateConnectorRegistryEntry(
+            root: dataRoot,
+            provider: "github",
+            createIfMissing: true
+        ) { entry in
+            entry["id"] = .string("github")
+            entry["name"] = .string("GitHub")
+            entry["kind"] = .string("connector")
+            entry["description"] = .string(description)
+            entry["enabled"] = .bool(true)
+            entry["registered"] = .bool(true)
+            entry["client_id_present"] = .bool(true)
+            entry["authState"] = .string("connected")
+            entry["healthStatus"] = .string("ok")
+            entry["connected"] = .bool(true)
+            entry["connected_at"] = .string(now)
+            entry["connectedAt"] = .string(now)
+        }
     }
 
     static func loadGitHubToken(

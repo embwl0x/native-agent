@@ -25,8 +25,6 @@ struct TodayViewSnapshotTests {
                 VStack(alignment: .leading, spacing: 20) {
                     Text("Today").font(ShellType.display)
                     TodaySection(title: "What I did today", rows: rows, onReadDream: { _ in true })
-                    TodayRowCard(row: TodayRow(id: "dream", title: "I dreamed",
-                        line: "A garden after rain.", at: at))
                 }
                 .padding(24)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)

@@ -76,20 +76,33 @@ struct KGNativeStackHeader: View {
     let status: KGNativeStackStatus
     let totalEntities: Int
     let totalEdges: Int
+    /// A row inside the Advanced shell's alive group card: no material strip
+    /// of its own, and shell inks (the system tertiary fails on the haze).
+    var plain: Bool = false
     var body: some View {
-        HStack(spacing: 12) {
+        let quiet: Color = plain ? NativeAgentShell.secondary : .secondary
+        let strip = HStack(spacing: 12) {
             Text("\(totalEntities) entities").font(.caption.weight(.semibold))
-            Text("·").foregroundStyle(.tertiary)
+            Text("·").foregroundStyle(plain ? AnyShapeStyle(NativeAgentShell.secondary) : AnyShapeStyle(.tertiary))
             Text("\(totalEdges) relationships").font(.caption.weight(.semibold))
-            Text("·").foregroundStyle(.tertiary)
-            Text("last-updated \(Self.relative(status.lastUpdated))").font(.caption).foregroundStyle(.secondary)
+            Text("·").foregroundStyle(plain ? AnyShapeStyle(NativeAgentShell.secondary) : AnyShapeStyle(.tertiary))
+            Text("last-updated \(Self.relative(status.lastUpdated))").font(.caption).foregroundStyle(quiet)
             Spacer()
-            Label("\(status.sqliteEntities) SQLite", systemImage: "cylinder.split.1x2").font(.caption2)
-            Label("\(status.embeddingDim)d vectors", systemImage: "cpu").font(.caption2)
-            Label(status.cloudKitState, systemImage: "icloud").font(.caption2)
+            Group {
+                Label("\(status.sqliteEntities) SQLite", systemImage: "cylinder.split.1x2")
+                Label("\(status.embeddingDim)d vectors", systemImage: "cpu")
+                Label(status.cloudKitState, systemImage: "icloud")
+            }
+            .font(.caption2)
+            .foregroundStyle(plain ? AnyShapeStyle(NativeAgentShell.secondary) : AnyShapeStyle(.primary))
         }
-        .padding(.vertical, 6).padding(.horizontal, 10)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 8))
+        if plain {
+            strip.foregroundStyle(NativeAgentShell.text)
+        } else {
+            strip
+                .padding(.vertical, 6).padding(.horizontal, 10)
+                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 8))
+        }
     }
     private static func relative(_ date: Date?) -> String {
         guard let date else { return "—" }

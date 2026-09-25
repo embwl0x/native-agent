@@ -192,7 +192,9 @@ extension TelegramPollLoop {
         chatId: Int,
         text: String,
         threadId: Int? = nil,
-        session: URLSession = .shared,
+        // nil = the bounded reply session. `.shared` here overrode every bound
+        // (7-day resource timeout), so a stalled send could hold the chat lane.
+        session: URLSession? = nil,
         sleep: @escaping @Sendable (UInt64) async throws -> Void = { try await Task.sleep(nanoseconds: $0) }
     ) async throws {
         // Telegram hard-rejects messages over 4096 chars with HTTP 400 —
@@ -205,7 +207,7 @@ extension TelegramPollLoop {
                     token: token,
                     method: "sendMessage",
                     resultType: TelegramAPIMessageResult.self,
-                    session: session
+                    session: session ?? replySendSession
                 ) {
                     var body = _tgDestinationBody(
                         TelegramDestination(chatId: chatId, threadId: threadId)
@@ -278,6 +280,15 @@ extension TelegramPollLoop {
         let configuration = URLSessionConfiguration.default
         configuration.timeoutIntervalForRequest = 20
         configuration.timeoutIntervalForResource = 30
+        return URLSession(configuration: configuration)
+    }()
+
+    // Ordinary reply chunks: bounded, but roomier than the 30s delivery bound
+    // so a slow chunk mid-reply does not fail after earlier chunks landed.
+    private static let replySendSession: URLSession = {
+        let configuration = URLSessionConfiguration.default
+        configuration.timeoutIntervalForRequest = 60
+        configuration.timeoutIntervalForResource = 120
         return URLSession(configuration: configuration)
     }()
 

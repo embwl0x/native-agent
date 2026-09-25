@@ -174,30 +174,35 @@ enum QuietSelfAdminRender {
     // MARK: - The page, built offscreen
 
     @ViewBuilder
-    static func pageView(for page: QuietPage, appModel: AppModel) -> some View {
+    static func pageView(for page: QuietPage, appModel: AppModel, size: CGSize = defaultSize) -> some View {
         Group {
+            if QuietPages.drawOnly.contains(page) {
+                SimpleShellView()
+                    .environment(\.simpleSettingsMenuDrawnOpen, page.id == "simple_settings_menu")
+            } else {
             switch page.item {
             case .chat: ChatView()
             case .activity: TodayView()
             case .memories: MemoriesRailPage()
             case .desk: DeskPageView()
-            case .inboxPolicy: ShellRailPage(title: "Notifications", subtitle: SidebarItem.inboxPolicy.shellPageSubtitle) { InboxSettingsView() }
+            case .inboxPolicy: ShellRailPage(title: "Notifications", alive: true) { InboxSettingsView() }
             case .bots: BotsShelfPreviewPage()
             case .personality: PersonalityRailPage()
-            case .providers: ShellRailPage(title: "Providers", subtitle: SidebarItem.providers.shellPageSubtitle, wide: true) { ProviderSettingsView() }
+            case .providers: ShellRailPage(title: "Providers", subtitle: SidebarItem.providers.shellPageSubtitle, wide: true, alive: true) { ProviderSettingsView() }
             case .trust: TrustRailPage()
             case .connectors: ConnectorsRailPage()
-            case .capabilities: ShellRailPage(title: "Capabilities", subtitle: SidebarItem.capabilities.shellPageSubtitle) { CapabilitiesView() }
+            case .capabilities: ShellRailPage(title: "Capabilities", subtitle: SidebarItem.capabilities.shellPageSubtitle, alive: true) { CapabilitiesView() }
             case .diagnostics: DiagnosticsRailPage()
             case .settings: SetupView()
             default: EmptyView()
+            }
             }
         }
         .environment(appModel)
         // Nobody opened this page. Lifecycle work stays asleep (`liveTask` /
         // `liveOnAppear`), so a read cannot change what the page reports.
         .environment(\.quietOffscreenRead, true)
-        .frame(width: defaultSize.width, height: defaultSize.height)
+        .frame(width: size.width, height: size.height)
         // The room, drawn HERE and nowhere else in a quiet read.
         //
         // On the glass the ground is the window's job (`ShellFrame` draws
@@ -240,23 +245,24 @@ enum QuietSelfAdminRender {
     /// from a host that had never been through a display pass, which is why a
     /// screenshot came back as a title on an empty page.
     private static func withPreparedHost<T>(
-        for page: QuietPage, appModel: AppModel, _ body: (NSHostingView<AnyView>) -> T
+        for page: QuietPage, appModel: AppModel, size: CGSize = defaultSize,
+        _ body: (NSHostingView<AnyView>) -> T
     ) async -> T {
         await loadPageData(for: page, appModel: appModel)
 
         let hosting = NSHostingView(rootView: AnyView(
-            pageView(for: page, appModel: appModel)
+            pageView(for: page, appModel: appModel, size: size)
                 // A capture is one moment, so nothing is captured mid-animation.
                 .transaction { $0.animation = nil }
         ))
-        hosting.frame = CGRect(origin: .zero, size: defaultSize)
+        hosting.frame = CGRect(origin: .zero, size: size)
 
         // An unordered window. NSHostingView resolves accessibility and native
         // scroll geometry against a window; this one is created, used, and
         // released without ever being ordered in, made key, or given a level —
         // so it exists for AppKit and for nobody else.
         let host = NSWindow(
-            contentRect: CGRect(origin: .zero, size: defaultSize),
+            contentRect: CGRect(origin: .zero, size: size),
             styleMask: [.borderless],
             backing: .buffered,
             defer: true
@@ -307,17 +313,17 @@ enum QuietSelfAdminRender {
     /// grant, works while the app is behind other apps, and cannot capture
     /// anything that is not ours.
     static func pageImagePNG(
-        for page: QuietPage, appModel: AppModel
+        for page: QuietPage, appModel: AppModel, size: CGSize = defaultSize
     ) async -> (data: Data, width: Int, height: Int)? {
-        await withPreparedHost(for: page, appModel: appModel) { hosting in
+        await withPreparedHost(for: page, appModel: appModel, size: size) { hosting in
             // 1x: a retina page doubles the bytes for detail a model does not read.
             guard let bitmap = NSBitmapImageRep(
                 bitmapDataPlanes: nil,
-                pixelsWide: Int(defaultSize.width), pixelsHigh: Int(defaultSize.height),
+                pixelsWide: Int(size.width), pixelsHigh: Int(size.height),
                 bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
                 colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0
             ) else { return nil }
-            bitmap.size = defaultSize
+            bitmap.size = size
             hosting.cacheDisplay(in: hosting.bounds, to: bitmap)
             guard let data = bitmap.representation(using: .png, properties: [:]) else { return nil }
             return (data, bitmap.pixelsWide, bitmap.pixelsHigh)
@@ -631,8 +637,10 @@ extension QuietSelfAdminRender {
             let descriptor = InlineInteractionResolver.descriptor(
                 for: pair.interaction, dataRoot: root
             )
+            // The same live read as the glass: done elsewhere reads as done.
             let card = InlineCardProjection.model(
-                pair.interaction, descriptor: descriptor,
+                await InlineInteractionResolver.liveProjection(pair.interaction, dataRoot: root),
+                descriptor: descriptor,
                 repeatCount: collapsed.counts[pair.interaction.id] ?? 1
             )
             // The glass does not draw a settled card as a card. It draws ONE
@@ -703,9 +711,10 @@ extension QuietSelfAdminRender {
                 )
             }
             if let note = card.persistenceNote { lines.append(note) }
-            if let field = card.field {
+            if let signIn = card.signInLabel { lines.append("Offers: \(signIn)") }
+            for field in card.fields {
                 lines.append(
-                    "Takes: \(field.label)\(field.isSecret ? " (secret — pass it as `value`)" : "")"
+                    "Takes: \(field.label)\(field.isSecret ? " (secret — the person types it into the card, never into chat)" : "")"
                 )
             }
             for choice in card.choices {

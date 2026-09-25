@@ -22,7 +22,24 @@ extension MacFourVerbs {
         case none(nearest: [String])
     }
 
-    static func resolve(_ target: String, among targets: [ActTarget]) -> Resolution {
+    /// `actionable` (every verb but scroll): when a control and a container
+    /// (sheet, window, group, any region) share the name, the control wins.
+    static func resolve(_ target: String, among targets: [ActTarget], actionable: Bool = true) -> Resolution {
+        // Her-screen 09-24 — a symbol names the control whose AX label is its
+        // word (Calculator's "=" is the button "Equals"). Only when no AX
+        // control carries the symbol itself; an AX control beats a pixel guess
+        // of the same glyph.
+        if let words = symbolAliasWords(target) {
+            let raw = target.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            if !targets.contains(where: { !$0.isSupplemental && ($0.label ?? "").lowercased() == raw }) {
+                let aliased = targets.filter { !$0.isSupplemental && words.contains(normalize($0.label ?? "")) }
+                if aliased.count == 1 { return .hit(aliased[0]) }
+                if aliased.count > 1 { return .ambiguous(aliased) }
+            }
+        }
+        // A handle straight from `screen` names exactly that target.
+        let asHandle = target.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let byHandle = targets.first(where: { $0.handle == asHandle }) { return .hit(byHandle) }
         let hint = roleHint(in: target)
         let identityTarget = stripWithinTargetAimQualifier(target)
         let qualifier = trailingRoleQualifier(in: identityTarget)
@@ -57,12 +74,68 @@ extension MacFourVerbs {
                let index = spans.firstIndex(of: best) {
                 return candidates[index]
             }
-            let controls: Set<String> = ["button", "link", "radio", "tab", "checkbox"]
-            let plain: Set<String> = ["text", "group", "window", "web area"]
+            let controls: Set<String> = ["button", "link", "radio", "tab", "checkbox", "menu item"]
+            let plain: Set<String> = ["text", "group", "window", "web area", "sheet"]
             let picked = candidates.filter { controls.contains($0.kind) }
+            // Her-screen 09-24 — a window's title repeated by its own
+            // descendants (TextEdit's ruler row, scroll area) names the window.
+            let windows = candidates.filter { $0.kind == "window" }
+            if picked.isEmpty, windows.count == 1 {
+                let window = windows[0]
+                let title = normalize(window.label ?? "")
+                let repeats = candidates.allSatisfy { candidate in
+                    guard candidate != window else { return true }
+                    guard normalize(candidate.label ?? "") == title else { return false }
+                    guard let root = window.sourceAXPath, let path = candidate.sourceAXPath else { return true }
+                    return path.count > root.count && Array(path.prefix(root.count)) == root
+                }
+                if !title.isEmpty, repeats { return window }
+            }
+            // Two actionable controls tying is still a question, never a pick.
             guard picked.count == 1,
-                  candidates.allSatisfy({ controls.contains($0.kind) || plain.contains($0.kind) }) else { return nil }
+                  candidates.allSatisfy({
+                      controls.contains($0.kind) || plain.contains($0.kind) || (actionable && $0.regionOnly)
+                  }) else { return nil }
             return picked[0]
+        }
+
+        // Her-screen 09-24 — a bare number. A real (AX) control literally
+        // named it wins (Calculator's "1" key); else it is the row the render
+        // numbered it. A pixel/OCR "1" is only a last resort when neither
+        // exists (the exact rungs below), never over a numbered row.
+        // Content rows (ordinal set) are not "controls named 1": a row 2
+        // labeled "1" must not beat numbered row 1.
+        if hint == nil, qualifier == nil, let number = Int(needle) {
+            if let hit = narrow(targets.filter {
+                !$0.isSupplemental && $0.ordinal == nil && normalize($0.label ?? "") == needle
+            }) {
+                return hit
+            }
+            if let hit = narrow(targets.filter { $0.ordinal == number }) { return hit }
+        }
+
+        // 3. ordinal. A bare ordinal, `row N` and `item N` mean the visible
+        // content-row number (`item N` falls back to list items by role only
+        // when no row has that number). Every other role uses its own visible
+        // ordinal, so repeated unlabeled buttons, tabs, text areas, and
+        // landmarks have an honest natural address.
+        func ordinalHit() -> Resolution? {
+            guard let ordinal = ordinalAddress(in: target) else { return nil }
+            if hint == nil || hint == "row" || hint == "item",
+               let hit = narrow(targets.filter { $0.ordinal == ordinal }) {
+                return hit
+            }
+            if let hint, let hit = narrow(targets.filter { $0.kind == hint && $0.roleOrdinal == ordinal }) {
+                return hit
+            }
+            return nil
+        }
+        // A pure `row 1` / `item 1` address is the numbered row before any
+        // label match (a row 2 labeled "Row 1", or "Row 12", must not win).
+        let words = needle.split(separator: " ")
+        if words.count == 2, ordinalNouns.contains(String(words[0])), Int(words[1]) != nil,
+           let hit = ordinalHit() {
+            return hit
         }
 
         // A region's rendered kind is itself a valid name ("web area",
@@ -118,13 +191,20 @@ extension MacFourVerbs {
         if let hit = narrow(targets.filter { normalize($0.label ?? "") == needle && !needle.isEmpty }) {
             return hit
         }
-        // 2. contains
+        // A short or numeric name is exact-only (her-screen 09-23: "7" became
+        // row 7 = the Apple menu, "6" became Help). No fuzzy rung, and a bare
+        // number is not an ordinal — "row 7" / "button 7" still are.
+        if isExactOnlyName(needle) {
+            return .none(nearest: nearest(to: needle, among: targets))
+        }
+        // 2. contains — whole phrases only, both sides at least three
+        //    characters, so a fragment never drifts onto an unrelated control.
         let contains = targets.filter { candidate in
             guard !needle.isEmpty else { return false }
             let labelMatches: Bool = {
                 guard let label = candidate.label else { return false }
                 let normalized = normalize(label)
-                return !normalized.isEmpty
+                return normalized.count >= 3
                     && (normalized.contains(needle) || needle.contains(normalized))
             }()
             let aliasMatches = candidate.aliases.contains { alias in
@@ -137,27 +217,80 @@ extension MacFourVerbs {
             return labelMatches || aliasMatches
         }
         if let hit = narrow(contains) { return hit }
-        // 3. ordinal. A bare ordinal and `row N` mean the visible content-row
-        // number. Every other role uses its own visible ordinal, so repeated
-        // unlabeled buttons, tabs, text areas, and landmarks have an honest
-        // natural address.
-        if let ordinal = ordinalAddress(in: target) {
-            if hint == "row",
-               let hit = narrow(targets.filter { $0.ordinal == ordinal }) {
-                return hit
-            }
-            if let hint,
-               let hit = narrow(targets.filter {
-                   $0.kind == hint && $0.roleOrdinal == ordinal
-               }) {
-                return hit
-            }
-            if hint == nil,
-               let hit = narrow(targets.filter { $0.ordinal == ordinal }) {
-                return hit
-            }
-        }
+        if let hit = ordinalHit() { return hit }
         return .none(nearest: nearest(to: needle, among: targets))
+    }
+
+    /// Her-screen 09-23 — does the element acted on ANSWER to what was asked?
+    /// Independent of which resolver rung picked it: an explicit address
+    /// ("row 3", "button 2 Remove"), an exact alias or kind, the exact label,
+    /// or a whole-phrase containment of at least three characters. "7" is never
+    /// answered by "Apple".
+    static func answers(_ target: String, _ candidate: ActTarget) -> Bool {
+        if candidate.handle == target.trimmingCharacters(in: .whitespacesAndNewlines) { return true }
+        if let words = symbolAliasWords(target), words.contains(normalize(candidate.label ?? "")) { return true }
+        let identity = stripWithinTargetAimQualifier(target)
+        if labeledOrdinalAddress(in: identity) != nil { return true }
+        let asked = trailingRoleQualifier(in: identity)?.label ?? normalize(stripRoleWords(identity))
+        if !isExactOnlyName(asked), ordinalAddress(in: identity) != nil { return true }
+        // A bare number answers to the row the render numbered with it.
+        if let number = Int(asked), candidate.ordinal == number { return true }
+        let whole = normalize(identity)
+        if candidate.aliases.contains(where: { normalize($0) == whole }) || candidate.kind == whole { return true }
+        let label = normalize(candidate.label ?? "")
+        if asked.isEmpty { return roleHint(in: identity) == candidate.kind }
+        if label == asked || label == whole { return true }
+        // The label must answer the WHOLE request: "Delete" does not answer
+        // "Delete selected file" (a label inside a longer request is refused).
+        guard !isExactOnlyName(asked) else { return false }
+        if label.count >= 3, label.contains(asked) { return true }
+        return candidate.aliases.contains { normalize($0).contains(asked) }
+    }
+
+    /// A bare number that took a control while the render ALSO numbered a row
+    /// with it: say which was taken and how to name the other.
+    static func bareNumberNote(_ target: String, chose candidate: ActTarget, among targets: [ActTarget]) -> String? {
+        let asked = normalize(target)
+        guard let number = Int(asked), candidate.ordinal != number,
+              let row = targets.first(where: { $0.ordinal == number && $0 != candidate }) else { return nil }
+        return "(\"\(asked)\" is the control named \(asked); row \(number) is \((row.label ?? "").isEmpty ? "unlabeled" : name(row)) — say \"row \(number)\" for that.)"
+    }
+
+    /// Symbols and key caps → the words apps label those controls with.
+    static let symbolAliases: [String: Set<String>] = [
+        "=": ["equals", "equal"],
+        "×": ["multiply", "times"], "*": ["multiply", "times"], "x": ["multiply", "times"],
+        "÷": ["divide"], "/": ["divide"],
+        "+": ["add", "plus"],
+        "−": ["subtract", "minus"], "-": ["subtract", "minus"],
+        "ac": ["all clear", "clear"], "c": ["clear", "all clear"],
+        "%": ["percent"],
+        "±": ["negate", "change sign"], "+/-": ["negate", "change sign"], "+/−": ["negate", "change sign"],
+        ".": ["decimal", "point", "decimal point"],
+    ]
+
+    static func symbolAliasWords(_ target: String) -> Set<String>? {
+        symbolAliases[target.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()]
+    }
+
+    /// `press cmd+s`, `press return`, `press key w` are keys; `press Save` and
+    /// `press 7` are controls. Named keys that are also common button names
+    /// (Delete, Help, Home, End) stay controls — `key delete` reaches the key.
+    static func pressMeansKey(_ target: String) -> Bool {
+        if keySpec(target) != nil { return true }
+        // `press +` / `press =` mean the button; `key +` still reaches the key.
+        if symbolAliasWords(target) != nil { return false }
+        let tokens = target.split(whereSeparator: { $0.isWhitespace }).map { $0.lowercased() }
+        guard !tokens.isEmpty, (try? MacKeySyntax.parseChords(target)) != nil else { return false }
+        let buttonNames: Set<String> = ["delete", "backspace", "del", "help", "home", "end"]
+        return tokens.allSatisfy { $0.contains("+") || (MacKeySyntax.namedKeys[$0] != nil && !buttonNames.contains($0)) }
+    }
+
+    /// Too short or too numeric to be matched by anything but its exact name:
+    /// one or two characters, or digits/operators only ("7", "×", "12.5").
+    static func isExactOnlyName(_ needle: String) -> Bool {
+        guard !needle.isEmpty else { return false }
+        return needle.count <= 2 || needle.allSatisfy { $0.isNumber || $0.isPunctuation || $0.isSymbol || $0 == " " }
     }
 
     static func isPotentialDynamicVisualReference(_ target: String) -> Bool {
@@ -211,7 +344,7 @@ extension MacFourVerbs {
             if matches.count == 1, let match = matches.first { return .hit(match) }
             if matches.count > 1 { return .ambiguous(matches) }
         }
-        return resolve(target, among: targets)
+        return resolve(target, among: targets, actionable: false)
     }
 
     /// What she DID see, so a miss is a fact she can act on rather than a dead
@@ -246,7 +379,7 @@ extension MacFourVerbs {
     static func normalize(_ text: String) -> String {
         var value = text.lowercased()
             .trimmingCharacters(in: .whitespacesAndNewlines)
-            .trimmingCharacters(in: CharacterSet(charactersIn: ".,:;!?\"'"))
+            .trimmingCharacters(in: CharacterSet(charactersIn: ".,:;!?\"'…"))
             .replacingOccurrences(of: "(", with: " ")
             .replacingOccurrences(of: ")", with: " ")
         for article in ["the ", "a ", "an "] where value.hasPrefix(article) {

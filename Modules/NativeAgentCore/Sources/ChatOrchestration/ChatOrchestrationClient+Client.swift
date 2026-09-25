@@ -79,6 +79,12 @@ public actor SwiftNativeChatOrchestrationClient: ChatOrchestrationClient {
         autocompactionConfig: ChatSessionAutocompactionConfig = .productionDefault(),
         clock: @escaping @Sendable () -> Date = { Date() }
     ) {
+        // The tool-call guard lets a read recur in one reply but never an
+        // action: parallel-safe tools are reads, and a bare `workspace` call
+        // is her home screen.
+        RunawayOutputDetector.registerReadOnlyCalls { name, bare in
+            ParallelToolDispatch.isParallelSafe(internalToolName: name) || (name == "workspace" && bare)
+        }
         self.engine = engine
         self.tools = tools
         self.llm = llm

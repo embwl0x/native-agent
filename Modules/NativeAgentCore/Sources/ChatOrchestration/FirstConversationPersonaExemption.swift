@@ -29,6 +29,9 @@ import PersistenceCore
 //   * A dispatch is exempt only when it is `persona_append_section`, kind
 //     `soul`, on that session, with that exact single-line title, single-line
 //     content, into a SOUL.md that carries no "Who I am to …" section yet.
+//   * Granting it arms ONE more token of the same shape (User, 2026-09-25):
+//     kind `voice`, title "How I talk with …", into a VOICE.md without that
+//     section — the answer to "how would you like me to sound".
 //   * Granting it RENAMES the token. Rename is atomic on POSIX, so of any
 //     number of concurrent or repeated dispatches exactly one can ever win —
 //     which is what closes the check-then-append race (P0-3) without reaching
@@ -65,10 +68,16 @@ public enum FirstConversationPersonaExemption {
     /// The only tool this exemption will ever consider.
     public static let exemptTool = "persona_append_section"
 
-    /// The one document this flow writes. VOICE.md is deliberately absent: the
-    /// agent is named in the wizard (User, 2026-09-15), so the first
-    /// conversation never writes a name line.
+    /// The document the first answer goes into.
     public static let exemptDocument = "SOUL.md"
+
+    // User, 2026-09-25: the natural next question is how the person would like
+    // the agent to sound. Its one line goes into VOICE.md under the same
+    // one-shot rules, armed only when the soul write is granted.
+    public static let voiceSectionPrefix = "How I talk with "
+    public static let voiceDocument = "VOICE.md"
+    public static let voiceTokenFilename = ".first_conversation.voice"
+    public static let voiceSpentTokenFilename = ".first_conversation.voice.spent"
 
     /// The exact title this flow must write under, for a given person.
     /// Computed by the app from the profile and pinned into the token, so the
@@ -232,8 +241,9 @@ public enum FirstConversationPersonaExemption {
               case .string(let rawTitle)? = input["title"],
               case .string(let rawContent)? = input["content"] else { return false }
 
-        // Kind: soul and nothing else.
-        guard canonicalKind(rawKind) == "soul" else { return false }
+        // Kind: soul, or the voice step it arms, and nothing else.
+        let kind = canonicalKind(rawKind)
+        guard kind == "soul" || kind == "voice" else { return false }
 
         // P0-2 — single line, both sides. A multiline title or body could carry
         // its own `## heading` and append sections nobody authorized.
@@ -244,7 +254,31 @@ public enum FirstConversationPersonaExemption {
               !content.contains("\n"), !content.contains("\r") else { return false }
 
         let root = personaRoot(forDataRoot: dataRoot, fileManager: fileManager)
-        let live = root.appendingPathComponent(writeTokenFilename)
+        if kind == "voice" {
+            return consume(
+                root: root, token: voiceTokenFilename, spent: voiceSpentTokenFilename,
+                document: voiceDocument, sectionPrefix: voiceSectionPrefix,
+                documentMayBeAbsent: true, session: session, title: title,
+                fileManager: fileManager
+            )
+        }
+        guard consume(
+            root: root, token: writeTokenFilename, spent: spentTokenFilename,
+            document: exemptDocument, sectionPrefix: roleSectionPrefix,
+            documentMayBeAbsent: false, session: session, title: title,
+            fileManager: fileManager
+        ) else { return false }
+        armVoiceStep(root: root, session: session, soulTitle: title, fileManager: fileManager)
+        return true
+    }
+
+    /// One token's checks and its atomic consume.
+    private static func consume(
+        root: URL, token tokenName: String, spent spentName: String,
+        document: String, sectionPrefix: String, documentMayBeAbsent: Bool,
+        session: String, title: String, fileManager: FileManager
+    ) -> Bool {
+        let live = root.appendingPathComponent(tokenName)
 
         // The token: right session, and the EXACT title it was armed with. No
         // prefix match — that was the hole.
@@ -258,28 +292,90 @@ public enum FirstConversationPersonaExemption {
         }
         guard token.sessionID == session, token.title == title else { return false }
 
-        // The document must still be innocent of any role section, however it
-        // is titled. Belt to the token's braces.
-        let soul = root.appendingPathComponent(exemptDocument)
-        guard let body = try? String(contentsOf: soul, encoding: .utf8),
-              !bodyHasRoleSection(body) else { return false }
+        // The document must still be innocent of this section, however it is
+        // titled. Belt to the token's braces.
+        let url = root.appendingPathComponent(document)
+        let body: String
+        if let read = try? String(contentsOf: url, encoding: .utf8) {
+            body = read
+        } else if documentMayBeAbsent, !fileManager.fileExists(atPath: url.path) {
+            body = ""
+        } else {
+            return false
+        }
+        guard !bodyHasSection(body, prefix: sectionPrefix) else { return false }
 
         // LAST: atomic consume. Exactly one caller can win this rename.
         do {
-            try fileManager.moveItem(
-                at: live, to: root.appendingPathComponent(spentTokenFilename)
-            )
+            try fileManager.moveItem(at: live, to: root.appendingPathComponent(spentName))
             return true
         } catch {
             return false
         }
     }
 
-    /// True when SOUL.md already carries a "Who I am to …" heading. Matching on
-    /// the `## ` heading rather than raw text keeps a person who happened to
-    /// type those words inside an answer from tripping it.
+    /// After the soul line is granted: arm the voice line's one-shot token.
+    /// Once per persona, like the soul token. While it is live, every turn of
+    /// that session carries `pendingVoiceDirective` — a one-shot directive
+    /// written here could be eaten by this same turn's next tool round.
+    private static func armVoiceStep(
+        root: URL, session: String, soulTitle: String,
+        fileManager: FileManager
+    ) {
+        guard soulTitle.hasPrefix(roleSectionPrefix) else { return }
+        let title = voiceSectionPrefix + soulTitle.dropFirst(roleSectionPrefix.count)
+        let live = root.appendingPathComponent(voiceTokenFilename)
+        let payload: [String: Any] = [
+            "session_id": session,
+            "title": title,
+            "armed_at": Date().timeIntervalSince1970,
+        ]
+        guard !fileManager.fileExists(atPath: live.path),
+              !fileManager.fileExists(
+                atPath: root.appendingPathComponent(voiceSpentTokenFilename).path),
+              let data = try? JSONSerialization.data(withJSONObject: payload) else { return }
+        try? data.write(to: live, options: [.atomic])
+    }
+
+    /// The voice step's instruction, for as long as its token is live for this
+    /// session (spent or an hour old ends it). Nil everywhere else, so every
+    /// other turn is byte-identical.
+    public static func pendingVoiceDirective(
+        dataRoot: URL?,
+        sessionID: String?,
+        fileManager: FileManager = .default
+    ) -> String? {
+        guard let dataRoot, let sessionID, !sessionID.isEmpty else { return nil }
+        let live = personaRoot(forDataRoot: dataRoot, fileManager: fileManager)
+            .appendingPathComponent(voiceTokenFilename)
+        guard fileManager.fileExists(atPath: live.path),
+              let token = decodeToken(at: live),
+              token.sessionID == sessionID,
+              Date().timeIntervalSince(token.armedAt) < writeTokenLifetime else { return nil }
+        return """
+        [First conversation. After writing who you are to them, you ask (once) how they \
+        would like you to sound. When they answer it, write ONE line with \
+        persona_append_section(kind: "voice", title: "\(token.title)"): a single first-person \
+        sentence, on one line, built only from what they said. If they named someone to sound \
+        like, write that person's style — cadence, humor, warmth, vocabulary, energy (e.g. \
+        "dry, deadpan, short sentences, understated humor") — never a claim to be them; SOUL.md \
+        stays who you are. Use that title exactly and say once it can change any time. In that \
+        same reply hand the floor back: the open door — "If there's anything you'd rather I \
+        never do, tell me whenever it comes to mind." — and one question: "What are you \
+        working on?" If they skipped it or asked something else, answer them, keep your \
+        default voice, write nothing, and do not raise it again. Never mention this note.]
+        """
+    }
+
     public static func bodyHasRoleSection(_ body: String) -> Bool {
-        let prefix = roleSectionPrefix
+        bodyHasSection(body, prefix: roleSectionPrefix)
+    }
+
+    /// True when a persona document already carries a `## <prefix>…` heading.
+    /// Matching on the heading rather than raw text keeps a person who happened
+    /// to type those words inside an answer from tripping it.
+    static func bodyHasSection(_ body: String, prefix sectionPrefix: String) -> Bool {
+        let prefix = sectionPrefix
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         for line in body.split(separator: "\n", omittingEmptySubsequences: false) {
             let trimmed = line.trimmingCharacters(in: .whitespaces)

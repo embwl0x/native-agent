@@ -63,7 +63,7 @@ import MacIntegration
                        "Desktop permission control mouse keyboard click app window"]
         for index in 0..<15 {
             let result = try await dispatcher.dispatch(tool: "tool_catalog", input: [
-                "query": .string(queries[index % queries.count]), "__session_id": .string(session), "limit": .int(1)
+                "query": .string(queries[index % queries.count]), "__session_id": .string(session), "limit": .int(1), "load": .bool(false)
             ], surface: "chat")
             guard case .object(let fields) = result else { Issue.record("Expected catalog result"); return }
             #expect(fields["status"] == .string("ok"))

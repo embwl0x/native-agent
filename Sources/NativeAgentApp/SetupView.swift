@@ -95,9 +95,14 @@ struct ShellPageFrame<Content: View>: View {
     /// User, 2026-09-04: Providers is two columns of controls; at the 920
     /// measure its model menu had no width left. A wide page takes the room.
     var wide: Bool = false
+    /// Alive glass (User, 2026-09-23): the serif header, whose one sentence the
+    /// page's content hands up through `alivePageLine`, in place of the
+    /// display title and the fixed subtitle.
+    var alive: Bool = false
     @ViewBuilder var content: Content
 
     @Environment(\.dismiss) private var dismiss
+    @State private var aliveLine: AlivePageLine?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -122,27 +127,37 @@ struct ShellPageFrame<Content: View>: View {
                 .accessibilityIdentifier("shell.page.back")
             }
 
-            Text(title)
-                .font(ShellType.display)
-                .foregroundStyle(NativeAgentShell.text)
-                .padding(.top, 6)
-                .padding(.bottom, subtitle == nil ? 14 : 4)
-                .accessibilityAddTraits(.isHeader)
+            if alive {
+                AlivePageHeader(title: title, line: aliveLine?.text ?? subtitle,
+                                lineID: aliveLine?.id ?? "shell.page.subtitle")
+                    .padding(.top, showsBack ? 6 : 0)
+            } else {
+                Text(title)
+                    .font(ShellType.display)
+                    .foregroundStyle(NativeAgentShell.text)
+                    .padding(.top, 6)
+                    .padding(.bottom, subtitle == nil ? 14 : 4)
+                    .accessibilityAddTraits(.isHeader)
 
-            if let subtitle {
-                Text(subtitle)
-                    .font(ShellType.labelMedium)
-                    .foregroundStyle(NativeAgentShell.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .padding(.bottom, 14)
-                    .accessibilityIdentifier("shell.page.subtitle")
+                if let subtitle {
+                    Text(subtitle)
+                        .font(ShellType.labelMedium)
+                        .foregroundStyle(NativeAgentShell.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(.bottom, 14)
+                        .accessibilityIdentifier("shell.page.subtitle")
+                }
             }
 
             content
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                // The header's 20pt gap, as a soft edge scrolled rows fade
+                // across rather than a line that slices them.
+                .aliveTopDissolve(alive ? 20 : 0)
         }
         .padding(.horizontal, 20)
-        .padding(.top, 20)
+        .padding(.top, alive && !showsBack ? TodayMetrics.topPadding : 20)
+        .onPreferenceChange(AlivePageLineKey.self) { aliveLine = $0 }
         .frame(maxWidth: wide ? .infinity : TodayMetrics.contentWidth, alignment: .leading)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         // The pages' own Lists and Forms paint a slab by default; this is the
@@ -150,8 +165,8 @@ struct ShellPageFrame<Content: View>: View {
         .scrollContentBackground(.hidden)
         // User, 2026-09-03: the frame used to tint the whole page teal, so every
         // bordered button on every Advanced page wore the waiting colour. The
-        // teal has one job. Buttons take the text colour; the switches that
-        // are meant to be teal set it themselves.
+        // teal has one job. Buttons take the text colour; a control with an
+        // "on" state wears the haze itself (`hazeTinted`, WindowHaze.swift).
         .tint(NativeAgentShell.text)
         .background { ShellRoomBackdrop() }
         // The NavigationStack still owns the back gesture; only its chrome is
@@ -171,10 +186,15 @@ struct SetupRouteView: View {
     @State private var skillsSection: SkillsToolsSection = .skills
 
     var body: some View {
-        ShellPageFrame(title: route.displayName, backLabel: backLabel) {
+        ShellPageFrame(title: route.displayName, backLabel: backLabel, alive: route == .inboxPolicy || Self.aliveRoutes.contains(route)) {
             page
         }
     }
+
+    /// The settings-type pages rebuilt in the Alive style (2026-09-23).
+    private static let aliveRoutes: Set<SetupRoute> = [
+        .providers, .trust, .personality, .connectors, .capabilities, .diagnostics, .minds,
+    ]
 
     @ViewBuilder
     private var page: some View {
@@ -257,30 +277,40 @@ struct SetupView: View {
     var body: some View {
         NavigationStack {
             ScrollView {
-                VStack(alignment: .leading, spacing: 22) {
-                    header
-                    fourThings
-                    // User, 2026-09-04: "a switch for each of her features,
-                    // all here, simple." One card per feature, wired to the
-                    // key the feature actually reads (SetupFeatureRows).
+                // Alive glass (2026-09-23): the page's sections, each ONE
+                // group card of rows under an eyebrow, where every setting
+                // used to be its own card.
+                VStack(alignment: .leading, spacing: AliveMetrics.sectionSpacing) {
+                    AlivePageHeader(
+                        title: appModel.agentDisplayName,
+                        line: "Four things make up who I am. Everything else I carry is below."
+                    )
+                    .accessibilityElement(children: .combine)
+                    section("Four things") { fourThings }
                     // User, 2026-09-05: the everyday controls come first; the
                     // fourteen feature switches sit below them.
-                    sectionLabel("And the rest")
-                    postureRow
-                    mindRow
-                    // User's call, 2026-09-02: the switch a person flips most
-                    // sits above the connection cards.
-                    appearanceRow
-                    connectionCards
-                    // User, 2026-09-04: no All settings door. What lived there
-                    // is here, as cards (SetupRestRows).
-                    SetupRestRows()
-                    sectionLabel("Inner life and memory")
+                    section("And the rest") {
+                        postureRow
+                        mindRow
+                        // User's call, 2026-09-02: the switch a person flips
+                        // most sits above the connection rows.
+                        appearanceRow
+                        // User, 2026-09-04: no All settings door. What lived
+                        // there is here, as rows (SetupRestRows).
+                        SetupRestRows(part: .everyday)
+                    }
+                    section("Connections") { connectionRows }
+                    SetupRestRows(part: .app)
+                    // User, 2026-09-04: "a switch for each of her features,
+                    // all here, simple." One row per feature, wired to the
+                    // key the feature actually reads (SetupFeatureRows).
                     SetupFeatureRows()
                 }
-                .frame(maxWidth: 920, alignment: .leading)
-                .frame(maxWidth: .infinity, alignment: .center)
-                .padding(16)
+                .padding(.horizontal, 20)
+                .padding(.top, TodayMetrics.topPadding)
+                .padding(.bottom, 32)
+                .frame(maxWidth: TodayMetrics.contentWidth, alignment: .leading)
+                .frame(maxWidth: .infinity)
             }
             .navigationTitle("Settings")
             // The registration sits at the root and is unconditional, so a
@@ -316,95 +346,79 @@ struct SetupView: View {
 
     // MARK: Header
 
-    private func sectionLabel(_ text: String) -> some View {
-        Text(text)
-            .font(ShellType.labelSemibold)
-            .foregroundStyle(.secondary)
-            .textCase(.uppercase)
-            .padding(.top, 6)
-    }
-
-    private var header: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(appModel.agentDisplayName)
-                .font(NativeAgentFont.display)
-            Text("Four things make up \(voice.object). Everything else \(voice.subject) \(voice.verb("carry")) is below.")
-                .font(ShellType.labelMedium)
-                .foregroundStyle(NativeAgentShell.secondary)
-        }
-        .accessibilityElement(children: .combine)
+    private func section<Rows: View>(_ title: String, @ViewBuilder rows: () -> Rows) -> some View {
+        SetupSection(title: title, rows: rows)
     }
 
     // MARK: The four things
 
+    @ViewBuilder
     private var fourThings: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            SetupSwitchCard(
-                title: "An inner life",
-                sentence: "\(voice.Subject) \(voice.verb("feel")), \(voice.verb("remember")) what happened, and \(voice.verb("carry")) it between conversations. On, it also turns on reflection, moods, and memory in every reply below.",
-                isOn: Binding(
-                    get: { subconsciousEnabled },
-                    set: { enabled in Task { await setInnerLife(enabled) } }
-                ),
-                disabled: savingInnerLife
-            ) {
-                // ONE MIND ON THIS PAGE. The reflection-mind picker moved to
-                // Advanced ▸ minds (SetupMindsView); this card is a switch.
-                if let innerLifeError {
-                    Text(innerLifeError)
-                        .font(ShellType.labelMedium)
-                        .foregroundStyle(.orange)
-                        .textSelection(.enabled)
-                        .padding(.top, 8)
-                }
+        SetupSwitchCard(
+            title: "An inner life",
+            sentence: "I feel, remember what happened, and carry it between conversations. On, this also turns on reflection, moods, and memory in every reply below.",
+            isOn: Binding(
+                get: { subconsciousEnabled },
+                set: { enabled in Task { await setInnerLife(enabled) } }
+            ),
+            disabled: savingInnerLife
+        ) {
+            // ONE MIND ON THIS PAGE. The reflection-mind picker moved to
+            // Advanced ▸ minds (SetupMindsView); this card is a switch.
+            if let innerLifeError {
+                Text(innerLifeError)
+                    .font(ShellType.labelMedium)
+                    .foregroundStyle(.orange)
+                    .textSelection(.enabled)
+                    .padding(.top, 8)
             }
-
-            SetupSwitchCard(
-                title: "Moments \(voice.subject) \(voice.verb("keep"))",
-                sentence: "Small things that happened between you. \(voice.Subject) picks which stay.",
-                isOn: Binding(
-                    get: { momentsEnabled },
-                    set: { enabled in
-                        momentsEnabled = enabled
-                        appModel.statusText = enabled
-                            ? "\(appModel.agentDisplayName) keeps moments again"
-                            : "\(appModel.agentDisplayName) is no longer keeping moments"
-                    }
-                )
-            )
-
-            SetupSwitchCard(
-                title: "\(voice.Possessive) hour",
-                sentence: "Once a day, when nothing is happening, an hour with no task set.",
-                isOn: Binding(
-                    get: { studioWanderEnabled },
-                    set: { enabled in
-                        studioWanderEnabled = enabled
-                        Task { await NativeCognitionRuntime.reloadStudioWanderInstallation() }
-                    }
-                ),
-                // The hour is background cognition and cannot outlive the
-                // inner life, exactly as the old switch could not.
-                disabled: savingInnerLife || !subconsciousEnabled
-            )
-            // The hour's provider/model pickers moved to Advanced ▸ minds.
-
-            // User, 2026-09-04: this was a switch bound to a constant. Each
-            // capability is its own grant and macOS asks again on first use,
-            // so there is nothing one switch could honestly do. The card
-            // says what is granted and opens the page where the grants are.
-            SetupInfoCard(
-                title: "Use my Mac",
-                detail: macPermissionsUnavailable
-                    ? "Integration policy unavailable. Open Mac settings for details."
-                    : macPermissionsLoaded
-                        ? (anyMacCapabilityEnabled
-                            ? "Integration policy enabled. macOS permissions are checked separately; choose what the agent may reach."
-                            : "Integration policy off. Choose what the agent may reach.")
-                        : "Reading integration policy.",
-                route: .macIntegration
-            )
         }
+
+        SetupSwitchCard(
+            title: "Moments I keep",
+            sentence: "Small things that happened between us. I pick which stay.",
+            isOn: Binding(
+                get: { momentsEnabled },
+                set: { enabled in
+                    momentsEnabled = enabled
+                    appModel.statusText = enabled
+                        ? "I keep moments again"
+                        : "I am no longer keeping moments"
+                }
+            )
+        )
+
+        SetupSwitchCard(
+            title: "\(voice.Possessive) hour",
+            sentence: "Once a day, when nothing is happening, an hour with no task set.",
+            isOn: Binding(
+                get: { studioWanderEnabled },
+                set: { enabled in
+                    studioWanderEnabled = enabled
+                    Task { await NativeCognitionRuntime.reloadStudioWanderInstallation() }
+                }
+            ),
+            // The hour is background cognition and cannot outlive the
+            // inner life, exactly as the old switch could not.
+            disabled: savingInnerLife || !subconsciousEnabled
+        )
+        // The hour's provider/model pickers moved to Advanced ▸ minds.
+
+        // User, 2026-09-04: this was a switch bound to a constant. Each
+        // capability is its own grant and macOS asks again on first use,
+        // so there is nothing one switch could honestly do. The card
+        // says what is granted and opens the page where the grants are.
+        SetupInfoCard(
+            title: "Use my Mac",
+            detail: macPermissionsUnavailable
+                ? "Can't read this right now. Open Mac settings for details."
+                : macPermissionsLoaded
+                    ? (anyMacCapabilityEnabled
+                        ? "On — macOS still asks for each app."
+                        : "Off. Choose what I may reach.")
+                    : "Checking…",
+            route: .macIntegration
+        )
     }
 
     private var anyMacCapabilityEnabled: Bool {
@@ -421,68 +435,58 @@ struct SetupView: View {
         // The control is always on the page. Full Mac is not one of these three
         // words, so it selects the nearest (Trusted) and says underneath what is
         // actually granted rather than hiding the control behind a link.
-        return SetupCardShell {
-            VStack(alignment: .leading, spacing: 6) {
-                HStack(alignment: .center, spacing: 12) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("What \(voice.subject) \(voice.doesVerb) without asking")
-                            .fontWeight(.semibold)
-                            .lineLimit(1)
-                        Text(live?.sentence(voice)
-                             ?? "More than any of these: \(voice.subject) \(voice.hasVerb) full run of this Mac right now.")
-                            .font(ShellType.labelMedium)
-                            .foregroundStyle(NativeAgentShell.secondary)
-                            .lineLimit(2)
-                            .truncationMode(.tail)
-                    }
-                    .frame(height: SetupMetrics.restCardContentHeight, alignment: .topLeading)
-                    Spacer(minLength: 12)
-                    Picker("What \(voice.subject) \(voice.doesVerb) without asking", selection: Binding(
-                        get: { live ?? .trusted },
-                        set: { posture in
-                            // `live` is optional, so at Full Mac every segment —
-                            // Trusted included — differs from it and applies.
-                            guard posture != live else { return }
-                            // The one segment that is one click from full run
-                            // of the Mac asks first.
-                            if posture == .everything {
-                                confirmEverything = true
-                            } else {
-                                Task { await applyPosture(posture) }
-                            }
-                        }
-                    )) {
-                        ForEach(SetupPosture.allCases) { posture in
-                            Text(posture.title).tag(posture)
+        return VStack(alignment: .leading, spacing: 6) {
+            SetupRow(
+                title: "What I do without asking",
+                detail: live?.sentence(voice)
+                    ?? "More than any of these: I have full run of this Mac right now."
+            ) {
+                Picker("What I do without asking", selection: Binding(
+                    get: { live ?? .trusted },
+                    set: { posture in
+                        // `live` is optional, so at Full Mac every segment —
+                        // Trusted included — differs from it and applies.
+                        guard posture != live else { return }
+                        // The one segment that is one click from full run
+                        // of the Mac asks first.
+                        if posture == .everything {
+                            confirmEverything = true
+                        } else {
+                            Task { await applyPosture(posture) }
                         }
                     }
-                    .pickerStyle(.segmented)
-                    // No accent on the selected segment: the four switches
-                    // above stay the only teal on the page (Agent's read).
-                    .labelsHidden()
-                    .fixedSize()
-                    .confirmationDialog(
-                        "Give \(voice.object) full run of this Mac?",
-                        isPresented: $confirmEverything,
-                        titleVisibility: .visible
-                    ) {
-                        Button("Give \(voice.object) everything", role: .destructive) {
-                            // The dialog IS the confirmation; without the flag
-                            // the apply asked for it again and did nothing.
-                            Task { await applyPosture(.everything, confirmed: true) }
-                        }
-                        Button("Not now", role: .cancel) {}
-                    } message: {
-                        Text("\(voice.Subject) will change anything on this Mac without asking. You can pick another level any time.")
+                )) {
+                    ForEach(SetupPosture.allCases) { posture in
+                        Text(posture.title).tag(posture)
                     }
-                    .disabled(applyingPosture)
                 }
-                if live == nil {
-                    Text("Choosing a level replaces the current permissions. Review the details on the Trust page.")
-                        .font(ShellType.labelMedium)
-                        .foregroundStyle(NativeAgentShell.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
+                .pickerStyle(.segmented)
+                // The selected segment wears the haze, like the switches
+                // above (User, 2026-09-23: system blue clashed with it).
+                .hazeTinted(.segments)
+                .labelsHidden()
+                .fixedSize()
+                .confirmationDialog(
+                    "Turn on Full Mac?",
+                    isPresented: $confirmEverything,
+                    titleVisibility: .visible
+                ) {
+                    Button("Turn on Full Mac", role: .destructive) {
+                        // The dialog IS the confirmation; without the flag
+                        // the apply asked for it again and did nothing.
+                        Task { await applyPosture(.everything, confirmed: true) }
+                    }
+                    Button("Not now", role: .cancel) {}
+                } message: {
+                    Text("I will be able to change anything on this Mac without asking. You can pick another level any time.")
                 }
+                .disabled(applyingPosture)
+            }
+            if live == nil {
+                Text("Choosing a level replaces the current permissions. Review the details on the Trust page.")
+                    .font(.system(size: 12))
+                    .foregroundStyle(NativeAgentShell.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
     }
@@ -511,45 +515,30 @@ struct SetupView: View {
     /// on this page. It drives the primary chat provider — the same
     /// `setChatProvider` + `saveChatBrainDefaults` pair the chat brain bar uses.
     private var mindRow: some View {
-        SetupCardShell {
-            HStack(alignment: .center, spacing: 12) {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("\(voice.Subject) \(voice.verb("think")) with")
-                        .fontWeight(.semibold)
-                        .lineLimit(1)
-                    Text("The mind behind every reply in Chat.")
-                        .font(ShellType.labelMedium)
-                        .foregroundStyle(NativeAgentShell.secondary)
-                        .lineLimit(2)
-                        .truncationMode(.tail)
-                }
-                .frame(height: SetupMetrics.restCardContentHeight, alignment: .topLeading)
-                Spacer(minLength: 12)
-                SetupChatMindPicker()
-            }
+        SetupRow(
+            title: "I think with",
+            detail: "The mind behind every reply in Chat."
+        ) {
+            SetupChatMindPicker()
         }
     }
 
     // MARK: Telegram / iPhone
 
-    private var connectionCards: some View {
-        LazyVGrid(
-            columns: Array(repeating: GridItem(.flexible(), spacing: 10), count: 2),
-            spacing: 10
-        ) {
-            SetupInfoCard(
-                title: "Telegram",
-                // The live status, not the launch-time default: `telegramStatus`
-                // is what the Settings refresh actually fetches.
-                detail: telegramConnected ? "Connected" : "Not set up",
-                route: .telegram
-            )
-            SetupInfoCard(
-                title: "iPhone",
-                detail: peerPaired ? "Paired" : "Not paired",
-                route: .pairDevice
-            )
-        }
+    @ViewBuilder
+    private var connectionRows: some View {
+        SetupInfoCard(
+            title: "Telegram",
+            // The live status, not the launch-time default: `telegramStatus`
+            // is what the Settings refresh actually fetches.
+            detail: telegramConnected ? "Connected" : "Not set up",
+            route: .telegram
+        )
+        SetupInfoCard(
+            title: "iPhone",
+            detail: peerPaired ? "Paired" : "Not paired",
+            route: .pairDevice
+        )
     }
 
     private var telegramConnected: Bool {
@@ -557,23 +546,14 @@ struct SetupView: View {
     }
 
     private var appearanceRow: some View {
-        SetupCardShell {
-            HStack {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Appearance").fontWeight(.semibold).lineLimit(1)
-                    Text("Prefer the dark window, whatever the system is doing.")
-                        .font(ShellType.labelMedium)
-                        .foregroundStyle(NativeAgentShell.secondary)
-                        .lineLimit(2)
-                        .truncationMode(.tail)
-                }
-                .frame(height: SetupMetrics.restCardContentHeight, alignment: .topLeading)
-                Spacer(minLength: 12)
-                Toggle("Prefer Dark Appearance", isOn: $preferDark)
-                    .labelsHidden()
-                    .toggleStyle(.switch)
-                    .tint(NativeAgentBrand.accent)
-            }
+        SetupRow(
+            title: "Appearance",
+            detail: "Prefer the dark window, whatever the system is doing."
+        ) {
+            Toggle("Prefer Dark Appearance", isOn: $preferDark)
+                .labelsHidden()
+                .toggleStyle(.switch)
+                .hazeTinted()
         }
     }
 
@@ -621,16 +601,16 @@ struct SetupView: View {
                 status = await NativeContextFlowRuntime.shared.modeStatus()
             }
             if status.effectiveMode != preferred {
-                innerLifeError = "Some of \(voice.possessive) inner life is held off by setup, safety, or provider health."
+                innerLifeError = "Some of my inner life is held off by setup, safety, or provider health."
             }
         }
 
         if enabled && !state.enabled {
-            innerLifeError = "Connect a provider, or choose \(voice.possessive) reflection mind under Personality ▸ \(voice.possessive) minds, before turning this on."
+            innerLifeError = "Connect a provider, or choose my reflection mind under Personality ▸ \(voice.possessive) minds, before turning this on."
         }
         appModel.statusText = state.enabled
-            ? "\(appModel.agentDisplayName) has an inner life again"
-            : "\(appModel.agentDisplayName)'s inner life is off"
+            ? "I have an inner life again"
+            : "My inner life is off"
     }
 
     @MainActor
@@ -647,68 +627,84 @@ struct SetupView: View {
 
 }
 
-// MARK: - Cards
+// MARK: - Rows
 
-/// ONE HEIGHT PER KIND OF CARD. User, 2026-09-02: the column read ragged
-/// because every card was as tall as its own copy. These are fixed frames, not
-/// minimums — a minimum drifts the moment a sentence or a name changes length.
-/// Both numbers land the same total card height (78pt), so the four switch
-/// cards and the rest sit on one rhythm.
+/// ONE HEIGHT FOR EVERY ROW. User, 2026-09-02: the column read ragged because
+/// every card was as tall as its own copy. A fixed frame, not a minimum — a
+/// minimum drifts the moment a sentence or a name changes length.
 enum SetupMetrics {
-    /// One 17pt rounded title plus one 13pt sentence line.
-    static let switchCardContentHeight: CGFloat = 42
-    /// One 13pt title plus up to two 13pt lines — "Everything" needs the
-    /// second one to say plainly what full run means.
-    static let restCardContentHeight: CGFloat = 50
+    /// A 14pt title plus up to two 12pt lines ("Full Mac" needs the second
+    /// one to say plainly what full run means).
+    static let rowContentHeight: CGFloat = 50
 }
 
-/// The one card shape on this page: 12pt radius, 5% fill, 1px 6% border.
-enum SetupSurface {
-    static func fill(_ scheme: ColorScheme) -> Color {
-        scheme == .dark ? Color.white.opacity(0.05) : Color.black.opacity(0.04)
+/// An eyebrow and ONE group card holding the section's rows, hairlines
+/// between them (Alive glass, 2026-09-23). Rows carry no chrome of their own.
+struct SetupSection<Rows: View>: View {
+    let title: String
+    let rows: Rows
+
+    init(title: String, @ViewBuilder rows: () -> Rows) {
+        self.title = title
+        self.rows = rows()
     }
-
-    static func stroke(_ scheme: ColorScheme) -> Color {
-        scheme == .dark ? Color.white.opacity(0.06) : Color.black.opacity(0.08)
-    }
-
-    static let radius: CGFloat = 12
-}
-
-struct SetupCardShell<Content: View>: View {
-    @Environment(\.colorScheme) private var colorScheme
-    var verticalPadding: CGFloat = 14
-    @ViewBuilder var content: Content
 
     var body: some View {
-        content
-            .padding(.vertical, verticalPadding)
-            .padding(.horizontal, 20)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(
-                RoundedRectangle(cornerRadius: SetupSurface.radius)
-                    .fill(SetupSurface.fill(colorScheme))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: SetupSurface.radius)
-                    .strokeBorder(SetupSurface.stroke(colorScheme), lineWidth: 1)
-            )
+        VStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
+            AliveEyebrow(title)
+            AliveGroupCard { rows }
+        }
     }
 }
 
-/// One of the four. A rounded-bold title, one plain sentence, a switch on the
+/// THE ONE ROW SHAPE on the settings pages: a 14pt medium title, one 12pt
+/// secondary sentence (two lines at most), and the control on the right.
+struct SetupRow<Control: View>: View {
+    let title: String
+    let detail: String
+    @ViewBuilder var control: Control
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 12) {
+            SetupRowText(title: title, detail: detail)
+            Spacer(minLength: 12)
+            control
+        }
+    }
+}
+
+/// The text half of a row, held to the one row height.
+struct SetupRowText: View {
+    let title: String
+    let detail: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(title)
+                .font(.system(size: 14, weight: .medium))
+                .foregroundStyle(NativeAgentShell.text)
+                .lineLimit(1)
+                .truncationMode(.tail)
+            Text(detail)
+                .font(.system(size: 12))
+                .foregroundStyle(NativeAgentShell.secondary)
+                .lineLimit(2)
+                .truncationMode(.tail)
+                .multilineTextAlignment(.leading)
+        }
+        .frame(height: SetupMetrics.rowContentHeight, alignment: .leading)
+    }
+}
+
+/// One of the four, as a row: a title, one plain sentence, a switch on the
 /// right, and whatever the switch reveals underneath it.
 struct SetupSwitchCard<Detail: View>: View {
     let title: String
     let sentence: String
     @Binding var isOn: Bool
     var disabled: Bool = false
-    /// A card that leads somewhere says so ON the sentence line. It used to
-    /// hang under the sentence, which made that one card taller than the rest.
-    var linkTitle: String? = nil
     /// Where the card LEADS, if it leads anywhere. A card with a route has no
-    /// setting of its own: its link and its switch are both NavigationLinks to
-    /// this page, which is how a card can navigate on a stack that owns its
+    /// setting of its own: its switch is a NavigationLink to this page, which is how a card can navigate on a stack that owns its
     /// own path (see `SetupView.body`).
     var route: SetupRoute? = nil
     @ViewBuilder var detail: Detail
@@ -718,7 +714,6 @@ struct SetupSwitchCard<Detail: View>: View {
         sentence: String,
         isOn: Binding<Bool>,
         disabled: Bool = false,
-        linkTitle: String? = nil,
         route: SetupRoute? = nil,
         @ViewBuilder detail: () -> Detail = { EmptyView() }
     ) {
@@ -726,51 +721,29 @@ struct SetupSwitchCard<Detail: View>: View {
         self.sentence = sentence
         self._isOn = isOn
         self.disabled = disabled
-        self.linkTitle = linkTitle
         self.route = route
         self.detail = detail()
     }
 
     var body: some View {
-        SetupCardShell(verticalPadding: 18) {
-            VStack(alignment: .leading, spacing: 0) {
-                HStack(alignment: .center, spacing: 12) {
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text(title)
-                            .font(ShellType.bodySemibold)
-                            .lineLimit(1)
-                            .truncationMode(.tail)
-                        HStack(spacing: 10) {
-                            Text(sentence)
-                                .font(ShellType.labelMedium)
-                                .foregroundStyle(NativeAgentShell.secondary)
-                                .lineLimit(1)
-                                .truncationMode(.tail)
-                            if let linkTitle, let route {
-                                NavigationLink(value: route) { SetupLink(linkTitle) }
-                                    .buttonStyle(.plain)
-                                    .layoutPriority(1)
-                            }
-                            Spacer(minLength: 0)
-                        }
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(alignment: .center, spacing: 12) {
+                // The fixed box every row shares.
+                SetupRowText(title: title, detail: sentence)
+                Spacer(minLength: 12)
+                if let route {
+                    // Same switch, same hit target, but it TRAVELS: the
+                    // toggle is only the face, the link takes the click.
+                    NavigationLink(value: route) {
+                        switchFace.allowsHitTesting(false)
                     }
-                    // The fixed box every one of the four shares.
-                    .frame(height: SetupMetrics.switchCardContentHeight, alignment: .topLeading)
-                    Spacer(minLength: 12)
-                    if let route {
-                        // Same switch, same hit target, but it TRAVELS: the
-                        // toggle is only the face, the link takes the click.
-                        NavigationLink(value: route) {
-                            switchFace.allowsHitTesting(false)
-                        }
-                        .buttonStyle(.plain)
-                        .disabled(disabled)
-                    } else {
-                        switchFace
-                    }
+                    .buttonStyle(.plain)
+                    .disabled(disabled)
+                } else {
+                    switchFace
                 }
-                detail
             }
+            detail
         }
     }
 
@@ -779,41 +752,15 @@ struct SetupSwitchCard<Detail: View>: View {
             .labelsHidden()
             .toggleStyle(.switch)
             // A grey track reads the same on and off, in either appearance and
-            // in an inactive window. The brand teal is the same hex the mockup
-            // paints the on-track with.
-            .tint(NativeAgentBrand.accent)
+            // in an inactive window. The on-track wears the haze's colour.
+            .hazeTinted()
             .disabled(disabled)
             .accessibilityLabel(title)
             .accessibilityHint(sentence)
     }
 }
 
-/// THE ONE LINK SHAPE on this page. Not system blue: plain secondary text with
-/// a chevron, so a link reads as "there is more through here" instead of
-/// borrowing an accent the house does not use.
-///
-/// A FACE, not a button: the caller wraps it in whatever actually travels —
-/// on this page, always a `NavigationLink`, because the stack owns its path.
-struct SetupLink: View {
-    let title: String
-
-    init(_ title: String) {
-        self.title = title
-    }
-
-    var body: some View {
-        HStack(spacing: 4) {
-            Text(title).lineLimit(1)
-            Image(systemName: "chevron.right").font(ShellType.captionSemibold)
-        }
-        .font(ShellType.labelMedium)
-        .foregroundStyle(NativeAgentShell.secondary)
-        .contentShape(Rectangle())
-    }
-}
-
 struct SetupInfoCard: View {
-    @Environment(\.colorScheme) private var colorScheme
     let title: String
     let detail: String
     /// The page the card opens. A value, not a closure: see `SetupView.body`.
@@ -821,27 +768,13 @@ struct SetupInfoCard: View {
 
     var body: some View {
         NavigationLink(value: route) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title).fontWeight(.semibold).lineLimit(1)
-                Text(detail)
-                    .font(ShellType.labelMedium)
+            SetupRow(title: title, detail: detail) {
+                Image(systemName: "chevron.right")
+                    .font(ShellType.captionSemibold)
                     .foregroundStyle(NativeAgentShell.secondary)
-                    .lineLimit(2)
-                    .multilineTextAlignment(.leading)
             }
-            .frame(height: SetupMetrics.restCardContentHeight, alignment: .topLeading)
-            .padding(.vertical, 14)
-            .padding(.horizontal, 20)
             .frame(maxWidth: .infinity, alignment: .leading)
             .contentShape(Rectangle())
-            .background(
-                RoundedRectangle(cornerRadius: SetupSurface.radius)
-                    .fill(SetupSurface.fill(colorScheme))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: SetupSurface.radius)
-                    .strokeBorder(SetupSurface.stroke(colorScheme), lineWidth: 1)
-            )
         }
         .buttonStyle(.plain)
         .accessibilityLabel("\(title): \(detail)")
@@ -1120,7 +1053,7 @@ struct SetupReflectionModelPicker: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             if appModel.providersList.isEmpty {
-                Text("Connect a provider to choose the mind \(AgentVoice.live.subject) \(AgentVoice.live.verb("reflect")) with.")
+                Text("Connect a provider to choose the mind I reflect with.")
                     .font(.caption)
                     .foregroundStyle(.orange)
             } else {
@@ -1220,7 +1153,7 @@ struct SetupStudioWanderPicker: View {
             if !loaded {
                 ProgressView().controlSize(.small)
             } else if providers.isEmpty {
-                Text("Connect a provider to choose the mind \(AgentVoice.live.possessive) hour is spent with.")
+                Text("Connect a provider to choose the mind my hour is spent with.")
                     .font(.caption)
                     .foregroundStyle(.orange)
             } else {
@@ -1311,9 +1244,9 @@ struct SetupStudioWanderPicker: View {
                 serviceTier: serviceTier
             )
             errorMessage = nil
-            appModel.statusText = "\(AgentVoice.live.possessive) hour → \(model) saved"
+            appModel.statusText = "My hour → \(model) saved"
         } catch {
-            errorMessage = "The mind for \(AgentVoice.live.possessive) hour could not be saved: \(error.localizedDescription)"
+            errorMessage = "The mind for my hour could not be saved: \(error.localizedDescription)"
         }
     }
 }
@@ -1330,12 +1263,12 @@ struct SetupMindsView: View {
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 24) {
+            VStack(alignment: .leading, spacing: AliveMetrics.sectionSpacing) {
                 SetupKitSection(
-                    label: "The mind \(AgentVoice.live.subject) \(AgentVoice.live.verb("reflect")) with",
+                    label: "The mind I reflect with",
                     note: subconsciousEnabled
-                        ? "Used by \(AgentVoice.live.possessive) inner life, between conversations."
-                        : "\(AgentVoice.live.possessive) inner life is off, so nothing reflects with this yet."
+                        ? "Used by my inner life, between conversations."
+                        : "My inner life is off, so nothing reflects with this yet."
                 ) {
                     SetupReflectionModelPicker()
                 }
@@ -1343,8 +1276,8 @@ struct SetupMindsView: View {
                 SetupKitSection(
                     label: "\(AgentVoice.live.possessive) hour",
                     note: studioWanderEnabled
-                        ? "The provider and model for \(AgentVoice.live.possessive) daily hour."
-                        : "\(AgentVoice.live.possessive) hour is off, so this selection is not in use yet."
+                        ? "The provider and model for my daily hour."
+                        : "My hour is off, so this selection is not in use yet."
                 ) {
                     SetupStudioWanderPicker()
                 }
@@ -1364,32 +1297,20 @@ private struct SetupKitSection<Content: View>: View {
     @ViewBuilder var content: Content
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text(label)
-                .font(ShellType.labelSemibold)
-                .textCase(.uppercase)
-                .kerning(0.6)
-                .foregroundStyle(NativeAgentShell.secondary)
-                .padding(.horizontal, 2)
+        VStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
+            AliveEyebrow(label)
 
-            VStack(alignment: .leading, spacing: 12) {
-                content
+            AliveGroupCard {
+                VStack(alignment: .leading, spacing: 12) {
+                    content
+                }
             }
-            .padding(16)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(
-                RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
-                    .fill(NativeAgentShell.quietFill)
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
-                    .strokeBorder(NativeAgentShell.hairline, lineWidth: 1)
-            )
 
             if let note {
                 Text(note)
-                    .font(ShellType.caption)
-                    .foregroundStyle(NativeAgentShell.tertiary)
+                    .font(.system(size: 12))
+                    // Secondary, not tertiary: tertiary fails where the haze peaks.
+                    .foregroundStyle(NativeAgentShell.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                     .padding(.horizontal, 2)
             }

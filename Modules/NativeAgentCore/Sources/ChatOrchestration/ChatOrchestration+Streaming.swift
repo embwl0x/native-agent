@@ -541,7 +541,7 @@ extension SwiftNativeTurnEngine {
                             chunkIndex += 1
                             if let flag = cancelFlagPath,
                                chunkIndex % max(1, cancelCheckEveryN) == 0,
-                               FileManager.default.fileExists(atPath: flag.path) {
+                               ChatCancelFlag.isRaised(flag) {
                                 cancelledByFlag = true
                                 break
                             }
@@ -597,8 +597,7 @@ extension SwiftNativeTurnEngine {
                     // A remote Stop can arrive after the final chunk. Recheck
                     // at EOF so a silent finish cannot turn that partial (or a
                     // native tool-only response) into a completed iteration.
-                    if let flag = cancelFlagPath,
-                       FileManager.default.fileExists(atPath: flag.path) {
+                    if ChatCancelFlag.isRaised(cancelFlagPath) {
                         cancelledByFlag = true
                     }
                     if Task.isCancelled || cancelledByFlag {
@@ -966,7 +965,7 @@ extension SwiftNativeTurnEngine {
     nonisolated static func renderNativeToolInstructions() -> String {
         """
         NativeAgent Swift tool protocol (native tool use):
-        - Your Swift tools are attached to this request as native tools and are ready to call directly through the tool-use channel. tool_load expands the set when a needed capability is absent.
+        - Your Swift tools are attached to this request as native tools and are ready to call directly through the tool-use channel. A capability not listed: open its place by name in workspace (mail, music, github…) for its tools and arguments, or call a known tool name directly (calling loads it).
         - COMPLETION CONTRACT: every reply must be EITHER tool call(s) OR your complete final answer. You have no background execution — work you describe but do not call never happens. A reply that only announces or narrates in-progress work ("checking now", "reading the files now", "going through it") is invalid and NativeAgent bounces it back to you. Do the work in THIS reply: make the next tool call, or deliver the finished answer.
         \(DelegatedCampaignGuidance.rendered)
         - After NativeAgent returns a tool result, use the result to answer or make another call.
@@ -1054,7 +1053,7 @@ extension SwiftNativeTurnEngine {
         return """
         \(AnthropicOAuthDirectAdapter.textToolProtocolHeader)
         - This provider request intentionally does not include provider-native tools. Do not infer that tools are unavailable.
-        - Every tool in Available Swift tools is ready to call directly. tool_load expands the set when a needed capability is absent.
+        - Every tool in Available Swift tools is ready to call directly. A capability not listed: open its place by name in workspace (mail, music, github…) for its tools and arguments, or call a known tool name directly (calling loads it).
         - To use a Swift tool, output only one or more exact markers, with a JSON object body, all wrapped in ONE block per reply:
           <function_calls>
           <tool_use name="tool_name">{"arg":"value"}</tool_use>
@@ -1080,10 +1079,12 @@ extension SwiftNativeTurnEngine {
         let required = Set((raw["required"] as? [String]) ?? [])
         // 2026-09-22: required first — alphabetical-only hid required params
         // past the 8 cut for act, commit_memory, invoke_codex and others.
+        // 2026-09-24: no cut at all — names are cheap, and the 8 cap hid
+        // act's `steps` (alphabetically 17th) from every plan.
         let ordered = properties.keys.sorted { a, b in
             required.contains(a) != required.contains(b) ? required.contains(a) : a < b
         }
-        return ordered.prefix(8).map { key in
+        return ordered.map { key in
             let requiredMarker = required.contains(key) ? "*" : ""
             guard let property = properties[key] as? [String: Any],
                   let rawEnum = property["enum"] as? [Any],

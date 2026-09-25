@@ -101,9 +101,20 @@ extension SwiftToolDispatcher {
         try await resolveDeskRef(try requireString(input, "handle"))
     }
 
+    /// The item number in what she wrote: her screen's `desk.4`, `#4`, or
+    /// `4 Title` copied from a board row all mean 4.
+    static func deskAlias(_ raw: String) -> String {
+        var r = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if r.lowercased().hasPrefix("desk.") { r = String(r.dropFirst(5)) }
+        if r.hasPrefix("#") { r = String(r.dropFirst()) }
+        if let first = r.split(separator: " ").first, first.count < r.count,
+           first.allSatisfy({ $0.isNumber || $0 == "." }) { r = String(first) }
+        return r
+    }
+
     /// Map a handle-or-alias string to a CURRENT stable handle, or throw.
     private func resolveDeskRef(_ raw: String) async throws -> String {
-        let r = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        let r = Self.deskAlias(raw)
         guard !r.isEmpty else {
             throw AutonomyGateError.toolDenied(reason: "desk: empty item reference")
         }
@@ -119,7 +130,7 @@ extension SwiftToolDispatcher {
     /// `laneOf` has no hierarchy validator in the store because it is display
     /// metadata, so its tool boundary must prove the referenced item is live.
     private func resolveDeskLaneRef(_ raw: String, updating handle: String? = nil) async throws -> String {
-        let reference = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        let reference = Self.deskAlias(raw)
         guard !reference.isEmpty else {
             throw AutonomyGateError.toolDenied(reason: "desk: empty lane_of reference")
         }
@@ -164,7 +175,7 @@ extension SwiftToolDispatcher {
             return .object([
                 "status": .string("ok"), "sort": .string("stale"), "count": .int(Int64(open.count)),
                 "items": .array(open.map {
-                    .object(["id": .string($0.handle), "title": .string(String($0.title.prefix(160))),
+                    .object(["id": .string($0.alias), "title": .string(String($0.title.prefix(160))),
                              "status": .string($0.status.rawValue), "updated": .string(String($0.updatedAt.prefix(10)))])
                 }),
             ])
@@ -172,7 +183,8 @@ extension SwiftToolDispatcher {
 
         let rawMatches: [DeskItem]
         if let handle, !handle.isEmpty {
-            rawMatches = state.items.filter { $0.handle == handle || $0.alias == handle }
+            let wanted = Self.deskAlias(handle)
+            rawMatches = state.items.filter { $0.handle == wanted || $0.alias == wanted }
         } else if let query, !query.isEmpty {
             let needle = query.folding(
                 options: [.caseInsensitive, .diacriticInsensitive],
@@ -219,6 +231,20 @@ extension SwiftToolDispatcher {
         if isFiltered, matches.isEmpty {
             text += "\nno live Desk items matched"
         }
+        // Never a silent cut: say what's hidden and how to reach it.
+        if isFiltered, rawMatches.count > matchCap {
+            text += "\nshowing \(matchCap) of \(rawMatches.count) matches — narrow the query"
+        } else if !isFiltered, case let shown = DeskProjection.cappedTopLevel(state), shown.count < state.topLevel.count {
+            let shownHandles = Set(shown.map(\.handle))
+            let quietBefore = DeskClock.nowISO(Date().addingTimeInterval(-20 * 86_400))
+            let quiet = state.topLevel.filter {
+                !$0.status.isTerminal && !shownHandles.contains($0.handle)
+                    && DeskProjection.lastActive($0, in: state) < quietBefore
+            }.count
+            text += "\nshowing \(shown.count) of \(state.topLevel.count) top-level, most recently active first"
+                + (quiet > 0 ? " · \(quiet) quiet 20d+" : "")
+                + " — sort:\"stale\" to see them; or query / handle"
+        }
         // Asked for by NAME: open the folder, not the board. The compact
         // projection above keeps its caps — every note but the latest one of a
         // blocked row is dropped, refs collapse to a count — which is right for
@@ -226,7 +252,8 @@ extension SwiftToolDispatcher {
         // handle/alias read appends the item's own record: summary, refs,
         // dependency edges both ways, parts, and its notes in order. A `query`
         // read is still a board read and is untouched.
-        if let handle, !handle.isEmpty {
+        // A query that finds exactly one item opens it too: no second read.
+        if handle?.isEmpty == false || matches.count == 1 {
             for match in matches {
                 text += "\n\n" + DeskProjection.renderRecord(match, in: state)
             }
@@ -411,7 +438,12 @@ extension SwiftToolDispatcher {
 
     func impl_desk_set_status(input: [String: JSONValue]) async throws -> JSONValue {
         let handle = try await resolveDeskHandle(input)
-        let statusRaw = try requireString(input, "status").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        var statusRaw = try requireString(input, "status").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        // The words people use for the same states.
+        let synonyms = ["cancelled": "canceled", "cancel": "canceled", "dropped": "canceled", "complete": "done", "completed": "done",
+                        "finished": "done", "closed": "done", "in_progress": "now", "in progress": "now", "active": "now",
+                        "doing": "now", "working": "now", "started": "now", "backlog": "todo"]
+        statusRaw = synonyms[statusRaw] ?? statusRaw
         guard let status = DeskStatus(rawValue: statusRaw) else {
             throw AutonomyGateError.toolDenied(
                 reason: "desk_set_status: unknown status '\(statusRaw)' (expected one of \(DeskStatus.allCases.map(\.rawValue).joined(separator: "/")))"
@@ -429,6 +461,19 @@ extension SwiftToolDispatcher {
             laneOf = nil
         }
         let store = deskStore()
+        // Closing an item with open parts: say the one call that does it.
+        if status.isTerminal {
+            let state = try await store.liveState()
+            let open = SwiftNativeDeskStore.descendants(of: handle, in: state).filter { !$0.status.isTerminal }
+            if !open.isEmpty {
+                let alias = state.items.first { $0.handle == handle }?.alias ?? handle
+                let parts = open.prefix(6).map(\.alias).joined(separator: ", ") + (open.count > 6 ? ", …" : "")
+                return .object([
+                    "status": .string("refused"),
+                    "reason": .string("\(alias) still has \(open.count) open part\(open.count == 1 ? "" : "s") (\(parts)). desk_close with handle \"\(alias)\", subtree true\(status == .canceled ? ", canceled true" : "") and an outcome_summary closes them and it in one call."),
+                ])
+            }
+        }
         _ = try await store.setStatus(
             handle,
             status: status,
@@ -527,16 +572,58 @@ extension SwiftToolDispatcher {
         guard !outcome.isEmpty else {
             throw AutonomyGateError.toolDenied(reason: "desk_close: outcome_summary must be non-empty")
         }
-        let canceled: Bool
-        switch input["canceled"] {
-        case .some(.bool(let b)): canceled = b
-        case .some(.string(let s)): canceled = ["true", "1", "yes", "y", "on"].contains(s.lowercased())
-        default: canceled = false
+        func flag(_ key: String) -> Bool {
+            switch input[key] {
+            case .some(.bool(let b)): return b
+            case .some(.string(let s)): return ["true", "1", "yes", "y", "on"].contains(s.lowercased())
+            default: return false
+            }
         }
+        let canceled = flag("canceled")
+        let subtree = flag("subtree")
         let store = deskStore()
         let expectedUpdatedAt = optionalString(input, "expected_updated_at")?.trimmingCharacters(
             in: .whitespacesAndNewlines
         )
+        let refusedChanged: JSONValue = .object([
+            "status": .string("refused"),
+            "reason": .string("desk_close: item changed or is no longer active; refresh the Desk before closing it"),
+        ])
+        // subtree: close every open descendant deepest-first, then the item,
+        // so a whole campaign closes in one call instead of one per row.
+        var closedAliases: [String] = []
+        func subtreeResult(_ status: String, reason: String? = nil) -> JSONValue {
+            var out: [String: JSONValue] = [
+                "status": .string(status), "closed": .int(Int64(closedAliases.count)),
+                "handles": .array(closedAliases.map { .string($0) }),
+            ]
+            if let reason { out["reason"] = .string(reason) }
+            return .object(out)
+        }
+        if subtree {
+            let state = try await store.liveState()
+            let root = state.items.first { $0.handle == handle }
+            if let expectedUpdatedAt, !expectedUpdatedAt.isEmpty, root?.updatedAt != expectedUpdatedAt {
+                return refusedChanged
+            }
+            for kid in SwiftNativeDeskStore.descendants(of: handle, in: state).reversed() where !kid.status.isTerminal {
+                do {
+                    // A child keeps its own summary; only a bare one gets a pointer.
+                    let own = kid.summary?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                    _ = try await store.closeItem(kid.handle, outcomeSummary: own.isEmpty ? "closed with \(root?.alias ?? handle)" : own, canceled: canceled)
+                    closedAliases.append(kid.alias)
+                } catch let e as DeskError {
+                    return subtreeResult("partial", reason: "\(kid.alias): \(e.errorDescription ?? "\(e)")")
+                }
+            }
+            do {
+                _ = try await store.closeItem(handle, outcomeSummary: outcome, canceled: canceled)
+                closedAliases.insert(root?.alias ?? handle, at: 0)
+            } catch let e as DeskError {
+                return subtreeResult(closedAliases.isEmpty ? "refused" : "partial", reason: e.errorDescription ?? "\(e)")
+            }
+            return subtreeResult("ok")
+        }
         if let expectedUpdatedAt, !expectedUpdatedAt.isEmpty {
             let closed = try await store.closeItemIfUnchanged(
                 handle,
@@ -544,14 +631,7 @@ extension SwiftToolDispatcher {
                 outcomeSummary: outcome,
                 canceled: canceled
             )
-            guard closed else {
-                return .object([
-                    "status": .string("refused"),
-                    "reason": .string(
-                        "desk_close: item changed or is no longer active; refresh the Desk before closing it"
-                    ),
-                ])
-            }
+            guard closed else { return refusedChanged }
         } else {
             do {
                 _ = try await store.closeItem(handle, outcomeSummary: outcome, canceled: canceled)
@@ -731,6 +811,7 @@ extension SwiftToolDispatcher {
         let store = deskStore()
         let parentHandle: String
         let project: String
+        var reusedParent = false
         let parentRaw = optionalString(input, "parent")?.trimmingCharacters(in: .whitespacesAndNewlines)
         if let parentRaw, !parentRaw.isEmpty {
             // Graft mode: attach the new sub-items to an existing item.
@@ -753,11 +834,21 @@ extension SwiftToolDispatcher {
                     reason: "desk_breakdown: unknown kind '\(kindRaw ?? "")' — one of \(DeskKind.allCases.map(\.rawValue).joined(separator: ", "))")
             }
             let summary = optionalString(input, "summary")?.trimmingCharacters(in: .whitespacesAndNewlines)
-            let parentItem = try await store.createItem(
-                kind: kind, project: proj, title: title,
-                parent: nil, summary: (summary?.isEmpty == false) ? summary : nil
-            )
-            parentHandle = parentItem.handle
+            // A re-run must not mint a second same-titled live campaign under a
+            // new number — duplicates read as "the numbers shifted". Reuse the
+            // live campaign of the same kind and add only its missing steps.
+            let same = SwiftNativeDeskStore.equivalentDeskText
+            if let existing = try await store.liveState().topLevel.first(where: {
+                !$0.status.isTerminal && $0.kind == kind && same($0.project) == same(proj) && same($0.title) == same(title)
+            }) {
+                parentHandle = existing.handle
+                reusedParent = true
+            } else {
+                parentHandle = try await store.createItem(
+                    kind: kind, project: proj, title: title,
+                    parent: nil, summary: (summary?.isEmpty == false) ? summary : nil
+                ).handle
+            }
             project = proj
         }
 
@@ -766,6 +857,11 @@ extension SwiftToolDispatcher {
         // what already exists on the desk.
         var createdHandles: [String] = []
         var planLines: [String] = []
+        // Steps already open under a reused campaign keep their handle and
+        // wiring; batch positions still map to them.
+        var reusedSteps: Set<Int> = []
+        let openSteps = reusedParent
+            ? try await store.liveState().children(of: parentHandle).filter { !$0.status.isTerminal } : []
         func partial(_ reason: String) async -> JSONValue {
             let state = try? await store.liveState()
             let parentAlias = state?.items.first { $0.handle == parentHandle }?.alias ?? parentHandle
@@ -777,6 +873,13 @@ extension SwiftToolDispatcher {
             ])
         }
         for (idx, spec) in specs.enumerated() {
+            if let open = openSteps.first(where: {
+                SwiftNativeDeskStore.equivalentDeskText($0.title) == SwiftNativeDeskStore.equivalentDeskText(spec.title)
+            }) {
+                createdHandles.append(open.handle)
+                reusedSteps.insert(idx)
+                continue
+            }
             do {
                 let child = try await store.createItem(
                     kind: .plan, project: project, title: spec.title,
@@ -788,7 +891,7 @@ extension SwiftToolDispatcher {
                 return await partial("creating child \(idx + 1) '\(spec.title)': \(error.localizedDescription)")
             }
         }
-        for (idx, spec) in specs.enumerated() {
+        for (idx, spec) in specs.enumerated() where !reusedSteps.contains(idx) {
             let tokens = spec.blockedOnCSV.split(separator: ",")
                 .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
             if !tokens.isEmpty {
@@ -825,7 +928,8 @@ extension SwiftToolDispatcher {
         let parentAlias = state.items.first { $0.handle == parentHandle }?.alias ?? parentHandle
         let byHandle = Dictionary(uniqueKeysWithValues: state.items.map { ($0.handle, $0) })
         var lines: [String] = []
-        for handle in createdHandles {
+        let addedHandles = createdHandles.enumerated().filter { !reusedSteps.contains($0.offset) }.map(\.element)
+        for handle in addedHandles {
             guard let item = byHandle[handle] else { continue }
             var segs = ["\(item.alias) \(item.title)"]
             segs.append(contentsOf: DeskProjection.sequencingSegments(item, in: state, plan: plan, includeRollup: false))
@@ -833,6 +937,16 @@ extension SwiftToolDispatcher {
         }
         let readyNow = createdHandles.filter { plan.byHandle[$0]?.isReady == true }
             .compactMap { byHandle[$0]?.alias }
+        if reusedParent {
+            return .object([
+                "status": .string("existing"),
+                "parent": .string(parentAlias),
+                "handle": .string(parentHandle),
+                "plan": .array(lines.map { .string($0) }),
+                "ready_now": .array(readyNow.map { .string($0) }),
+                "confirmation": .string("campaign \(parentAlias) already live · added \(addedHandles.count) missing step(s), \(reusedSteps.count) already open"),
+            ])
+        }
         return .object([
             "status": .string("ok"),
             "parent": .string(parentAlias),

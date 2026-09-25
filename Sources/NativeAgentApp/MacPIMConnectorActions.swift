@@ -12,6 +12,50 @@ struct NativeAppLocalPIMStatusProvider: LocalPIMStatusProvider {
     }
 }
 
+/// Gmail / Google Calendar proof = the Connectors page's own row: connected,
+/// and health still "ok" after `ConnectorHealthDecay` (a real call succeeded
+/// in the last 7 days). Local files only; one registry read per status call.
+actor NativeAppConnectorProofProvider: ConnectorProofProvider {
+    private let root: URL
+    private var rows: [ConnectorRecord]?
+
+    init(root: URL) { self.root = root }
+
+    func proofStatus(provider: String) async -> [String: JSONValue] {
+        // The status client says email/calendar; the Google rows are gmail/gcal
+        // ("calendar" is the EventKit row).
+        let id = ["email": "gmail", "calendar": "gcal"][provider] ?? provider
+        if rows == nil { rows = (try? await NativeClient.readConnectorRecords(root: root)) ?? [] }
+        let row = rows?.first { $0.id == id }
+        if row?.healthStatus == "ok" { return ["verified": .bool(true)] }
+        if let row, ["connected", "configured", "connected_unverified"].contains(row.authState ?? "") {
+            let name = row.name.isEmpty ? id : row.name
+            return [
+                "verified": .bool(false),
+                "nextStep": .string("You're signed in to \(name), but I haven't had a successful read in the last 7 days, so it isn't verified."),
+            ]
+        }
+        return ["verified": .bool(false), "nextStep": .string("Configure connector proof in the NativeAgent app")]
+    }
+}
+
+/// iPhone push is ready when a notification can actually reach a phone: the
+/// person hasn't switched phone delivery off, and either the paired iPhone
+/// advertised CloudKit visual notifications or direct APNs has a target.
+struct NativeAppMobilePushStatusProvider: MobilePushStatusProvider {
+    func pushStatus() async -> [String: JSONValue] {
+        guard NotificationChannelPreference.push() else {
+            return ["status": .string("off"), "nextStep": .string("Turn on Deliver to the phone in Settings.")]
+        }
+        let peerReady = await MainActor.run { iCloudBridge.shared.cloudKitVisualNotificationPeerReady }
+        let apnsTargets = await SwiftNativeAPNSSender.shared.deliverableTargetCount()
+        if peerReady || apnsTargets > 0 {
+            return ["status": .string("ready"), "tokenConfigured": .bool(apnsTargets > 0)]
+        }
+        return ["status": .string("needs_setup"), "nextStep": .string("Configure mobile push in NativeAgent settings")]
+    }
+}
+
 @MainActor
 enum MacPIMConnectorActions {
     enum CalendarAccessIntent: Equatable {
@@ -160,7 +204,7 @@ enum MacPIMConnectorActions {
             return .object([
                 "status": .string("failed"),
                 "actionId": .string("mac.calendar_create_event"),
-                "reason": .string("Missing or invalid required field: start (ISO-8601 string or epoch seconds)"),
+                "reason": .string("start needs a time like 2026-09-25T15:00 (local), one with Z or an offset, or epoch seconds."),
             ])
         }
         let endDate = parseInputDate(input["end"]) ?? startDate.addingTimeInterval(3600)
@@ -337,7 +381,7 @@ enum MacPIMConnectorActions {
                 return .object([
                     "status": .string("failed"),
                     "actionId": .string("mac.calendar_modify_event"),
-                    "reason": .string("Invalid field: start (ISO-8601 string or epoch seconds)"),
+                    "reason": .string("start needs a time like 2026-09-25T15:00 (local), one with Z or an offset, or epoch seconds."),
                 ])
             }
             event.startDate = newStart
@@ -349,7 +393,7 @@ enum MacPIMConnectorActions {
                 return .object([
                     "status": .string("failed"),
                     "actionId": .string("mac.calendar_modify_event"),
-                    "reason": .string("Invalid field: end (ISO-8601 string or epoch seconds)"),
+                    "reason": .string("end needs a time like 2026-09-25T16:00 (local), one with Z or an offset, or epoch seconds."),
                 ])
             }
             event.endDate = newEnd
@@ -551,22 +595,31 @@ enum MacPIMConnectorActions {
             )
         }
 
-        guard let id = inputString(input["id"])?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !id.isEmpty else {
-            return .object([
-                "status": .string("failed"),
-                "actionId": .string("mac.reminders_complete"),
-                "reason": .string("Missing required field: id"),
-            ])
+        let id = inputString(input["id"])?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let title = inputString(input["title"])?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        func failed(_ reason: String) -> JSONValue {
+            .object(["status": .string("failed"), "actionId": .string("mac.reminders_complete"), "reason": .string(reason)])
         }
-
-        guard let reminder = store.calendarItem(withIdentifier: id) as? EKReminder else {
-            return .object([
-                "status": .string("failed"),
-                "actionId": .string("mac.reminders_complete"),
-                "reason": .string("Reminder not found for id: \(id)"),
-            ])
+        guard !id.isEmpty || !title.isEmpty else {
+            return failed("Give the reminder's title (or its id from mac_reminders_list_due_today).")
         }
+        var found = id.isEmpty ? nil : store.calendarItem(withIdentifier: id) as? EKReminder
+        if found == nil {
+            // By title among open reminders: exactly one exact match, never a
+            // containing one ("pay bill" must not complete "Do not pay bill").
+            let wanted = (title.isEmpty ? id : title).lowercased()
+            let open = await openReminderTitles(store: store)
+            let exact = open.filter { $0.title.lowercased() == wanted }
+            guard exact.count == 1 else {
+                let near = exact.isEmpty ? open.filter { $0.title.lowercased().contains(wanted) } : exact
+                let names = near.prefix(5).map { "\"\($0.title)\"" }.joined(separator: ", ")
+                return failed(exact.count > 1
+                    ? "\(exact.count) open reminders are titled \"\(title.isEmpty ? id : title)\"; give the id from mac_reminders_list_due_today."
+                    : "No open reminder is titled exactly \"\(title.isEmpty ? id : title)\"." + (near.isEmpty ? "" : " Close: \(names). Give one of those exactly."))
+            }
+            found = store.calendarItem(withIdentifier: exact[0].id) as? EKReminder
+        }
+        guard let reminder = found else { return failed("That reminder is gone; mac_reminders_list_due_today shows the current ones.") }
 
         let completedAt = Date()
         reminder.isCompleted = true
@@ -587,8 +640,19 @@ enum MacPIMConnectorActions {
             "actionId": .string("mac.reminders_complete"),
             "source": .string("eventkit"),
             "reminderId": .string(reminder.calendarItemIdentifier),
+            "title": .string(NativeAppSecretRedactor.redactText(reminder.title ?? "")),
             "completedAt": .string(iso(completedAt)),
         ])
+    }
+
+    /// Open reminders' ids and titles, made Sendable on EventKit's queue.
+    private static func openReminderTitles(store: EKEventStore) async -> [(id: String, title: String)] {
+        let predicate = store.predicateForIncompleteReminders(withDueDateStarting: nil, ending: nil, calendars: nil)
+        return await withCheckedContinuation { continuation in
+            store.fetchReminders(matching: predicate) { reminders in
+                continuation.resume(returning: (reminders ?? []).map { ($0.calendarItemIdentifier, $0.title ?? "") })
+            }
+        }
     }
 
     // MARK: - TCC status (for Mac Integration permission wizard)
@@ -747,6 +811,14 @@ enum MacPIMConnectorActions {
             if let d = fractional.date(from: trimmed) { return d }
             if let epoch = TimeInterval(trimmed) {
                 return Date(timeIntervalSince1970: epoch)
+            }
+            // A local time without a zone, or a bare day (midnight local).
+            let local = DateFormatter()
+            local.locale = Locale(identifier: "en_US_POSIX")
+            local.timeZone = .current
+            for format in ["yyyy-MM-dd'T'HH:mm:ss", "yyyy-MM-dd'T'HH:mm", "yyyy-MM-dd HH:mm:ss", "yyyy-MM-dd HH:mm", "yyyy-MM-dd"] {
+                local.dateFormat = format
+                if let d = local.date(from: trimmed) { return d }
             }
             return nil
         case .int(let i):

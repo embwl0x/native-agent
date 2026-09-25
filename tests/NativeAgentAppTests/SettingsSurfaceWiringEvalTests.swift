@@ -112,7 +112,7 @@ struct SettingsSurfaceWiringEvalTests {
     // MARK: - setting.nativeagent.compactionThresholdTokens
 
     /// The Settings stepper's number is a CEILING, not the threshold: a
-    /// smaller-window model compacts at 40% of its window. Pinned at BOTH
+    /// smaller-window model compacts at 60% of its window. Pinned at BOTH
     /// stepper endpoints for a small-window and a large-window model, so a
     /// regression that makes the user number authoritative (throwing away
     /// history far too late on a 128k model) or that ignores it entirely
@@ -124,26 +124,26 @@ struct SettingsSurfaceWiringEvalTests {
         let minimum = 50_000
         let maximum = 500_000
 
-        // A small-window model: 40% of its window clamps the user's ceiling at
+        // A small-window model: 60% of its window clamps the user's ceiling at
         // both ends of the stepper. `gpt-5.4` (128k) played this part until it
         // was retired on 2026-09-13; Claude Haiku 4.5 (200k) is a model this
-        // build still carries, so 40% is 80_000.
+        // build still carries, so 60% is 120_000.
         let small = "claude-haiku-4-5"
         #expect(ProviderRouting.verifiedContextLength(forModel: small, providerID: "anthropic") == 200_000)
         for ceiling in [minimum, maximum] {
             let config = ChatSessionAutocompactionConfig(thresholdTokens: ceiling)
             let effective = config.effectiveThresholdTokens(forModel: small, providerID: "anthropic")
-            #expect(effective == min(ceiling, 80_000),
-                    "200k model with ceiling \(ceiling) should compact at \(min(ceiling, 80_000)), got \(effective)")
+            #expect(effective == min(ceiling, 120_000),
+                    "200k model with ceiling \(ceiling) should compact at \(min(ceiling, 120_000)), got \(effective)")
         }
 
-        // A 1M-window model: 40% is 400_000, so the USER's ceiling wins below
-        // that and the model's pressure ceiling wins above it.
+        // A 1M-window model: 60% is 600_000, so the USER's ceiling wins across
+        // the whole stepper range.
         let large = "claude-sonnet-5"
         #expect(ProviderRouting.verifiedContextLength(forModel: large, providerID: "anthropic") == 1_000_000)
         let big = ChatSessionAutocompactionConfig(thresholdTokens: maximum)
-        #expect(big.effectiveThresholdTokens(forModel: large, providerID: "anthropic") == 400_000,
-                "a 500k ceiling must still yield to the model's 40% pressure ceiling")
+        #expect(big.effectiveThresholdTokens(forModel: large, providerID: "anthropic") == maximum,
+                "a 500k ceiling sits under the 1M model's 60% (600k), so it wins")
         let small2 = ChatSessionAutocompactionConfig(thresholdTokens: minimum)
         #expect(small2.effectiveThresholdTokens(forModel: large, providerID: "anthropic") == minimum,
                 "the user's ceiling wins when it is the smaller of the two")

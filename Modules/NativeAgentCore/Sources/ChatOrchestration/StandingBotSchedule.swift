@@ -51,6 +51,24 @@ public enum StandingBotSchedule {
         return .cron(expression: "\(minute) \(hour) * * \(days)", timeZone: zone)
     }
 
+    /// The words the Bots page shows ("Weekly", "Manual only"); the agent's
+    /// home screen says the same.
+    public static func words(_ cadence: BotCadence) -> String {
+        switch cadence {
+        case .manual: return "Manual only"
+        case .interval(let seconds):
+            return seconds == 43200 ? "Twice daily" : seconds == 86400 ? "Daily" : seconds == 604800 ? "Weekly"
+                : seconds < 3600 ? "Every \(Int(seconds / 60)) minutes"
+                : seconds.truncatingRemainder(dividingBy: 86400) == 0 ? "Every \(Int(seconds / 86400)) days"
+                : "Every \((seconds / 3600).formatted()) hours"
+        case .cron(_, let timeZone):
+            // "Daily at 23:57", not the raw cron; the zone only when it isn't this Mac's.
+            let said = describe(cadence)
+            return said.prefix(1).uppercased() + said.dropFirst()
+                + (timeZone == TimeZone.current.identifier ? "" : " · \(timeZone)")
+        }
+    }
+
     public static func describe(_ cadence: BotCadence) -> String {
         switch cadence {
         case .manual: return "manual"

@@ -111,17 +111,53 @@ struct ShellTabbedPage<Key: Hashable, Content: View>: View {
     var subtitle: String?
     let tabs: [ShellTab<Key>]
     @Binding var selection: Key
+    /// The serif header; the tab content hands its line up (`alivePageLine`).
+    var alive: Bool = false
     @ViewBuilder let content: (Key) -> Content
 
     var body: some View {
-        ShellPageFrame(title: title, subtitle: subtitle, showsBack: false) {
+        ShellPageFrame(title: title, subtitle: subtitle, showsBack: false, alive: alive) {
             VStack(alignment: .leading, spacing: 0) {
                 ShellTabs(tabs: tabs, selection: $selection)
-                    .padding(.bottom, 18)
+                    .padding(.bottom, alive ? 0 : 18)
                 content(selection)
                     .id(selection)
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                    .aliveTopDissolve(alive ? 18 : 0)
             }
+        }
+    }
+}
+
+private let aliveTopClearBand: CGFloat = 8
+
+extension View {
+    /// An alive page's gap under its pinned header or tab row, as a dissolve
+    /// instead of a gap. The gap becomes safe area, so content still rests
+    /// `gap` down but scrolls up into it, and a static alpha mask fades it
+    /// out across the gap: the soft edge the chat header has
+    /// (`roomTopChrome`), not a hard slice at the scroll view's edge.
+    /// Static geometry, no `safeAreaBar` (it pinned the main thread).
+    /// The first `aliveTopClearBand` points are fully clear, so a line cut
+    /// at the edge shows no partial glyphs; the ramp fills the rest of the
+    /// gap and ends where content rests. Chat's 24pt fade (`simpleTopFade`)
+    /// runs over scrolled lines only; here the gap is the whole budget.
+    @ViewBuilder
+    func aliveTopDissolve(_ gap: CGFloat) -> some View {
+        if gap > 0 {
+            safeAreaPadding(.top, gap)
+                .mask(alignment: .top) {
+                    VStack(spacing: 0) {
+                        Color.clear
+                            .frame(height: min(aliveTopClearBand, gap))
+                        LinearGradient(colors: [.clear, .black], startPoint: .top, endPoint: .bottom)
+                            .frame(height: max(gap - aliveTopClearBand, 0))
+                        Color.black
+                    }
+                    .ignoresSafeArea(edges: .bottom)
+                }
+        } else {
+            self
         }
     }
 }
@@ -131,9 +167,11 @@ struct ShellRailPage<Content: View>: View {
     let title: String
     var subtitle: String?
     var wide: Bool = false
+    /// The serif header; the content hands its line up (`alivePageLine`).
+    var alive: Bool = false
     @ViewBuilder let content: Content
 
     var body: some View {
-        ShellPageFrame(title: title, subtitle: subtitle, showsBack: false, wide: wide) { content }
+        ShellPageFrame(title: title, subtitle: subtitle, showsBack: false, wide: wide, alive: alive) { content }
     }
 }

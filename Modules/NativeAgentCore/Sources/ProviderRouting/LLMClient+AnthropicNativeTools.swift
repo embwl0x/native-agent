@@ -770,6 +770,7 @@ extension AnthropicAdapter {
         var openThinkingData: String?
         var thinkingBlocks: [AnthropicThinkingBlock] = []
         var streamedToolUseIDs: [String] = []
+        var runaway = RunawayOutputDetector()
 
         do {
             // R15: SSEEventStream owns framing; protocol semantics stay here.
@@ -910,6 +911,21 @@ extension AnthropicAdapter {
                         }
                         yieldedSemanticOutput = true
                         continuation.yield(.textDelta(text))
+                        if runaway.feed(text) {
+                            // Recorded like message_stop would: the loop is the costliest call.
+                            await telemetry.record(
+                                requestBody: req.httpBody,
+                                provider: providerId,
+                                model: model,
+                                streaming: true,
+                                usage: usage.isEmpty ? nil : usage,
+                                ttftMs: ttftMs,
+                                durationMs: Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000),
+                                status: "incomplete",
+                                stopReason: "client_runaway"
+                            )
+                            throw runaway.stopError
+                        }
                     case "input_json_delta":
                         if ttftMs == nil {
                             ttftMs = Int(

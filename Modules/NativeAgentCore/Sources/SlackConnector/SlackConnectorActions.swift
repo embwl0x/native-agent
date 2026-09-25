@@ -37,9 +37,35 @@ public enum SlackConnectorActions {
                 "types": request.types,
             ]
         )
+        // One short row per conversation; Slack's full objects ran ~1 KB each.
+        var compact = response
+        if let channels = response["channels"] as? [[String: Any]] {
+            // A DM is named for the person in it (users.list, one call; ids if that scope is missing).
+            var people: [String: String] = ["USLACKBOT": "Slackbot"]
+            if channels.contains(where: { $0["is_im"] as? Bool == true }),
+               let users = (try? await call(method: "users.list", httpMethod: "GET", params: ["limit": "200"]))?["members"] as? [[String: Any]] {
+                for user in users {
+                    guard let id = user["id"] as? String else { continue }
+                    let profile = user["profile"] as? [String: Any]
+                    let name = [profile?["display_name"], profile?["real_name"], user["name"]].compactMap { $0 as? String }.first { !$0.isEmpty }
+                    if let name { people[id] = name }
+                }
+            }
+            compact["channels"] = channels.map { channel -> [String: Any] in
+                let direct = channel["is_im"] as? Bool == true
+                let kind = direct ? "DM" : channel["is_mpim"] as? Bool == true ? "group DM"
+                    : channel["is_private"] as? Bool == true ? "private" : "public"
+                var words = [kind]
+                if let members = channel["num_members"] as? Int { words.append("\(members) member\(members == 1 ? "" : "s")") }
+                if !direct, channel["is_member"] as? Bool == false { words.append("bot not in channel") }
+                let user = channel["user"] as? String
+                let name = direct ? (user.flatMap { people[$0] } ?? user ?? "") : (channel["name"] as? String ?? "")
+                return ["id": channel["id"] ?? "", "name": name, "kind": words.joined(separator: " · ")]
+            }
+        }
         return envelope(
             action: "slack.list_channels",
-            response: response,
+            response: compact,
             successStatus: "completed"
         )
     }
@@ -70,9 +96,26 @@ public enum SlackConnectorActions {
                 "count": String(count),
             ]
         )
+        // Each match as who, where, when and the words.
+        var compact = response
+        if var messages = response["messages"] as? [String: Any], let matches = messages["matches"] as? [[String: Any]] {
+            messages["matches"] = matches.map { match -> [String: Any] in
+                let channel = (match["channel"] as? [String: Any])?["name"] as? String
+                let who = (match["username"] as? String ?? match["user"] as? String ?? "someone") + (channel.map { " in #" + $0 } ?? "")
+                var row: [String: Any] = ["from": who, "text": String((match["text"] as? String ?? "").prefix(600))]
+                if let ts = match["ts"] as? String, let seconds = Double(ts) {
+                    row["ts"] = ts
+                    row["when"] = ISO8601DateFormatter().string(from: Date(timeIntervalSince1970: seconds))
+                }
+                if let link = match["permalink"] as? String { row["permalink"] = link }
+                return row
+            }
+            messages.removeValue(forKey: "paging")
+            compact["messages"] = messages
+        }
         return envelope(
             action: "slack.search_messages",
-            response: response,
+            response: compact,
             successStatus: "completed"
         )
     }
@@ -403,6 +446,17 @@ public enum SlackConnectorActions {
         ]
         if let error = response["error"] as? String, !error.isEmpty {
             obj["error"] = .string(error)
+            // What to do next, in words, for the codes that have one.
+            let fix: String? = switch error {
+            case "not_authed", "invalid_auth", "token_revoked", "account_inactive": "The Slack token no longer works; reconnect Slack in Connectors."
+            case "missing_scope": "The Slack app lacks the scope \((response["needed"] as? String) ?? "this needs"); add it in the Slack app settings and reconnect."
+            case "not_allowed_token_type": "This needs a user token (search does); a bot token cannot do it."
+            case "channel_not_found": "No channel by that name or id; slack_list_channels shows them."
+            case "not_in_channel": "The bot isn't in that channel; invite it there with /invite first."
+            case "ratelimited": "Slack is rate limiting; wait a minute before trying again."
+            default: nil
+            }
+            if let fix { obj["fix"] = .string(fix) }
         }
         return redactReceipt(.object(obj))
     }

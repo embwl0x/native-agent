@@ -465,12 +465,18 @@ public protocol MacEventSink: Sendable {
     func post(key: MacKeyEvent)
     func post(mouse: MacMouseEvent)
     func post(scroll: MacScrollEvent)
+    /// Her-screen Phase 4 — a keystroke addressed to ONE process
+    /// (`CGEvent.postToPid`), never to whatever is key. False = not sent.
+    func post(key: MacKeyEvent, toPid pid: Int32) -> Bool
 }
 
 public extension MacEventSink {
     /// A sink that cannot measure it must not INVENT it: an unmeasured `true`
     /// would refuse every keystroke forever.
     var secureKeyboardEntryActive: Bool { false }
+    /// A sink with no per-process route says so; it never falls back to the
+    /// global post, which would type into the key window.
+    func post(key: MacKeyEvent, toPid pid: Int32) -> Bool { false }
 }
 
 /// The live probe. Carbon's `IsSecureEventInputEnabled()` is the only public
@@ -513,12 +519,25 @@ public struct CGEventSink: MacEventSink {
         return out
     }
 
+    public func post(key event: MacKeyEvent, toPid pid: Int32) -> Bool {
+        guard pid > 0, pid != getpid(), let cg = keyEvent(event) else { return false }
+        NativeAgentMotorEpoch.noteAgentMotorEvent()
+        cg.postToPid(pid)
+        return true
+    }
+
     public func post(key event: MacKeyEvent) {
+        guard let cg = keyEvent(event) else { return }
+        NativeAgentMotorEpoch.noteAgentMotorEvent()
+        cg.post(tap: .cghidEventTap)
+    }
+
+    private func keyEvent(_ event: MacKeyEvent) -> CGEvent? {
         guard let cg = CGEvent(
             keyboardEventSource: source(),
             virtualKey: CGKeyCode(event.keyCode),
             keyDown: event.down
-        ) else { return }
+        ) else { return nil }
         cg.setIntegerValueField(
             .eventSourceUserData,
             value: NativeAgentMacEventIdentity.sourceUserData
@@ -531,8 +550,7 @@ public struct CGEventSink: MacEventSink {
                 cg.keyboardSetUnicodeString(stringLength: buffer.count, unicodeString: base)
             }
         }
-        NativeAgentMotorEpoch.noteAgentMotorEvent()
-        cg.post(tap: .cghidEventTap)
+        return cg
     }
 
     public func post(mouse event: MacMouseEvent) {
@@ -803,6 +821,16 @@ public protocol MacAXActSource: Sendable {
     func resolve(menuPath: [Int], inAppPid pid: Int32) -> MacAXPidResolution
     func perform(_ target: MacAXActTarget, action: String) -> MacAXActOutcome
     func setValue(_ target: MacAXActTarget, value: String) -> MacAXActOutcome
+    /// Her-screen Phase 4 — insert at the element's own insertion point
+    /// (`AXSelectedText`), which an AppKit text view takes while its app is in
+    /// the back. Default `.unsupported`.
+    func setSelectedText(_ target: MacAXActTarget, text: String) -> MacAXActOutcome
+    /// Is THIS element the app's `AXFocusedUIElement` right now? The gate in
+    /// front of every keystroke addressed to a background pid. Default false.
+    func isFocusedElement(_ target: MacAXActTarget, pid: Int32) -> Bool
+    /// A menu item's key equivalent, as (glyphs "⇧⌘S", chord "cmd+shift+s"),
+    /// or nil when it publishes none. Default nil.
+    func menuShortcut(_ target: MacAXActTarget) -> (glyphs: String, chord: String)?
     /// Give the element the keyboard focus WITHOUT invoking its handler.
     /// `type`'s keystroke fallback needs a focused field; it used to get one by
     /// pressing the element, which on a button is activation, not focus.
@@ -860,6 +888,9 @@ public extension MacAXActSource {
     }
 
     func setFocused(_ target: MacAXActTarget) -> MacAXActOutcome { .unsupported }
+    func setSelectedText(_ target: MacAXActTarget, text: String) -> MacAXActOutcome { .unsupported }
+    func isFocusedElement(_ target: MacAXActTarget, pid: Int32) -> Bool { false }
+    func menuShortcut(_ target: MacAXActTarget) -> (glyphs: String, chord: String)? { nil }
 
     /// fable51 item 29. Default `.appGone`: a source with no menu bar has
     /// nothing to resolve against, and the menu organ turns that into words
@@ -1302,7 +1333,7 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
                     if currentRole == role {
                         let currentLabel: String?
                         if labelSource == "title" {
-                            currentLabel = MacAXAttributeRead.copyString(current, kAXTitleAttribute) ?? MacAXAttributeRead.copyString(current, kAXDescriptionAttribute)
+                            currentLabel = MacAXAttributeRead.copyLabel(current, role: currentRole)
                         } else {
                             currentLabel = MacAXAttributeRead.copyRaw(current, kAXValueAttribute)
                                 .flatMap(SystemMacAXElementSource.stringifiedValue)?
@@ -1407,6 +1438,56 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
         MacAXExecutionLane.sync { setFocusedOnExecutionLane(target) }
     }
 
+    public func menuShortcut(_ target: MacAXActTarget) -> (glyphs: String, chord: String)? {
+        MacAXExecutionLane.sync {
+            guard let element = element(target.handle),
+                  let char = MacAXAttributeRead.copyString(element, kAXMenuItemCmdCharAttribute)?
+                      .trimmingCharacters(in: .whitespacesAndNewlines),
+                  char.count == 1 else { return nil }
+            var raw: CFTypeRef?
+            var mods = 0
+            if AXUIElementCopyAttributeValue(element, kAXMenuItemCmdModifiersAttribute as CFString, &raw) == .success,
+               let number = raw as? NSNumber { mods = number.intValue }
+            // kAXMenuItemModifier*: shift 1, option 2, control 4, no-command 8.
+            var glyphs = "", chord: [String] = []
+            if mods & 4 != 0 { glyphs += "⌃"; chord.append("ctrl") }
+            if mods & 2 != 0 { glyphs += "⌥"; chord.append("option") }
+            if mods & 1 != 0 { glyphs += "⇧"; chord.append("shift") }
+            if mods & 8 == 0 { glyphs += "⌘"; chord.insert("cmd", at: 0) }
+            guard !chord.isEmpty else { return nil }
+            return (glyphs + char.uppercased(), (chord + [char.lowercased()]).joined(separator: "+"))
+        }
+    }
+
+    public func isFocusedElement(_ target: MacAXActTarget, pid: Int32) -> Bool {
+        MacAXExecutionLane.sync {
+            guard pid != getpid(), let element = element(target.handle) else { return false }
+            var focused: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(
+                AXUIElementCreateApplication(pid),
+                kAXFocusedUIElementAttribute as CFString,
+                &focused
+            ) == .success, let focused, CFGetTypeID(focused) == AXUIElementGetTypeID() else { return false }
+            return CFEqual(focused, element)
+        }
+    }
+
+    public func setSelectedText(_ target: MacAXActTarget, text: String) -> MacAXActOutcome {
+        MacAXExecutionLane.sync {
+            guard let element = element(target.handle) else { return .invalidTarget }
+            var settable: DarwinBoolean = false
+            let probe = AXUIElementIsAttributeSettable(element, kAXSelectedTextAttribute as CFString, &settable)
+            guard probe == .success, settable.boolValue else { return .unsupported }
+            NativeAgentMotorEpoch.noteAgentMotorEvent()
+            let status = AXUIElementSetAttributeValue(element, kAXSelectedTextAttribute as CFString, text as CFTypeRef)
+            switch status {
+            case .success: return .performed
+            case .attributeUnsupported, .actionUnsupported: return .unsupported
+            default: return .failed
+            }
+        }
+    }
+
     public func setSelected(_ target: MacAXActTarget) -> MacAXActOutcome {
         MacAXExecutionLane.sync { setSelectedOnExecutionLane(target) }
     }
@@ -1455,7 +1536,9 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
         return MacAXActTarget(
             handle: handle ?? mint(element),
             role: role,
-            title: MacAXAttributeRead.copyString(element, kAXTitleAttribute) ?? MacAXAttributeRead.copyString(element, kAXDescriptionAttribute),
+            // Same name rule as perception, or a caption-named field ("Save
+            // As") fails the drift guard as `handle_drifted` on every act.
+            title: MacAXAttributeRead.copyLabel(element, role: role),
             value: MacAXAttributeRead.copyRaw(element, kAXValueAttribute).flatMap(SystemMacAXElementSource.stringifiedValue),
             enabled: MacAXAttributeRead.copyBool(element, kAXEnabledAttribute) ?? true,
             frame: MacAXAttributeRead.copyFrame(element),

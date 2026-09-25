@@ -27,48 +27,100 @@ struct ChromeControlPermissionsView: View {
         appModel.trustPolicy.map(AppModel.fullMacGrantIsActive) ?? false
     }
 
+    private var isOn: Bool { enabled || fullMacActive }
+
+    /// The row's one status line: permission, then connection, each said
+    /// once. Full Mac and the switch both read "Allowed"; the switch (or the
+    /// Full Mac tooltip) says where the permission comes from.
+    private var statusText: String {
+        guard isOn else { return "Not allowed" }
+        switch connectionState {
+        case .connected: return "Allowed · connected"
+        case .disconnected: return "Allowed · extension not connected"
+        case .extensionNotLoaded: return "Allowed · extension not set up"
+        }
+    }
+
+    /// Two rows for Trust's group card (Alive glass): the switch with its
+    /// state, then the setup — folded away once Chrome is connected.
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Toggle("Chrome control", isOn: Binding(
-                    get: { enabled || fullMacActive },
-                    set: { newValue in
-                        enabled = newValue
-                        Task {
-                            isSaving = true
-                            await appModel.saveChromeControlEnabled(newValue)
-                            isSaving = false
-                            syncFromPolicy()
+        Group {
+            HStack(alignment: .center, spacing: 12) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Chrome control")
+                        .font(.system(size: 14, weight: .medium))
+                        .foregroundStyle(NativeAgentShell.text)
+                    Text("I use Chrome while you are signed in. I can open background tabs or work in a selected tab. I stop using a tab when you interact with it and check this permission before every action.")
+                        .font(.system(size: 12))
+                        .foregroundStyle(NativeAgentShell.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer(minLength: 12)
+                AlivePill(statusText)
+                    .accessibilityIdentifier("trust.chrome.status")
+                    // Full Mac holds this on, so there is no switch (a disabled
+                    // one read as off); the tooltip says where "Allowed" comes from.
+                    .help(fullMacActive
+                        ? "Full Mac allows Chrome control. In narrower modes this is a switch. The Chrome extension must still be installed."
+                        : "")
+                if !fullMacActive {
+                    Toggle("Chrome control", isOn: Binding(
+                        get: { isOn },
+                        set: { newValue in
+                            enabled = newValue
+                            Task {
+                                isSaving = true
+                                await appModel.saveChromeControlEnabled(newValue)
+                                isSaving = false
+                                syncFromPolicy()
+                            }
                         }
-                    }
-                ))
-                .disabled(isSaving || fullMacActive)
-                .help("Full Mac grants Chrome control. In narrower modes, use this switch. The Chrome extension must still be installed.")
-                EffectTimingTag(timing: .now)
-                Spacer()
+                    ))
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+                    .hazeTinted()
+                    .disabled(isSaving)
+                    .help("The Chrome extension must still be installed.")
+                }
             }
-            Text("I use Chrome while you are signed in. I can open background tabs or work in a selected tab. I stop using a tab when you interact with it and check this permission before every action.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-            Text(connectionState.status(enabled: enabled || fullMacActive))
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .accessibilityIdentifier("trust.chrome.status")
+            .task {
+                syncFromPolicy()
+                for await state in await ChromeControlRuntime.shared.connectionStates() {
+                    connectionState = state
+                }
+            }
+            .onChange(of: appModel.trustPolicy) { _, _ in
+                if !isSaving { syncFromPolicy() }
+            }
+
+            if isOn && connectionState == .connected {
+                DisclosureGroup("How to set up again") {
+                    setupSteps.padding(.top, 8)
+                }
+                .font(.system(size: 13))
+            } else {
+                setupSteps
+            }
+        }
+    }
+
+    private var setupSteps: some View {
+        VStack(alignment: .leading, spacing: 8) {
             Button("Set up Chrome", systemImage: "arrow.up.forward.app") {
                 setUpChrome()
             }
             .accessibilityIdentifier("trust.chrome.setup")
-            Text("Set up Chrome puts the extension in your home folder, shows it in Finder and opens Chrome's extensions page. Then:\n1. On that page, turn on Developer mode (top right).\n2. Click Load unpacked.\n3. Choose the \"\(ChromeExtensionFolder.visible.lastPathComponent)\" folder in your home folder, or drag it from Finder onto the page.")
-                .font(.caption)
+            Text("Set up Chrome puts the extension in your home folder, shows it in Finder and opens Chrome's extensions page. Then:\n1. On that page, turn on Chrome's Developer mode (top right).\n2. Click Load unpacked.\n3. Choose the \"\(ChromeExtensionFolder.visible.lastPathComponent)\" folder in your home folder, or drag it from Finder onto the page.")
+                .font(.system(size: 12))
                 .textSelection(.enabled)
                 .fixedSize(horizontal: false, vertical: true)
-            Text("The app sets up its part automatically. The extension is a separate step on each Mac and does not sync with your Google account. The purple NativeAgent tab group can sync even when the extension is missing.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            Text("I set up my part automatically. The extension is a separate step on each Mac and does not sync with your Google account. The purple NativeAgent tab group can sync even when the extension is missing.")
+                .font(.system(size: 12))
+                .foregroundStyle(NativeAgentShell.secondary)
+                .fixedSize(horizontal: false, vertical: true)
             if let chromeSetupMessage {
                 Text(chromeSetupMessage)
-                    .font(.caption)
+                    .font(.system(size: 12))
                     .textSelection(.enabled)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -76,15 +128,6 @@ struct ChromeControlPermissionsView: View {
                 ProgressView("Updating Chrome control…")
                     .controlSize(.small)
             }
-        }
-        .task {
-            syncFromPolicy()
-            for await state in await ChromeControlRuntime.shared.connectionStates() {
-                connectionState = state
-            }
-        }
-        .onChange(of: appModel.trustPolicy) { _, _ in
-            if !isSaving { syncFromPolicy() }
         }
     }
 
@@ -110,40 +153,36 @@ struct MultimodalPermissionsView: View {
         draftPolicy
     }
 
+    /// Alive glass (2026-09-23): one group card of switch rows. Every change
+    /// here applies at once; Trust's feature footnote says so.
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Toggle("Allow screen capture", isOn: policyBinding(\.screen_capture))
-                    .help("NativeAgent will capture your screen when you click the camera button in Chat.")
-                EffectTimingTag(timing: .now)
-                Spacer()
-            }
-            HStack {
-                Toggle("Allow image understanding", isOn: policyBinding(\.vision_api_calls))
-                    .help("Allows attached images to be sent to the selected AI service so I can read them. Counts toward your subscription usage.")
-                EffectTimingTag(timing: .now)
-                Spacer()
-            }
-            HStack {
-                Toggle("Allow reading PDFs", isOn: policyBinding(\.file_ingestion_pdf))
-                    .help("The text of a PDF you attach is read into the conversation. Off, the attachment is skipped and the agent is told it was — it never guesses at what the document says. A PDF that is only pictures of pages has no text to read.")
-                EffectTimingTag(timing: .now)
-                Spacer()
-            }
-            HStack {
-                Toggle("Allow image generation", isOn: policyBinding(\.image_generation_openai))
-                    .help("Lets me make images when you ask for one.")
-                EffectTimingTag(timing: .now)
-                Spacer()
-            }
-            Divider()
-            HStack {
-                Toggle("Read replies aloud automatically", isOn: $voiceAutoRead)
-                    .help("Reads new replies aloud using your saved voice settings. OpenAI voice access needs separate permission.")
-                    .accessibilityIdentifier("trust.multimodal.voice-output.auto-read")
-                EffectTimingTag(timing: .now)
-                Spacer()
-            }
+        AliveGroupCard {
+            FeatureSwitchRow(
+                title: "Allow screen capture",
+                detail: "I capture your screen when you click the camera button in Chat.",
+                isOn: policyBinding(\.screen_capture)
+            )
+            FeatureSwitchRow(
+                title: "Allow image understanding",
+                detail: "I send images you attach to your AI provider so I can read them. This counts toward your subscription usage.",
+                isOn: policyBinding(\.vision_api_calls)
+            )
+            FeatureSwitchRow(
+                title: "Allow reading PDFs",
+                detail: "I read the text of a PDF you attach into the conversation. With this off, I skip the attachment and I'm told I did, so I never guess at what it says. A PDF that is only pictures of pages has no text to read.",
+                isOn: policyBinding(\.file_ingestion_pdf)
+            )
+            FeatureSwitchRow(
+                title: "Allow image generation",
+                detail: "I make images when you ask for one.",
+                isOn: policyBinding(\.image_generation_openai)
+            )
+            FeatureSwitchRow(
+                title: "Read replies aloud automatically",
+                detail: "I read new replies aloud with your saved voice settings. The OpenAI voice needs its own permission.",
+                identifier: "trust.multimodal.voice-output.auto-read",
+                isOn: $voiceAutoRead
+            )
         }
         .task { syncDraftPolicy() }
         .onChange(of: appModel.trustPolicy) { _, _ in
@@ -198,13 +237,19 @@ struct TrainingPermissionsView: View {
     @State private var dreamReadGate = LatestAsyncRequestGate()
     @State private var unattendedReadGate = LatestAsyncRequestGate()
 
+    /// Alive glass (2026-09-23): the master switch in its own group card, then
+    /// practice runs and automatic review as their own eyebrow and card. No
+    /// per-row timing pills; Trust's feature footnote says when changes land.
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
+        VStack(alignment: .leading, spacing: 24) {
+            AliveGroupCard {
                 // Sweep R4 C9 — COPY ONLY. "improvement kernel" named an
                 // internal component, not a thing the user grants.
-                Toggle(
-                    "Let the agent work unattended (bots, practice runs, background improvement)",
+                FeatureSwitchRow(
+                    title: "Let me work unattended",
+                    detail: unattendedForced
+                        ? "Full Mac access lets me work unattended: bots on their schedules, practice runs and background improvement. Changing the access mode above is how to turn it off. Run once is you asking, so it works either way."
+                        : "The main switch for background work: scheduled bots and replies to events, practice runs and app improvements. Run once is you asking, so it works either way. Even with this on, I can only change my own files inside NativeAgent, never the rest of your Mac.",
                     isOn: Binding(
                         get: { draftEnableAutonomy || unattendedForced },
                         set: { newValue in
@@ -215,25 +260,13 @@ struct TrainingPermissionsView: View {
                     )
                 )
                 .disabled(unattendedForced)
-                .help(unattendedForced
-                      ? "Full Mac access lets the agent work unattended — bots on their schedules, practice runs and background improvement. Choose a narrower access mode above to turn it off. Run once is you asking, so it works either way."
-                      : "The master switch for background work: scheduled bots and responses to events, practice runs, and app improvements. Run once is you asking, so it works either way. Even when this is on, the agent can only change its own files inside NativeAgent — never the rest of your Mac.")
-                EffectTimingTag(timing: .restart)
-                Spacer()
             }
-            if unattendedForced {
-                Text("Full Mac access runs unattended work. Changing the access mode is how to turn it off.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            Divider()
             // Taste pass 2026-07-24: was "Autonomous Training", an exact echo
             // of the card title directly above it.
-            Text("Practice Runs")
-                .font(.headline)
-            HStack {
-                Toggle(
-                    "Let the agent practice on its own",
+            featureSection("Practice runs") {
+                FeatureSwitchRow(
+                    title: "Let me practice on my own",
+                    detail: "I work through my own saved exercises in the background, notice where my answers have slipped, and write up suggested changes. I never apply a change on my own; every suggestion waits for you.",
                     isOn: Binding(
                         get: { draftTraining.autonomous_training },
                         set: { newValue in
@@ -248,16 +281,12 @@ struct TrainingPermissionsView: View {
                         }
                     )
                 )
-                // Sweep R4 C9 — COPY ONLY. Was a raw endpoint path for a
-                // daemon that no longer exists (README "What exists today":
-                // the Swift app owns the runtime in-process).
-                .help("The agent works through its own saved exercises in the background, notices where its answers have slipped, and writes up suggested changes. It never applies a change on its own — every suggestion waits for you.")
-                EffectTimingTag(timing: .nextRun)
-                Spacer()
-            }
-            HStack {
-                Toggle(
-                    "Run dream cycle nightly",
+                // Sweep R4 C9 — COPY ONLY. The detail was a raw endpoint path
+                // for a daemon that no longer exists (README "What exists
+                // today": the Swift app owns the runtime in-process).
+                FeatureSwitchRow(
+                    title: "Run dream cycle nightly",
+                    detail: "Once a night at 3:30 AM I look back over recent conversations and what I learned that day, write it up as a dated diary entry, and leave you a short digest in the morning. Needs practice runs turned on above.",
                     isOn: Binding(
                         // 2026-09-06: this read and wrote trainingPolicy
                         // .dream_scheduler alone, while the runtime requires
@@ -275,22 +304,19 @@ struct TrainingPermissionsView: View {
                     )
                 )
                 .disabled(!draftTraining.autonomous_training)
-                .help("Once a night at 3:30 AM the agent looks back over recent conversations and what it learned that day, writes it up as a dated diary entry, and leaves you a short digest in the morning. Needs practice runs turned on above.")
-                EffectTimingTag(timing: .nextRun)
-                Spacer()
             }
-
-            Divider()
 
             // PATCH-2026-05-07: self-improvement-ui Promotion engine trust toggles
             // Sweep R4 C9 — COPY ONLY. "Promotion engine" was the internal
             // component name; what the user is granting is an automatic
             // check that a proposed change is good enough to keep.
-            Text("Automatic Review")
-                .font(.headline)
-            HStack {
-                Toggle(
-                    "Check proposed changes automatically",
+            featureSection("Automatic review") {
+                // Sweep R4 C9 — COPY ONLY. The detail was a raw endpoint path
+                // plus "harness eval", neither of which appears anywhere else
+                // in the UI.
+                FeatureSwitchRow(
+                    title: "Check proposed changes automatically",
+                    detail: "Before any suggested change is kept, I re-run my own test set against it. A change that scores worse than what it replaces is thrown away instead of applied.",
                     isOn: Binding(
                         get: { draftPromotion.enabled },
                         set: { newValue in
@@ -310,16 +336,12 @@ struct TrainingPermissionsView: View {
                         }
                     )
                 )
-                // Sweep R4 C9 — COPY ONLY. Was a raw endpoint path plus
-                // "harness eval", neither of which appears anywhere else
-                // in the UI.
-                .help("Before any suggested change is kept, the agent re-runs its own test set against it. A change that scores worse than what it replaces is thrown away instead of applied.")
-                EffectTimingTag(timing: .nextRun)
-                Spacer()
-            }
-            HStack {
-                Toggle(
-                    "Keep low-risk changes without asking me (personality notes, practice exercises)",
+                // Sweep R4 C9 — COPY ONLY. "Tier A acts as Tier B" was the
+                // only place those tiers were ever named; nothing in the UI
+                // defined either one.
+                FeatureSwitchRow(
+                    title: "Keep low-risk changes without asking you",
+                    detail: "Low-risk means my own notes about how I should behave and the exercises I practice against, never your files or your settings. With this off, every change waits for your sign-off, however small. Turn it on only if you trust the automatic check above to catch a bad one.",
                     isOn: Binding(
                         get: { draftPromotion.auto_promote_tier_a },
                         set: { newValue in
@@ -332,16 +354,9 @@ struct TrainingPermissionsView: View {
                     )
                 )
                 .disabled(!draftPromotion.enabled)
-                // Sweep R4 C9 — COPY ONLY. "Tier A acts as Tier B" was the
-                // only place those tiers were ever named; nothing in the UI
-                // defined either one.
-                .help("Low-risk means the agent's own notes about how it should behave and the exercises it practices against — never your files or your settings. With this off, every change waits for your sign-off no matter how small. Turn it on only if you trust the automatic check above to catch a bad one.")
-                EffectTimingTag(timing: .nextRun)
-                Spacer()
-            }
-            HStack {
-                Toggle(
-                    "Put practice suggestions through the automatic check too",
+                FeatureSwitchRow(
+                    title: "Put practice suggestions through the automatic check too",
+                    detail: "A suggestion you approve is still tested before it is written, instead of being applied straight away. Needs both practice runs and automatic review turned on.",
                     isOn: Binding(
                         get: { draftTraining.route_through_promotion },
                         set: { newValue in
@@ -357,14 +372,8 @@ struct TrainingPermissionsView: View {
                     )
                 )
                 .disabled(!draftPromotion.enabled || !draftTraining.autonomous_training)
-                .help("A suggestion you approve is still tested before it is written, instead of being applied straight away. Needs both practice runs and automatic review turned on.")
-                EffectTimingTag(timing: .nextRun)
-                Spacer()
+                FeatureNote("Practice only ever suggests. Changes to my personality and voice never apply without your approval.")
             }
-
-            Text("Autonomous training is propose-only. Corrections to SOUL/VOICE never apply without your approval.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
         }
         .task(id: appModel.trustPolicy) {
             let policy = appModel.trustPolicy
@@ -383,6 +392,14 @@ struct TrainingPermissionsView: View {
             _ = dreamReadGate.begin()
             _ = unattendedReadGate.begin()
         }
+    }
+
+    private func featureSection<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
+            AliveEyebrow(title)
+            AliveGroupCard { content() }
+        }
+        .accessibilityElement(children: .contain)
     }
 
     /// The one gate every unattended lane asks, minus the raw toggle: what is
@@ -462,38 +479,29 @@ struct WorkshopPermissionsView: View {
         draftPolicy.showTimeline ?? true
     }
 
+    /// Alive glass (2026-09-23): one group card of switch rows.
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Toggle(
-                    "Allow Desk task execution",
-                    isOn: Binding(
-                        get: { workshopExecutionsEnabled },
-                        set: { newValue in
-                            Task { await saveWorkshopPolicy(enabled: newValue, showTimeline: showTimeline) }
-                        }
-                    )
+        AliveGroupCard {
+            FeatureSwitchRow(
+                title: "Allow Desk tasks",
+                detail: "I create Desk tasks and plan them in several steps.",
+                isOn: Binding(
+                    get: { workshopExecutionsEnabled },
+                    set: { newValue in
+                        Task { await saveWorkshopPolicy(enabled: newValue, showTimeline: showTimeline) }
+                    }
                 )
-                .help("Allows Swift-native Desk task creation and multi-step planning.")
-                EffectTimingTag(timing: .nextRun)
-                Spacer()
-            }
-            HStack {
-                Toggle(
-                    "Show Desk execution timeline",
-                    isOn: Binding(
-                        get: { showTimeline },
-                        set: { newValue in
-                            Task { await saveWorkshopPolicy(enabled: workshopExecutionsEnabled, showTimeline: newValue) }
-                        }
-                    )
+            )
+            FeatureSwitchRow(
+                title: "Show the Desk timeline",
+                isOn: Binding(
+                    get: { showTimeline },
+                    set: { newValue in
+                        Task { await saveWorkshopPolicy(enabled: workshopExecutionsEnabled, showTimeline: newValue) }
+                    }
                 )
-                EffectTimingTag(timing: .now)
-                Spacer()
-            }
-            Text("Desk execution follows app-wide tool autonomy. Admitted Full Mac actions run without an additional app approval; narrower modes may ask before sends or destructive actions.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            )
+            FeatureNote("Desk tasks follow the same approval rules as the rest of my tools. In Full Mac, allowed actions run without asking you again; narrower modes may ask before I send or delete anything.")
         }
         .task { syncDraftPolicy() }
         .onChange(of: appModel.trustPolicy) { _, _ in
@@ -525,126 +533,104 @@ struct LivingMemoryPermissionsView: View {
         appModel.memoryProposals.filter { $0.status == "pending" }.count
     }
 
+    /// Alive glass (2026-09-23): one group card of switch rows. Titles match
+    /// the same switches on Setup (SetupFeatureRows.swift).
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Toggle(
-                    "Cross-session memory recall",
-                    isOn: Binding(
-                        get: { draftPolicy.cross_session_recall },
-                        set: { v in
-                            var next = draftPolicy
-                            next.cross_session_recall = v
-                            draftPolicy = next
-                            Task { await saveMemoryPolicy(next) }
-                        }
-                    )
+        AliveGroupCard(waiting: pendingCount > 0) {
+            FeatureSwitchRow(
+                title: "Remember across conversations",
+                detail: "Each time you write, I look through all our past conversations for what is relevant. Read only; on by default.",
+                isOn: Binding(
+                    get: { draftPolicy.cross_session_recall },
+                    set: { v in
+                        var next = draftPolicy
+                        next.cross_session_recall = v
+                        draftPolicy = next
+                        Task { await saveMemoryPolicy(next) }
+                    }
                 )
-                .help("Per-turn: the agent retrieves relevant memories from all past sessions (read-only, default on).")
-                EffectTimingTag(timing: .now)
-                Spacer()
-            }
-            HStack {
-                Toggle(
-                    "Nightly memory consolidation",
-                    isOn: Binding(
-                        get: { draftPolicy.consolidation_enabled },
-                        set: { v in
-                            var next = draftPolicy
-                            next.consolidation_enabled = v
-                            if !v {
-                                next.auto_promote_consolidated = false
-                            }
-                            draftPolicy = next
-                            Task { await saveMemoryPolicy(next) }
+            )
+            FeatureSwitchRow(
+                title: "Nightly memory consolidation",
+                detail: MemoryPolicyHelpCopy.nightlyConsolidation,
+                isOn: Binding(
+                    get: { draftPolicy.consolidation_enabled },
+                    set: { v in
+                        var next = draftPolicy
+                        next.consolidation_enabled = v
+                        if !v {
+                            next.auto_promote_consolidated = false
                         }
-                    )
+                        draftPolicy = next
+                        Task { await saveMemoryPolicy(next) }
+                    }
                 )
-                .help(MemoryPolicyHelpCopy.nightlyConsolidation)
-                EffectTimingTag(timing: .nextRun)
-                Spacer()
-            }
-            HStack {
-                Toggle(
-                    "Auto-promote consolidated memories",
-                    isOn: Binding(
-                        get: { draftPolicy.auto_promote_consolidated },
-                        set: { v in
-                            var next = draftPolicy
-                            next.consolidation_enabled = true
-                            next.auto_promote_consolidated = v
-                            draftPolicy = next
-                            Task { await saveMemoryPolicy(next) }
-                        }
-                    )
+            )
+            FeatureSwitchRow(
+                title: "Keep consolidated memories without asking",
+                detail: MemoryPolicyHelpCopy.autoPromoteConsolidated,
+                isOn: Binding(
+                    get: { draftPolicy.auto_promote_consolidated },
+                    set: { v in
+                        var next = draftPolicy
+                        next.consolidation_enabled = true
+                        next.auto_promote_consolidated = v
+                        draftPolicy = next
+                        Task { await saveMemoryPolicy(next) }
+                    }
                 )
-                .disabled(!draftPolicy.consolidation_enabled)
-                .help(MemoryPolicyHelpCopy.autoPromoteConsolidated)
-                EffectTimingTag(timing: .nextRun)
-                Spacer()
-            }
-            Divider()
-            HStack {
-                Toggle(
-                    "Knowledge Graph",
-                    isOn: Binding(
-                        get: { draftPolicy.knowledge_graph_enabled },
-                        set: { v in
-                            var next = draftPolicy
-                            next.knowledge_graph_enabled = v
-                            draftPolicy = next
-                            Task { await patchMemoryPolicy(next, knowledgeGraph: v) }
-                        }
-                    )
+            )
+            .disabled(!draftPolicy.consolidation_enabled)
+            FeatureSwitchRow(
+                title: "Knowledge graph",
+                detail: "I join up the people, places and things your conversations keep mentioning, and draw them in Memory → Graph.",
+                isOn: Binding(
+                    get: { draftPolicy.knowledge_graph_enabled },
+                    set: { v in
+                        var next = draftPolicy
+                        next.knowledge_graph_enabled = v
+                        draftPolicy = next
+                        Task { await patchMemoryPolicy(next, knowledgeGraph: v) }
+                    }
                 )
-                .help("Builds entity links from conversations and powers Memory → Graph.")
-                EffectTimingTag(timing: .now)
-                Spacer()
-            }
-            HStack {
-                Toggle(
-                    "Adaptive memory promotion",
-                    isOn: Binding(
-                        get: { draftPolicy.adaptive_promotion },
-                        set: { v in
-                            var next = draftPolicy
-                            next.adaptive_promotion = v
-                            draftPolicy = next
-                            Task { await patchMemoryPolicy(next, adaptivePromotion: v) }
-                        }
-                    )
+            )
+            FeatureSwitchRow(
+                title: "Memories that recur become facts",
+                detail: "When something useful keeps coming back, I suggest keeping it as a lasting fact, without loading all my memory into every reply.",
+                isOn: Binding(
+                    get: { draftPolicy.adaptive_promotion },
+                    set: { v in
+                        var next = draftPolicy
+                        next.adaptive_promotion = v
+                        draftPolicy = next
+                        Task { await patchMemoryPolicy(next, adaptivePromotion: v) }
+                    }
                 )
-                .help("Allows recurring high-value memories to become proposed durable facts without loading all memory into each chat turn.")
-                EffectTimingTag(timing: .nextRun)
-                Spacer()
-            }
-            HStack {
-                Toggle(
-                    "Memory hygiene",
-                    isOn: Binding(
-                        get: { draftPolicy.hygiene_enabled },
-                        set: { v in
-                            var next = draftPolicy
-                            next.hygiene_enabled = v
-                            draftPolicy = next
-                            Task { await patchMemoryPolicy(next, hygiene: v) }
-                        }
-                    )
+            )
+            FeatureSwitchRow(
+                title: "Memory hygiene",
+                detail: "I regularly clear out old, noisy, duplicate and low-value memories so they don't pile up.",
+                isOn: Binding(
+                    get: { draftPolicy.hygiene_enabled },
+                    set: { v in
+                        var next = draftPolicy
+                        next.hygiene_enabled = v
+                        draftPolicy = next
+                        Task { await patchMemoryPolicy(next, hygiene: v) }
+                    }
                 )
-                .help("Runs regular cleanup so old, noisy, duplicate, and low-value memory does not accumulate forever.")
-                EffectTimingTag(timing: .nextRun)
-                Spacer()
-            }
+            )
             if pendingCount > 0 {
-                Label("\(pendingCount) memory proposal\(pendingCount == 1 ? "" : "s") pending — review in Memory", systemImage: "brain.head.profile")
-                    .font(.caption)
-                    .foregroundStyle(.green)
+                HStack(spacing: 8) {
+                    AliveWaitingDot()
+                    Text("\(pendingCount) memory suggestion\(pendingCount == 1 ? "" : "s") waiting for you in Memory")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(NativeAgentShell.text)
+                }
             }
             // Sweep R4 C9 — COPY ONLY. "harness and promotion proposals"
             // named machinery; the user is being told which page to look on.
-            Text("What the agent remembers, how it recalls it, and how it tidies itself up are all set here. Suggested memory changes wait for you in Memory; suggested changes to how the agent behaves wait in Self-Improvement.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            FeatureNote("What I remember, how I recall it, and how I tidy myself up are all set here. Suggested memory changes wait for you in Memory; suggested changes to how I behave wait in Self-Improvement.")
         }
         .task { syncDraftFromPolicy() }
         .onChange(of: appModel.trustPolicy) { _, _ in
@@ -676,6 +662,50 @@ struct LivingMemoryPermissionsView: View {
         )
         isSaving = false
         syncDraftFromPolicy()
+    }
+}
+
+/// A switch row on Trust's feature cards (Alive glass): the words on the
+/// left, the haze switch on the right. Same shape as the Mac control rows.
+private struct FeatureSwitchRow: View {
+    let title: String
+    var detail: String? = nil
+    var identifier: String? = nil
+    @Binding var isOn: Bool
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 12) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title)
+                    .font(.system(size: 14, weight: .medium))
+                    .foregroundStyle(NativeAgentShell.text)
+                if let detail {
+                    Text(detail)
+                        .font(.system(size: 12))
+                        .foregroundStyle(NativeAgentShell.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            Spacer(minLength: 12)
+            Toggle(title, isOn: $isOn)
+                .labelsHidden()
+                .toggleStyle(.switch)
+                .hazeTinted()
+                .accessibilityIdentifier(identifier ?? "")
+        }
+    }
+}
+
+/// A quiet line of explanation inside a feature card.
+private struct FeatureNote: View {
+    let text: String
+    init(_ text: String) { self.text = text }
+
+    var body: some View {
+        Text(text)
+            .font(.system(size: 12))
+            .foregroundStyle(NativeAgentShell.secondary)
+            .fixedSize(horizontal: false, vertical: true)
     }
 }
 
@@ -723,7 +753,7 @@ struct TrustBoundaryRow: View {
 // wording is pinnable in PublicHonestyCopyTests.
 enum MemoryPolicyHelpCopy {
     static let nightlyConsolidation =
-        "Once a night, the agent looks for things that keep coming up in your conversations and suggests them for your long-term memory profile."
+        "Once a week, I look for things that keep coming up in your conversations and suggest them for your long-term memory profile."
 
     static let autoPromoteConsolidated =
         "Adds those suggestions to your long-term memory profile automatically, instead of waiting for you to approve each one."

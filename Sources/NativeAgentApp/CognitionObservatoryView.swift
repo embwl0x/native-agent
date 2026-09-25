@@ -168,7 +168,7 @@ struct CognitionObservatoryView: View {
                     VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
                         Toggle("Background thinking", isOn: enabledBinding)
                             .disabled(detail == nil)
-                        Toggle("Give the agent a thought summary", isOn: capsuleEnabledBinding)
+                        Toggle("Give me a thought summary", isOn: capsuleEnabledBinding)
                             .disabled(!enabled)
                         Toggle("Keep thinking in the background", isOn: backgroundEnabledBinding)
                             .disabled(!enabled)
@@ -191,7 +191,7 @@ struct CognitionObservatoryView: View {
                         // toggles are the research-console overrides.
                         Text("Settings \u{25B8} Subconscious is the master switch — flipping it there resets all of these together.")
                             .font(.caption2)
-                            .foregroundStyle(.tertiary)
+                            .foregroundStyle(NativeAgentShell.secondary)
                         HStack(spacing: NativeAgentSpacing.sm) {
                             Button("Refresh", systemImage: "arrow.clockwise") {
                                 Task { await refresh() }
@@ -400,7 +400,7 @@ struct CognitionObservatoryView: View {
                     // moved to the Activity surface (B2.4); Identity Proposals was
                     // retired after its experimental producer proved inert.
                     // This segment is the read-only observational core.
-                    collapsible(.timeline, title: "How the agent has grown", systemImage: "timeline.selection", tint: .pink,
+                    collapsible(.timeline, title: "How I have grown", systemImage: "timeline.selection", tint: .pink,
                                 count: detail.developmentalTimeline.count) {
                         developmentalTimeline(detail.developmentalTimeline, week: detail.growthWeek)
                     }

@@ -110,6 +110,33 @@ public struct ShelfStore: Sendable {
         }
     }
 
+    /// `latestEntries` without the store lock, for a glance that must not
+    /// wait: read-only, never upgrades or replays; an index not yet upgraded
+    /// or an entry caught mid-write throws and the caller falls back.
+    public func latestEntriesUnlocked(botIDs: Set<UUID>) throws -> [ShelfEntry] {
+        // No index yet: an older shelf a locked read has not migrated, or
+        // nothing has run. Read the legacy books as they are (writing
+        // nothing), so "no runs" is only ever said when there are none.
+        guard let index = try disk.read(Index.self, at: indexPath) else {
+            var latest: [UUID: Book] = [:]
+            for book in try legacyBooks() where botIDs.contains(book.entry.botId) {
+                latest[book.entry.botId] = book  // ascending sequence: the last one wins
+            }
+            return latest.values.map(\.entry)
+        }
+        guard let latest = index.latestByBot else {
+            throw StandingBotsError.corruptStore("latest helper result index not ready")
+        }
+        return try botIDs.compactMap { bot in
+            guard let id = latest[bot] else { return nil }
+            guard let book = try disk.read(Book.self, at: indexedPath(id)), book.entry.botId == bot else {
+                throw StandingBotsError.corruptStore("latest helper result index")
+            }
+            try validate(book.entry)
+            return book.entry
+        }
+    }
+
     /// Last successful append, including a successful check that found nothing new.
     public func lastGood(bot: UUID) throws -> ShelfEntry? {
         try disk.locked {
@@ -271,11 +298,14 @@ public struct ShelfStore: Sendable {
         var index: Index
         if let saved = try disk.read(Index.self, at: indexPath) { index = saved }
         else {
-            index = Index()
+            // A new index is born upgraded, so the lock-free glance can read
+            // it from the first run on (it never upgrades one itself).
+            index = Index(latestByBot: [:])
             for book in try legacyBooks() {
                 try disk.write(book, at: indexedPath(book.entry.id))
                 index.sequence = book.sequence
                 index.lastEntry = book.entry.id
+                index.latestByBot?[book.entry.botId] = book.entry.id
                 if [.ok, .nothingNew].contains(book.entry.runHealth) { index.lastGood[book.entry.botId] = book.entry.id }
             }
             try disk.write(index, at: indexPath)

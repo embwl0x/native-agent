@@ -76,6 +76,10 @@ enum SameTurnToolSchemaRefresh {
         }
     }
 
+    static let placeOpeningTools: Set<String> = [
+        "workspace", "browser.chrome_navigate", "browser.chrome_acquire",
+    ]
+
     static func wasRequested(
         calls: [ParsedToolCall],
         providerTools: ProviderToolNameMap
@@ -83,6 +87,9 @@ enum SameTurnToolSchemaRefresh {
         calls.contains { call in
             let name = providerTools.internalName(forProviderName: call.name)
             if name == "tool_load" { return true }
+            // Her-screen Phase 3: opening a place or a page loads its tools
+            // inside the call, so the next provider call must offer them.
+            if placeOpeningTools.contains(name) { return true }
             guard name == "tool_catalog" || name == "list_tools" else { return false }
             if call.input["load"] == .bool(true) { return true }
             if case .string(let raw)? = call.input["load"] {
@@ -648,9 +655,10 @@ extension SwiftNativeTurnEngine {
         startNs: UInt64,
         providerCallCount: Int
     ) async -> TurnEngineResult {
-        let prefix = ToolCallParser.visiblePrefix(in: ToolCallParser.stripToolUseMarkers(partial))
+        // 2026-09-23: keep the prose before any repetition loop, and say why.
+        let (kept, notice) = RunawayOutputDetector.cutoffReply(partial)
+        let prefix = ToolCallParser.visiblePrefix(in: ToolCallParser.stripToolUseMarkers(kept))
         let prose = LLMCallContext.turnTokenBudget != nil ? prefix : prefix.trimmingCharacters(in: .whitespacesAndNewlines)
-        let notice = LLMError.outputLengthLimitNotice
         await ctx.fluidContextTurn?.recordOutcome(.abandoned)
         return TurnEngineResult(
             reply: LLMCallContext.turnTokenBudget != nil ? prose : (prose.isEmpty ? notice : prose + "\n\n" + notice),
@@ -886,8 +894,7 @@ extension SwiftNativeTurnEngine {
             // Stop that only WROTE cancelled.flag (no Task handle) halts the
             // turn here instead of running to iterationLimit burning tokens.
             // Mirrors the streaming loop's mid-stream poll, at iteration grain.
-            if let flag = cancelFlagPath,
-               FileManager.default.fileExists(atPath: flag.path) {
+            if ChatCancelFlag.isRaised(cancelFlagPath) {
                 throw CancellationError()
             }
             // A6: stop only at the safe iteration boundary. Cancellation keeps
@@ -986,7 +993,7 @@ extension SwiftNativeTurnEngine {
             } catch {
                 if case .outputLengthLimit(let partial) = error as? LLMError {
                     try Task.checkCancellation()
-                    if let flag = cancelFlagPath, FileManager.default.fileExists(atPath: flag.path) {
+                    if ChatCancelFlag.isRaised(cancelFlagPath) {
                         throw CancellationError()
                     }
                     return await finishLengthLimitedTurn(
@@ -1025,8 +1032,7 @@ extension SwiftNativeTurnEngine {
                         // ordering as the retry ladder below. No backoff: the body
                         // CHANGED, so asking again immediately is the right move.
                         try Task.checkCancellation()
-                        if let flag = cancelFlagPath,
-                           FileManager.default.fileExists(atPath: flag.path) {
+                        if ChatCancelFlag.isRaised(cancelFlagPath) {
                             throw CancellationError()
                         }
                         await progress?(.notice(
@@ -1077,8 +1083,7 @@ extension SwiftNativeTurnEngine {
                     // Cancellation outranks recovery, by Task state and by the
                     // cross-process flag the loop already polls at this grain.
                     try Task.checkCancellation()
-                    if let flag = cancelFlagPath,
-                       FileManager.default.fileExists(atPath: flag.path) {
+                    if ChatCancelFlag.isRaised(cancelFlagPath) {
                         throw CancellationError()
                     }
                     // A silent reconnect looks identical to a hang. Emitted
@@ -1095,8 +1100,7 @@ extension SwiftNativeTurnEngine {
                     // A Stop written during the backoff must not start one more
                     // provider call: re-check both signals after the wait.
                     try Task.checkCancellation()
-                    if let flag = cancelFlagPath,
-                       FileManager.default.fileExists(atPath: flag.path) {
+                    if ChatCancelFlag.isRaised(cancelFlagPath) {
                         throw CancellationError()
                     }
                     // The retry ladder is not exempt from the whole-turn budget:
@@ -1122,8 +1126,7 @@ extension SwiftNativeTurnEngine {
             // stop signals before touching the response — the streaming lane
             // already does exactly this at stream EOF.
             try Task.checkCancellation()
-            if let flag = cancelFlagPath,
-               FileManager.default.fileExists(atPath: flag.path) {
+            if ChatCancelFlag.isRaised(cancelFlagPath) {
                 throw CancellationError()
             }
             lastRawResponse = raw
@@ -1228,8 +1231,7 @@ extension SwiftNativeTurnEngine {
             // exhaustion. Decide cancellation right after the round, on the
             // same two signals the dispatch runner polls.
             try Task.checkCancellation()
-            if let flag = cancelFlagPath,
-               FileManager.default.fileExists(atPath: flag.path) {
+            if ChatCancelFlag.isRaised(cancelFlagPath) {
                 throw CancellationError()
             }
             if surface == "bot", ChatTurnExecution.current?.waitingForApproval == true {

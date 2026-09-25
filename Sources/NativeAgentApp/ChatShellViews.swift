@@ -15,10 +15,14 @@ struct ShellRoomHeader: View {
     var name: String
     var status: ChatShellStatus
     var trustPolicy: TrustPolicy?
+    /// Simple view: the settled posture line is the composer's to say; the
+    /// dot still shows when something waits or went wrong.
+    var showsPosture = true
 
     // Full Mac has no timer (2026-09-10), so nothing in the header goes
     // stale on a clock; policy changes come from AppModel observation.
     private var permissionRefreshDates: [Date] { [Date()] }
+    private var isSettled: Bool { if case .settled = status { true } else { false } }
 
     var body: some View {
         HStack(spacing: 8) {
@@ -37,32 +41,34 @@ struct ShellRoomHeader: View {
             // Conversation… (⌘F) — so this one is simply gone.
             // Conversation controls live beside the draft in the composer.
 
-            TimelineView(.explicit(permissionRefreshDates)) { context in
-                let currentStatus: ChatShellStatus = if case .settled = status {
-                    .settled(.make(policy: trustPolicy, now: context.date))
-                } else {
-                    status
-                }
-                Button {
-                    NotificationCenter.default.post(name: .openCommandRouteRequest, object: "trust")
-                } label: {
-                    HStack(spacing: 8) {
-                        Circle()
-                            .fill(currentStatus.color)
-                            .frame(width: 8, height: 8)
-                        Text(currentStatus.text)
-                            .font(ShellType.label)
-                            .foregroundStyle(NativeAgentShell.secondary)
-                            .lineLimit(1)
+            if showsPosture || !isSettled {
+                TimelineView(.explicit(permissionRefreshDates)) { context in
+                    let currentStatus: ChatShellStatus = if case .settled = status {
+                        .settled(.make(policy: trustPolicy, now: context.date))
+                    } else {
+                        status
                     }
-                    .contentShape(Rectangle())
+                    Button {
+                        NotificationCenter.default.post(name: .openCommandRouteRequest, object: "trust")
+                    } label: {
+                        HStack(spacing: 8) {
+                            Circle()
+                                .fill(currentStatus.color)
+                                .frame(width: 8, height: 8)
+                            Text(currentStatus.text)
+                                .font(ShellType.label)
+                                .foregroundStyle(NativeAgentShell.secondary)
+                                .lineLimit(1)
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .help("Review permissions in Trust")
+                    .accessibilityElement(children: .combine)
+                    .accessibilityLabel("\(currentStatus.text). Open Trust")
+                    .accessibilityIdentifier("chat.shell.status-dot")
+                    .padding(.leading, 4)
                 }
-                .buttonStyle(.plain)
-                .help("Review permissions in Trust")
-                .accessibilityElement(children: .combine)
-                .accessibilityLabel("\(currentStatus.text). Open Trust")
-                .accessibilityIdentifier("chat.shell.status-dot")
-                .padding(.leading, 4)
             }
         }
         // Agent, 2026-09-02: her name used to float at the far left of the

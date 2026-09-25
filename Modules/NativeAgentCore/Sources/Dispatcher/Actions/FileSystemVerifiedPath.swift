@@ -196,7 +196,7 @@ enum VerifiedImageRead {
 
     static func deliver(data: Data, name: String) -> JSONValue {
         guard LocalToolImage.sink != nil else {
-            return failure("Image pixels require a model tool turn; this direct text-only call cannot display an image.")
+            return failure("No image slot for this call: it is text-only, or this round already reads 8 images. Read it in the next call.")
         }
         guard !data.isEmpty, data.count <= LocalToolImage.maximumBytes else {
             return failure("Image must be a nonempty regular file of at most 8 MiB.")

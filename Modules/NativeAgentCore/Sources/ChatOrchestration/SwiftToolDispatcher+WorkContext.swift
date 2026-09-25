@@ -257,7 +257,7 @@ extension SwiftToolDispatcher {
 
     static func workContextDeskItem(_ item: DeskItem, state: DeskState, plan: DeskSequencing.ItemPlan?) -> JSONValue {
         var out: [String: JSONValue] = [
-            "handle": .string(item.handle), "title": .string(String(item.title.prefix(300))),
+            "handle": .string(item.handle), "alias": .string(item.alias), "title": .string(String(item.title.prefix(300))),
             "project": .string(String(item.project.prefix(200))),
             "status": .string(item.status.rawValue), "updated_at": .string(item.updatedAt),
             "is_open": .bool(!item.status.isTerminal),
@@ -291,7 +291,7 @@ extension SwiftToolDispatcher {
         }
         let children = state.children(of: item.handle)
         out["children"] = .array(children.prefix(5).map {
-            .object(["title": .string(String($0.title.prefix(300))), "status": .string($0.status.rawValue),
+            .object(["alias": .string($0.alias), "title": .string(String($0.title.prefix(300))), "status": .string($0.status.rawValue),
                      "read_locator": workContextRead("desk_read", ["handle": .string($0.handle)])])
         })
         out["additional_children"] = .bool(children.count > 5)

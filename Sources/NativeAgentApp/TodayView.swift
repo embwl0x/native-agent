@@ -32,6 +32,11 @@
 // Rule of the page: no counts as numerals, no valence, no weights, no ids, no
 // internal vocabulary, no markdown. Clock times and weekday names are the only
 // digits, because a day needs a spine.
+//
+// Alive glass (User approved the mockup, 2026-09-23): same three sections, now
+// drawn from AlivePageKit — a serif "Today" with one first-person sentence
+// built from the page's own counts, the waiting things in ONE group card, what
+// I did as a timeline on a haze line, and what's ahead as pills.
 
 import SwiftUI
 import NativeAgentShared
@@ -39,6 +44,7 @@ import NativeAgentCore
 import CognitiveSubstrate
 import PersistenceCore
 import MemoryV2
+import ApprovalInbox
 
 // MARK: - Palette
 
@@ -93,8 +99,10 @@ enum TodayPalette {
 enum TodayMetrics {
     static let contentWidth: CGFloat = 920
     static let cardRadius: CGFloat = 12
-    /// Wide enough for "6:51–9:55 am" on one line.
-    static let timeColumnWidth: CGFloat = 100
+    /// The timeline's time column, fixed. Wide enough for "10:53–11:55 am"
+    /// at 12pt: a folded row says its span, and the mockup's 64pt only held
+    /// a single clock.
+    static let timeColumnWidth: CGFloat = 98
     static let rowSpacing: CGFloat = 10
     static let sectionSpacing: CGFloat = 20
     static let topPadding: CGFloat = 36
@@ -214,7 +222,9 @@ enum TodayWords {
             }
             // Inline emphasis and code spans. `_` is deliberately left alone:
             // it lives inside identifiers far more often than around emphasis.
-            line.removeAll { $0 == "*" || $0 == "`" }
+            // A backslash is never something to read: a stray one in a quote
+            // rendered "exax\ctly" on Memories (2026-09-23).
+            line.removeAll { $0 == "*" || $0 == "`" || $0 == "\\" }
             return line.trimmingCharacters(in: .whitespaces)
         }
         return lines
@@ -296,6 +306,32 @@ enum TodayWords {
 
     static func weekday(_ date: Date) -> String {
         date.formatted(.dateTime.weekday(.abbreviated))
+    }
+
+    /// "Today", "Tonight", "Tomorrow" or the weekday — from the real date and
+    /// hour, so a 4:30 am dream is never called tonight's.
+    static func dayWord(_ date: Date, now: Date = Date(), calendar: Calendar = DisplayTimeZone.calendar) -> String {
+        if calendar.isDate(date, inSameDayAs: now) {
+            return calendar.component(.hour, from: date) >= 18 ? "Tonight" : "Today"
+        }
+        if let tomorrow = calendar.date(byAdding: .day, value: 1, to: now),
+           calendar.isDate(date, inSameDayAs: tomorrow) { return "Tomorrow" }
+        return date.formatted(.dateTime.weekday(.wide))
+    }
+
+    /// Raw ids out of a line: `conversation-cbd5dce3af1b903c`, UUIDs, long
+    /// hex. What is left is tidied so no empty "()" or trailing colon remains.
+    static func withoutIDs(_ text: String) -> String {
+        var out = text
+            .replacing(/[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}/, with: "")
+            .replacing(/\b[A-Za-z]+[-_][0-9A-Fa-f]{8,}\b/, with: "")
+            .replacing(/\b(?=[0-9A-Fa-f]*[0-9])[0-9A-Fa-f]{12,}\b/, with: "")
+        out = out.replacing(/\(\s*\)/, with: "").replacing(/\s{2,}/, with: " ")
+        out = out.trimmingCharacters(in: .whitespaces)
+        while let last = out.last, ":·-".contains(last) {
+            out = String(out.dropLast()).trimmingCharacters(in: .whitespaces)
+        }
+        return out
     }
 
     /// The honest date of something still open from an earlier day:
@@ -481,7 +517,7 @@ struct TodaySnapshot: Sendable, Equatable {
                     title: "I kept \(TodayWords.spelledLower(count)) \(noun) today",
                     line: "",
                     at: first.at,
-                    details: shown.map { "\u{201C}\($0.quote)\u{201D}" },
+                    details: shown.map { "\u{201C}\(TodayWords.plain($0.quote))\u{201D}" },
                     gutter: TodayWords.clockSpan(first.at, newest.at)
                 )
             }
@@ -502,11 +538,10 @@ struct TodaySnapshot: Sendable, Equatable {
                 dreamDate: dreamDate
             )
         }
-        if snapshot.facing?.id != "facing" || snapshot.facing?.title.contains("dream") == false,
-           let dreamAt, let tonight = calendar.date(byAdding: .day, value: 1, to: dreamAt), tonight > now {
-            // After midnight, the next dream is tomorrow night's, not tonight's.
-            let soon = tonight.timeIntervalSince(now) < 12 * 3600
-            snapshot.nextDream = TodayRow(id: "nextDream", title: soon ? "Tonight I'll dream" : "Tomorrow night I'll dream", line: "", at: tonight)
+        // The chip's day word comes from this date (TodayAhead), never from
+        // how soon it is.
+        if let dreamAt, let next = calendar.date(byAdding: .day, value: 1, to: dreamAt), next > now {
+            snapshot.nextDream = TodayRow(id: "nextDream", title: "I'll dream", line: "", at: next)
         }
 
         // ── Something I'm facing ─────────────────────────────────────────
@@ -514,8 +549,8 @@ struct TodaySnapshot: Sendable, Equatable {
             let label = TodayWords.capitalizedFirst(TodayWords.line(toward.displayLabel))
             if label.lowercased().contains("dream") {
                 snapshot.facing = TodayRow(
-                    id: "facing",
-                    title: "Tonight I'll dream",
+                    id: "facingDream",
+                    title: "I'll dream",
                     line: "",
                     at: toward.dueAt
                 )
@@ -566,6 +601,33 @@ enum TodayWaitingCopy {
         let verb = count == 1 ? "is" : "are"
         return "\(TodayWords.spelled(count)) \(noun) I'd like to keep \(verb) waiting for you to read."
     }
+
+    /// An approval's name in plain words. A skill proposal's own title is a
+    /// tool sequence ("workspace → workspace"); that is not a name.
+    static func approvalTitle(_ approval: ApprovalRequest) -> String {
+        ApprovalWords.title(action: approval.action, title: approval.title, reason: approval.reason ?? "")
+    }
+}
+
+// MARK: - Waiting on you, defined once
+
+/// "Waiting on you" — ONE definition, read by the Today and Desk headers alike
+/// (Agent, 2026-09-23: the two pages contradicted each other). Something that
+/// needs his decision or action: a pending approval, a memory to review, or a
+/// Desk item waiting on him. Failures and notices are never in it.
+@MainActor
+enum WaitingOnYou {
+    static func approvals(_ appModel: AppModel) -> [ApprovalRequest] {
+        appModel.approvals.filter { OwnerAttentionPolicy.approvalWaits(status: $0.status) }
+    }
+
+    static func memories(_ appModel: AppModel) -> Int { appModel.memoryProposals.count }
+
+    static func deskItems(_ items: [DeskItem]) -> [DeskItem] { DeskPageContent.waitingOnOwner(items) }
+
+    static func count(_ appModel: AppModel, deskItems items: [DeskItem]) -> Int {
+        approvals(appModel).count + memories(appModel) + deskItems(items).count
+    }
 }
 
 // MARK: - The page
@@ -595,12 +657,11 @@ enum TodayCollaboration {
         }
         guard let first = dates.min(), let last = dates.max() else { return nil }
         let noun = sessions.count == 1 ? "conversation" : "conversations"
+        let names = participants.sorted().map(TodayWords.capitalizedFirst).joined(separator: " and ")
         return TodayRow(
             id: "worked",
-            title: participants.count == 1 ? "I worked with another builder" : "I worked with other builders",
-            line: participants.count == 1
-                ? "\(TodayWords.spelled(sessions.count)) \(noun) with a builder."
-                : "\(TodayWords.spelled(sessions.count)) \(noun) with other builders.",
+            title: "I worked with \(names)",
+            line: "\(TodayWords.spelled(sessions.count)) \(noun).",
             at: first,
             gutter: TodayWords.clockSpan(first, last)
         )
@@ -616,33 +677,44 @@ struct TodayView: View {
     @State private var dreamUnavailable = false
     @State private var openedNote: InboxItemRecord?
     @State private var noteFlight = InboxRowActionFlight()
+    @State private var earlierOpen = false
+    /// The Desk board, for the one shared "waiting on you" count.
+    @State private var deskItems: [DeskItem] = []
+    @State private var deskUnreadable = false
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: TodayMetrics.sectionSpacing) {
-                Text("Today")
-                    .font(ShellType.display)
+            VStack(alignment: .leading, spacing: AliveMetrics.sectionSpacing) {
+                AlivePageHeader(title: "Today", line: headerLine)
 
                 if hasWaiting {
                     TodayWaitingCard(
-                        momentsLine: TodayWaitingCopy.momentsLine(snapshot.pendingMoments),
+                        momentsLine: TodayWaitingCopy.momentsLine(WaitingOnYou.memories(appModel)),
                         onReadMoments: openMomentReview,
-                        approvals: pendingApprovals,
-                        olderNotes: olderPendingNotes,
-                        onOpenNote: { openedNote = $0 }
+                        approvals: WaitingOnYou.approvals(appModel),
+                        deskCount: WaitingOnYou.deskItems(deskItems).count
                     )
                 }
 
-                // Older FYIs are not obligations. One grey line, dated, that
-                // opens the whole Inbox where every one of them still is.
+                // Failures and notices from earlier days are not waiting. One
+                // folded quiet line; it opens the grouped list in place.
                 if let earlierNotesLine {
-                    Button(earlierNotesLine) {
-                        _ = NativeAgentAppCoordinator.shared.request(.activity(.inbox))
+                    VStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
+                        Button(earlierNotesLine + (earlierOpen ? " · Hide" : " · Show")) {
+                            earlierOpen.toggle()
+                        }
+                        .buttonStyle(.plain)
+                        .font(ShellType.labelMedium)
+                        .foregroundStyle(NativeAgentShell.secondary)
+                        .accessibilityIdentifier("today.earlier-notes")
+                        if earlierOpen {
+                            AliveGroupCard {
+                                ForEach(earlierNotes) { note in
+                                    TodayEarlierNoteRow(note: note) { openedNote = note.newest }
+                                }
+                            }
+                        }
                     }
-                    .buttonStyle(.plain)
-                    .font(ShellType.labelMedium)
-                    .foregroundStyle(NativeAgentShell.tertiary)
-                    .accessibilityIdentifier("today.earlier-notes")
                 }
 
                 let did = didTodayRows
@@ -652,7 +724,7 @@ struct TodayView: View {
 
                 let ahead = aheadRows
                 if !ahead.isEmpty {
-                    TodaySection(title: "What's ahead", rows: ahead)
+                    TodayAhead(rows: ahead)
                 }
 
                 if !hasWaiting, did.isEmpty, ahead.isEmpty, earlierNotesLine == nil,
@@ -668,7 +740,7 @@ struct TodayView: View {
                 if snapshot.memoryUnreadable {
                     Text("I couldn't read my memory just now.")
                         .font(ShellType.labelMedium)
-                        .foregroundStyle(NativeAgentShell.tertiary)
+                        .foregroundStyle(NativeAgentShell.secondary)
                         .padding(.top, 4)
                         .accessibilityIdentifier("today.memory-trouble")
                 }
@@ -676,13 +748,13 @@ struct TodayView: View {
                 if dreamUnavailable {
                     Text("I couldn't read the dream source just now.")
                         .font(ShellType.labelMedium)
-                        .foregroundStyle(NativeAgentShell.tertiary)
+                        .foregroundStyle(NativeAgentShell.secondary)
                 }
 
                 if let trouble = providerTroubleLine {
                     Text(trouble)
                         .font(ShellType.labelMedium)
-                        .foregroundStyle(NativeAgentShell.tertiary)
+                        .foregroundStyle(NativeAgentShell.secondary)
                         .padding(.top, 4)
                         .accessibilityIdentifier("today.provider-trouble")
                 }
@@ -745,56 +817,79 @@ struct TodayView: View {
         }
     }
 
+    // MARK: the header's one sentence
+
+    /// One first-person sentence from counts the page already holds. No model
+    /// call, and nothing said before the lanes are read: a page that has not
+    /// looked yet does not get to say "nothing is waiting".
+    private var headerLine: String? {
+        guard snapshot.loaded else { return nil }
+        let hour = Calendar.current.component(.hour, from: Date())
+        let part = hour < 12 ? "morning" : hour < 17 ? "afternoon" : "evening"
+        let did = didTodayRows.count
+        let day: String
+        switch did {
+        case 0: day = "A quiet \(part) so far."
+        case 1...2: day = "A quiet \(part)."
+        default: day = "I've had a full \(part)."
+        }
+        // A store that would not open cannot vouch for "nothing".
+        let waiting = WaitingOnYou.count(appModel, deskItems: deskItems)
+        if waiting == 0 {
+            return snapshot.memoryUnreadable || deskUnreadable ? day : "\(day) Nothing is waiting on you."
+        }
+        let things = waiting == 1 ? "thing is" : "things are"
+        return "\(day) \(DeskPageWords.spelled(waiting)) \(things) waiting on you."
+    }
+
     // MARK: what's waiting
 
-    /// Approvals actually waiting on him, whatever day they were raised. The
-    /// teal card is about what is OPEN, not about today.
-    private var pendingApprovals: [ApprovalRequest] {
-        appModel.approvals.filter { $0.status.lowercased() == "pending" }
-    }
-
-    /// Notes she left on an earlier day that he still has not dealt with.
-    /// Today's own notes are already in the timeline below; these would
-    /// otherwise fall off the page when the date rolls over.
-    /// Every older pending note, newest first — the split below reads from this.
-    private var olderNotesByRecency: [(InboxItemRecord, Date)] {
-        let calendar = Calendar.current
+    /// Notes from an earlier day he has not cleared — failures and things she
+    /// told him. Not waiting: today's own notes are in the timeline, and a
+    /// morning brief from yesterday is just a note. Grouped so the same agent
+    /// failing the same way twice is one row, "×2"; newest group first.
+    private var earlierNotes: [TodayEarlierNote] {
         let now = Date()
-        return appModel.inboxItems
-            .filter { $0.isActivityPending && $0.isForYouLane }
-            .compactMap { item -> (InboxItemRecord, Date)? in
-                guard let at = TodayWords.parseTimestamp(item.created_at),
-                      !calendar.isDate(at, inSameDayAs: now) else { return nil }
-                return (item, at)
+        var groups: [String: TodayEarlierNote] = [:]
+        for item in appModel.inboxItems where item.isActivityPending && item.isForYouLane {
+            guard let at = TodayWords.parseTimestamp(item.created_at),
+                  !Calendar.current.isDate(at, inSameDayAs: now) else { continue }
+            let title = TodayWords.withoutIDs(TodayWords.line(item.title, limit: 90))
+            let lower = title.lowercased()
+            let failure = lower.contains("fail") || lower.contains("lost") || lower.contains("didn't finish")
+            let key = "\(item.source.lowercased())|\(lower)"
+            if var group = groups[key] {
+                group.count += 1
+                if at > group.at { group.at = at; group.newest = item }
+                if at < group.oldest { group.oldest = at }
+                groups[key] = group
+            } else {
+                groups[key] = TodayEarlierNote(
+                    id: key, title: title.isEmpty ? "A note I left you" : title,
+                    isFailure: failure, count: 1, at: at, oldest: at, newest: item)
             }
-            .sorted { $0.1 > $1.1 }
+        }
+        return groups.values.sorted {
+            $0.isFailure != $1.isFailure ? $0.isFailure : $0.at > $1.at
+        }
     }
 
-    /// Only what still wants a decision or an action from him. An unread FYI is
-    /// exempt from inbox pruning, so before this split one could sit in the
-    /// morning's attention card forever while newer notes fell off the cap.
-    private var olderPendingNotes: [InboxItemRecord] {
-        olderNotesByRecency
-            .filter { $0.0.needsYou }
-            .prefix(TodayMetrics.noteRowsShown)
-            .map { $0.0 }
-    }
-
-    /// The rest: things she told him. One quiet dated line under the card,
-    /// nothing lost — the whole collection is one tap away in Activity.
-    private var olderInformationalNotes: [(InboxItemRecord, Date)] {
-        olderNotesByRecency.filter { !$0.0.needsYou }
-    }
-
+    /// "3 failures and 1 note since Monday".
     private var earlierNotesLine: String? {
-        guard let newest = olderInformationalNotes.first?.1 else { return nil }
-        let count = olderInformationalNotes.count
-        let things = count == 1 ? "one thing" : "\(TodayWords.spelledLower(count)) things"
-        return "Earlier notes · \(things) I told you about, latest \(TodayWords.dayLabel(newest))"
+        let notes = earlierNotes
+        guard let oldest = notes.map(\.oldest).min() else { return nil }
+        let failures = notes.filter(\.isFailure).reduce(0) { $0 + $1.count }
+        let others = notes.reduce(0) { $0 + $1.count } - failures
+        var parts: [String] = []
+        if failures > 0 { parts.append("\(failures) \(failures == 1 ? "failure" : "failures")") }
+        if others > 0 { parts.append("\(others) \(others == 1 ? "note" : "notes")") }
+        var since = TodayWords.dayLabel(oldest)
+        if since == "Yesterday" { since = "yesterday" }
+        return TodayWords.capitalizedFirst(parts.joined(separator: " and ")) + " since \(since)"
     }
 
     private var hasWaiting: Bool {
-        snapshot.pendingMoments > 0 || !pendingApprovals.isEmpty || !olderPendingNotes.isEmpty
+        WaitingOnYou.count(appModel, deskItems: deskItems) > 0
     }
 
     /// The Memories page's Pending tab IS the moment review. Same coordinator
@@ -810,9 +905,11 @@ struct TodayView: View {
     /// — `isForYouLane` is the app's existing split and it already names them.
     /// The horizon read and the diary can both name tonight's dream; one card.
     private var aheadRows: [TodayRow] {
-        var ahead = [snapshot.facing, snapshot.nextDream].compactMap { $0 }.sorted { $0.at < $1.at }
-        if ahead.count == 2, ahead[0].title == ahead[1].title { ahead.removeLast() }
-        return ahead
+        // One dream chip: the horizon's own due time when it names the dream.
+        let dreamFacing = snapshot.facing?.id == "facingDream"
+        return [snapshot.facing, dreamFacing ? nil : snapshot.nextDream]
+            .compactMap { $0 }
+            .sorted { $0.at < $1.at }
     }
 
     private var didTodayRows: [TodayRow] {
@@ -910,8 +1007,8 @@ struct TodayView: View {
                 if haveDreamRow, source == "dream_cycle" || source == "rem_cycle" { return nil }
                 guard let at = TodayWords.parseTimestamp(item.created_at),
                       calendar.isDate(at, inSameDayAs: now) else { return nil }
-                var title = TodayWords.line(item.title, limit: 90)
-                var summary = TodayWords.firstSentence(item.summary)
+                var title = TodayWords.withoutIDs(TodayWords.line(item.title, limit: 90))
+                var summary = TodayWords.withoutIDs(TodayWords.firstSentence(item.summary))
                 // "Claude finished: shell-consult-open-items" and "Claude
                 // delegation failed" are routing labels, and what sits under
                 // them is a slug. A slug is not a sentence: the row says
@@ -1049,6 +1146,13 @@ struct TodayView: View {
             }
         }
         collaborationMessages = loaded
+        // The same board read the Desk page takes, for the shared count.
+        do {
+            deskItems = try await SwiftNativeDeskStore(dataRoot: PersistenceCore.defaultDataRoot()).liveState().items
+            deskUnreadable = false
+        } catch {
+            deskUnreadable = true
+        }
         snapshot = await TodaySnapshot.load(
             sessionIDs: Array(sessionIDs),
             recollections: recollections,
@@ -1072,111 +1176,161 @@ struct TodayView: View {
 
 // MARK: - Pieces
 
-/// A titled run of rows. The title is the only chrome the section carries.
+/// A titled run of rows, as a timeline: a haze line down the left, one ring
+/// per row, the time in a fixed column. Not cards — a day is one thread.
 struct TodaySection: View {
     let title: String
     let rows: [TodayRow]
     var onReadDream: ((String) async -> Bool)? = nil
+    @AppStorage(HazeColor.key) private var colorRaw = HazeColor.defaultValue.rawValue
 
     var body: some View {
-        VStack(alignment: .leading, spacing: TodayMetrics.rowSpacing) {
-            Text(title)
-                .font(ShellType.labelSemibold)
-                .textCase(.uppercase)
-                .kerning(0.6)
-                .foregroundStyle(NativeAgentShell.secondary)
-            ForEach(rows) { row in
-                TodayRowCard(row: row, onReadDream: onReadDream)
-                    .motionArrival()
+        let haze = HazeColor(stored: colorRaw).base
+        VStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
+            AliveEyebrow(title)
+            VStack(alignment: .leading, spacing: 0) {
+                ForEach(Array(rows.enumerated()), id: \.element.id) { index, row in
+                    TodayTimelineRow(
+                        row: row,
+                        // Each ring a little quieter than the one above it.
+                        dotOpacity: rows.count <= 1 ? 1 : 1 - 0.55 * Double(index) / Double(rows.count - 1),
+                        haze: haze,
+                        onReadDream: onReadDream)
+                }
+            }
+            .background(alignment: .topLeading) {
+                LinearGradient(colors: [haze.opacity(0.5), haze.opacity(0.05)],
+                               startPoint: .top, endPoint: .bottom)
+                    .frame(width: 1.5)
+                    .padding(.leading, TodayMetrics.timeColumnWidth + 3.75)
+                    .padding(.vertical, 14)
+                    .accessibilityHidden(true)
             }
         }
     }
 }
 
-/// The one tinted card on the page. It exists only when something is actually
-/// waiting on him, it NAMES each thing, and it carries the action beside it.
+/// What's ahead, as pills. Only what the page already reads — the horizon and
+/// the next dream — never an invented plan.
+struct TodayAhead: View {
+    let rows: [TodayRow]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
+            AliveEyebrow("Ahead")
+            AliveFlow {
+                ForEach(rows) { row in
+                    // A horizon's line already carries its day; a bare title
+                    // gets the time the old gutter gave it.
+                    AlivePill(row.line.isEmpty ? row.title : row.line,
+                              leading: row.line.isEmpty
+                                ? "\(TodayWords.dayWord(row.at)), \(TodayWords.clock(row.at))"
+                                : nil)
+                }
+            }
+        }
+        .accessibilityIdentifier("today.ahead")
+    }
+}
+
+/// The one card that exists only when something is actually waiting on him.
+/// It NAMES each thing and carries the action beside it.
 struct TodayWaitingCard: View {
     let momentsLine: String?
     let onReadMoments: () -> Void
     let approvals: [ApprovalRequest]
-    var olderNotes: [InboxItemRecord] = []
-    var onOpenNote: (InboxItemRecord) -> Void = { _ in }
+    /// Desk items waiting on him; one row that opens the Desk.
+    var deskCount = 0
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Text("Waiting for you")
-                .font(ShellType.labelSemibold)
-                .textCase(.uppercase)
-                .kerning(0.6)
-                .foregroundStyle(TodayPalette.accent)
+        VStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
+            AliveEyebrow("Waiting for you")
+            AliveGroupCard(waiting: true) {
+                if let momentsLine {
+                    HStack(alignment: .center, spacing: 12) {
+                        AliveWaitingDot()
+                        Text(TodayWords.bounded(momentsLine, limit: 80))
+                            .font(.system(size: 15, weight: .medium))
+                            .foregroundStyle(NativeAgentShell.text)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                            .frame(height: TodayMetrics.rowContentHeightSingle)
+                        Spacer(minLength: 12)
+                        Button(momentsLine.hasPrefix("One ") ? "Read it with me" : "Read them with me", action: onReadMoments)
+                            .buttonStyle(.borderedProminent)
+                            .controlSize(.small)
+                            .hazeTinted(.button)
+                            .accessibilityIdentifier("today.waiting.read-moments")
+                    }
+                }
 
-            if let momentsLine {
-                HStack(alignment: .firstTextBaseline, spacing: 12) {
-                    Text(momentsLine)
-                        .font(ShellType.body)
-                        .fixedSize(horizontal: false, vertical: true)
-                    Spacer(minLength: 0)
-                    Button(momentsLine.hasPrefix("One ") ? "Read it with me" : "Read them with me", action: onReadMoments)
+                ForEach(approvals) { approval in
+                    TodayApprovalRow(approval: approval)
+                }
+
+                if deskCount > 0 {
+                    HStack(alignment: .center, spacing: 12) {
+                        AliveWaitingDot()
+                        Text(deskCount == 1
+                             ? "One thing on the Desk needs your answer."
+                             : "\(DeskPageWords.spelled(deskCount)) things on the Desk need your answer.")
+                            .font(.system(size: 15, weight: .medium))
+                            .foregroundStyle(NativeAgentShell.text)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                            .frame(height: TodayMetrics.rowContentHeightSingle)
+                        Spacer(minLength: 12)
+                        Button("Open the Desk") {
+                            _ = NativeAgentAppCoordinator.shared.request(.sidebar(.desk))
+                        }
                         .buttonStyle(.borderedProminent)
                         .controlSize(.small)
-                        .tint(TodayPalette.accent)
-                        .accessibilityIdentifier("today.waiting.read-moments")
-                }
-            }
-
-            ForEach(approvals) { approval in
-                if momentsLine != nil || approval.id != approvals.first?.id {
-                    Divider().overlay(TodayPalette.hairline)
-                }
-                TodayApprovalRow(approval: approval)
-            }
-
-            ForEach(olderNotes) { note in
-                if momentsLine != nil || !approvals.isEmpty || note.id != olderNotes.first?.id {
-                    Divider().overlay(TodayPalette.hairline)
-                }
-                Button {
-                    onOpenNote(note)
-                } label: {
-                    HStack(alignment: .firstTextBaseline, spacing: 12) {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text(TodayWords.line(note.title, limit: 110))
-                                .font(ShellType.bodySemibold)
-                                .fixedSize(horizontal: false, vertical: true)
-                            let summary = TodayWords.firstSentence(note.summary)
-                            if !summary.isEmpty {
-                                Text(summary)
-                                    .font(ShellType.labelMedium)
-                                    .foregroundStyle(NativeAgentShell.secondary)
-                                    .fixedSize(horizontal: false, vertical: true)
-                            }
-                        }
-                        Spacer(minLength: 0)
-                        if let at = TodayWords.parseTimestamp(note.created_at) {
-                            Text(TodayWords.dayLabel(at))
-                                .font(ShellType.labelMedium)
-                                .foregroundStyle(NativeAgentShell.secondary)
-                        }
+                        .hazeTinted(.button)
+                        .accessibilityIdentifier("today.waiting.open-desk")
                     }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .contentShape(Rectangle())
                 }
-                .buttonStyle(.plain)
-                .accessibilityIdentifier("today.waiting.note.\(note.id)")
             }
+            .accessibilityIdentifier("today.waiting-for-you")
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.vertical, 18)
-        .padding(.horizontal, 20)
-        .background(
-            RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
-                .fill(TodayPalette.waitingFill)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
-                .strokeBorder(TodayPalette.waitingStroke, lineWidth: 1)
-        )
-        .accessibilityIdentifier("today.waiting-for-you")
+    }
+}
+
+/// Notes from earlier days that are not waiting on him: one group per source
+/// and title, so the same failure twice is one row.
+struct TodayEarlierNote: Identifiable {
+    let id: String
+    let title: String
+    let isFailure: Bool
+    var count: Int
+    /// The newest in the group — its date, and the note a click opens.
+    var at: Date
+    var oldest: Date
+    var newest: InboxItemRecord
+}
+
+/// One group in the folded earlier-notes list. The row opens the newest note.
+struct TodayEarlierNoteRow: View {
+    let note: TodayEarlierNote
+    let onOpen: () -> Void
+
+    var body: some View {
+        Button(action: onOpen) {
+            HStack(alignment: .firstTextBaseline, spacing: 12) {
+                Text(TodayWords.bounded(note.title, limit: 80) + (note.count > 1 ? " ×\(note.count)" : ""))
+                    .font(.system(size: 14, weight: .medium))
+                    .foregroundStyle(NativeAgentShell.text)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                Spacer(minLength: 12)
+                Text(TodayWords.dayLabel(note.at))
+                    .font(.system(size: 13))
+                    .foregroundStyle(NativeAgentShell.secondary)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityIdentifier("today.earlier-note")
     }
 }
 
@@ -1188,9 +1342,13 @@ struct TodayApprovalRow: View {
 
     @State private var isDeciding = false
     @State private var errorText: String?
+    /// The reason is one line; a click opens the whole of it. User,
+    /// 2026-09-12: "I can't see the REM lesson, what it is, to approve it" —
+    /// the lesson stays one click from the button that approves it.
+    @State private var reasonOpen = false
 
     private var title: String {
-        let named = TodayWords.line(approval.title, limit: 110)
+        let named = TodayWords.line(TodayWaitingCopy.approvalTitle(approval), limit: 110)
         return named.isEmpty ? TodayWords.line(approval.action, limit: 110) : named
     }
 
@@ -1203,47 +1361,68 @@ struct TodayApprovalRow: View {
         return TodayWords.bounded(TodayWords.plain(approval.payloadPreview ?? ""), limit: 240)
     }
 
+    private var shortReason: String { TodayWords.bounded(reason, limit: 90) }
+    private var reasonFolds: Bool { shortReason != reason }
+    private var canResolve: Bool { ApprovalPayloadPreviewPresentation.canResolve(approval) }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text(title.isEmpty ? "I'm asking first" : title)
-                .font(ShellType.bodySemibold)
-                .fixedSize(horizontal: false, vertical: true)
-            if !reason.isEmpty {
-                Text(reason)
-                    .font(ShellType.labelMedium)
-                    .foregroundStyle(NativeAgentShell.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            if !ApprovalPayloadPreviewPresentation.canResolve(approval) {
-                Text(ApprovalPayloadPreviewPresentation.unavailableText)
-                    .font(ShellType.labelMedium)
-                    .foregroundStyle(.orange)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            if let errorText {
-                Text(errorText)
-                    .font(ShellType.labelMedium)
-                    .foregroundStyle(.red)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            HStack(spacing: 8) {
-                Button("Approve") { decide("approved") }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.small)
-                    .tint(.green)
-                    .disabled(isDeciding || !ApprovalPayloadPreviewPresentation.canResolve(approval))
-                    .accessibilityIdentifier("today.waiting.approve.\(approval.id)")
+            HStack(alignment: .center, spacing: 12) {
+                AliveWaitingDot()
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(title.isEmpty ? "I'm asking first" : TodayWords.bounded(title, limit: 70))
+                        .font(.system(size: 15, weight: .medium))
+                        .foregroundStyle(NativeAgentShell.text)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                    if !reason.isEmpty {
+                        Text(reasonOpen ? reason : shortReason)
+                            .font(.system(size: 13))
+                            .foregroundStyle(NativeAgentShell.secondary)
+                            .lineLimit(reasonOpen ? nil : 1)
+                            .truncationMode(.tail)
+                            .fixedSize(horizontal: false, vertical: reasonOpen)
+                    }
+                }
+                // Fixed while closed; only an opened reason may grow the row.
+                .frame(height: reasonOpen ? nil : (reason.isEmpty ? TodayMetrics.rowContentHeightSingle : TodayMetrics.rowContentHeight),
+                       alignment: .leading)
+                .contentShape(Rectangle())
+                .onTapGesture { if reasonFolds { reasonOpen.toggle() } }
+                .accessibilityElement(children: .combine)
+                .accessibilityAction(named: reasonOpen ? "Show less" : "Read the whole reason") {
+                    if reasonFolds { reasonOpen.toggle() }
+                }
+                Spacer(minLength: 12)
+                if isDeciding { ProgressView().controlSize(.small) }
                 Button("Decline") { decide("denied") }
                     .buttonStyle(.bordered)
                     .controlSize(.small)
-                    .tint(.red)
-                    .disabled(isDeciding || !ApprovalPayloadPreviewPresentation.canResolve(approval))
+                    .disabled(isDeciding || !canResolve)
                     .accessibilityIdentifier("today.waiting.decline.\(approval.id)")
-                if isDeciding { ProgressView().controlSize(.small) }
-                Spacer(minLength: 0)
+                Button("Approve") { decide("approved") }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .hazeTinted(.button)
+                    .disabled(isDeciding || !canResolve)
+                    .accessibilityIdentifier("today.waiting.approve.\(approval.id)")
+            }
+            if !canResolve {
+                troubleLine(ApprovalPayloadPreviewPresentation.unavailableText)
+            }
+            if let errorText {
+                troubleLine(errorText)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func troubleLine(_ text: String) -> some View {
+        Text(text)
+            .font(.system(size: 13))
+            .foregroundStyle(NativeAgentShell.trouble)
+            .fixedSize(horizontal: false, vertical: true)
+            .padding(.leading, 20)
     }
 
     private func decide(_ decision: String) {
@@ -1264,10 +1443,13 @@ struct TodayApprovalRow: View {
     }
 }
 
-/// One timeline row: the 40pt gutter, a title, one plain line. A row that
-/// folds several things opens on click instead of spilling them down the page.
-struct TodayRowCard: View {
+/// One timeline row: the time, a ring on the line, a title and one plain
+/// line. A row that folds several things opens on click instead of spilling
+/// them down the page.
+struct TodayTimelineRow: View {
     let row: TodayRow
+    var dotOpacity: Double = 1
+    var haze: Color
     var onReadDream: ((String) async -> Bool)? = nil
     @State private var isOpen = false
     @State private var readingDream = false
@@ -1287,44 +1469,56 @@ struct TodayRowCard: View {
         TodayWords.bounded(row.line, limit: TodayMetrics.rowLineLimit)
     }
 
+    private static let dotSize: CGFloat = 9
+    private static let textLead: CGFloat = 16
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack(alignment: .top, spacing: 14) {
+            HStack(alignment: .top, spacing: 0) {
+                // Secondary, not tertiary: tertiary measured ≈2.6:1 on the
+                // room where the haze discs overlap.
                 Text(gutter)
-                    .font(ShellType.labelMedium)
-                    // 2026-09-12: the time is the page's faintest text and the
-                    // silver card is 17 L* brighter than the slate it replaced.
-                    // Tertiary measured 3.07:1 on it (and only ever Lc 46 on the
-                    // old one); secondary is the rung that clears the floor.
+                    .font(.system(size: 12))
+                    .monospacedDigit()
                     .foregroundStyle(NativeAgentShell.secondary)
-                    .frame(width: TodayMetrics.timeColumnWidth, alignment: .trailing)
-                    .padding(.top, 2)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.85)
+                    .frame(width: TodayMetrics.timeColumnWidth, alignment: .leading)
+                    .padding(.top, 1)
+                Circle()
+                    .fill(NativeAgentShell.room)
+                    .overlay(Circle().strokeBorder(haze.opacity(dotOpacity), lineWidth: 2))
+                    .frame(width: Self.dotSize, height: Self.dotSize)
+                    .padding(.top, 4)
+                    .accessibilityHidden(true)
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(alignment: .firstTextBaseline, spacing: 6) {
                         Text(row.title)
-                            .font(ShellType.bodySemibold)
+                            .font(.system(size: 14, weight: .medium))
+                            .foregroundStyle(NativeAgentShell.text)
                             .lineLimit(1)
                             .truncationMode(.tail)
                         if foldable {
                             Image(systemName: "chevron.right")
-                                .font(ShellType.labelSemibold)
-                                .foregroundStyle(NativeAgentShell.tertiary)
+                                .font(ShellType.captionSemibold)
+                                .foregroundStyle(NativeAgentShell.secondary)
                                 .rotationEffect(.degrees(isOpen ? 90 : 0))
+                                .accessibilityHidden(true)
                         }
                         Spacer(minLength: 0)
                     }
                     if !line.isEmpty {
                         Text(line)
-                            .font(ShellType.labelMedium)
+                            .font(.system(size: 13))
                             .foregroundStyle(NativeAgentShell.secondary)
                             .lineLimit(1)
                             .truncationMode(.tail)
                     }
                 }
-                // THE FIXED BOX. A one-line row, a two-line row and the
-                // morning brief all occupy exactly this, so the column reads
-                // as a column.
+                // THE FIXED BOX. A one-line row and a two-line row each occupy
+                // exactly this, so the column reads as a column.
                 .frame(height: row.line.isEmpty ? TodayMetrics.rowContentHeightSingle : TodayMetrics.rowContentHeight, alignment: .topLeading)
+                .padding(.leading, Self.textLead)
                 Spacer(minLength: 0)
                 if row.id == "dream" {
                     if let date = row.dreamDate, let onReadDream, !dreamMissing {
@@ -1341,44 +1535,38 @@ struct TodayRowCard: View {
                         .accessibilityIdentifier("today.read-dream")
                     } else {
                         Text("Dream source unavailable")
-                            .font(ShellType.labelMedium)
+                            .font(.system(size: 13))
                             .foregroundStyle(NativeAgentShell.secondary)
                     }
                 }
             }
-            // The fold is the one thing allowed to grow a card, and only while
+            // The fold is the one thing allowed to grow a row, and only while
             // it is open. Closed, it is the same height as every other row.
             if foldable, isOpen {
                 VStack(alignment: .leading, spacing: 8) {
                     ForEach(Array(row.details.enumerated()), id: \.offset) { _, detail in
                         Text(detail)
-                            .font(ShellType.labelMedium)
+                            .font(.system(size: 13))
                             .foregroundStyle(NativeAgentShell.secondary)
                             .fixedSize(horizontal: false, vertical: true)
                     }
                 }
                 .padding(.top, 10)
-                .padding(.leading, TodayMetrics.timeColumnWidth + 14)
+                .padding(.leading, TodayMetrics.timeColumnWidth + Self.dotSize + Self.textLead)
                 .transition(NativeAgentMotion.reveal(reduceMotion: reduceMotion))
             }
         }
-        .padding(.vertical, 16)
-        .padding(.horizontal, 18)
-        .background(
-            RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
-                .fill(TodayPalette.cardFill)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
-                .strokeBorder(TodayPalette.cardStroke, lineWidth: 1)
-        )
-        .contentShape(RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous))
-        .onTapGesture {
-            guard foldable else { return }
-            withAnimation(NativeAgentMotion.respecting(
-                NativeAgentMotion.quick, reduceMotion: reduceMotion
-            )) { isOpen.toggle() }
-        }
+        .padding(.vertical, 10)
+        .contentShape(Rectangle())
+        .onTapGesture { toggle() }
+        .accessibilityAction(named: isOpen ? "Fold" : "Open") { toggle() }
         .accessibilityIdentifier("today.row")
+    }
+
+    private func toggle() {
+        guard foldable else { return }
+        withAnimation(NativeAgentMotion.respecting(
+            NativeAgentMotion.quick, reduceMotion: reduceMotion
+        )) { isOpen.toggle() }
     }
 }

@@ -625,7 +625,7 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
             var ttftMs: Int?
             var yieldedAnyText = false
             var lastStopReason: String?
-            var streamedText = ""
+            var runaway = RunawayOutputDetector(endsAtToolBoundary: body["stop_sequences"] != nil)
             // R15: SSEEventStream owns framing; protocol semantics stay here.
             for try await sse in SSEEventStream(bytes) {
                 try Task.checkCancellation()
@@ -674,10 +674,10 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
                     // 2026-09-22: a max_tokens cut-off is a truncated reply, not
                     // a finished one — tool markers in it must never dispatch.
                     if lastStopReason == "max_tokens" {
-                        Self.logCutoffShape(streamedText)
-                        throw LLMError.outputLengthLimit(partial: streamedText)
+                        Self.logCutoffShape(runaway.text)
+                        throw LLMError.outputLengthLimit(partial: runaway.text)
                     }
-                    Self.logStopWithoutToolCall(lastStopReason, streamedText)
+                    Self.logStopWithoutToolCall(lastStopReason, runaway.text)
                     continuation.finish()
                     return
                 case "content_block_delta":
@@ -690,8 +690,33 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
                         ttftMs = Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
                     }
                     yieldedAnyText = true
-                    streamedText += text
-                    continuation.yield(text)
+                    let stop = runaway.feed(text)
+                    let kept = runaway.keptPart(of: text)
+                    if !kept.isEmpty { continuation.yield(kept) }
+                    if stop {
+                        // Ended by us, not by message_stop: record the call anyway, so
+                        // the turn's cost stays visible (usage has message_start's input
+                        // and cache counts; output tokens are unknown after cancel).
+                        // A loop trip is recorded too: it is the costliest call.
+                        await telemetry.record(
+                            requestBody: req.httpBody,
+                            provider: providerId,
+                            model: model,
+                            streaming: true,
+                            usage: usage.isEmpty ? nil : usage,
+                            ttftMs: ttftMs,
+                            durationMs: Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000),
+                            status: runaway.toolBoundary != nil ? "ok" : "incomplete",
+                            substitutedFrom: substitutedFrom,
+                            cacheMarkers: Self.cacheMarkers(in: body),
+                            stopReason: runaway.toolBoundary != nil ? "client_tool_boundary" : "client_runaway"
+                        )
+                        // Ended at a complete tool block, like a stop sequence:
+                        // a normal finish, so the calls before it dispatch.
+                        guard runaway.toolBoundary != nil else { throw runaway.stopError }
+                        continuation.finish()
+                        return
+                    }
                 default:
                     continue
                 }
@@ -804,7 +829,7 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
             var ttftMs: Int?
             var yieldedSemanticOutput = false
             var lastStopReason: String?
-            var streamedText = ""
+            var runaway = RunawayOutputDetector(endsAtToolBoundary: body["stop_sequences"] != nil)
             // Mid-stream transport errors (resource timeout, connection
             // lost, ...) thrown by the byte stream must route through the SAME
             // transientNetworkError mapping the initial session.bytes(for:)
@@ -869,10 +894,10 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
                         // tool calls parsed from the cut-off text. Truncated is
                         // not finished: the text lane stops on this error.
                         if lastStopReason == "max_tokens" {
-                            Self.logCutoffShape(streamedText)
-                            throw LLMError.outputLengthLimit(partial: streamedText)
+                            Self.logCutoffShape(runaway.text)
+                            throw LLMError.outputLengthLimit(partial: runaway.text)
                         }
-                        Self.logStopWithoutToolCall(lastStopReason, streamedText)
+                        Self.logStopWithoutToolCall(lastStopReason, runaway.text)
                         continuation.finish()
                         return
                     case "content_block_start":
@@ -893,8 +918,34 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
                                 ttftMs = Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
                             }
                             yieldedSemanticOutput = true
-                            streamedText += text
-                            continuation.yield(.textDelta(text))
+                            let stop = runaway.feed(text)
+                            let kept = runaway.keptPart(of: text)
+                            if !kept.isEmpty { continuation.yield(.textDelta(kept)) }
+                            if stop {
+                                // Ended by us, not by message_stop: record the call anyway, so
+                                // the turn's cost stays visible (usage has message_start's input
+                                // and cache counts; output tokens are unknown after cancel).
+                                // A loop trip is recorded too: it is the costliest call.
+                                await telemetry.record(
+                                    requestBody: req.httpBody,
+                                    provider: providerId,
+                                    model: model,
+                                    streaming: true,
+                                    usage: usage.isEmpty ? nil : usage,
+                                    ttftMs: ttftMs,
+                                    durationMs: Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000),
+                                    status: runaway.toolBoundary != nil ? "ok" : "incomplete",
+                                    substitutedFrom: substitutedFrom,
+                                    cacheMarkers: Self.cacheMarkers(in: body),
+                                    stopReason: runaway.toolBoundary != nil ? "client_tool_boundary" : "client_runaway"
+                                )
+                                // Ended at a complete tool block, like a stop
+                                // sequence: a normal finish, so the calls
+                                // before it dispatch.
+                                guard runaway.toolBoundary != nil else { throw runaway.stopError }
+                                continuation.finish()
+                                return
+                            }
                         case "thinking_delta":
                             // Turn Inspector W2 — summarized-thinking lane.
                             // Fire the thinking text onto the bus (redacted +

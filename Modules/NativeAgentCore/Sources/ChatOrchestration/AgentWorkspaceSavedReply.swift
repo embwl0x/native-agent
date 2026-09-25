@@ -14,7 +14,9 @@ struct AgentWorkspaceSavedReply: Sendable {
     var location: AgentWorkspaceLocation { .record(tool: "shelf_entry", input: input, title: title) }
     var agent: String { "bot:" + botID }
 
-    static func title(_ result: JSONValue) -> String {
+    /// `now` nil leaves the age out: a list row's read keeps one title, so
+    /// its number stays with it as it ages.
+    static func title(_ result: JSONValue, now: Date? = Date()) -> String {
         guard case .object(let row) = result else { return "Saved reply" }
         let name: String
         if case .string(let value)? = row["agent_name"] {
@@ -27,21 +29,22 @@ struct AgentWorkspaceSavedReply: Sendable {
             let parser = ISO8601DateFormatter()
             let parsed = parser.date(from: timestamp)
             parser.formatOptions.insert(.withFractionalSeconds)
+            // Relative like every other room (walk 4: these alone read in UTC).
             if let time = parsed ?? parser.date(from: timestamp) {
-                let formatter = DateFormatter()
-                formatter.locale = Locale(identifier: "en_US_POSIX")
-                formatter.timeZone = TimeZone(secondsFromGMT: 0)
-                formatter.dateFormat = "MMM d, HH:mm:ss 'UTC'"
-                date = formatter.string(from: time)
+                guard let now else { return (name.isEmpty ? "Helper" : name) + " — " + subject(row) }
+                date = HerScreen.age(now.timeIntervalSince(time)) + " ago"
             }
         }
-        let subject: String
+        return (name.isEmpty ? "Helper" : name) + " — " + date + " — " + subject(row)
+    }
+
+    private static func subject(_ row: [String: JSONValue]) -> String {
         if case .string(let headline)? = row["headline"], !headline.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            subject = String(headline.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ").prefix(100))
+            return String(headline.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ").prefix(100))
         } else if case .string(let state)? = row["run_status"] ?? row["status"], state != "ok" {
-            subject = state
-        } else { subject = "Saved reply" }
-        return (name.isEmpty ? "Helper" : name) + " — " + date + " — " + subject
+            return state
+        }
+        return "Saved reply"
     }
 
     struct Failure: Error, LocalizedError {

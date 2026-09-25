@@ -12,6 +12,10 @@ struct AgentWorkspaceForm: Sendable, Equatable {
     /// Drafts are input, never an admitted action. Only explicitly supported
     /// non-authority fields can cross restart; the current owner is rechecked.
     let draftID: UUID
+    /// The name this draft keeps while it is open (`draft.3f2a9c01`), unlike an
+    /// offered action id that expires with the view. Eight hex characters: at
+    /// most four drafts are resident, and a name matching two is refused.
+    var lastingName: String { "draft." + draftID.uuidString.prefix(8).lowercased() }
     private(set) var draftValues: [String: JSONValue] = [:]
     private(set) var showOptionalFields = false
     private(set) var focusedField: String?
@@ -294,7 +298,7 @@ struct AgentWorkspaceForm: Sendable, Equatable {
         if schemaIssue != nil {
             actions.insert(.init(label: "Refresh form availability", action: .open(.form(self))), at: 0)
         }
-        actions.append(.init(label: "Discard this draft", action: .discardDraft(self)))
+        actions.append(.init(label: "Discard this draft (later, by name: \(lastingName).discard)", action: .discardDraft(self)))
         if properties.keys.contains(where: { !required.contains($0) }) {
             actions.append(.init(label: showOptionalFields ? "Hide optional fields" : "More options", action: .open(.form(showingOptionalFields(!showOptionalFields)))))
         }

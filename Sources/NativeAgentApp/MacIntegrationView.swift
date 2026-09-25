@@ -129,18 +129,20 @@ private struct MacIntegrationPermissionLoadErrorPanel: View {
 
     var body: some View {
         MacSection(title: "Permissions") {
-            Text("Permission controls unavailable")
-                .font(ShellType.bodySemibold)
-                .foregroundStyle(NativeAgentShell.trouble)
-            Text(detail)
-                .font(ShellType.label)
-                .foregroundStyle(NativeAgentShell.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-                .accessibilityIdentifier("mac-integration.permissions.load-error.detail")
-            Text("Mac integration is blocked because the saved permissions could not be read. The saved file has not been changed. After it is repaired, choose Retry to check again.")
-                .font(ShellType.label)
-                .foregroundStyle(NativeAgentShell.secondary)
-                .fixedSize(horizontal: false, vertical: true)
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Permission controls unavailable")
+                    .font(ShellType.bodySemibold)
+                    .foregroundStyle(NativeAgentShell.trouble)
+                Text(detail)
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("mac-integration.permissions.load-error.detail")
+                Text("Mac integration is blocked because I could not read the saved permissions. The saved file has not been changed. After it is repaired, choose Retry to check again.")
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             Button {
                 retry()
             } label: {
@@ -272,7 +274,7 @@ struct MacIntegrationView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
-                Text("Choose which Mac apps and features the agent can read from or use. Sensitive apps — Contacts, Mail, Messages, Notes — start with read on and write off; turn on write to allow sending or changing anything. Changes take effect immediately.")
+                Text("Choose which Mac apps and features I can read from or use. Contacts, Mail, Messages and Notes start with read on and write off; turn on write to let me send or change anything there. Changes apply right away.")
                     .font(ShellType.label)
                     .foregroundStyle(NativeAgentShell.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -290,7 +292,7 @@ struct MacIntegrationView: View {
                     // 2026-08-18: Speech Recognition first — it is the one the
                     // headless Telegram voice path silently depends on, and the
                     // one a user has no other way to discover is missing.
-                    tccStatusRow(label: "Speech Recognition", icon: "waveform", statusKey: MacIntegrationSystemPermissionPresentation.speechRecognitionKey, frameworkPermission: .speechRecognition)
+                    tccStatusRow(label: "Speech recognition", icon: "waveform", statusKey: MacIntegrationSystemPermissionPresentation.speechRecognitionKey, frameworkPermission: .speechRecognition)
                     tccStatusRow(label: "Microphone", icon: "mic", statusKey: MacIntegrationSystemPermissionPresentation.microphoneKey, frameworkPermission: .microphone)
                     tccStatusRow(label: "Calendar", icon: "calendar", statusKey: MacIntegrationSystemPermissionPresentation.calendarKey, frameworkPermission: .calendar)
                     tccStatusRow(label: "Reminders", icon: "checklist", statusKey: MacIntegrationSystemPermissionPresentation.remindersKey, frameworkPermission: .reminders)
@@ -326,7 +328,7 @@ struct MacIntegrationView: View {
                     }
                 }
 
-                Text("These are macOS privacy permissions, separate from the read and write toggles below. Notifications, Spotlight and the scheduler need none of them. Mail, Messages, Notes and Music are automation grants — each app's first probe triggers its own prompt.")
+                Text("These are macOS privacy permissions, separate from the read and write switches below. Notifications, Spotlight and the scheduler need none of them. Mail, Messages, Notes and Music each ask for automation access the first time I check them.")
                     .font(ShellType.caption)
                     .foregroundStyle(NativeAgentShell.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -364,7 +366,7 @@ struct MacIntegrationView: View {
                 // tab — pointed to here so each control has one discoverable
                 // home instead of the old two-tab split.
                 MacSection(title: "Mac control capabilities") {
-                    Text("Mac control capabilities — shell, AppleScript, accessibility, file operations, iOS remote and the assistant watch — live on the Trust page under Mac control.")
+                    Text("Shell commands, AppleScript, clicking and typing, file operations, iPhone remote control and background watches live on the Trust page under Mac control.")
                         .font(ShellType.label)
                         .foregroundStyle(NativeAgentShell.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -440,7 +442,7 @@ struct MacIntegrationView: View {
             Image(systemName: Self.iconName(for: id))
                 .font(ShellType.body)
                 .frame(width: 24, height: 24)
-                .foregroundStyle(NativeAgentShell.tertiary)
+                .foregroundStyle(NativeAgentShell.secondary)
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(MacIntegrationID.displayName(for: id))
@@ -461,6 +463,7 @@ struct MacIntegrationView: View {
                         .foregroundStyle(supportsRead ? NativeAgentShell.secondary : NativeAgentShell.tertiary)
                 }
                 .toggleStyle(.switch)
+                .hazeTinted()
                 .controlSize(.small)
                 .disabled(!supportsRead)
                 .accessibilityLabel("\(MacIntegrationID.displayName(for: id)) read permission")
@@ -474,6 +477,7 @@ struct MacIntegrationView: View {
                         .foregroundStyle(supportsWrite ? NativeAgentShell.secondary : NativeAgentShell.tertiary)
                 }
                 .toggleStyle(.switch)
+                .hazeTinted()
                 .controlSize(.small)
                 .disabled(!supportsWrite)
                 .accessibilityLabel("\(MacIntegrationID.displayName(for: id)) write permission")
@@ -572,7 +576,7 @@ struct MacIntegrationView: View {
             Image(systemName: icon)
                 .font(ShellType.body)
                 .frame(width: 24, height: 24)
-                .foregroundStyle(NativeAgentShell.tertiary)
+                .foregroundStyle(NativeAgentShell.secondary)
             VStack(alignment: .leading, spacing: 3) {
                 Text(label)
                     .font(ShellType.bodySemibold)
@@ -1008,7 +1012,7 @@ struct MacIntegrationView: View {
     /// Critically: it does NOT trigger a prompt. Safe to call on every
     /// view appear and during the auto-refresh poll. App doesn't need to
     /// be running — TCC state is per-bundle, not per-process.
-    private static func probeAppleEventApp(_ app: String) async -> String {
+    static func probeAppleEventApp(_ app: String) async -> String {
         await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
                 guard let bundleID = appleEventsTargetBundleIDs[app] else {
@@ -1077,6 +1081,17 @@ struct MacIntegrationView: View {
 // the shell's one sheet that read as a stack of plates rather than a page.
 // A section is now the Advanced list's shape — an eyebrow, then one card.
 
-/// One section of the page: the eyebrow the Advanced list uses, and the rows
-/// under it on one card.
-private typealias MacSection<Content: View> = SettingsCardSection<Content>
+/// One section of the page: an eyebrow over one group card, a hairline
+/// between rows (Alive glass, 2026-09-23 — the Trust tab's kit).
+private struct MacSection<Content: View>: View {
+    let title: String
+    @ViewBuilder var content: Content
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
+            AliveEyebrow(title)
+            AliveGroupCard { content }
+        }
+        .accessibilityElement(children: .contain)
+    }
+}

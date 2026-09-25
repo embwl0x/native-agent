@@ -292,6 +292,7 @@ public struct TurnTraceEvent: Sendable, Equatable {
                 // per-field guard below.
                 "historyMessageBytes", "historyMessageCount",
                 "volatileBlockBytes", "personaSourceBytes", "memoryRecall",
+                "toolCatalogSystemBytes", "toolCatalogBriefBytes",
             ]
             for key in stableKeys {
                 guard let field = object[key],
@@ -1366,9 +1367,13 @@ public struct TurnTraceRecentReader: Sendable {
 
     private let lane: TurnTracePersistLane
     private let persistence = SwiftNativePersistenceCore()
+    private let rowLimit: Int
 
-    public init(dataRootOverride: URL? = nil) {
+    /// `rowLimit` widens the tail for a reader that must find one session's
+    /// latest turn: on a busy day 2,000 rows can end before it.
+    public init(dataRootOverride: URL? = nil, rowLimit: Int = TurnTraceRecentReader.maxRows) {
         self.lane = TurnTracePersistLane(dataRootOverride: dataRootOverride)
+        self.rowLimit = rowLimit
     }
 
     /// Reads only the bounded tail of the current local-day trace file.
@@ -1384,7 +1389,7 @@ public struct TurnTraceRecentReader: Sendable {
         }
         let rows = try await persistence.tailJSONL(
             sourceURL,
-            limit: Self.maxRows,
+            limit: rowLimit,
             maxBytes: Self.maxBytes
         )
         return Snapshot(

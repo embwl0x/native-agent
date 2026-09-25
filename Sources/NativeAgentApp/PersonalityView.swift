@@ -241,7 +241,7 @@ struct PersonalityView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
             } else {
                 ScrollView {
-                    VStack(alignment: .leading, spacing: 24) {
+                    VStack(alignment: .leading, spacing: AliveMetrics.sectionSpacing) {
                         if personaInitialized {
                             identityPanel
                             docsPanel
@@ -379,7 +379,7 @@ struct PersonalityView: View {
                 if let updatedAt = draft.updatedAt {
                     Text("Updated \(updatedAt)")
                         .font(ShellType.caption)
-                        .foregroundStyle(NativeAgentShell.tertiary)
+                        .foregroundStyle(NativeAgentShell.secondary)
                 }
             }
         }
@@ -409,7 +409,7 @@ struct PersonalityView: View {
     private var docsPanel: some View {
         PersonalityKitSection(
             label: "Persona documents",
-            note: "These documents guide the agent's identity, expression, and choices. Choose a purpose to read the document or edit it where allowed."
+            note: "These documents guide my identity, expression, and choices. Choose a purpose to read the document or edit it where allowed."
         ) {
             Picker("Document", selection: documentPickerSelection) {
                 ForEach(PersonalityDocumentDraftState.usableDocuments(in: appModel.personalityDocs)) { doc in
@@ -417,6 +417,7 @@ struct PersonalityView: View {
                 }
             }
             .pickerStyle(.segmented)
+            .hazeTinted(.segments)
             .labelsHidden()
             if let doc = selectedPersonalityDoc {
                 PersonalityDocumentPurposeDetail(documentID: doc.id, filename: doc.filename)
@@ -465,7 +466,7 @@ struct PersonalityView: View {
                 if let path = selectedPersonalityDoc?.path {
                     Text(path)
                         .font(ShellType.label.monospaced())
-                        .foregroundStyle(NativeAgentShell.tertiary)
+                        .foregroundStyle(NativeAgentShell.secondary)
                         .lineLimit(1)
                         .truncationMode(.middle)
                         .textSelection(.enabled)
@@ -662,32 +663,23 @@ private struct PersonalityKitSection<Content: View>: View {
     @ViewBuilder var content: Content
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text(label)
-                .font(ShellType.labelSemibold)
-                .textCase(.uppercase)
-                .kerning(0.6)
-                .foregroundStyle(NativeAgentShell.secondary)
-                .padding(.horizontal, 2)
+        // Alive glass (2026-09-23): the eyebrow and card Today and the Desk wear.
+        VStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
+            AliveEyebrow(label)
 
             VStack(alignment: .leading, spacing: 12) {
                 content
             }
-            .padding(16)
+            .padding(.horizontal, AliveMetrics.rowInsetH)
+            .padding(.vertical, 16)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(
-                RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
-                    .fill(NativeAgentShell.quietFill)
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
-                    .strokeBorder(NativeAgentShell.hairline, lineWidth: 1)
-            )
+            .aliveCard()
 
             if let note {
                 Text(note)
-                    .font(ShellType.caption)
-                    .foregroundStyle(NativeAgentShell.tertiary)
+                    .font(.system(size: 12))
+                    // Secondary, not tertiary: tertiary fails where the haze peaks.
+                    .foregroundStyle(NativeAgentShell.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                     .padding(.horizontal, 2)
             }
@@ -729,12 +721,12 @@ enum PersonalityDocumentPurpose {
 
     static func explanation(for id: String) -> String {
         switch id.uppercased() {
-        case "SOUL": "The agent's identity, values, and sense of purpose. Editable here."
-        case "VOICE": "How the agent speaks and expresses ideas. Editable here."
-        case "USER": "What the agent knows about you. Generated from your long-term memory profile and read-only here; make changes on the Memories page."
-        case "GROWTH": "Lessons and changes in the agent's outlook, including approved personal growth. Editable here."
+        case "SOUL": "My identity, values, and sense of purpose. Editable here."
+        case "VOICE": "How I speak and express ideas. Editable here."
+        case "USER": "What I know about you. Generated from your long-term memory profile and read-only here; make changes on the Memories page."
+        case "GROWTH": "Lessons and changes in my outlook, including approved personal growth. Editable here."
         case "MEMORY": "Durable memories distilled during memory review. Not listed in this editor."
-        case "AGENTS": "Guidelines for how the agent approaches work and makes decisions. Editable here."
+        case "AGENTS": "Guidelines for how I approach work and make decisions. Editable here."
         default: "Read the document below."
         }
     }

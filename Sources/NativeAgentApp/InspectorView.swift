@@ -50,6 +50,7 @@ struct InspectorView: View {
                     }
                 }
                 .pickerStyle(.segmented)
+                .hazeTinted(.segments)
                 .frame(width: 180)
                 .labelsHidden()
             }
@@ -95,7 +96,7 @@ struct InspectorView: View {
                     Spacer()
                     Text("Shows saved turns from an earlier day")
                         .font(NativeAgentFont.tag)
-                        .foregroundStyle(.tertiary)
+                        .foregroundStyle(NativeAgentShell.secondary)
                 }
             }
         }
@@ -126,7 +127,7 @@ struct InspectorView: View {
         VStack(spacing: NativeAgentSpacing.sm) {
             Image(systemName: store.mode == .live ? "waveform.path.ecg" : "calendar.badge.clock")
                 .font(.largeTitle)
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(NativeAgentShell.secondary)
             Text(store.mode == .live
                  ? "Waiting for a turn — send a message to watch it happen."
                  : (store.replayFileExists
@@ -161,11 +162,8 @@ private struct TurnCardView: View {
             }
         }
         .padding(NativeAgentSpacing.md)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: NativeAgentRadius.panel, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: NativeAgentRadius.panel, style: .continuous)
-                .strokeBorder(Color.primary.opacity(0.07), lineWidth: 1)
-        }
+        // Alive glass (2026-09-23): a fill, never glass, on the content layer.
+        .aliveCard(radius: NativeAgentRadius.panel)
     }
 
     private var summaryLine: some View {
@@ -191,7 +189,7 @@ private struct TurnCardView: View {
             Spacer()
             Text(card.id.prefix(8))
                 .font(NativeAgentFont.mono)
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(NativeAgentShell.secondary)
         }
     }
 }
@@ -223,7 +221,7 @@ private struct EventRowView: View {
                         HStack(alignment: .top, spacing: NativeAgentSpacing.sm) {
                             Text(line.label)
                                 .font(NativeAgentFont.tag)
-                                .foregroundStyle(.tertiary)
+                                .foregroundStyle(NativeAgentShell.secondary)
                                 .frame(width: 96, alignment: .leading)
                             Text(line.value)
                                 .font(NativeAgentFont.mono)
@@ -253,13 +251,13 @@ private struct EventRowView: View {
             if let ms = row.durationMs {
                 Text("\(ms)ms")
                     .font(NativeAgentFont.tag)
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(NativeAgentShell.secondary)
                     .monospacedDigit()
             }
             if row.isExpandable {
                 Image(systemName: expanded ? "chevron.down" : "chevron.right")
                     .font(.caption2)
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(NativeAgentShell.secondary)
             }
         }
         .contentShape(Rectangle())

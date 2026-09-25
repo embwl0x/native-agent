@@ -38,7 +38,7 @@ enum ChromeExtensionFolder {
         }
         return SetupResult(folder: folder, extensionsPageOpened: opened,
             message: opened
-                ? "Extension folder ready. In Chrome, turn on Developer mode, choose Load unpacked and select \(folder.path). Then check Chrome connection status. No permissions were changed."
+                ? "Extension folder ready. Turn on Chrome's Developer mode, choose Load unpacked and select \(folder.path). Then check Chrome connection status. No permissions were changed."
                 : "Extension folder ready at \(folder.path), but Chrome could not open its extensions page. Open chrome://extensions to load it. No permissions were changed.")
     }
     static let requiredFiles = ["manifest.json", "src/background.js", "src/page-agent.js", "src/user-touch.js"]

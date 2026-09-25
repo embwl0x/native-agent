@@ -27,6 +27,9 @@ public struct AgentConversationRecord: Codable, Sendable {
     public var replyRoute: [String: String]?
     public var selected: Bool = false
     public var exchanges: [AgentConversationExchange]?
+    /// The current send was typed by the person in the contact's thread, so
+    /// its answer settles here and never starts an agent turn.
+    public var personInitiated: Bool?
 }
 
 public enum AgentConversationContext {
@@ -47,6 +50,10 @@ public struct AgentConversationStore: Sendable {
     public func records() throws -> [AgentConversationRecord] {
         try locked { try load() }
     }
+
+    /// Read-only and without the lock, for a glance that must not wait; a
+    /// file caught mid-write fails to decode and throws.
+    public func recordsUnlocked() throws -> [AgentConversationRecord] { try load() }
 
     public func find(scopeSessionID: String, agent: String, label: String?) throws -> AgentConversationRecord? {
         let rows = try records()
@@ -70,7 +77,8 @@ public struct AgentConversationStore: Sendable {
     public func begin(scopeSessionID: String, agent: String, name: String, label: String?,
                       fresh: Bool, sourceSurface: String, fingerprint: String?,
                       replyRoute: [String: String]?, message: String? = nil,
-                      legacyFingerprint: String? = nil) throws -> AgentConversationRecord {
+                      legacyFingerprint: String? = nil, personInitiated: Bool = false,
+                      supersedeWaiting: Bool = false) throws -> AgentConversationRecord {
         guard !scopeSessionID.isEmpty, scopeSessionID.utf8.count <= 256,
               label == nil || (label!.count <= 120 && !label!.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty) else {
             throw Failure(message: "Choose a short conversation name.")
@@ -79,7 +87,9 @@ public struct AgentConversationStore: Sendable {
             var rows = try load()
             let old = try select(rows, scope: scopeSessionID, agent: agent, label: label)
                 ?? (fresh ? nil : Self.continuing(rows, agent: agent, label: label))
-            if !fresh, let old, ["sending", "waiting"].contains(old.phase) {
+            // An accepted ask its peer never answered (Grok Bot) may be superseded;
+            // an unsettled send never is.
+            if !fresh, let old, old.phase == "sending" || (old.phase == "waiting" && !supersedeWaiting) {
                 throw Failure(message: "This conversation is still waiting for its previous message. Open it to see the current state; do not send that message again.")
             }
             if !fresh, let old, old.peerRouteFingerprint != fingerprint,
@@ -108,8 +118,9 @@ public struct AgentConversationStore: Sendable {
             row.updatedAt = Date()
             row.operationStartedAt = row.updatedAt
             row.exchanges = try AgentConversationExchange.bounded((row.exchanges ?? []) + [
-                .started(operationID: row.operationID, at: row.updatedAt, message: message)
+                .started(operationID: row.operationID, at: row.updatedAt, message: message, byPerson: personInitiated)
             ])
+            row.personInitiated = personInitiated ? true : nil
             row.sourceSurface = sourceSurface
             row.peerRouteFingerprint = fingerprint
             row.replyRoute = replyRoute
@@ -125,7 +136,9 @@ public struct AgentConversationStore: Sendable {
         }
     }
 
-    @discardableResult public func update(id: String, operationID: String,
+    /// `touch: false` (a read) moves updatedAt only when the phase or the
+    /// newest reply changed, so opening a conversation never reads as news.
+    @discardableResult public func update(id: String, operationID: String, touch: Bool = true,
         edit: (inout AgentConversationRecord) throws -> Void) throws -> AgentConversationRecord {
         try locked {
             var rows = try load()
@@ -137,8 +150,10 @@ public struct AgentConversationStore: Sendable {
             guard rows[i].id == identity.id, rows[i].agent == identity.agent,
                   rows[i].scopeSessionID == identity.scopeSessionID,
                   rows[i].operationID == operationID else { throw Failure(message: "Conversation identity cannot change.") }
-            rows[i].updatedAt = Date()
             try Self.absorbExchange(into: &rows[i])
+            if touch || rows[i].phase != identity.phase || rows[i].exchanges?.last?.reply != identity.exchanges?.last?.reply {
+                rows[i].updatedAt = Date()
+            }
             if rows[i].selected {
                 for j in rows.indices where j != i && rows[j].scopeSessionID == rows[i].scopeSessionID && rows[j].agent == rows[i].agent {
                     rows[j].selected = false
@@ -177,7 +192,9 @@ public struct AgentConversationStore: Sendable {
                 // Only terminal transitions are written. In particular an
                 // unchanged/in-progress snapshot cannot self-trigger this
                 // file-watched runner, and a later read retains its full receipt.
-                guard next.phase != "waiting", next.phase != row.phase else { continue }
+                // A live hand-off stays waiting (its answer is a chat); its receipt is written once.
+                guard (next.phase != "waiting" && next.phase != row.phase)
+                        || (AgentConversationSession.liveHandOff(next) && !AgentConversationSession.liveHandOff(row)) else { continue }
                 next.updatedAt = Date()
                 try Self.absorbExchange(into: &next)
                 rows[index] = next

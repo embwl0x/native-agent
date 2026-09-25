@@ -150,10 +150,18 @@ public struct GitHubCredentialMetadata: Sendable, Equatable {
 public actor GitHubCredentialStore {
     public static let shared = GitHubCredentialStore()
     public static let keychainService = "com.nativeagent.connector.github.pat.v1"
+    /// The OAuth device-flow credential (JSON). It wins over the PAT when present.
+    public static let oauthKeychainService = "com.nativeagent.connector.github.oauth.v1"
 
     private static let secretKeys = ["access_token", "token", "pat"]
     private let vault: any GitHubCredentialVault
     private let persistence: any PersistenceCoreProtocol
+    /// One refresh at a time per data root: GitHub rotates the refresh token,
+    /// so a second concurrent refresh would spend a dead one.
+    private var refreshInFlight: [String: Task<GitHubOAuthDeviceFlow.Token?, any Error>] = [:]
+    /// Bumped by every save and delete, per data root. A refresh that
+    /// finishes after one of those must not write or clear anything.
+    private var generation: [String: Int] = [:]
 
     public init(
         vault: any GitHubCredentialVault = SystemGitHubCredentialVault(),
@@ -189,8 +197,93 @@ public actor GitHubCredentialStore {
         let token = rawToken.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !token.isEmpty else { throw GitHubCredentialVaultError.invalidStoredValue }
         let account = Self.credentialAccount(dataRoot: dataRoot)
+        generation[account, default: 0] += 1
         try writeAndVerify(token, account: account)
-        try await rewriteMetadata(dataRoot: dataRoot, metadata: metadata, createMissing: true)
+        // A token pasted now is the person's choice; a stored sign-in would
+        // otherwise keep winning over it.
+        try vault.delete(service: Self.oauthKeychainService, account: account)
+        try await rewriteMetadata(dataRoot: dataRoot, metadata: metadata, createMissing: true,
+                                  authMode: "personal_access_token")
+    }
+
+    /// Saves a device-flow sign-in. Any saved PAT stays as the fallback.
+    public func saveOAuthToken(
+        _ token: GitHubOAuthDeviceFlow.Token,
+        metadata: GitHubCredentialMetadata,
+        dataRoot: URL
+    ) async throws {
+        let account = Self.credentialAccount(dataRoot: dataRoot)
+        generation[account, default: 0] += 1
+        try writeOAuth(token, account: account)
+        try await rewriteMetadata(dataRoot: dataRoot, metadata: metadata, createMissing: true,
+                                  authMode: "oauth_device")
+    }
+
+    /// After GitHub answered 401 to `rejected`: refresh the sign-in once and
+    /// return the new access token, or nil when there is no sign-in to refresh.
+    public func refreshAfterRejection(_ rejected: String, dataRoot: URL) async throws -> String? {
+        let account = Self.credentialAccount(dataRoot: dataRoot)
+        guard let stored = try readOAuth(account: account), stored.refreshToken != nil else { return nil }
+        // Another caller already refreshed past the rejected token.
+        if stored.accessToken != rejected { return stored.accessToken }
+        return try await refreshedOAuth(stored, account: account)?.accessToken
+    }
+
+    private func readOAuth(account: String) throws -> GitHubOAuthDeviceFlow.Token? {
+        guard let raw = try vault.read(service: Self.oauthKeychainService, account: account) else {
+            return nil
+        }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .secondsSince1970
+        guard let token = try? decoder.decode(GitHubOAuthDeviceFlow.Token.self, from: Data(raw.utf8)),
+              !token.accessToken.isEmpty
+        else { throw GitHubCredentialVaultError.invalidStoredValue }
+        return token
+    }
+
+    private func writeOAuth(_ token: GitHubOAuthDeviceFlow.Token, account: String) throws {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .secondsSince1970
+        let raw = String(decoding: try encoder.encode(token), as: UTF8.self)
+        try vault.write(raw, service: Self.oauthKeychainService, account: account)
+        guard try vault.read(service: Self.oauthKeychainService, account: account) == raw else {
+            throw GitHubCredentialVaultError.verificationFailed
+        }
+    }
+
+    /// Refreshes, coalesced. A refresh token GitHub rejects clears the dead
+    /// sign-in and returns nil, so resolution falls back to a PAT or to
+    /// "not configured" — which offers Connect again.
+    private func refreshedOAuth(
+        _ stored: GitHubOAuthDeviceFlow.Token, account: String
+    ) async throws -> GitHubOAuthDeviceFlow.Token? {
+        if let inFlight = refreshInFlight[account] {
+            return try await inFlight.value
+        }
+        guard let refreshToken = stored.refreshToken else { return stored }
+        let started = generation[account, default: 0]
+        // Runs on this actor; it writes before any waiter resumes.
+        let task = Task { () throws -> GitHubOAuthDeviceFlow.Token? in
+            defer { self.refreshInFlight[account] = nil }
+            do {
+                let fresh = try await GitHubOAuthDeviceFlow.refresh(refreshToken)
+                // Saved or disconnected meanwhile: that choice stands.
+                guard self.generation[account, default: 0] == started else {
+                    return try self.readOAuth(account: account)
+                }
+                try self.writeOAuth(fresh, account: account)
+                return fresh
+            } catch GitHubOAuthDeviceFlow.FlowError.refreshRejected(let code) {
+                guard self.generation[account, default: 0] == started else {
+                    return try self.readOAuth(account: account)
+                }
+                NSLog("[github] OAuth refresh rejected (%@); clearing the sign-in", code)
+                try self.vault.delete(service: Self.oauthKeychainService, account: account)
+                return nil
+            }
+        }
+        refreshInFlight[account] = task
+        return try await task.value
     }
 
     /// Resolves the Keychain token and performs the one-time plaintext migration.
@@ -206,6 +299,18 @@ public actor GitHubCredentialStore {
 
     private func resolveToken(dataRoot: URL, reconcileMetadata: Bool) async throws -> String? {
         let account = Self.credentialAccount(dataRoot: dataRoot)
+        if let oauth = try readOAuth(account: account) {
+            if !oauth.needsRefresh() { return oauth.accessToken }
+            do {
+                if let fresh = try await refreshedOAuth(oauth, account: account) {
+                    return fresh.accessToken
+                }
+            } catch {
+                // Transient (offline, 5xx): the old token may still have minutes left.
+                if let expiresAt = oauth.expiresAt, expiresAt > Date() { return oauth.accessToken }
+                throw error
+            }
+        }
         if let stored = try vault.read(service: Self.keychainService, account: account) {
             let token = stored.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !token.isEmpty else { throw GitHubCredentialVaultError.invalidStoredValue }
@@ -232,7 +337,9 @@ public actor GitHubCredentialStore {
 
     public func deleteCredential(dataRoot: URL) async throws {
         let account = Self.credentialAccount(dataRoot: dataRoot)
+        generation[account, default: 0] += 1
         try vault.delete(service: Self.keychainService, account: account)
+        try vault.delete(service: Self.oauthKeychainService, account: account)
         var firstError: (any Error)?
         for path in Self.metadataPaths(dataRoot: dataRoot) {
             do {
@@ -268,7 +375,8 @@ public actor GitHubCredentialStore {
     private func rewriteMetadata(
         dataRoot: URL,
         metadata: GitHubCredentialMetadata?,
-        createMissing: Bool
+        createMissing: Bool,
+        authMode: String? = nil
     ) async throws {
         var firstError: (any Error)?
         for path in Self.metadataPaths(dataRoot: dataRoot) {
@@ -281,7 +389,11 @@ public actor GitHubCredentialStore {
                     for key in Self.secretKeys { object.removeValue(forKey: key) }
                     object["provider"] = .string("github")
                     object["token_type"] = .string("token")
-                    object["auth_mode"] = .string("personal_access_token")
+                    if let authMode {
+                        object["auth_mode"] = .string(authMode)
+                    } else if object["auth_mode"] == nil {
+                        object["auth_mode"] = .string("personal_access_token")
+                    }
                     object["credential_store"] = .string("macos_keychain")
                     object["credential_version"] = .int(1)
                     if let metadata {

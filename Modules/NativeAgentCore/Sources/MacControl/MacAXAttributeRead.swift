@@ -34,6 +34,30 @@ enum MacAXAttributeRead {
         }
     }
 
+    /// Own title/description, else — for a field or popup Cocoa names with a
+    /// separate label ("Save As:", "Where:") — that label's text: its
+    /// AXTitleUIElement, else the previous sibling static text ending in ":".
+    /// The ONE name rule for perception and for the act-side drift check.
+    static func copyLabel(_ element: AXUIElement, role: String) -> String? {
+        if let own = copyString(element, kAXTitleAttribute) ?? copyString(element, kAXDescriptionAttribute) {
+            return own
+        }
+        guard MacPerceptionCompiler.captionedRoles.contains(role) else { return nil }
+        if let caption = copyElement(element, kAXTitleUIElementAttribute) {
+            return MacPerceptionCompiler.captionText(
+                copyString(caption, kAXValueAttribute) ?? copyString(caption, kAXTitleAttribute)
+            )
+        }
+        guard let parent = copyElement(element, kAXParentAttribute) else { return nil }
+        let siblings = copyElementArray(parent, kAXChildrenAttribute)
+        guard let index = siblings.firstIndex(where: { CFEqual($0, element) }), index > 0 else { return nil }
+        let previous = siblings[index - 1]
+        guard copyString(previous, kAXRoleAttribute) == "AXStaticText",
+              let raw = copyString(previous, kAXValueAttribute) ?? copyString(previous, kAXTitleAttribute),
+              raw.trimmingCharacters(in: .whitespacesAndNewlines).hasSuffix(":") else { return nil }
+        return MacPerceptionCompiler.captionText(raw)
+    }
+
     static func copyActions(_ element: AXUIElement) -> [String] {
         var raw: CFArray?
         guard AXUIElementCopyActionNames(element, &raw) == .success, let raw else { return [] }

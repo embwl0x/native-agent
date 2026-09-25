@@ -91,9 +91,20 @@ extension OpenAIOAuthDirectAdapter {
                 .appendingPathComponent("auth.json")
         }
         if let dataRoot = environment["NATIVE_AGENT_DATA_ROOT"], !dataRoot.isEmpty {
-            return URL(fileURLWithPath: (dataRoot as NSString).expandingTildeInPath)
+            let root = URL(fileURLWithPath: (dataRoot as NSString).expandingTildeInPath)
+            let owned = root
                 .appendingPathComponent("codex_home", isDirectory: true)
                 .appendingPathComponent("auth.json")
+            // A Codex CLI session this root consented to adopt is its sign-in
+            // too, exactly as the badge and readiness already count it; without
+            // this, onboarding said "Signed in" and every turn failed.
+            let shared = userCodexHome.appendingPathComponent("auth.json")
+            if !hasUsableTokens(at: owned),
+               cliAdoptionConsent(dataRoot: root) == .allowed,
+               hasUsableTokens(at: shared) {
+                return shared
+            }
+            return owned
         }
         let candidates = authPathCandidates(
             dataRoot: dataRoot,

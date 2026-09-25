@@ -40,7 +40,7 @@ struct DeskMissedBot: Identifiable, Equatable, Sendable {
         guard let missed = try? BotRunnerScheduler.missedRuns(dataRoot: root), !missed.isEmpty,
               let bots = try? BotDefinitionStore(dataRoot: root).list() else { return [] }
         return bots.compactMap { bot in
-            guard let run = missed[bot.id] else { return nil }
+            guard bot.cadence != .manual, let run = missed[bot.id] else { return nil }
             return DeskMissedBot(id: bot.id, name: bot.name,
                                  line: "Missed · \(run.words).", dueAt: run.dueAt)
         }.sorted { $0.dueAt > $1.dueAt }
@@ -65,7 +65,7 @@ struct DeskTimedBot: Identifiable, Equatable, Sendable {
 
 /// What the Bots page says when unattended work is switched off.
 enum BotsShelfUnattended {
-    static let pageLine = "Scheduled and event runs are off. Run once still works \u{2014} turn on \u{201C}Let the agent work unattended\u{201D} in Trust, or choose Full Mac."
+    static let pageLine = "Scheduled and event runs are off. Run once still works \u{2014} turn on \u{201C}Let me work unattended\u{201D} in Trust, or choose Full Mac."
     static let cardLine = "Won\u{2019}t run on its own: unattended work is off"
 }
 
@@ -205,21 +205,7 @@ struct BotsShelfRecord: Identifiable, Equatable, Sendable {
         entries.filter { [.ok, .nothingNew].contains($0.runHealth) }.max { $0.runAt < $1.runAt }
     }
     var cadence: String { Self.cadence(definition.cadence) }
-    static func cadence(_ cadence: BotCadence) -> String {
-        switch cadence {
-        case .manual: return "Manual only"
-        case .interval(let seconds):
-            return seconds == 43200 ? "Twice daily" : seconds == 86400 ? "Daily" : seconds == 604800 ? "Weekly"
-                : seconds < 3600 ? "Every \(Int(seconds / 60)) minutes"
-                : seconds.truncatingRemainder(dividingBy: 86400) == 0 ? "Every \(Int(seconds / 86400)) days"
-                : "Every \((seconds / 3600).formatted()) hours"
-        case .cron(_, let timeZone):
-            // "Daily at 23:57", not the raw cron; the zone only when it isn't this Mac's.
-            let said = StandingBotSchedule.describe(cadence)
-            return said.prefix(1).uppercased() + said.dropFirst()
-                + (timeZone == TimeZone.current.identifier ? "" : " · \(timeZone)")
-        }
-    }
+    static func cadence(_ cadence: BotCadence) -> String { StandingBotSchedule.words(cadence) }
     var state: String {
         if needsModelChoice { return "Choose a model" }
         if definition.paused { return "Paused" }

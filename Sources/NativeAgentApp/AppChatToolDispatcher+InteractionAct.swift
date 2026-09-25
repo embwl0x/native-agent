@@ -394,6 +394,10 @@ extension AppChatToolDispatcher {
 
         var selection: String? = current.target
         var scope: InlineInteraction.Scope?
+        // A fixed reason class, never the service's own text (it can echo the
+        // secret back); the raw text goes to the local log, redacted.
+        var setupError: String?
+        var note: String?
         switch route {
         case .connectorToken(let connector):
             // The connector's own writer, which validates with the service
@@ -406,7 +410,11 @@ extension AppChatToolDispatcher {
             default: result = OAuthFlowResult(ok: false, error: "No token route for \(connector).")
             }
             if !result.ok {
-                NSLog("[interaction_act] \(connector) token rejected: \(result.error ?? "")")
+                setupError = InlineConnectorSetup.failureReason(
+                    result.error ?? "",
+                    service: InlineInteractionRegistry.connectorDisplayName(connector, dataRoot: dataRoot),
+                    typed: [value]
+                )
             }
             selection = connector
 
@@ -430,9 +438,13 @@ extension AppChatToolDispatcher {
             )
 
         case .providerKey:
-            _ = try? await appModel.configureProvider(
-                current.target, apiKey: value, authMode: "api_key", defaultModel: nil
+            // Checked with the provider before it is saved, as the card does.
+            let outcome = await InlineConnectorSetup.saveProviderKey(
+                value, provider: InlineInteractionRegistry.canonicalProviderID(current.target),
+                appModel: appModel
             )
+            setupError = outcome.error
+            note = outcome.note
 
         case .inlineSelection:
             selection = choice.isEmpty ? nil : choice
@@ -456,6 +468,8 @@ extension AppChatToolDispatcher {
                 attribution: Self.authorityMutation(route) == nil
                     ? "Answered by the agent"
                     : "Allowed by the agent",
+                setupError: setupError,
+                note: note,
                 dataRoot: dataRoot
             )
             return Self.interactionReceipt(
@@ -485,6 +499,10 @@ extension AppChatToolDispatcher {
         switch control {
         case .internetAccounts:
             return .needsGlass("Add and enable a Mail account in Internet Accounts on the Mac.")
+        case .chromeSetup:
+            return .needsGlass("Loading the extension happens in Chrome, with the person there.")
+        case .pairDevice:
+            return .needsGlass("Pairing needs the person's iPhone and the Pair button on the Mac.")
         case .connectorManualToken:
             let connector = InlineInteractionRegistry.canonicalConnectorID(interaction.target)
             // Slack's setup is a token PLUS its channel/user allowlists; there
@@ -498,6 +516,12 @@ extension AppChatToolDispatcher {
             // Decided BEFORE the card is marked running: a missing token has
             // to leave it pending, not stranded mid-flight.
             guard !value.isEmpty else {
+                if connector == "github" {
+                    return .needsGlass(
+                        "GitHub signs in in the browser: the person taps Connect with GitHub on the "
+                        + "card and approves the code. Or pass a GitHub token as `value`."
+                    )
+                }
                 return .needsGlass(
                     "Pass the \(descriptor.displayName) token as `value`, or the person pastes "
                     + "it in Connectors."
@@ -633,15 +657,18 @@ extension AppChatToolDispatcher {
     /// Mac check re-run inside that lock. Same reason as the Mac-control
     /// helper — a whole cached block overwrites switches nobody touched.
     @MainActor
+    /// `requireFullMac` is for the agent answering; a person's tap on the card
+    /// is the same switch they could flip in Trust, in any mode.
     static func applyCapabilityFlagGrant(
-        policyKey: String, appModel: AppModel, dataRoot: URL, logTag: String
+        policyKey: String, appModel: AppModel, dataRoot: URL, logTag: String,
+        requireFullMac: Bool = true
     ) async {
         do {
             let saved = try await NativeClient.applyTrustPolicyPatch(
                 body: ["multimodalPolicy": [policyKey: true]],
                 dataRoot: dataRoot,
                 guardedByLockedPolicy: { locked in
-                    guard Self.lockedPolicyIsFullMac(locked) else {
+                    guard !requireFullMac || Self.lockedPolicyIsFullMac(locked) else {
                         throw QuietSettingError.unavailable(
                             "This Mac is no longer in Full Mac, so the capability was "
                             + "not turned on.")

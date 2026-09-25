@@ -44,7 +44,7 @@ public enum AgentConversationRouting {
             guard let id = UUID(uuidString: String(agent.dropFirst(4))) else { throw invalid("bot reference must contain a UUID.") }
             botID = id
         } else {
-            guard ["codex", "claude", "omp"].contains(agent) else { throw invalid("Use codex, claude, omp, bot:<UUID>, or peer:<UUID> from agent discovery.") }
+            guard ["codex", "claude", "omp"].contains(agent) else { throw invalid("No contact is named '\(raw)'. Use a name exactly as agent_contacts shows it, or codex, claude or omp.") }
             botID = nil
         }
         let canonical = botID.map { "bot:" + $0.uuidString } ?? agent

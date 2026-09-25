@@ -28,8 +28,13 @@ extension AgentWorkspaceNavigation {
     func bindCurrent(from previous: AgentWorkspaceLocation, to bound: AgentWorkspaceLocation, key: String) {
         guard previous != bound, var session = sessions[key] else { return }
         if session.path.last == previous { session.path[session.path.count - 1] = bound }
-        session.places.removeAll { Self.placeIdentity($0) == Self.placeIdentity(previous) || Self.placeIdentity($0) == Self.placeIdentity(bound) }
-        session.places.append(bound)
+        // Only a window already open is rebound: a read (a look, a contact's
+        // conversation) left no window in navigate and must not gain one here.
+        let ids = [Self.placeIdentity(previous), Self.placeIdentity(bound)]
+        if session.places.contains(where: { ids.contains(Self.placeIdentity($0)) }) {
+            session.places.removeAll { ids.contains(Self.placeIdentity($0)) }
+            session.places.append(bound)
+        }
         if let saved = Self.keepablePlace(bound, session: session),
            let index = session.keptPlaces.firstIndex(where: { Self.placeIdentity($0) == Self.placeIdentity(previous) }) {
             session.keptPlaces[index] = saved
@@ -38,7 +43,10 @@ extension AgentWorkspaceNavigation {
                 Self.placeIdentity(place).map { seen.insert($0).inserted } ?? false
             }
         }
-        if session.places.count > 24 { session.places.removeFirst(session.places.count - 24) }
+        while session.places.count > 24 {
+            guard let index = session.places.firstIndex(where: { if case .form = $0 { return false }; return true }) else { break }
+            session.places.remove(at: index)
+        }
         sessions[key] = session
     }
 }

@@ -36,14 +36,18 @@ public struct BotDefinitionStore: Sendable {
     }
 
     public func list() throws -> [BotDefinition] {
-        try disk.locked {
-            try disk.files(at: disk.root.appendingPathComponent("definitions"), extension: "json").map { path in
-                guard let id = UUID(uuidString: path.deletingPathExtension().lastPathComponent) else {
-                    throw StandingBotsError.corruptStore("invalid definition filename")
-                }
-                return try disk.definition(id).definition
-            }.filter { $0.deleted != true }.sorted { $0.id.uuidString < $1.id.uuidString }
-        }
+        try disk.locked { try listUnlocked() }
+    }
+
+    /// The same read without the store lock, for a glance that must not wait:
+    /// read-only; a definition caught mid-write fails its check and throws.
+    public func listUnlocked() throws -> [BotDefinition] {
+        try disk.files(at: disk.root.appendingPathComponent("definitions"), extension: "json").map { path in
+            guard let id = UUID(uuidString: path.deletingPathExtension().lastPathComponent) else {
+                throw StandingBotsError.corruptStore("invalid definition filename")
+            }
+            return try disk.definition(id).definition
+        }.filter { $0.deleted != true }.sorted { $0.id.uuidString < $1.id.uuidString }
     }
 
     /// Pass the previously read value with edits. A concurrent update is rejected, never silently lost.

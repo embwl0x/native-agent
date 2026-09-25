@@ -123,17 +123,26 @@ public enum IntraTurnContextCompaction {
         chars(windowTokens: windowTokens, fraction: pressureFraction)
     }
 
-    /// The user's compaction threshold (`nativeagent.compactionThresholdTokens`,
-    /// default 200k) is also the ceiling for a single turn's working context:
-    /// User, 2026-09-05, "I don't like letting the window get too big." The
-    /// effective window is the smaller of the model's and the one whose 80%
-    /// pressure point lands exactly on that threshold, so on a 272k or 1M model
-    /// a long tool loop still trims at the same 200k the transcript lane uses.
+    /// `windowTokens` is already HER window (`ContextBudgetPolicy.windowTokens`,
+    /// 60% of the model's capped by the Custom size), so the 80% pressure point
+    /// lands exactly on it: a long tool loop trims where the transcript lane
+    /// compacts (User, 2026-09-05, "I don't like letting the window get too
+    /// big"). On a small model the trim point is also held to 90% of the
+    /// model's window (at least her window ÷ 0.6) less persona + tools (~40k)
+    /// and output (~32k), so a whole request fits: a 200k model trims at 108k,
+    /// not 120k. An unknown model keeps the saved size, within a 128k window.
     static func effectiveWindowTokens(_ windowTokens: Int?) -> Int {
-        let window = windowTokens.map { $0 > 0 ? $0 : defaultWindowTokens } ?? defaultWindowTokens
-        let configured = ChatSessionAutocompactionConfig.productionDefault().thresholdTokens
-        let ceilingWindow = Int(Double(configured) / pressureFraction)
-        return max(1, min(window, ceilingWindow))
+        let trimPoint: Int
+        if let window = windowTokens, window > 0 {
+            let requestRoom = Int(Double(window) * 1.5) - 72_000
+            trimPoint = max(window / 2, min(window, requestRoom))
+        } else {
+            trimPoint = min(
+                Int(Double(defaultWindowTokens) * pressureFraction),
+                ChatSessionAutocompactionConfig.productionDefault().thresholdTokens
+            )
+        }
+        return max(1, Int(Double(trimPoint) / pressureFraction))
     }
 
     private static func chars(windowTokens: Int?, fraction: Double) -> Int {

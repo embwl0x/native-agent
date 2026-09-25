@@ -91,7 +91,8 @@ enum AgentWorkspaceActivity {
             "scope": .string("At most eight appointments today and eight incomplete reminders due today or earlier. Empty and unavailable sections are different. Open each area for more.")]),
             items: items, actions: [read("Today's calendar", tool: "mac_calendar_list_upcoming", input: ["day": .string("today"), "limit": .int(16)]),
                 read("All due reminders", tool: "mac_reminders_list_due_today", input: ["limit": .int(16)]),
-                .init(label: "Ongoing work", action: .open(.area("ongoing"))),
+                // It opens the Desk room: named for what it opens (walk 4: `today.ongoing` landed on DESK).
+                .init(label: "Desk (work in progress)", action: .open(.area("ongoing"))),
                 .init(label: "Refresh today", action: .open(.area("today")))])
     }
 
@@ -107,7 +108,8 @@ enum AgentWorkspaceActivity {
             let name = AgentWorkspaceSavedReply.title(.object(row))
             var buttons: [AgentWorkspaceButton] = []
             if let id = uuid(row["id"]), let bot = uuid(row["bot"]) {
-                buttons.append(read("Read reply", tool: "shelf_entry", input: ["id": .string(id), "bot_id": .string(bot)], title: name))
+                buttons.append(read("Read reply", tool: "shelf_entry", input: ["id": .string(id), "bot_id": .string(bot)],
+                                    title: AgentWorkspaceSavedReply.title(.object(row), now: nil)))
                 buttons.append(.init(label: "Follow up", action: .followUpSavedReply(.init(
                     entryID: id, botID: bot, title: name)), needsText: true))
             }
@@ -150,7 +152,10 @@ enum AgentWorkspaceActivity {
     }
 
     private static func calendar(_ result: JSONValue) -> AgentWorkspaceProjection {
-        list(title: "Calendar", result: result, key: "events", actions: [configure("Create an event", tool: "mac_calendar_create_event"), configure("Choose day or calendar", tool: "mac_calendar_list_upcoming")]) { row in
+        // A day by name in one call (the old "choose" form ran the default read).
+        let day = AgentWorkspaceButton(label: "One day", action: .perform(tool: "mac_calendar_list_upcoming", input: ["limit": .int(16)],
+            title: "One day", textField: "day", isEffect: false), needsText: true)
+        var projection = list(title: "Calendar", result: result, key: "events", actions: [configure("Create an event", tool: "mac_calendar_create_event"), day]) { row in
             let title = text(row["title"]) ?? "Calendar event"
             var actions = text(row["id"]).map { [configure("Edit event", tool: "mac_calendar_modify_event", input: ["id": .string($0)])] } ?? []
             if let id = text(row["id"]), let title = text(row["title"]), let start = text(row["startAt"]) {
@@ -159,10 +164,18 @@ enum AgentWorkspaceActivity {
             }
             return .init(title: title, content: .object(row), actions: actions)
         }
+        // An empty read says it read fine, so it is not taken for no access.
+        if projection.items.isEmpty, object(result)["status"] == .string("completed"), case .object(var content) = projection.content {
+            let hours: Int64 = if case .int(let n)? = object(result)["hoursAhead"] { n } else { 24 }
+            let span = text(object(result)["day"]) ?? "in the next \(hours)h"
+            content["message"] = .string("no events \(span) (calendar access ok)")
+            projection.content = .object(content)
+        }
+        return projection
     }
 
     private static func reminders(_ result: JSONValue) -> AgentWorkspaceProjection {
-        list(title: "Reminders", result: result, key: "reminders", actions: [configure("Create a reminder", tool: "mac_reminders_create")]) { row in
+        var projection = list(title: "Reminders", result: result, key: "reminders", actions: [configure("Create a reminder", tool: "mac_reminders_create")]) { row in
             var row = row
             let title = text(row["title"]) ?? "Reminder"
             if let due = text(row["dueAt"]), let date = ISO8601DateFormatter().date(from: due) {
@@ -171,10 +184,15 @@ enum AgentWorkspaceActivity {
             var actions: [AgentWorkspaceButton] = []
             // Some owner versions omit the identifier. Never guess it from a title.
             if row["completed"] == .bool(false), let id = text(row["id"]) {
-                actions.append(effect("Mark complete", tool: "mac_reminders_complete", input: ["id": .string(id)]))
+                actions.append(effect("Done (mark complete)", tool: "mac_reminders_complete", input: ["id": .string(id)]))
             }
             return .init(title: title, content: .object(row), actions: actions)
         }
+        if projection.items.isEmpty, object(result)["status"] == .string("completed"), case .object(var content) = projection.content {
+            content["message"] = .string("nothing due today or overdue (reminders access ok)")
+            projection.content = .object(content)
+        }
+        return projection
     }
 
     private static func mail(_ result: JSONValue) -> AgentWorkspaceProjection {

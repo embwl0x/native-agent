@@ -424,8 +424,8 @@ extension CognitiveSubstrate {
             cognitionEnabled: frozenRead?.configuration.enabled,
             affectEnabled: frozenRead?.configuration.affectEnabled
         )
-        // ONE gate for the rut nudge, whether it rides as a suffix on the
-        // exemplar echo or stands alone: they are the same sentence.
+        // ONE gate for the named rut line, whether or not the exemplar echo
+        // speaks this turn.
         let rutSpeaks = soundRutAwarenessShouldSpeak(
             signature: echo.wornSignature,
             at: now,
@@ -433,14 +433,15 @@ extension CognitiveSubstrate {
             presentationState: &presentationState
         )
         if let echoLine = echo.line {
-            tailLines.append(rutSpeaks ? echoLine + Self.soundRutAwarenessSuffix : echoLine)
+            tailLines.append(echoLine)
             if let leadingWasNegative = echo.leadingWasNegative {
                 presentationState.negativeSoundEchoRun = leadingWasNegative
                     ? presentationState.negativeSoundEchoRun + 1
                     : 0
             }
-        } else if rutSpeaks {
-            tailLines.append(Self.soundRutAwarenessLine)
+        }
+        if rutSpeaks, let rutLine = echo.rutLine {
+            tailLines.append(rutLine)
         }
 
         // The felt fingerprint REPLACES the Focus/Feeling/Voice sentences (User,
@@ -771,7 +772,12 @@ extension CognitiveSubstrate {
     /// nag, not a corruption.
     func restoreCapsulePresentation(from payloads: [JSONValue]) {
         guard case .object(let object)? = payloads.first else { return }
+        // A named rut's signature is "kind:phrase". Anything else was left by
+        // the retired unnamed nudge; carried forward it read as a CHANGE and
+        // held the first named line behind the 2-turn gap (live 2026-09-25:
+        // the rut slid below threshold before the gap cleared).
         soundRutSignature = stringValue(object["soundRutSignature"])
+            .flatMap { $0.contains(":") ? $0 : nil }
         soundRutLastSurfacedAt = dateValue(object["soundRutLastSurfacedAt"])
         soundRutTurnsSinceSurfaced = min(
             max(0, Int(exactly: (doubleValue(object["soundRutTurnsSinceSurfaced"]) ?? 0).rounded(.towardZero)) ?? 0),

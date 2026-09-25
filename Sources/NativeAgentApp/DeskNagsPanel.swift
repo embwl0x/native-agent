@@ -71,6 +71,7 @@ struct DeskNagsPanel: View {
             }
         }
         .toggleStyle(.switch)
+        .hazeTinted()
     }
 
     @ViewBuilder
@@ -127,6 +128,7 @@ struct DeskNagsPanel: View {
                             }
                         }
                         .toggleStyle(.switch)
+                        .hazeTinted()
                         .controlSize(.small)
                     }
                 }
@@ -146,6 +148,7 @@ struct DeskNagsPanel: View {
             }
         }
         .toggleStyle(.switch)
+        .hazeTinted()
         .controlSize(.small)
     }
 }

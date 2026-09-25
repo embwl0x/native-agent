@@ -13,11 +13,13 @@ extension SwiftToolDispatcher {
             throw AutonomyGateError.toolDenied(reason: "screen pixels must be true or false")
         }
         guard requested else { return false }
+        // Her-screen Phase 6: pixels:true WITH app or part is that window's
+        // (or region's) image through the ordinary screen read, not the desktop.
         for key in ["app", "part"] {
             guard let selector = input[key], selector != .null else { continue }
             if case .string(let text) = selector,
                text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { continue }
-            throw AutonomyGateError.toolDenied(reason: "screen pixels captures the primary desktop; omit app and part to avoid confusing desktop pixels with an isolated window")
+            return false
         }
         return true
     }

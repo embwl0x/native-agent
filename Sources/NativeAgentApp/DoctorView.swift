@@ -437,7 +437,7 @@ struct DoctorView: View {
 
             Label(safeRepairState.detail, systemImage: safeRepairState.systemImage)
                 .font(.caption)
-                .foregroundStyle(NativeAgentTheme.statusColor(safeRepairState.status))
+                .foregroundStyle(AdvancedStatusWords.color(safeRepairState.status))
 
             if let oauthLoginNotice {
                 Label(
@@ -452,14 +452,14 @@ struct DoctorView: View {
             if let runNotice {
                 Label(runNotice.detail, systemImage: runNotice.status == "failed" ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
                     .font(.callout)
-                    .foregroundStyle(NativeAgentTheme.statusColor(runNotice.status))
+                    .foregroundStyle(AdvancedStatusWords.color(runNotice.status))
                     .accessibilityIdentifier("doctor.run.notice")
             }
 
             if let snapshotNotice {
                 Label(snapshotNotice.detail, systemImage: snapshotNotice.status == "failed" ? "exclamationmark.triangle.fill" : "shippingbox.fill")
                     .font(.callout)
-                    .foregroundStyle(NativeAgentTheme.statusColor(snapshotNotice.status))
+                    .foregroundStyle(AdvancedStatusWords.color(snapshotNotice.status))
                     .accessibilityIdentifier("doctor.supportSnapshot.notice")
             }
 
@@ -539,7 +539,7 @@ struct DoctorView: View {
                         } else if healthyCount > 0 {
                             Text(DoctorPlainCopy.otherLoopsHealthyText(count: healthyCount))
                                 .font(NativeAgentFont.label)
-                                .foregroundStyle(.tertiary)
+                                .foregroundStyle(NativeAgentShell.secondary)
                         }
                         DisclosureGroup("Details") {
                             VStack(alignment: .leading, spacing: 2) {
@@ -617,7 +617,8 @@ struct DoctorView: View {
                 }
             }
         }
-        .padding()
+        // No inset of its own: the page frame's column is the edge, as on
+        // every alive page.
         .navigationTitle("Health checks")
         .motionArrival(when: appModel.doctorReport != nil)
         .task {
@@ -656,8 +657,8 @@ struct DoctorView: View {
     private func oauthLoginColor(for tone: DoctorOAuthLoginButtonPresentation.Tone) -> Color {
         switch tone {
         case .progress: return .secondary
-        case .success: return NativeAgentTheme.ok
-        case .failure: return NativeAgentTheme.warn
+        case .success: return NativeAgentShell.calm
+        case .failure: return NativeAgentShell.trouble
         }
     }
 
@@ -814,7 +815,7 @@ enum DoctorPlainCopy {
         case "Connectors": return "Connected services"
         case "Data": return "Your data"
         case "Tools": return "Tools"
-        case "Autonomy": return "Actions the agent takes independently"
+        case "Autonomy": return "Actions I take on my own"
         // "Release" holds the store-validity checks (JSON stores, chat logs,
         // memory database) — "App version" mislabeled them (taste pass).
         case "Release": return "Stored data health"
@@ -865,7 +866,7 @@ struct DoctorCheckRow: View {
             if let repair = check.repair, !repair.isEmpty {
                 Text(repair.withoutStaleNextGenPhaseCopy)
                     .font(NativeAgentFont.label)
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(NativeAgentShell.secondary)
             }
         }
         .padding(.vertical, 4)

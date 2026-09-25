@@ -1036,6 +1036,10 @@ private func tempRoot() throws -> URL {
     #expect(GitHubConnectorActions.secondaryRateBackoff(
         status: 403, message: "API rate limit exceeded",
         retryAfterHeader: nil, rateLimitRemaining: 0) == nil)
+    // A permission 403 with budget left is not a throttle.
+    #expect(GitHubConnectorActions.secondaryRateBackoff(
+        status: 403, message: "Resource not accessible by personal access token",
+        retryAfterHeader: nil, rateLimitRemaining: 4994) == nil)
     // Ordinary failures never trip a back-off.
     #expect(GitHubConnectorActions.secondaryRateBackoff(
         status: 404, message: "Not Found",

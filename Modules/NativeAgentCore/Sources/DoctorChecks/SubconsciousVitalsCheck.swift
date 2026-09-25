@@ -52,7 +52,7 @@ public struct SubconsciousVitalsCheck: DoctorCheck {
     private let feltWarnPercent = 25.0
     private let feltFailPercent = 40.0
     /// The Sound line that says her phrasing has gone stale.
-    private let rutMarker = "same words keep echoing"
+    private let rutMarker = "let the moment pick the word"
     private let rutWarnPercent = 20.0
     private let rutFailPercent = 40.0
     /// Below this many turns the RATES above are reported but not graded. The
@@ -136,9 +136,10 @@ public struct SubconsciousVitalsCheck: DoctorCheck {
                 feltTurns += 1
                 for word in felt { feltCounts[word, default: 0] += 1 }
             }
-            if let sound = CognitivePreviewReader.line(after: "- Sound: ", in: text) {
+            if CognitivePreviewReader.line(after: "- Sound: ", in: text) != nil {
                 soundTurns += 1
-                if sound.localizedCaseInsensitiveContains(rutMarker) { rutTurns += 1 }
+                // The named rut rides its own Sound line after the echo.
+                if text.localizedCaseInsensitiveContains(rutMarker) { rutTurns += 1 }
             }
             if let inner = CognitivePreviewReader.line(after: "- Inner: ", in: text) {
                 innerTurns += 1

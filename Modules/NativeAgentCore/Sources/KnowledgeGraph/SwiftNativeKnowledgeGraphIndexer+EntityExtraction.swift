@@ -62,7 +62,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
     }
 
     /// Named entities the system's tagger is sure of — personal, place and
-    /// organisation names, joined across words ("NativeAgent Contributors", "New York") —
+    /// organisation names, joined across words ("Ada Lovelace", "New York") —
     /// minus the shapes it gets wrong on short memory rows. Every rule in
     /// `taggedNameIsCredible` is a failure observed in the live store on
     /// 2026-09-05 ("Judge", "Nudge", "KG upgrades", "Greet User", "AI", "the

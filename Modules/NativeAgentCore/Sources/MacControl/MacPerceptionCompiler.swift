@@ -862,6 +862,45 @@ public enum MacPerceptionCompiler {
         path.map(String.init).joined(separator: ",")
     }
 
+    /// Fields and popups that Cocoa names with a separate label.
+    static let captionedRoles: Set<String> = ["AXTextField", "AXComboBox", "AXPopUpButton"]
+
+    /// "Save As:" → "Save As"; nil when there is no text.
+    static func captionText(_ raw: String?) -> String? {
+        var text = (raw ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        if text.hasSuffix(":") { text.removeLast() }
+        text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return text.isEmpty ? nil : text
+    }
+
+    /// Her-screen 09-24 — an unnamed field/popup whose previous sibling is a
+    /// static text ending in ":" takes that text as its name, so "Save As"
+    /// and "Where" address the save sheet's field and popup.
+    private static func captioned(_ snapshot: MacAXTreeSnapshot) -> MacAXTreeSnapshot {
+        var byPath: [String: MacAXNode] = [:]
+        for node in snapshot.nodes { byPath[key(node.path)] = node }
+        var changed = false
+        let nodes = snapshot.nodes.map { node -> MacAXNode in
+            let a = node.attributes
+            guard a.title == nil, captionedRoles.contains(a.role),
+                  let index = node.path.last, index > 0,
+                  let previous = byPath[key(Array(node.path.dropLast()) + [index - 1])],
+                  previous.attributes.role == "AXStaticText",
+                  let raw = previous.attributes.value ?? previous.attributes.title,
+                  raw.trimmingCharacters(in: .whitespacesAndNewlines).hasSuffix(":"),
+                  let caption = captionText(raw) else { return node }
+            changed = true
+            return MacAXNode(attributes: MacAXAttributes(
+                role: a.role, subrole: a.subrole, title: caption, value: a.value, enabled: a.enabled,
+                selected: a.selected, frame: a.frame, actions: a.actions
+            ), path: node.path)
+        }
+        guard changed else { return snapshot }
+        return MacAXTreeSnapshot(nodes: nodes, truncated: snapshot.truncated,
+                                 truncationReasons: snapshot.truncationReasons,
+                                 skippedAtLeast: snapshot.skippedAtLeast)
+    }
+
     /// Compile ONE walk into ONE percept. Pure: same snapshot in ⇒ same percept
     /// out, handles included.
     public static func compile(
@@ -872,6 +911,7 @@ public enum MacPerceptionCompiler {
         maxAffordances: Int = MacPerceptionCompiler.maxAffordances
     ) -> MacLookPercept {
         let cap = max(1, min(maxAffordances, MacPerceptionCompiler.maxAffordances))
+        let snapshot = captioned(snapshot)
         var byPath: [String: MacAXNode] = [:]
         for node in snapshot.nodes { byPath[key(node.path)] = node }
 
@@ -1710,8 +1750,9 @@ public extension MacPerceptionCompiler {
 /// The task-scoped perceptual frame, modelled exactly on `MacScreenViewStore`
 /// and carrying the same three properties:
 ///
-///  • SINGLE SLOT — "the last look" is the only look whose handles can still be
-///    trusted; holding several ids cannot be reasoned around.
+///  • SINGLE SLOT PER SOURCE — "the last look" is the only look whose handles
+///    can still be trusted; holding several ids cannot be reasoned around. The
+///    workspace and direct `screen`/`act` each have one (Phase 3, 2026-09-23).
 ///  • TTL — 180 s. A frame older than that is not a description of the screen.
 ///  • NO AUTHORITY — `resolve` returns a path and a rect. Item 3's verbs sit
 ///    behind the same gates the injection tools already clear; a handle can
@@ -1753,24 +1794,31 @@ public actor MacLookFrameStore {
         }
     }
 
-    private var latest: MacLookFrame?
+    /// Her-screen Phase 3 (2026-09-23): one slot PER SOURCE. A look through her
+    /// workspace and a direct `screen`/`act` each keep their own latest frame,
+    /// so neither stales the other's handles. Still single-slot per source, and
+    /// a handle is still only a reference: every act re-resolves live against
+    /// the frame's own pid and window.
+    @TaskLocal public static var source = "direct"
+
+    private var latestBySource: [String: MacLookFrame] = [:]
+    private var latest: MacLookFrame? { latestBySource[Self.source] }
 
     public init() {}
 
-    public func record(_ frame: MacLookFrame) { latest = frame }
+    public func record(_ frame: MacLookFrame) { latestBySource[Self.source] = frame }
 
     public func latestFrameId() -> String? { latest?.frameId }
 
+    /// The frame with this id if it is the latest of ANY source (ids are UUIDs).
     public func frame(frameId: String) -> MacLookFrame? {
-        guard let latest, latest.frameId == frameId else { return nil }
-        return latest
+        latestBySource.values.first { $0.frameId == frameId }
     }
 
-    /// True when the held frame is past its TTL — the signal the live seam uses
+    /// True when no held frame is within its TTL — the signal the live seam uses
     /// to decide the Chromium enhanced-AX flag's lifetime is over.
     public func isExpired(now: Date) -> Bool {
-        guard let latest else { return true }
-        return now.timeIntervalSince(latest.capturedAt) > Self.ttlSeconds
+        !latestBySource.values.contains { now.timeIntervalSince($0.capturedAt) <= Self.ttlSeconds }
     }
 
     public func resolve(
@@ -1778,8 +1826,8 @@ public actor MacLookFrameStore {
         frameId: String,
         now: Date
     ) -> Result<MacLookFrameEntry, ResolveFailure> {
-        guard let latest else { return .failure(.noFrame) }
-        guard latest.frameId == frameId else { return .failure(.staleFrame) }
+        guard !latestBySource.isEmpty else { return .failure(.noFrame) }
+        guard let latest = frame(frameId: frameId) else { return .failure(.staleFrame) }
         guard now.timeIntervalSince(latest.capturedAt) <= Self.ttlSeconds else {
             return .failure(.frameExpired)
         }
@@ -1789,10 +1837,11 @@ public actor MacLookFrameStore {
 
     /// Physical user input or a completed motor action may have moved
     /// everything. Same safety invalidation the view store carries.
-    public func invalidate() { latest = nil }
+    /// A dead frame may sit in either slot; clear both (rare path, safe side).
+    public func invalidate() { latestBySource = [:] }
 
     /// Test seam only.
-    public func reset() { latest = nil }
+    public func reset() { latestBySource = [:] }
 }
 
 // MARK: - The Chromium / Electron live seam
@@ -1926,6 +1975,14 @@ public extension SystemMacAXElementSource {
             // Same self-process fence as the flags above.
             guard pid != getpid() else { return }
             _ = AXUIElementSetMessagingTimeout(AXUIElementCreateApplication(pid), seconds)
+        }
+    }
+
+    /// Is either flag already on, before this module touches it?
+    static func enhancedAccessibilityIsOn(pid: Int32) -> Bool {
+        MacAXExecutionLane.sync {
+            guard pid != getpid() else { return false }
+            return readsEnhancedAccessibility(app: AXUIElementCreateApplication(pid))
         }
     }
 

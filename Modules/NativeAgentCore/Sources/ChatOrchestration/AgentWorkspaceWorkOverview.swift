@@ -175,6 +175,13 @@ extension AgentWorkspaceNavigation {
         }
         sessions[key]?.placeActions = receipts
     }
+    /// A place she acted on: a window (drafts, pages acted in), or one with
+    /// an action receipt. A mere read is neither, so it is not offered Keep.
+    static func actedOn(_ place: AgentWorkspaceLocation, session: Session) -> Bool {
+        session.places.contains { placeIdentity($0) == placeIdentity(place) }
+            || workReceiptKey(place).map { session.placeActions[$0] != nil } == true
+    }
+
     static func keepablePlace(_ location: AgentWorkspaceLocation, session: Session) -> AgentWorkspaceLocation? {
         if case .page(let source, _) = location { return keepablePlace(source, session: session) }
         if case .record("agent_read", let input, _) = location,
@@ -272,11 +279,22 @@ extension AgentWorkspaceNavigation {
             .init(label: "Keep this workspace as…", action: .saveWorkspace, needsText: true),
             .init(label: "Saved workspaces", action: .open(.savedWorkspaces))
         ]
+        // Keep is offered only for a source she acted on (a window, or one with
+        // an action receipt), never one she only read (walk 4: a design note).
         if let source = session.document, let place = Self.keepablePlace(source.location, session: session),
-           !session.keptPlaces.contains(where: { Self.placeIdentity($0) == Self.placeIdentity(place) }) {
+           !session.keptPlaces.contains(where: { Self.placeIdentity($0) == Self.placeIdentity(place) }),
+           Self.actedOn(place, session: session) {
             actions.insert(.init(label: "Keep " + place.title + " with this work", action: .keepWorkPlace(place)), at: 0)
         }
-        let items = session.keptPlaces.map { place in
+        // The work she is on is listed here as it is in windows (walk 4: windows
+        // named it while this said "nothing here").
+        var items: [AgentWorkspaceItem] = []
+        if let anchor = session.workAnchor, !session.keptPlaces.contains(where: { Self.placeIdentity($0) == Self.placeIdentity(anchor) }) {
+            items.append(.init(title: anchor.title, content: .object(Self.placeRecognition(anchor).merging(
+                ["work_context": .string(session.workTopic ?? "The work I'm on")]) { _, new in new }),
+                actions: [.init(label: "Open", action: .open(anchor))]))
+        }
+        items += session.keptPlaces.map { place in
             var recognition = Self.placeRecognition(place)
             if let receipt = Self.placeAction(place, session: session) { recognition["last_action_here"] = receipt }
             return AgentWorkspaceItem(title: place.title, content: .object(recognition), actions: [

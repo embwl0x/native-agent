@@ -33,16 +33,18 @@ extension AgentWorkspaceNavigation {
             session.needsStorageReload = true
             session.persistenceIssue = "Saved workspace storage is unavailable. Its bytes were preserved; current navigation remains temporary. " + error.localizedDescription
         }
-        // A desktop that starts empty is not hers. The people and helpers she
-        // already talks with are windows from the first look, one step away.
+        // The people and helpers she already talks with are watched for
+        // arrivals from the first look, but they are not windows: `windows`
+        // lists only what she has open (desk walk 4: Goose, never opened, was
+        // there; Codex and Grok, just read, were not). Home lists the people.
         let present = Set(session.places.compactMap { place -> String? in
             guard case .record("agent_read", let input, _) = place, case .string(let agent)? = input["agent"] else { return nil }
             return agent
         })
-        session.places.insert(contentsOf: Self.conversationWindows(dataRoot: dataRoot).filter {
+        session.watched = Self.conversationWindows(dataRoot: dataRoot).filter {
             guard case .record(_, let input, _) = $0, case .string(let agent)? = input["agent"] else { return false }
             return !present.contains(agent)
-        }, at: 0)
+        }
         return session
     }
 

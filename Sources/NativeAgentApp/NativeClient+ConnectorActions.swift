@@ -385,13 +385,7 @@ extension NativeClient {
     }
 
     static func runMacAssistantWatchTemplates() async throws -> JSONValue {
-        let impl = makeMacAssistantStatusClient(
-            dispatcherTools: StaticDispatcherToolAvailabilityProvider(availableTools: [
-                "calendar_list_upcoming",
-                "reminders_list_due_today",
-            ]),
-            localPIM: NativeAppLocalPIMStatusProvider()
-        )
+        let impl = makeAppMacAssistantStatusClient(root: PersistenceCore.defaultDataRoot())
         let status = try await impl.macAssistantStatus(lightweight: false)
         return status.toJSON()
     }

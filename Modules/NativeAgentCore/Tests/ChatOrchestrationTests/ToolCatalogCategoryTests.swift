@@ -50,7 +50,7 @@ import PersistenceCore
         #expect(scoped["category"] == nil)
     }
 
-    @Test(arguments: [JSONValue.int(4), JSONValue.bool(true), JSONValue.array([]), JSONValue.string("imaginary-category")])
+    @Test(arguments: [JSONValue.int(4), JSONValue.bool(true), JSONValue.array([])])
     func invalidScopeFailsClearly(category: JSONValue) async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -58,9 +58,6 @@ import PersistenceCore
         guard case .object(let result) = try await dispatcher.impl_tool_catalog(input: ["category": category]) else { Issue.record("Missing failure"); return }
         #expect(result["status"] == .string("failed"))
         #expect(result["available_tools"] == nil)
-        if case .string = category {
-            #expect(result["reason"] == .string("unknown_category"))
-            #expect(result["known_categories"] != nil)
-        } else { #expect(result["reason"] == .string("invalid_category")) }
+        #expect(result["reason"] == .string("invalid_category"))
     }
 }

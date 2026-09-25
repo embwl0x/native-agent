@@ -57,6 +57,8 @@ enum AgentConversationHistoryView {
                 value["you"] = .string(full ? prompt : String(prompt.prefix(600)))
                 value["your_message_truncated"] = .bool(item.promptTruncated || (!full && prompt.count > 600))
             }
+            // The person wrote this one in the contact's thread; it isn't yours to answer.
+            if item.byPerson == true { value["sent_by"] = .string("the person, from the contact's thread") }
             if let reply = item.reply {
                 value["peer"] = .string(row.name)
                 value["reply"] = .string(full ? reply : String(reply.prefix(800)))

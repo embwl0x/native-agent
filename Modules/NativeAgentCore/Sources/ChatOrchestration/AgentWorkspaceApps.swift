@@ -24,8 +24,17 @@ enum AgentWorkspaceApps {
         }
         switch tool {
         case "app_page_read":
-            return .init(label: "Read a page (chat, today, memories, desk, bots, personality, providers, trust, connectors, capabilities, diagnostics, settings)",
+            return .init(label: "Read a page (today, memories, desk, bots, personality, providers, trust, connectors, capabilities, diagnostics, settings)",
                 action: .perform(tool: tool, input: [:], title: "Read a page", textField: "page", isEffect: false), needsText: true)
+        // The same words as the memory results page: recall and record (walk 4).
+        case "commit_memory":
+            return .init(label: "Record a memory", action: .configure(tool: tool, input: [:], title: "Record a memory"))
+        case "contacts_create_or_update":
+            return .init(label: "New contact", action: .configure(tool: tool, input: [:], title: "New contact"))
+        // research.read with the address as text, not an empty form (desk walk 4).
+        case "read_page":
+            return .init(label: "Read a web page privately, no tab", action: .perform(tool: tool, input: [:], title: "Web source",
+                                                                                      textField: "url", isEffect: false), needsText: true)
         case "app_page_screenshot":
             return .init(label: "Look at a page", action: .perform(tool: tool, input: [:], title: "Look at a page", textField: "page", isEffect: false), needsText: true)
         default: break

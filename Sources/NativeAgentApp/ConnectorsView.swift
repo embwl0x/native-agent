@@ -289,21 +289,22 @@ struct ConnectorsView: View {
                     if registryRowsForDisplay.isEmpty {
                         ConnectorsCard {
                             ConnectorsNote(
-                                text: "The accounts the agent can read and write will be listed here. Refresh to load them.",
+                                text: "The accounts I can read and write will be listed here. Refresh to load them.",
                                 color: NativeAgentShell.secondary
                             )
                         }
                     } else {
-                        VStack(alignment: .leading, spacing: 8) {
+                        // Alive glass (2026-09-23): one group card, a row
+                        // per account, hairlines between.
+                        AliveGroupCard {
                             ForEach(registryRowsForDisplay) { connector in
                                 connectorRow(connector)
-                                    .motionArrival()
                             }
                         }
                     }
                 }
 
-                ConnectorsSection(label: "Folders the agent may open") {
+                ConnectorsSection(label: "Folders I may open") {
                     if appModel.workspaces.isEmpty {
                         ConnectorsCard {
                             ConnectorsNote(
@@ -311,29 +312,27 @@ struct ConnectorsView: View {
                                     ? "Shared folders haven't loaded yet. Choose Refresh to load them."
                                     : appModel.panelRefreshStatus[.connectors]?.failedEndpoints.contains("shared folders") == true
                                         ? "Shared folders could not be refreshed. Try Refresh to load them."
-                                        : "No folder is shared yet. Add one below and the agent can read the files in it.",
+                                        : "No folder is shared yet. Add one below and I can read the files in it.",
                                 color: NativeAgentShell.secondary
                             )
                         }
                     } else {
-                        VStack(alignment: .leading, spacing: 8) {
+                        AliveGroupCard {
                             ForEach(appModel.workspaces) { workspace in
-                                ConnectorsCard {
-                                    VStack(alignment: .leading, spacing: 2) {
-                                        Text(workspace.name)
-                                            .font(ShellType.bodySemibold)
-                                            .foregroundStyle(NativeAgentShell.text)
-                                        Text(workspace.path)
-                                            .font(ShellType.label)
-                                            .foregroundStyle(NativeAgentShell.secondary)
-                                            .lineLimit(1)
-                                            .truncationMode(.middle)
-                                        Text(workspace.permissions.joined(separator: ", "))
-                                            .font(ShellType.caption)
-                                            .foregroundStyle(NativeAgentShell.tertiary)
-                                    }
-                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text(workspace.name)
+                                        .font(.system(size: 14, weight: .medium))
+                                        .foregroundStyle(NativeAgentShell.text)
+                                    Text(workspace.path)
+                                        .font(.system(size: 12))
+                                        .foregroundStyle(NativeAgentShell.secondary)
+                                        .lineLimit(1)
+                                        .truncationMode(.middle)
+                                    Text(workspace.permissions.joined(separator: ", "))
+                                        .font(.system(size: 12))
+                                        .foregroundStyle(NativeAgentShell.secondary)
                                 }
+                                .frame(maxWidth: .infinity, alignment: .leading)
                             }
                         }
                     }
@@ -388,7 +387,7 @@ struct ConnectorsView: View {
                                 .font(ShellType.labelMedium)
                         }
                     }
-                    Toggle("Let the agent write to it", isOn: $workspaceWritable)
+                    Toggle("Let me write to it", isOn: $workspaceWritable)
                         .font(ShellType.label)
                     Button(isAddingWorkspace ? "Adding…" : "Share this folder") {
                         Task { await addWorkspace() }
@@ -522,21 +521,19 @@ struct ConnectorsView: View {
         let uiState = connectorUIState(connector)
         let actionPolicy = connectorActionPolicy(connector)
         let renderedStatusText = Self.statusText(for: connector, uiState: uiState)
-        ConnectorsCard {
+        // A row of the accounts group card: no chrome of its own.
             VStack(alignment: .leading, spacing: 8) {
-                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                HStack(alignment: .center, spacing: 8) {
                     Text(connector.name)
-                        .font(ShellType.bodySemibold)
+                        .font(.system(size: 14, weight: .medium))
                         .foregroundStyle(NativeAgentShell.text)
                     Spacer(minLength: 8)
-                    Text(renderedStatusText)
-                        .font(ShellType.captionSemibold)
-                        .foregroundStyle(uiState.statusColor)
+                    ConnectorsStatusPill(text: renderedStatusText, tone: uiState.statusColor)
                 }
                 Text(connector.id == "shortcuts"
                      ? "Run Apple Shortcuts for Desk tasks, Diagnostics, status, and chat."
                      : connector.description)
-                    .font(ShellType.label)
+                    .font(.system(size: 12))
                     .foregroundStyle(NativeAgentShell.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                 if let runtimeStatus = connector.runtimeStatus,
@@ -579,10 +576,9 @@ struct ConnectorsView: View {
                     }
                 }
                 .font(ShellType.caption)
-                .foregroundStyle(NativeAgentShell.tertiary)
+                .foregroundStyle(NativeAgentShell.secondary)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-        }
     }
 
     private var cleanWorkspaceName: String {
@@ -734,12 +730,8 @@ struct ConnectorsSection<Content: View>: View {
     @ViewBuilder var content: Content
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text(label)
-                .font(ShellType.labelSemibold)
-                .textCase(.uppercase)
-                .kerning(0.6)
-                .foregroundStyle(NativeAgentShell.secondary)
+        VStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
+            AliveEyebrow(label)
             content
         }
     }
@@ -751,7 +743,37 @@ struct ConnectorsCard<Content: View>: View {
     var body: some View {
         content
             .padding(16)
-            .settingsCardSurface()
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .aliveCard()
+            .accessibilityElement(children: .contain)
+    }
+}
+
+/// A row's status, as a pill: a dot in the state's tone and the word in text
+/// colour. The word never rides on the tone alone — light calm and trouble
+/// fail 4.5:1 on the card fill.
+struct ConnectorsStatusPill: View {
+    let text: String
+    let tone: Color
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Circle()
+                .fill(tone)
+                .frame(width: 6, height: 6)
+                .accessibilityHidden(true)
+            Text(text)
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(NativeAgentShell.text)
+                .lineLimit(1)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 4)
+        .background(Capsule().fill(reduceTransparency ? TodayPalette.cardFill : NativeAgentShell.softFill))
+        .overlay(Capsule().strokeBorder(AlivePalette.rim, lineWidth: 1))
+        .fixedSize()
+        .accessibilityElement(children: .combine)
     }
 }
 

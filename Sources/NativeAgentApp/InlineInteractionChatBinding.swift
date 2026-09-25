@@ -30,6 +30,11 @@ final class InlineInteractionChatBinding {
     /// not reimplement a token field.
     var connectorSheet: ConnectorSheetRequest?
 
+    /// Simple view has no pages: a page a card opens (Telegram, Trust,
+    /// Providers) shows here instead, in the floating glass panel over the
+    /// chat (SimpleSetupPanel.swift). Always nil in Advanced.
+    var panelPage: SidebarItem?
+
     private var sessionID: String = ""
     private var dataRoot: URL { PersistenceCore.defaultDataRoot() }
 
@@ -125,7 +130,15 @@ final class InlineInteractionChatBinding {
         guard self.sessionID == sessionID, refreshGeneration == generation else { return }
         var built: [String: [InlineCardModel]] = [:]
         let collapsed = Self.collapsedCards(pairs)
+        var live: [(rowID: String, interaction: InlineInteraction)] = []
         for pair in collapsed.pairs {
+            // Already done elsewhere → the receipt, not the ask.
+            live.append((pair.rowID, await InlineInteractionResolver.liveProjection(
+                pair.interaction, dataRoot: dataRoot
+            )))
+        }
+        guard self.sessionID == sessionID, refreshGeneration == generation else { return }
+        for pair in live {
             let descriptor = InlineInteractionResolver.descriptor(
                 for: pair.interaction, dataRoot: dataRoot
             )
@@ -293,11 +306,18 @@ final class InlineInteractionChatBinding {
             // turn with the consequence the card promised, so she carries on
             // and says plainly what she could not do.
             Task { await self.decline(card.id, sessionID: sessionID) }
-        case .primary(let value, let choice):
+        case .primary(let value, let choice, let values):
             Task {
                 await self.begin(
                     card.id, sessionID: sessionID,
-                    value: value, choice: choice, appModel: appModel
+                    value: value, choice: choice, values: values, appModel: appModel
+                )
+            }
+        case .fullSetup:
+            Task {
+                await self.begin(
+                    card.id, sessionID: sessionID,
+                    value: nil, choice: nil, fullSetup: true, appModel: appModel
                 )
             }
         case .retry:
@@ -332,6 +352,11 @@ final class InlineInteractionChatBinding {
             guard let current = await InlineInteractionResolver.interaction(
                 id: id, sessionID: originSessionID, dataRoot: dataRoot
             ), current.state.isOpen else { continue }
+            // A connector's page (Telegram) closed: same rule as the sheet.
+            if current.kind == .connector {
+                await settleOrReopen(id, sessionID: originSessionID)
+                continue
+            }
             let selection = await selectionForReturn(current)
             _ = try? await InlineInteractionResolver.complete(
                 id: id,
@@ -358,6 +383,8 @@ final class InlineInteractionChatBinding {
         sessionID: String,
         value: String?,
         choice: String?,
+        values: [String: String] = [:],
+        fullSetup: Bool = false,
         appModel: AppModel
     ) async {
         guard let current = await InlineInteractionResolver.interaction(
@@ -386,6 +413,8 @@ final class InlineInteractionChatBinding {
             descriptor: descriptor,
             value: value,
             choice: choice,
+            values: values,
+            fullSetup: fullSetup,
             appModel: appModel
         )
     }
@@ -400,12 +429,56 @@ final class InlineInteractionChatBinding {
         descriptor: InlineInteractionDescriptor,
         value: String?,
         choice: String?,
+        values: [String: String],
+        fullSetup: Bool,
         appModel: AppModel
     ) async {
         switch control {
         case .internetAccounts:
-            awaitingReturn[interaction.id] = sessionID
+            // System Settings is not a page of ours, so no return to Chat
+            // announces it closed: the card watches for the grant instead.
+            watchUntilGranted(interaction.id, sessionID: sessionID)
             NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.Internet-Accounts-Settings.extension")!)
+        case .chromeSetup:
+            // Trust's own Chrome switch, as the page's toggle writes it; then
+            // the same Set up Chrome the page runs. Chrome is the owner: the
+            // card settles when the extension connects.
+            let policy = appModel.trustPolicy
+            if policy?.chromeControlPolicy?.enabled != true,
+               !(policy.map(AppModel.fullMacGrantIsActive) ?? false) {
+                await appModel.saveChromeControlEnabled(true)
+            }
+            if await InlineInteractionResolver.completeIfVerified(
+                id: interaction.id, sessionID: sessionID, dataRoot: dataRoot
+            ) {
+                await refreshCurrent()
+                return
+            }
+            let setup = await ChromeExtensionFolder.setUp()
+            if setup.folder == nil || !setup.extensionsPageOpened {
+                await complete(interaction.id, sessionID: sessionID, selection: "chrome",
+                               scope: nil, setupError: setup.message)
+            } else {
+                watchUntilGranted(interaction.id, sessionID: sessionID)
+            }
+        case .pairDevice:
+            UserDefaults.standard.set("iphone", forKey: ShellRailTab.storageKey(.connectors))
+            openPage(.connectors, for: interaction.id, sessionID: sessionID)
+        case .connectorManualToken where !fullSetup && !values.isEmpty:
+            // The card's own fields, through the connector's own save and
+            // check. Connectors is then re-read, as after the sheet.
+            let outcome = await InlineConnectorSetup.save(
+                connector: descriptor.target, values: values,
+                appModel: appModel, dataRoot: dataRoot
+            )
+            await complete(
+                interaction.id, sessionID: sessionID,
+                selection: descriptor.target, scope: nil,
+                setupError: outcome.error, note: outcome.note
+            )
+        case .connectorManualToken where descriptor.target == "telegram":
+            // Telegram's full setup is its own page, not a wizard sheet.
+            openPage(.telegram, for: interaction.id, sessionID: sessionID)
         case .connectorManualToken, .connectorOAuth:
             // Connectors' own wizard, opened on the connector the card names.
             // It closes; `sheetClosed` asks Connectors what actually happened.
@@ -420,8 +493,7 @@ final class InlineInteractionChatBinding {
             // Nothing is granted and nothing is written. The person's posture
             // is theirs; Trust opens, and coming back to Chat is what asks the
             // policy whether it actually changed.
-            awaitingReturn[interaction.id] = sessionID
-            _ = NativeAgentAppCoordinator.shared.request(.sidebar(.trust))
+            openPage(.trust, for: interaction.id, sessionID: sessionID)
 
         case .capabilityFlag:
             await setCapabilityFlag(interaction, sessionID: sessionID, appModel: appModel)
@@ -436,8 +508,7 @@ final class InlineInteractionChatBinding {
                 // The explicit permanent choice. A card never writes a group's
                 // model behind Providers' back, so this goes where every other
                 // permanent change goes, and the return re-reads the snapshot.
-                awaitingReturn[interaction.id] = sessionID
-                _ = NativeAgentAppCoordinator.shared.request(.sidebar(.providers))
+                openPage(.providers, for: interaction.id, sessionID: sessionID)
             } else if let picked = choice, !picked.isEmpty {
                 // The card had the list, so the pick resolves here at the
                 // scope the primary promised — for one image, nothing is
@@ -452,8 +523,7 @@ final class InlineInteractionChatBinding {
                 // No list to pick from: Providers owns the choice. The card
                 // stays running, and coming back to Chat is what asks the
                 // routing snapshot what the group now runs on.
-                awaitingReturn[interaction.id] = sessionID
-                _ = NativeAgentAppCoordinator.shared.request(.sidebar(.providers))
+                openPage(.providers, for: interaction.id, sessionID: sessionID)
             }
 
         case .inlineChoice:
@@ -467,16 +537,63 @@ final class InlineInteractionChatBinding {
         }
     }
 
+    /// A page a card (or the chat's own empty state) needs: the panel in
+    /// Simple view, the page itself in Advanced. With an interaction, coming
+    /// back is what asks its owner whether the thing is done.
+    func openPage(_ item: SidebarItem, for id: String? = nil, sessionID: String = "") {
+        if let id { awaitingReturn[id] = sessionID }
+        if SimpleViewMode.isShowing {
+            panelPage = item
+        } else {
+            _ = NativeAgentAppCoordinator.shared.request(.sidebar(item))
+        }
+    }
+
+    /// The Simple panel closed, by Esc or its close button: the same
+    /// questions a closed sheet and a return to Chat ask.
+    func panelClosed() async {
+        panelPage = nil
+        await connectorSheetClosed()
+        await verifyOnReturn()
+    }
+
+    /// While the Simple panel is up: settle what it was opened for the moment
+    /// the owner says done, and close it. Writes nothing until then.
+    func settlePanelIfDone() async {
+        var waiting = awaitingReturn
+        if let sheet = connectorSheet { waiting[sheet.id] = sheet.sessionID }
+        guard !waiting.isEmpty else { return }
+        for (id, sessionID) in waiting {
+            guard await InlineInteractionResolver.completeIfVerified(
+                id: id, sessionID: sessionID, dataRoot: dataRoot
+            ) else { return }
+            awaitingReturn[id] = nil
+        }
+        panelPage = nil
+        connectorSheet = nil
+        await refreshCurrent()
+    }
+
     /// The connector sheet closed. Connectors is the authority on whether an
-    /// account is connected — a cancelled sheet and a rejected token both
-    /// settle as "still not connected", with the card and its retry intact.
+    /// account is connected. Closed without it connecting, nothing was tried
+    /// on the card, so the card goes back to its fresh "Connect <Name>" ask;
+    /// "still isn't connected" and "Try again" belong to a real failed attempt
+    /// (the card's own fields, which carry the owner's refusal).
     func connectorSheetClosed() async {
         guard let request = connectorSheet else { return }
         connectorSheet = nil
-        await complete(
-            request.id, sessionID: request.sessionID,
-            selection: request.provider, scope: nil
-        )
+        await settleOrReopen(request.id, sessionID: request.sessionID)
+    }
+
+    /// Settle if the owner now says done; otherwise put a card this tap left
+    /// running back to pending.
+    private func settleOrReopen(_ id: String, sessionID: String) async {
+        if !(await InlineInteractionResolver.completeIfVerified(id: id, sessionID: sessionID, dataRoot: dataRoot)),
+           let current = await InlineInteractionResolver.interaction(id: id, sessionID: sessionID, dataRoot: dataRoot),
+           case .running = current.state {
+            _ = try? await InlineInteractionResolver.returnToPending(current, sessionID: sessionID, dataRoot: dataRoot)
+        }
+        await refreshCurrent()
     }
 
     private func grantPermissions(
@@ -516,6 +633,18 @@ final class InlineInteractionChatBinding {
         }
         if !categories.isEmpty {
             await grantMacControlCategories(categories, appModel: appModel)
+        }
+        // macOS is asked only for what the app side actually allowed: a Trust
+        // write refused outside Full Mac never leads to a macOS prompt.
+        let granted = (try? await MacIntegrationPermissionStore.shared.currentChecked()) ?? [:]
+        let allowed = interaction.allTargets.filter { capability in
+            InlineInteractionRegistry.isMacControlCategory(capability)
+                ? InlineInteractionRegistry.macControlCategoryAllowed(capability, dataRoot: dataRoot)
+                : (granted[capability]?.read ?? false) || (granted[capability]?.write ?? false)
+        }
+        if await SystemPermissionPreflight.askMacOSForCard(allowed, mode: mode) {
+            watchUntilGranted(interaction.id, sessionID: sessionID)
+            return
         }
         // The store is re-read by the resolver; a capability that did not take
         // fails the card rather than settling it.
@@ -561,8 +690,13 @@ final class InlineInteractionChatBinding {
         }
         await AppChatToolDispatcher.applyCapabilityFlagGrant(
             policyKey: flag.policyKey, appModel: appModel,
-            dataRoot: dataRoot, logTag: "interaction"
+            dataRoot: dataRoot, logTag: "interaction", requireFullMac: false
         )
+        if flag.id != "screen_capture" || appModel.trustPolicy?.multimodalPolicy?.screen_capture == true,
+           await SystemPermissionPreflight.askMacOSForCard([flag.id], mode: nil) {
+            watchUntilGranted(interaction.id, sessionID: sessionID)
+            return
+        }
         // Trust is re-read by the resolver; the tap is not the authority.
         await complete(
             interaction.id, sessionID: sessionID,
@@ -577,20 +711,100 @@ final class InlineInteractionChatBinding {
         appModel: AppModel
     ) async {
         let key = (value ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        if !key.isEmpty {
-            // Providers' own configure call — the same one its sheet makes.
-            // `defaultModel: nil` so saving a key never silently repoints the
-            // provider at a different model.
-            _ = try? await appModel.configureProvider(
-                interaction.target, apiKey: key, authMode: "api_key", defaultModel: nil
+        let target = InlineInteractionRegistry.canonicalProviderID(interaction.target)
+        let signIn = InlineInteractionRegistry.providerSignIn(for: target)
+        var setupError: String?
+        var note: String?
+        if key.isEmpty, let signIn {
+            // Nothing pasted: the primary was "Sign in with …", the same
+            // browser sign-in onboarding's button runs. It returns when the
+            // browser does, and the card settles on Providers' answer.
+            let root = appModel.dataRootOverride ?? dataRoot
+            let result = await NativeOAuthFlow.startOAuthFlow(
+                providerId: signIn.oauthProviderID, dataRoot: root
             )
+            if result.ok {
+                await appModel.loadProvidersForChat()
+                await appModel.adoptProviderForBlankSurfaces(signIn.oauthProviderID)
+            } else {
+                setupError = InlineConnectorSetup.failureReason(
+                    result.error ?? "", service: signIn.displayShort, secret: "sign-in",
+                    otherwise: "\(signIn.displayShort) sign-in didn't finish (details in the app log)."
+                )
+            }
+        } else if target == "anthropic_oauth_direct" {
+            // Claude's paste is a setup token, saved the way its own field does.
+            if let raw = AnthropicSetupTokenInput.save(key) {
+                setupError = InlineConnectorSetup.failureReason(
+                    raw, service: "Claude", secret: "setup token", typed: [key]
+                )
+            } else {
+                await appModel.loadProvidersForChat()
+                await appModel.adoptProviderForBlankSurfaces(target)
+            }
+        } else if !key.isEmpty {
+            let outcome = await InlineConnectorSetup.saveProviderKey(
+                key, provider: target, appModel: appModel
+            )
+            setupError = outcome.error
+            note = outcome.note
         }
-        // Readiness is Providers' answer, not the fact that a key was typed: a
-        // key it rejects leaves the card live, with its retry.
+        // Readiness is then Providers' answer too, read back after the save.
         await complete(
             interaction.id, sessionID: sessionID,
-            selection: interaction.target, scope: nil
+            selection: target, scope: nil, setupError: setupError, note: note
         )
+    }
+
+    // MARK: - Grants made in System Settings
+
+    @ObservationIgnored private var grantWatches: [String: String] = [:]
+    @ObservationIgnored private var grantWatchTask: Task<Void, Never>?
+
+    /// A card that sent the person to System Settings settles by itself when
+    /// the grant lands: re-checked the moment the app becomes active again and
+    /// every few seconds while it waits, for two minutes. Nothing is written
+    /// until the owner says yes; at the cap the card is completed once, which
+    /// fails it honestly, with its retry, if the grant never came.
+    private func watchUntilGranted(_ id: String, sessionID: String) {
+        grantWatches[id] = sessionID
+        guard grantWatchTask == nil else { return }
+        grantWatchTask = Task { [weak self] in
+            var wasActive = NSApp.isActive
+            for tick in 1...120 {
+                try? await Task.sleep(for: .seconds(1))
+                guard let self, !Task.isCancelled else { return }
+                let active = NSApp.isActive
+                let cameBack = active && !wasActive
+                wasActive = active
+                guard cameBack || tick % 3 == 0 else { continue }
+                if await self.recheckGrants(final: false) {
+                    self.grantWatchTask = nil
+                    return
+                }
+            }
+            await self?.recheckGrants(final: true)
+            self?.grantWatchTask = nil
+        }
+    }
+
+    /// True when nothing is left waiting.
+    @discardableResult
+    private func recheckGrants(final: Bool) async -> Bool {
+        for (id, sessionID) in grantWatches {
+            if final {
+                _ = try? await InlineInteractionResolver.complete(
+                    id: id, sessionID: sessionID, dataRoot: dataRoot
+                )
+                grantWatches[id] = nil
+            } else if await InlineInteractionResolver.completeIfVerified(
+                id: id, sessionID: sessionID, dataRoot: dataRoot
+            ) {
+                grantWatches[id] = nil
+            }
+        }
+        await refreshCurrent()
+        return grantWatches.isEmpty
     }
 
     /// `sessionID` is the conversation the card was tapped in, carried from
@@ -603,7 +817,9 @@ final class InlineInteractionChatBinding {
         _ id: String,
         sessionID: String,
         selection: String?,
-        scope: InlineInteraction.Scope?
+        scope: InlineInteraction.Scope?,
+        setupError: String? = nil,
+        note: String? = nil
     ) async {
         do {
             _ = try await InlineInteractionResolver.complete(
@@ -611,6 +827,8 @@ final class InlineInteractionChatBinding {
                 sessionID: sessionID,
                 selection: selection,
                 scope: scope,
+                setupError: setupError,
+                note: note,
                 dataRoot: dataRoot
             )
         } catch {

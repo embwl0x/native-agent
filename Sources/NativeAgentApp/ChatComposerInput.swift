@@ -21,6 +21,8 @@ struct ChatComposerInput: View {
     let draft: ChatComposerDraft
     let classicShell: Bool
     let placeholder: String
+    /// "To: <agent>" before the field (Simple view); nil hides it.
+    var recipient: String? = nil
     let voiceInput: VoiceInputController
     let capabilitiesStore: CapabilitiesStore
     /// The conversation dictation started in, and the one on screen. Speech may
@@ -83,6 +85,9 @@ struct ChatComposerInput: View {
             showsConversationSettings: true,
             focusWordToken: focusWordToken
         ) {
+            // Simple view says who a message goes to, as contact threads do.
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+            if let recipient { ComposerRecipientChip(name: recipient) }
             TextField(
                 voiceInput.isListening ? "" : placeholder,
                 text: draft.textBinding,
@@ -158,6 +163,22 @@ struct ChatComposerInput: View {
                     onToast(msg)
                 })
             )
+            }
         }
+    }
+}
+
+/// The "To:" chip Simple view's composers lead with.
+struct ComposerRecipientChip: View {
+    let name: String
+    var body: some View {
+        Text("To: \(name)")
+            .font(ShellType.captionMedium)
+            .foregroundStyle(NativeAgentShell.secondary)
+            .lineLimit(1)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3)
+            .background(NativeAgentShell.softFill, in: Capsule())
+            .fixedSize()
     }
 }

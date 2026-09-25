@@ -51,7 +51,7 @@ public enum ChatToolOutcome {
         let code = [text("error_code"), text("errorCode"), oldReason].compactMap { $0 }.first {
             isCode($0) && !["failed", "error"].contains($0)
         } ?? "tool_failed"
-        let candidates = ["message", "text", "detail", "error", "content", "result", "fix"].flatMap { explanations(object[$0]) }
+        let candidates = ["message", "text", "detail", "error", "content", "result", "fix", "recovery_hint", "hint"].flatMap { explanations(object[$0]) }
         let message = candidates.first { !isCode($0) }
             ?? oldReason.flatMap { isCode($0) ? nil : $0 }
             ?? candidates.first
@@ -602,6 +602,11 @@ final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Sendable {
             )),
         ]
         if let durationMs { payload["durationMs"] = .int(Int64(durationMs)) }
+        // Her-screen Phase 4 — "User's screen touched: y/n" for the proof tasks.
+        if tool == "act", case .object(let reply)? = result, case .object(let detail)? = reply["detail"],
+           let changed = detail["user_front_changed"] {
+            payload["user_front_changed"] = changed
+        }
         if let result {
             if status == "failed", case .object(let failure) = result {
                 // Failure fields bypass the serialized preview, so apply its

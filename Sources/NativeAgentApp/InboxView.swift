@@ -1122,6 +1122,7 @@ struct InboxView: View {
             }
             .accessibilityLabel("Notification category")
             .pickerStyle(.segmented)
+            .hazeTinted(.segments)
             .labelsHidden()
             .padding(.horizontal, 16)
             .padding(.bottom, 8)

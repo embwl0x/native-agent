@@ -51,7 +51,7 @@ struct PersonalityDynamicsGoldenTests {
         #expect(d.soundEchoCount == 2)
         #expect(d.soundEchoRecencyHalfLife == 216_000)
         #expect(d.soundEchoDutyCycle == 4)
-        #expect(d.soundRutRecentTurnLimit == 12)
+        #expect(d.soundRutRecentTurnLimit == 20)
         #expect(d.soundRutEdgeSentenceCount == 2)
         #expect(d.soundEchoRegisterTolerance == 0.35)
         #expect(d.wornEchoThreshold == 3)

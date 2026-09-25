@@ -830,7 +830,8 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
         let reviewNote = (json["note"] as? String)?
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let shouldClear = action == "clear" || rawScenario.lowercased() == "clear"
-        let ttlSeconds = Self.timeInterval(json["ttlSeconds"]) ?? 120
+        // Clamped here: Int(ttlSeconds) below traps on "inf" or 1e300.
+        let ttlSeconds = Self.timeInterval(json["ttlSeconds"]).flatMap { $0.isFinite ? min(600, max(5, $0)) : nil } ?? 120
 
         // Same WorkLatch + asyncAfter bound as handleMessage/handleTool.
         let workLatch = WorkLatch()
@@ -2074,9 +2075,29 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
                 await client.drainDeferredMemoryPromotion()
             } catch is CancellationError {
                 await Self.publishChatTurnCompleted(sessionID: enqueued.sessionId)
-                // Nothing arms this lane's cancellation after the ack today;
-                // tolerate it anyway without a failure row (mirrors the legacy
-                // lane's cancelled-partial handling).
+                // A Stop on this session (cancelled.flag is per session, and
+                // bridge turns share the Mac's) cancels the turn after the
+                // ack. The caller was told to read the receipt, so write one:
+                // without it they wait forever. Receipt file only, no chat
+                // row (the cancelled partial is already in the transcript).
+                Self.persistMessageReply([
+                    "at": ISO8601DateFormatter().string(from: Date()),
+                    "status": "cancelled",
+                    "ack": "enqueued",
+                    "sessionId": enqueued.sessionId,
+                    "model": NSNull(),
+                    "runId": enqueued.runId,
+                    "durationMs": Int(Date().timeIntervalSince(started) * 1000),
+                    "reply": "",
+                    "detail": "turn stopped before it finished",
+                ], requestID: requestID)
+                self.publishEvent(kind: "message_failed", payload: [
+                    "requestId": requestID,
+                    "runId": enqueued.runId,
+                    "detail": "turn stopped before it finished",
+                    "status": "cancelled",
+                    "sessionId": enqueued.sessionId,
+                ])
             } catch {
                 await Self.publishChatTurnCompleted(sessionID: enqueued.sessionId)
                 Self.persistMessageReply([

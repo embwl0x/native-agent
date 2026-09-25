@@ -743,6 +743,10 @@ final class AppModel {
     /// into Chat as though the kickoff had happened.
     var onboardingWizardCompletionReceipt: OnboardingWizardCompletionReceipt?
     var streamingSessions: Set<String> = []
+    /// Sessions whose running turn has started to publish reply text. Written
+    /// once when the first non-empty snapshot lands and cleared with the
+    /// turn, never per token — the window haze reads it (WindowHaze.swift).
+    var replyingSessions: Set<String> = []
     var chatTasks: [String: Task<Void, Never>] = [:]
     var chatTaskGenerations: [String: Int] = [:]
     /// The one authoritative Mac presentation lifecycle for the current or

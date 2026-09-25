@@ -293,6 +293,13 @@ actor SwiftNativeAPNSSender {
         }
     }
 
+    /// How many devices `sendNotification` would push to right now: the same
+    /// config and token filter, local files only, nothing sent.
+    func deliverableTargetCount(dataRoot: URL = NativeAgentPaths.dataRoot) async -> Int {
+        guard let config = try? APNSConfig.load(from: dataRoot) else { return 0 }
+        return await loadTokens(dataRoot: dataRoot, config: config).compactMap { config.target(for: $0) }.count
+    }
+
     private func sendOne(
         target: APNSTarget,
         config: APNSConfig,

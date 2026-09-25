@@ -44,6 +44,31 @@ extension MacFourVerbs {
     /// still frontmost verbs, and a background sighting is a LOOK, not a
     /// license.
     public func screen(part: String? = nil, app: String? = nil, structured: Bool = false) async -> MacFourVerbsReply {
+        // The menu bar belongs to the app, not the window, so the window read
+        // never spends its budget there; `part: menu` reads it on purpose.
+        if let part, ["menu", "menus", "menu bar"].contains(Self.normalize(part)) {
+            var body: [String: JSONValue] = [:]
+            if let app { body["app"] = .string(app) }
+            guard let result = try? await host.dispatch(action: "menu", body: body), result.ok else {
+                return MacFourVerbsReply(ok: false, text: "I couldn't read that app's menu bar.",
+                                         detail: ["error": .string("menu_unavailable")])
+            }
+            let output = Self.object(result.output)
+            let rows = Self.array(output["paths"]).compactMap { row -> String? in
+                let item = Self.object(row)
+                guard let path = Self.string(item["path"]) else { return nil }
+                return path + (Self.bool(item["enabled"]) == false ? "  (greyed out)" : "")
+            }
+            let name = Self.string(Self.object(output["app"])["name"]) ?? "The app"
+            return MacFourVerbsReply(
+                ok: true,
+                text: "\(name)'s menus, read without opening anything (press one with menu_press)"
+                    + (output["enabled_state"] != nil ? "; which are greyed out is unknown until it's in front" : "")
+                    + ":\n"
+                    + rows.joined(separator: "\n"),
+                detail: ["menu_items": .int(Int64(rows.count))]
+            )
+        }
         switch await sight(part: part, app: app) {
         case .blind(let reply):
             return reply
@@ -210,6 +235,12 @@ extension MacFourVerbs {
         /// selections. Normal prose screen calls do not emit this extra data.
         let controls: JSONValue
         let detail: [String: JSONValue]
+        /// Her-screen Phase 4 — the app in front when an ANCHORED look was
+        /// taken (name, bundle id), so a `front:true` act can put it back.
+        /// nil for an unanchored look, which is the front by construction.
+        var frontmostApp: (name: String, pid: Int32, window: JSONValue?)? = nil
+        /// Her-screen Phase 5 — the window's kind, the app map's key.
+        var windowKind: String? = nil
     }
 
     /// A resolvable thing on the screen. `label` is the DISPLAY text — what the
@@ -301,7 +332,7 @@ extension MacFourVerbs {
             // body is the only difference; everything downstream reads the same
             // percept shape, and `front` in the output tells the renderer the
             // truth about what it is describing.
-            var body: [String: JSONValue] = ["grade": .string("look")]
+            var body: [String: JSONValue] = ["grade": .string("look"), "app_map": .bool(true)]
             if let app { body["app"] = .string(app) }
             result = try await host.dispatch(action: "look", body: body)
         } catch {
@@ -314,6 +345,17 @@ extension MacFourVerbs {
         let output = Self.object(result.output)
         if result.error == "self_inspection_unsupported" {
             return .blind(Self.ownAppRoute())
+        }
+        // Her-screen 09-24 — "locked" is usually just the screensaver. Nudge it
+        // (pointer move + bare shift, types nothing) and read again, twice at
+        // most (~1.4 s); only then say it couldn't be woken.
+        if result.error == "mac_locked" {
+            if wakeAttemptsRemaining > 0,
+               let wake = try? await host.dispatch(action: "wake", body: ["settle_ms": .int(700)]),
+               wake.ok || Self.object(Self.object(wake.output)["wake"])["still_obstructed"] == .bool(true) {
+                return await sight(part: part, app: app, wakeAttemptsRemaining: wakeAttemptsRemaining - 1)
+            }
+            MacScreenLock.wakeFailed = true
         }
         guard result.ok, let frameId = Self.string(output["frame_id"]) else {
             let why = Self.string(output["message"])
@@ -331,6 +373,7 @@ extension MacFourVerbs {
             ))
         }
 
+        MacScreenLock.wakeFailed = false
         let percept = Self.percept(from: output)
         if percept.app?.bundleIdentifier == MacWakeGuard.loginWindowBundleID {
             guard wakeAttemptsRemaining > 0 else {
@@ -564,6 +607,9 @@ extension MacFourVerbs {
                 values: supplement.values,
                 to: full
             )
+        } else if supplement != nil {
+            // Not this look's own window: nothing from that capture may leave.
+            supplementalSource?.rejected()
         }
 
         // A focused empty text area has no title or value, so it is not an AX
@@ -667,7 +713,17 @@ extension MacFourVerbs {
             let y = Int(((pointer.y - frame.y) / frame.h * 100).rounded())
             return "POINTER: \(x)%,\(y)% of the observed surface (system position)."
         }()
-        let renderedText = rendering.text + "\n" + pointerLine
+        // Her-screen Phase 5 — remembered controls the text render cut.
+        let windowKind = Self.string(output["window_kind"])
+        let knownLine = await knownLine(
+            bundle: percept.app?.bundleIdentifier, windowKind: windowKind,
+            live: targets,
+            rendered: zoom == nil ? Self.renderedPaths(full, options: options) : nil
+        )
+        let renderedText = rendering.text + (knownLine.map { $0 + "\n" } ?? "") + "\n" + pointerLine
+        if let name = percept.app?.name {
+            sightRecorder?.record(app: name, kind: windowKind, readouts: percept.readouts.compactMap(\.displayText))
+        }
         return .seen(Sighting(
             render: renderedText,
             effectRender: rendering.text,
@@ -695,7 +751,14 @@ extension MacFourVerbs {
                 "rows_dropped": .int(Int64(rendering.rowsDropped)),
                 "controls_dropped": .int(Int64(rendering.controlsDropped)),
                 "semantic_targets_omitted": .int(Int64(percept.affordancesOmitted)),
-            ].merging(supplementalDiagnostics) { current, _ in current }
+            ].merging(supplementalDiagnostics) { current, _ in current },
+            frontmostApp: {
+                let front = Self.object(output["frontmost_app"])
+                guard let name = Self.string(front["name"]),
+                      let pid = Self.int(front["pid"]).flatMap(Int32.init(exactly:)), pid > 0 else { return nil }
+                return (name, pid, front["window"])
+            }(),
+            windowKind: windowKind
         ))
     }
 

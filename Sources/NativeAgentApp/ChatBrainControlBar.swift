@@ -423,6 +423,7 @@ struct ChatBrainControlBar: View {
             }
             .labelsHidden()
             .pickerStyle(.segmented)
+            .hazeTinted(.segments)
             .frame(minWidth: 220, idealWidth: 300, maxWidth: 390)
             .disabled(selectedModelIsUnavailable)
             .help("Reasoning effort supported by the selected model, from Low through Max or Ultra where available.")
@@ -436,6 +437,7 @@ struct ChatBrainControlBar: View {
                         .font(.caption.weight(.semibold))
                 }
                 .toggleStyle(.switch)
+                .hazeTinted()
                 .help("Fast mode requests priority processing when the selected provider/model supports it.")
                 .onChange(of: appModel.chatFastMode) { _, _ in
                     Task { @MainActor in await appModel.saveChatBrainDefaults() }

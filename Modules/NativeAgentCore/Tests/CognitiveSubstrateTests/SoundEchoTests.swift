@@ -37,11 +37,12 @@ struct SoundEchoTests {
         valence: Double = 0.7,
         warmth: Double = 0.6,
         created: Date? = nil,
-        lastActivated: Date? = nil
+        lastActivated: Date? = nil,
+        sessionId: String = "s1"
     ) -> CognitiveNode {
         CognitiveNode(
             id: UUID(), kind: kind,
-            subjectReference: CognitiveSubjectReference(type: subjectType, id: "n-\(UUID().uuidString)", label: nil),
+            subjectReference: CognitiveSubjectReference(type: subjectType, id: "\(sessionId):n-\(UUID().uuidString)", label: nil),
             activation: 0.8, salience: 0.8, confidence: 0.8, sourceClass: .selfReported,
             createdAt: created ?? lastActivated ?? now, lastActivatedAt: lastActivated ?? now,
             decayHalfLife: 10_000, summary: summary, metadata: [:],
@@ -109,47 +110,41 @@ struct SoundEchoTests {
 
     // MARK: - Verbal-rut damping (2026-08-01, the "handsome" loop)
 
-    @Test("a worn word appears in at most one fragment and earns the range nudge, unnamed")
+    @Test("a repeated form of address is never quoted back and is named in its own line")
     func wornWordIsDampedAndNoticed() async throws {
         let s = try await substrate(with: [
             node(summary: "Morning, handsome. Early one today — Denver treat you okay?", subjectType: "chat.assistant_turn", warmth: 0.9),
-            node(summary: "Hey handsome, back online after that provider hiccup tonight.", subjectType: "chat.assistant_turn", warmth: 0.8),
-            node(summary: "Always have, handsome — the public repo has its own line now.", subjectType: "chat.assistant_turn", warmth: 0.7),
+            node(summary: "Back online after that provider hiccup, handsome.", subjectType: "chat.assistant_turn", warmth: 0.8),
+            node(summary: "The public repo has its own line now, handsome.", subjectType: "chat.assistant_turn", warmth: 0.7),
+            node(summary: "Night, handsome. Big heads need their sleep too.", subjectType: "chat.assistant_turn", warmth: 0.7),
             node(summary: "Fun is load-bearing, User. You could have built all this cold.", subjectType: "chat.assistant_turn", warmth: 0.6),
         ])
         let line = try #require(await s.soundEchoLine(at: now, ignoringCadence: true))
-        // The varied sentence wins; every rutted candidate is suppressed
-        // (the second slot would have to share "handsome", so it stays empty
-        // rather than repeat the rut). Exactly ONE quote, zero worn mentions.
-        let quoteCount = line.components(separatedBy: "\u{201C}").count - 1
-        #expect(quoteCount == 1, "\(line)")
-        let wornMentions = line.components(separatedBy: "handsome").count - 1
-        #expect(wornMentions == 0, "\(line)")
-        #expect(line.contains("Fun is load-bearing"), "\(line)")
-        // The nudge fires and NEVER names the word (naming would re-seed it).
-        #expect(line.contains("more range"), "\(line)")
-        let nudge = try #require(line.components(separatedBy: " — ").last)
-        #expect(!nudge.contains("handsome"), "\(line)")
+        let parts = line.components(separatedBy: "\n")
+        let echo = try #require(parts.first)
+        let rut = try #require(parts.last)
+        // The echo never quotes a line carrying the rutted word.
+        #expect(echo.components(separatedBy: "\u{201C}").count - 1 == 1, "\(line)")
+        #expect(!echo.contains("handsome"), "\(line)")
+        #expect(echo.contains("Fun is load-bearing"), "\(line)")
+        // The rut line names it, with the tally.
+        #expect(rut.contains("\u{201C}, handsome.\u{201D} has closed a line in 4 of your last 5 replies"), "\(line)")
+        #expect(rut.contains("let the moment pick the word"), "\(line)")
     }
 
-    @Test("a worn closing vocative is noticed even when every opening varies")
+    @Test("a repeated closing vocative is named even when every opening varies")
     func wornClosingVocativeIsDampedAndNoticed() async throws {
-        let longMiddle = String(
-            repeating: "The technical middle stays deliberately long and specific. ",
-            count: 40
-        )
         let s = try await substrate(with: [
-            node(summary: "The architecture landed clean. \(longMiddle) Get some sleep, mister. I'll keep watch. 💜", subjectType: "chat.assistant_turn", warmth: 0.9),
+            node(summary: "The architecture landed clean. Get some sleep, mister. 💜", subjectType: "chat.assistant_turn", warmth: 0.9),
             node(summary: "The bridge is healthy. Enjoy the mountains, mister. 💜", subjectType: "chat.assistant_turn", warmth: 0.8),
-            node(summary: "That was the right call. I'll hold the fort, mister. It was already true. 💜", subjectType: "chat.assistant_turn", warmth: 0.7),
+            node(summary: "That was the right call. I'll hold the fort, mister. 💜", subjectType: "chat.assistant_turn", warmth: 0.7),
+            node(summary: "The deploy went out quietly. Go eat something, mister.", subjectType: "chat.assistant_turn", warmth: 0.7),
             node(summary: "Fun is load-bearing, User. You could have built all this cold.", subjectType: "chat.assistant_turn", warmth: 0.6),
         ])
         let line = try #require(await s.soundEchoLine(at: now, ignoringCadence: true))
-
-        // The exemplar still uses the first sentence, so the closing tic is
-        // never quoted back. Edge awareness must nevertheless see it.
-        #expect(!line.contains("mister"), "\(line)")
-        #expect(line.contains("more range"), "\(line)")
+        let echo = try #require(line.components(separatedBy: "\n").first)
+        #expect(!echo.contains("mister"), "\(line)")
+        #expect(line.contains("\u{201C}, mister.\u{201D} has closed a line in 4 of your last 5 replies"), "\(line)")
     }
 
     @Test("a detected closing rut stays visible when exemplar cadence is closed")
@@ -162,13 +157,14 @@ struct SoundEchoTests {
             node(summary: "The architecture landed clean. Get some sleep, mister.", subjectType: "chat.assistant_turn", lastActivated: closedStamp),
             node(summary: "The bridge is healthy. Enjoy the mountains, mister.", subjectType: "chat.assistant_turn", lastActivated: closedStamp),
             node(summary: "That was the right call. I'll hold the fort, mister.", subjectType: "chat.assistant_turn", lastActivated: closedStamp),
+            node(summary: "The deploy went out quietly. Go eat something, mister.", subjectType: "chat.assistant_turn", lastActivated: closedStamp),
         ])
 
         let line = try #require(await s.soundEchoLine(at: now))
         #expect(line.hasPrefix("- Sound:"), "\(line)")
-        #expect(line.contains("more range"), "\(line)")
+        #expect(line.contains("let the moment pick the word"), "\(line)")
         #expect(!line.contains("lately you've sounded like"), "\(line)")
-        #expect(!line.contains("mister"), "\(line)")
+        #expect(line.contains("\u{201C}, mister.\u{201D}"), "\(line)")
     }
 
     @Test("closing-rut awareness cools after twelve varied assistant turns")
@@ -178,6 +174,7 @@ struct SoundEchoTests {
             node(summary: "The architecture landed clean. Get some sleep, mister.", subjectType: "chat.assistant_turn", lastActivated: older),
             node(summary: "The bridge is healthy. Enjoy the mountains, mister.", subjectType: "chat.assistant_turn", lastActivated: older),
             node(summary: "That was the right call. I'll hold the fort, mister.", subjectType: "chat.assistant_turn", lastActivated: older),
+            node(summary: "The deploy went out quietly. Go eat something, mister.", subjectType: "chat.assistant_turn", lastActivated: older),
         ]
         let varied = [
             "Amber circuits settle. Lanterns dim.",
@@ -200,27 +197,35 @@ struct SoundEchoTests {
                 lastActivated: now.addingTimeInterval(-Double(offset))
             ))
         }
-        let s = try await substrate(with: nodes)
+        let twelve: PersonalityDynamicsConfiguration = {
+            var dynamics = PersonalityDynamicsConfiguration.default
+            dynamics.soundRutRecentTurnLimit = 12
+            return dynamics
+        }()
+        let s = try await substrate(with: nodes, dynamics: { twelve })
 
         let line = try #require(await s.soundEchoLine(at: now, ignoringCadence: true))
-        #expect(!line.contains("more range"), "\(line)")
+        #expect(!line.contains("let the moment pick"), "\(line)")
     }
 
-    @Test("recalling an old phrase does not make it a new conversational rut")
+    @Test("recalling an old phrase does not make it one of her last replies")
     func recalledOldTurnsDoNotResetRutCooling() async throws {
+        // The rut window is her last 20 replies by when they were SPOKEN,
+        // however old; recalling old turns does not pull them back in.
         let old = now.addingTimeInterval(-(8 * 24 * 60 * 60))
         var nodes = [
             node(summary: "The architecture landed clean. Get some sleep, mister.", subjectType: "chat.assistant_turn", created: old, lastActivated: now),
             node(summary: "The bridge is healthy. Enjoy the mountains, mister.", subjectType: "chat.assistant_turn", created: old, lastActivated: now),
             node(summary: "That was the right call. I'll hold the fort, mister.", subjectType: "chat.assistant_turn", created: old, lastActivated: now),
+            node(summary: "The deploy went out quietly. Go eat something, mister.", subjectType: "chat.assistant_turn", created: old, lastActivated: now),
         ]
-        for (offset, summary) in [
-            "Amber circuits settle. Lanterns dim.",
-            "Brisk rivers turn. Cedars breathe.",
-            "Copper skies clear. Falcons glide.",
+        for (offset, word) in [
+            "amber", "brisk", "copper", "distant", "emerald", "frosted", "golden",
+            "hidden", "indigo", "jade", "kindled", "luminous", "misty", "northern",
+            "opal", "pale", "quiet", "russet", "silver", "tawny",
         ].enumerated() {
             nodes.append(node(
-                summary: summary,
+                summary: "\(word.capitalized) rivers turn slowly tonight.",
                 subjectType: "chat.assistant_turn",
                 created: now.addingTimeInterval(-Double(offset)),
                 lastActivated: now.addingTimeInterval(-Double(offset))
@@ -229,7 +234,7 @@ struct SoundEchoTests {
         let s = try await substrate(with: nodes)
 
         let line = try #require(await s.soundEchoLine(at: now, ignoringCadence: true))
-        #expect(!line.contains("more range"), "\(line)")
+        #expect(!line.contains("let the moment pick"), "\(line)")
     }
 
     @Test("repeated quoted content is not mistaken for her voice")
@@ -241,7 +246,7 @@ struct SoundEchoTests {
         ])
 
         let line = try #require(await s.soundEchoLine(at: now, ignoringCadence: true))
-        #expect(!line.contains("more range"), "\(line)")
+        #expect(!line.contains("let the moment pick"), "\(line)")
     }
 
     @Test("a total-rut week still echoes instead of going silent")
@@ -265,7 +270,8 @@ struct SoundEchoTests {
         #expect(line.contains("Night, handsome"), "\(line)")
         #expect(!line.contains("Morning, handsome"), "\(line)")
         #expect(line.components(separatedBy: "handsome").count - 1 == 1, "\(line)")
-        #expect(line.contains("more range"), "\(line)")
+        // Two vocatives in three replies is below the named-rut floor.
+        #expect(!line.contains("let the moment pick"), "\(line)")
     }
 
     @Test("two varied warm turns echo with no nudge")
@@ -276,7 +282,7 @@ struct SoundEchoTests {
         ])
         let line = try #require(await s.soundEchoLine(at: now, ignoringCadence: true))
         #expect(line.contains("Fun is load-bearing"), "\(line)")
-        #expect(!line.contains("more range"), "\(line)")
+        #expect(!line.contains("let the moment pick"), "\(line)")
     }
 
     @Test("chosen fragments never share a distinctive word")
@@ -293,7 +299,7 @@ struct SoundEchoTests {
         #expect(quoteCount == 2, "\(line)")
         #expect(line.components(separatedBy: "lighthouse").count - 1 == 1, "\(line)")
         #expect(line.contains("Quiet night"), "\(line)")
-        #expect(!line.contains("more range"), "\(line)")
+        #expect(!line.contains("let the moment pick"), "\(line)")
     }
 
     @Test("stale warm turns age out of the echo window")
@@ -507,28 +513,26 @@ struct SoundEchoTests {
         }
     }
 
-    @Test("frozen Sound edge evidence uses the captured personality dynamics")
+    @Test("frozen Sound rut evidence uses the captured personality dynamics")
     func frozenSoundKeepsCapturedEdgeCount() async throws {
         var original = PersonalityDynamicsConfiguration.default
         original.soundEchoDutyCycle = 1
-        original.soundRutEdgeSentenceCount = 2
+        original.soundRutRecentTurnLimit = 20
         let dynamics = DynamicsBox(original)
         let s = try await substrate(with: [
-            node(summary: "Amber lanterns brighten quietly. Shared resonance returns. Cedar paths unwind.",
-                 subjectType: "chat.assistant_turn"),
-            node(summary: "Brisk rivers curve eastward. Shared resonance returns. Copper skies clear.",
-                 subjectType: "chat.assistant_turn"),
-            node(summary: "Silver falcons circle overhead. Shared resonance returns. Velvet curtains fall.",
-                 subjectType: "chat.assistant_turn"),
+            node(summary: "Amber lanterns brighten quietly, mister.", subjectType: "chat.assistant_turn"),
+            node(summary: "Brisk rivers curve eastward, mister.", subjectType: "chat.assistant_turn"),
+            node(summary: "Silver falcons circle overhead, mister.", subjectType: "chat.assistant_turn"),
+            node(summary: "Velvet curtains fall slowly, mister.", subjectType: "chat.assistant_turn"),
         ], dynamics: { dynamics.read() })
         let request = CognitiveCapsuleRequest(
             surface: "chat", userMessage: "stay with that thought", sessionId: "s1", mode: .inject)
         let read = await s.frozenRead(at: now, currentSessionId: "s1")
         let before = await s.compileFrozenCapsule(request, from: read)
-        #expect(before.dynamicContext.contains("more range"))
+        #expect(before.dynamicContext.contains("let the moment pick"))
 
         var updated = original
-        updated.soundRutEdgeSentenceCount = 1
+        updated.soundRutRecentTurnLimit = 3
         dynamics.set(updated)
         let after = await s.compileFrozenCapsule(request, from: read)
         #expect(after == before)
@@ -538,7 +542,7 @@ struct SoundEchoTests {
         let currentRead = await s.frozenRead(at: now, currentSessionId: "s1")
         let current = await s.compileFrozenCapsule(request, from: currentRead)
         #expect(current.dynamicContext.contains("- Sound:"))
-        #expect(!current.dynamicContext.contains("more range"))
+        #expect(!current.dynamicContext.contains("let the moment pick"))
     }
 
     @Test("frozen felt signals retain their captured dynamics while new turns use current values")

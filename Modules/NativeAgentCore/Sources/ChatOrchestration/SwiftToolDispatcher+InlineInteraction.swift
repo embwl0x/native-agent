@@ -45,10 +45,14 @@ extension SwiftToolDispatcher {
         guard kind != .unknown else {
             return failed("unknown_kind", "There is no \(rawKind) request in this app.")
         }
-        guard let why = text("why", "reason") else {
+        // 2026-09-24 trace: she sent {"connector": "github", "message": ...}
+        // and burned two calls on missing_why / missing_target.
+        guard let why = text("why", "reason", "message") else {
             return failed("missing_why", "Say in one sentence why this is needed.")
         }
-        let target = text("target") ?? ""
+        // She names it by its kind as often as by `target` (09-24:
+        // connector:"github" came back missing_target).
+        let target = text("target", rawKind) ?? ""
         // Her own words for what a decline costs, when she has them; the
         // registry's default otherwise. Never empty — Agent's rule is that
         // every decline says what happens next.

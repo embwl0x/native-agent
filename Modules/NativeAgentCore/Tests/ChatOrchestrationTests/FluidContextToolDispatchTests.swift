@@ -133,6 +133,7 @@ struct FluidContextToolDispatchTests {
         #expect(result == .object([
             "status": .string("failed"),
             "reason": .string("pointer_not_offered_this_turn"),
+            "message": .string("That atom id is not in this turn's context pointer list (ids from earlier turns expire); use an id listed this turn, or read the source directly."),
             "atom_id": .string("atom:unoffered"),
         ]))
     }

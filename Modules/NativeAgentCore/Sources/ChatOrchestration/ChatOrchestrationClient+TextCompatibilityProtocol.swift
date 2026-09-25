@@ -20,23 +20,41 @@ extension SwiftNativeChatOrchestrationClient {
                     return ParsedToolCall(id: call.id, name: call.name, input: input)
                 }
                 : ToolCallParser.parse(iterAccumulated, parseInvoke: true).map { call in
+                    let properties = schemas.first(where: { $0.name == call.name })
+                        .flatMap { try? JSONSerialization.jsonObject(with: $0.parametersJSON) as? [String: Any] }
+                        .flatMap { $0["properties"] as? [String: Any] }
+                    var input = call.input
+                    // 2026-09-25 desk-walk3: a call block carried an `output`
+                    // field holding an invented notes list. Results come only
+                    // from tools, so a result-shaped field the tool does not
+                    // declare is dropped before dispatch, receipts or cards.
+                    // An unknown schema leaves the arguments alone.
+                    let written = properties.map { declared in
+                        input.keys.filter {
+                            Self.modelWrittenResultKeys.contains($0.lowercased()) && declared[$0] == nil
+                        }
+                    } ?? []
+                    for key in written { input.removeValue(forKey: key) }
                     // 2026-09-22: <invoke> text "42"/"true" parses as a number/
                     // bool; a string-schema param gets back the text as written.
-                    guard !call.invokeRawText.isEmpty,
-                          let schema = schemas.first(where: { $0.name == call.name }),
-                          let root = try? JSONSerialization.jsonObject(with: schema.parametersJSON) as? [String: Any],
-                          let properties = root["properties"] as? [String: Any] else { return call }
-                    var input = call.input
-                    for (key, raw) in call.invokeRawText {
-                        guard (properties[key] as? [String: Any])?["type"] as? String == "string" else { continue }
-                        switch input[key] {
-                        case .int?, .double?, .bool?, .null?: input[key] = .string(raw)
-                        default: continue
+                    if let properties {
+                        for (key, raw) in call.invokeRawText {
+                            guard (properties[key] as? [String: Any])?["type"] as? String == "string" else { continue }
+                            switch input[key] {
+                            case .int?, .double?, .bool?, .null?: input[key] = .string(raw)
+                            default: continue
+                            }
                         }
                     }
-                    return ParsedToolCall(id: call.id, name: call.name, input: input)
+                    var parsed = ParsedToolCall(id: call.id, name: call.name, input: input)
+                    parsed.wroteResult = !written.isEmpty
+                    return parsed
                 }
     }
+
+    nonisolated static let modelWrittenResultKeys: Set<String> = ["output", "result", "response"]
+    nonisolated static let modelWrittenResultNote =
+        "\nResults come only from tools; the output you wrote in this call was ignored."
 
     /// User, 2026-09-06: the turn's VISIBLE prose, round by round. `accumulated`
     /// used to absorb only the round that ended call-free, so every narrated

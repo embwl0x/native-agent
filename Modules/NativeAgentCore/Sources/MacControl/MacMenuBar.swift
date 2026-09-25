@@ -105,7 +105,18 @@ public enum MacMenuBar {
     /// but not a level of NAMED depth — which is why the cap is expressed in
     /// named levels: it is the thing a person counts when they say
     /// "File › Export › PDF".
-    public static func read(source: any MacAXElementSource, pid: Int32) -> Reading {
+    ///
+    /// Her-screen 09-24 — TARGETED. The item cap is PER top-level menu (a
+    /// long Edit menu used to spend the whole budget before Format was ever
+    /// reached). `top` walks only the top-level menus whose name contains it
+    /// (a path's first level); `until` stops the walk at the first item it
+    /// accepts (a bare-name find).
+    public static func read(
+        source: any MacAXElementSource,
+        pid: Int32,
+        top: String? = nil,
+        until stop: ((Item) -> Bool)? = nil
+    ) -> Reading {
         guard pid != getpid() else {
             return Reading(items: [], truncated: false, unavailable: "self_process")
         }
@@ -117,16 +128,21 @@ public enum MacMenuBar {
         }
         var items: [Item] = []
         var truncated = false
+        var inMenu = 0
+        var done = false
+        let wantedTop = top.map(normalized)
 
         func descend(_ element: MacAXElementRef, titles: [String], indices: [Int]) {
-            guard items.count < maxItems else {
+            guard !done else { return }
+            guard inMenu < maxItems else {
                 truncated = true
                 return
             }
             let children = source.children(of: element, limit: maxChildrenPerMenu + 1)
             if children.count > maxChildrenPerMenu { truncated = true }
             for (offset, child) in children.prefix(maxChildrenPerMenu).enumerated() {
-                guard items.count < maxItems else {
+                guard !done else { return }
+                guard inMenu < maxItems else {
                     truncated = true
                     return
                 }
@@ -142,6 +158,12 @@ public enum MacMenuBar {
                     // A separator publishes no title. It is furniture, not an
                     // address; skipping it is not hiding anything.
                     guard let title, !title.isEmpty else { continue }
+                    if titles.isEmpty {
+                        // A new top-level menu: its own budget, and only the
+                        // named one when a path said which.
+                        if let wantedTop, !normalized(title).contains(wantedTop) { continue }
+                        inMenu = 0
+                    }
                     let names = titles + [title]
                     // Does it OPEN something? The AXMenu child is the answer,
                     // and asking costs one ranged child read. Its real OFFSET
@@ -152,12 +174,18 @@ public enum MacMenuBar {
                         .children(of: child, limit: 4)
                         .enumerated()
                         .first { source.attributes(of: $0.element)?.role == "AXMenu" }
-                    items.append(Item(
+                    let item = Item(
                         titlePath: names,
                         path: indexPath,
                         enabled: attributes.enabled,
                         hasSubmenu: submenu != nil
-                    ))
+                    )
+                    items.append(item)
+                    inMenu += 1
+                    if stop?(item) == true {
+                        done = true
+                        return
+                    }
                     if let submenu, names.count < maxPathDepth {
                         descend(
                             submenu.element,
@@ -201,15 +229,24 @@ public enum MacMenuBar {
     }
 
     /// Split a spoken path on any accepted separator.
+    /// "/" and "|" separate levels only when no ›, », → or > is used, so
+    /// "Edit › Find/Replace" keeps its item whole.
     public static func components(_ raw: String) -> [String] {
         var working = raw
-        for separator in separators where separator != "›" {
+        let used = isPath(raw) ? separators.filter { $0 != "/" && $0 != "|" } : separators
+        for separator in used where separator != "›" {
             working = working.replacingOccurrences(of: separator, with: "›")
         }
         return working
             .split(separator: "›")
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
+    }
+
+    /// Written as a menu path: a ›, », → or > between levels ("/" alone is
+    /// a name, "Find/Replace").
+    public static func isPath(_ raw: String) -> Bool {
+        raw.contains(where: { "›»→>".contains($0) })
     }
 
     /// Resolve a spoken path against one reading.
@@ -298,7 +335,9 @@ public enum MacMenuBar {
     /// The read's payload. Titles go through the same shape redactor every
     /// other perception organ uses: a Window menu lists open document names,
     /// and a document can be called anything.
-    public static func json(_ reading: Reading) -> JSONValue {
+    /// `statesKnown` false (the app is not in front): enabled states are not
+    /// claimed — a background app's menus report stale ones.
+    public static func json(_ reading: Reading, statesKnown: Bool = true) -> JSONValue {
         var out: [String: JSONValue] = [
             "count": .int(Int64(reading.items.count)),
             "truncated": .bool(reading.truncated),
@@ -310,14 +349,15 @@ public enum MacMenuBar {
             return .object(out)
         }
         out["available"] = .bool(true)
+        if !statesKnown { out["enabled_state"] = .string("unknown until it's in front") }
         out["paths"] = .array(reading.items.map { item in
             var row: [String: JSONValue] = [
                 "path": MacScreenViewTextRedaction.redactedLegendString(
                     item.display,
                     valueChars: maxTitleChars * maxPathDepth
                 ),
-                "enabled": .bool(item.enabled),
             ]
+            if statesKnown { row["enabled"] = .bool(item.enabled) }
             if item.hasSubmenu { row["opens_submenu"] = .bool(true) }
             return .object(row)
         })

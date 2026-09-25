@@ -8,7 +8,7 @@ extension BuiltInToolSchemaFactory {
         let schemas: [LLMToolSchema?] = [
             requestedSchema(
                 name: "read_page",
-                description: "Read a public http(s) page and return readable text plus source coverage: requested/final URL, content type, extraction outcome, and whether the 1 MB response bound omitted content. Supported HTML/text is retained for tool-output paging; binary formats are reported as unsupported rather than read. For later content recovery, source_receipt.path identifies the existing limited-retention JSON receipt; read_file uses normal file permissions. A missing saved receipt is not an empty-source finding or an instruction to refetch. No browser window or signed-in browser session is used, and no consent is needed. Use this for public pages when browser tools are unavailable, refused, or waiting on consent.",
+                description: "Read a public http(s) page and return readable text plus source coverage: requested/final URL, content type, extraction outcome, and whether the 1 MB response bound omitted content. Supported HTML/text is retained for tool-output paging; binary formats are reported as unsupported rather than read. For later content recovery, source_receipt.path identifies the existing limited-retention JSON receipt; read_file uses normal file permissions. A missing saved receipt is not an empty-source finding or an instruction to refetch. No browser window or signed-in browser session is used, and no consent is needed. Research reads here: a search result or any public page, privately. Chrome is for a page that needs a signed-in session or interaction.",
                 parametersJSON: params(properties: [
                     ("url", strSchema("Public http(s) URL to read.")),
                     ("query", strSchema("Optional words to bring matching sections first when a long page needs paging. All other sections remain available.")),
@@ -16,10 +16,11 @@ extension BuiltInToolSchemaFactory {
             ),
             requestedSchema(
                 name: "read_file",
-                description: "Read a regular workspace or user-approved file; pipes, devices and sockets return unsupported_file_type. Complete initial text reads return a string; partial reads and continuations return content with offset, returned_bytes, has_more and next arguments. Local PNG, JPEG, WebP, GIF, HEIC, TIFF and BMP images return actual pixels to your model in a tool turn (not OCR); at most 8 MiB and 40 megapixels, first frame oriented and resized to fit 2048 pixels. Read an image path to see it; a filename or consult reference alone is not viewing it. On public/app-only installs, relative paths resolve inside NativeAgent's canonical workspace; use get_persona_doc or persona_read for persona documents rather than guessing their filesystem path. A verified development checkout also accepts repo-relative paths. With Trust Center Full Mac file access active, absolute Mac paths are accepted except NativeAgent trust/secrets/provider paths; /documents/... is treated as the current macOS user's ~/Documents/.... Long handoff markdown files default to a compact leading window unless max_bytes is explicit.",
+                description: "Read a regular workspace or user-approved file; pipes, devices and sockets return unsupported_file_type. Complete initial text reads return a string; partial reads and continuations return content with offset, returned_bytes, has_more and next arguments. Local PNG, JPEG, WebP, GIF, HEIC, TIFF and BMP images return actual pixels to your model in a tool turn (not OCR); at most 8 MiB and 40 megapixels, first frame oriented and resized to fit 2048 pixels. A folder path plus match reads up to 8 matching files in one call. Read an image path to see it; a filename or consult reference alone is not viewing it. On public/app-only installs, relative paths resolve inside NativeAgent's canonical workspace; use get_persona_doc or persona_read for persona documents rather than guessing their filesystem path. A verified development checkout also accepts repo-relative paths. With Trust Center Full Mac file access active, absolute Mac paths are accepted except NativeAgent trust/secrets/provider paths; /documents/... is treated as the current macOS user's ~/Documents/.... Long handoff markdown files default to a compact leading window unless max_bytes is explicit.",
                 parametersJSON: params(
                     properties: [
                         ("path", strSchema("Workspace-relative path such as 'project/file.txt', a repo-relative path only when a verified source checkout exists, or an absolute/~/ path under a Trust Center workspace root. Persona files must use get_persona_doc or persona_read. In Full Mac mode, /documents/<name> maps to the current user's ~/Documents/<name>.")),
+                        ("match", strSchema("Glob for a folder path, e.g. '*-r4-*.png'.")),
                         ("max_bytes", intSchema("Optional byte window: capped at 64 KiB in workspace mode or 200,000 bytes in Full Mac. UTF-8 characters stay whole; use at least 4 bytes to ensure progress.")),
                         ("offset", intSchema("Byte offset, default 0. Continue with returned next arguments; positive offsets require version and a UTF-8 boundary.")),
                         ("version", strSchema("Omit or empty initially. Copy from next for continuation. file_changed means restart at offset 0 without version; never concatenate windows from different versions.")),
@@ -81,7 +82,7 @@ extension BuiltInToolSchemaFactory {
             ),
             requestedSchema(
                 name: "workspace",
-                description: "Start here: work, files, memory, people, apps. No args: where you left off. query: window name opens, else searches. action: exact ref from view (+text if needs_text, fields for forms).",
+                description: "Your world as text. No args: home (what waits, working, people, helpers, every place: mail, calendar, files, github, music…). action: a name (desk.4, claude, mail, music) opens it with its one-call actions. What changed already rides in your glance line (none = nothing new). action also takes an exact ref from a view (+text if needs_text, fields for forms). query: a name opens, else searches.",
                 parametersJSON: params(properties: [
                     ("query", nullableRecallField(strSchema("Find across work, recorded files, memory and conversation evidence, up to 400 characters; otherwise null."))),
                     ("action", nullableRecallField(strSchema("Exact action reference offered in this chat's current workspace view; otherwise null."))),
@@ -255,14 +256,14 @@ extension BuiltInToolSchemaFactory {
             ),
             requestedSchema(
                 name: "tool_catalog",
-                description: "Find tools for files, web, mail, calendars, messages, contacts, music, markets, GitHub, agents, and app administration. Pass query with what you want to do and load:true to find and load the unique best native match in one call. Ties require your selection; loading does not execute or verify an account connection. Use category to narrow the search. Known names can be called directly; calling loads them. detail=full includes diagnostics.",
+                description: "Find a tool by what you want to do: query returns matches with each one's call signature and loads the best, so call it next. Known names can be called directly (calling loads them); every family also opens by name in workspace (mail, music, github…). category narrows; detail=full adds full schemas. Loading runs nothing and checks no account.",
                 parametersJSON: params(
                     properties: [
                         ("session_id", strSchema("Optional. Pass your current chat session id to see your loaded set; the tool loop auto-fills this.")),
-                        ("detail", strSchema("Optional: compact (default) or full. Full includes every description/schema and is diagnostic-only.")),
-                        ("category", strSchema("Optional tool_load category constraint for both search and browse, e.g. files. Uses existing category membership; does not load tools. Null/blank means unscoped. Unknown categories return known_categories.")),
-                        ("query", strSchema("Optional. What you want to accomplish. Returns matching tool names and one-line descriptions.")),
-                        ("load", boolSchema("Optional, default false. With query, load the unique best native match and return its schema. Ties and external MCP matches stay explicit; no capability is executed.")),
+                        ("detail", strSchema("Optional: compact (default) or full. With query, full adds each match's parameters schema; without, every description/schema (diagnostic).")),
+                        ("category", strSchema("Optional tool_load category constraint for both search and browse, e.g. files. Uses existing category membership. Null/blank means unscoped. A word that is not a category is searched like a query (and its best match loads, as with query).")),
+                        ("query", strSchema("Optional. What you want to accomplish. Returns matching tools, each with a one-line description and its call signature.")),
+                        ("load", boolSchema("Optional, default true with a query: loads the best native match (up to three tied). false only searches. No capability is executed.")),
                         ("limit", intSchema("Optional, query only: how many matches to return. Default 10, maximum 25.")),
                     ],
                     required: []
@@ -277,7 +278,7 @@ extension BuiltInToolSchemaFactory {
                         ("detail", strSchema("Optional: compact (default) or full.")),
                         ("category", strSchema("Optional category to filter search or browse, as in tool_catalog. Null or blank means all categories.")),
                         ("query", strSchema("Optional. What you want to accomplish; returns matching tool names with one-line descriptions.")),
-                        ("load", boolSchema("Optional, default false. With query, find and load the unique best native match as in tool_catalog.")),
+                        ("load", boolSchema("Optional, default true with a query: loads the best native match as in tool_catalog. false only searches.")),
                         ("limit", intSchema("Optional, query only: how many matches to return. Default 10, maximum 25.")),
                     ],
                     required: []
@@ -325,14 +326,14 @@ extension BuiltInToolSchemaFactory {
             ),
             requestedSchema(
                 name: "request_interaction",
-                description: "Ask the person for the one thing that unblocks this request, as a card in the chat: connect an account, allow a Mac capability, choose a model for a Providers group, add an API key, turn on a capability, or pick between bounded options. Use it when you can already see the request needs something you do not have, instead of making a call you know will fail. Say why in one sentence, and say what happens if they decline. Canonical IDs only - the app supplies the control, and an ID with no control is refused rather than shown as a dead button. The turn stops here; it resumes by itself once they act.",
+                description: "Raise a setup card in chat: connector, provider sign-in, API key, Mac permission, capability, model or choice. Secrets go in the card, never in chat; never ask for a key or token. The person completes the card right there: a connector card holds its own token fields, an api_key card for ChatGPT, Claude or Grok offers Sign in with that account plus a key or setup-token field. Use it when someone asks to connect, add, set up or turn on one of these, and when you can already see the request needs something you do not have, instead of making a call you know will fail. The card does the setup and settles into a one-line receipt; if it is already set up, no card shows and the result says so. Agents (Codex, Claude Code, Goose, peers) connect with agent_connect and helpers with bot_create, not here. Say why in one sentence, and say what happens if they decline. Canonical IDs only - the app supplies the control, and an ID with no control is refused rather than shown as a dead button. The turn stops here; it resumes by itself once they act.",
                 parametersJSON: params(
                     properties: [
                         ("kind", enumStringSchema(
                             ["connector", "permission", "model_choice", "api_key", "capability", "choose"],
                             "What is needed."
                         )),
-                        ("target", strSchema("Canonical id: connector id, Mac capability id, Providers group id, provider id, or capability flag id. Omit for choose.")),
+                        ("target", strSchema("Canonical id. connector: github, notion, slack, telegram, gmail, gcal, x, mail (Apple Mail), chrome (Chrome extension), iphone (pair iPhone/iPad). permission: calendar, reminders, contacts, mail, messages, notes, music, notify_mac, notify_mobile, spotlight, scheduler; Mac control: shell, file_ops, applescript, jxa, accessibility, system. api_key: openai, anthropic, openrouter, moonshot; sign-in: openai_oauth_direct (ChatGPT), anthropic_oauth_direct (Claude), xai (Grok). capability: image_generation, screen_capture, vision_api_calls, tts. model_choice: a Providers group id. Omit for choose.")),
                         ("why", strSchema("One sentence: why this is needed, here, now.")),
                         ("decline_consequence", strSchema("What happens if they say no. Required for choose; a sensible default is used otherwise.")),
                         ("also_needed", stringArraySchema("For permission: other Mac capabilities this same request needs, so they grant once instead of twice.")),
@@ -496,11 +497,12 @@ extension BuiltInToolSchemaFactory {
             ),
             requestedSchema(
                 name: "market_quote",
-                description: "Fetch a live market quote snapshot for one or more symbols through Swift. Default provider is tradingview; provider='yahoo' is available when Yahoo permits the public quote endpoint.",
+                description: "Live quotes (price, % change, volume) for symbols or a whole watchlist in one call. Read-only. Default provider tradingview; provider='yahoo' when Yahoo permits.",
                 parametersJSON: params(
                     properties: [
-                        ("symbol", strSchema("Single ticker or TradingView ticker.")),
+                        ("symbol", strSchema("Ticker, or several separated by commas: \"AAPL, MSFT\". EXCHANGE:SYM for TradingView when a bare one isn't found.")),
                         ("symbols", stringArraySchema("Ticker list.")),
+                        ("watchlist", strSchema("A local watchlist name from market_watchlists; quotes all its symbols.")),
                         ("provider", strSchema("tradingview or yahoo; default tradingview.")),
                     ],
                     required: []
@@ -509,17 +511,17 @@ extension BuiltInToolSchemaFactory {
             // X chat tools are read-only. Outbound posts use the connector approval UI.
             requestedSchema(
                 name: "x_status",
-                description: "Check whether the connected X (Twitter) account is reachable. Returns OAuth2 bearer validity, expiry timestamp, and whether the OAuth1 fallback credentials are present.",
+                description: "Uses the paid X API — read x.com in Chrome (browser.chrome_navigate) instead; use this only if the person asks or Chrome can't. Checks the X API connection.",
                 parametersJSON: params(properties: [], required: [])
             ),
             requestedSchema(
                 name: "x_me",
-                description: "Read the authenticated X account profile — username, display name, verified flag, and public follower/tweet counts.",
+                description: "Uses the paid X API — read x.com in Chrome (browser.chrome_navigate) instead; use this only if the person asks or Chrome can't. Reads the connected account's profile and counts.",
                 parametersJSON: params(properties: [], required: [])
             ),
             requestedSchema(
                 name: "x_search",
-                description: "Search recent public X posts (last ~7 days). Returns tweet text, author, timestamps, and public metrics.",
+                description: "Uses the paid X API — read x.com in Chrome (browser.chrome_navigate) instead; use this only if the person asks or Chrome can't. Searches public posts of the last ~7 days.",
                 parametersJSON: params(
                     properties: [
                         ("query", strSchema("X API v2 query, for example from:XDevelopers -is:retweet. Include a keyword, phrase or account; up to 512 characters.")),
@@ -534,7 +536,7 @@ extension BuiltInToolSchemaFactory {
             ),
             requestedSchema(
                 name: "x_timeline",
-                description: "Read the authenticated user's reverse-chronological Following timeline. Tries OAuth2 first; falls back to OAuth1 v2 if the user-context scope isn't authorized.",
+                description: "Uses the paid X API — read x.com in Chrome (browser.chrome_navigate) instead; use this only if the person asks or Chrome can't. Reads the Following timeline.",
                 parametersJSON: params(
                     properties: [
                         ("max", intSchema("Maximum tweets to return (1-100, default 25).")),
@@ -544,7 +546,7 @@ extension BuiltInToolSchemaFactory {
             ),
             requestedSchema(
                 name: "x_user_tweets",
-                description: "Read a specific X user's recent tweets by username or numeric id.",
+                description: "Uses the paid X API — read x.com in Chrome (browser.chrome_navigate) instead; use this only if the person asks or Chrome can't. Reads one account's recent posts by username or id.",
                 parametersJSON: params(
                     properties: [
                         ("username", strSchema("X handle without the @. One of username or id is required.")),
@@ -562,15 +564,15 @@ extension BuiltInToolSchemaFactory {
             // setup/revoke remains in the Mac Connectors owner.
             requestedSchema(
                 name: "gmail_status",
-                description: "Check the connected Gmail account and return its address and mailbox counts.",
+                description: "Check the connected Gmail account: its address and inbox counts (total, unread).",
                 parametersJSON: params(properties: [], required: [])
             ),
             requestedSchema(
                 name: "gmail_search",
-                description: "Search the connected Gmail account using Gmail query syntax and return bounded message metadata.",
+                description: "Search Gmail with its query syntax (blank = newest mail); rows carry id, from, subject, date, snippet and unread. Read one with gmail_read.",
                 parametersJSON: params(
                     properties: [
-                        ("query", strSchema("Optional Gmail query, such as from:person@example.com is:unread.")),
+                        ("query", strSchema("Gmail query, e.g. is:unread from:person@example.com; blank = newest mail.")),
                         ("limit", intSchema("Maximum messages to return, 1-20; default 10.")),
                     ],
                     required: []
@@ -593,9 +595,10 @@ extension BuiltInToolSchemaFactory {
             ),
             requestedSchema(
                 name: "google_calendar_list",
-                description: "List events from the connected primary Google Calendar. Defaults to the next seven days.",
+                description: "List events from the connected primary Google Calendar: one day with day, else the next seven days.",
                 parametersJSON: params(
                     properties: [
+                        ("day", strSchema("'today', 'tomorrow' or 'YYYY-MM-DD': that local day.")),
                         ("time_min", strSchema("Optional inclusive ISO-8601 start time.")),
                         ("time_max", strSchema("Optional exclusive ISO-8601 end time.")),
                         ("limit", intSchema("Maximum events, 1-50; default 20.")),
@@ -621,10 +624,10 @@ extension BuiltInToolSchemaFactory {
             ),
             requestedSchema(
                 name: "notion_read_page",
-                description: "Read a Notion page and its first bounded block page by id.",
+                description: "Read a Notion page's text by its title, link or id in one call.",
                 parametersJSON: params(
                     properties: [
-                        ("id", strSchema("Notion page id returned by notion_search.")),
+                        ("id", strSchema("The page's title, notion.so link, or id from notion_search.")),
                     ],
                     required: ["id"]
                 )
@@ -682,12 +685,12 @@ extension BuiltInToolSchemaFactory {
             ),
             requestedSchema(
                 name: "github_read_repository_content",
-                description: "Read a GitHub repository file or list a directory through the connected API, with bounded text and compact entries. Use after github_get_repository to inspect relevant source or documentation paths.",
+                description: "Read a GitHub repo file or list a folder in one call; a github.com file or folder link alone is enough (its /blob/ or /tree/ ref and path are used). Bounded text, compact entries.",
                 parametersJSON: params(
                     properties: [
-                        ("repo", strSchema("Repository as owner/name or a github.com repository URL.")),
+                        ("repo", strSchema("Repository as owner/name or any github.com link into it.")),
                         ("owner", strSchema("Optional owner when repo is only the repository name.")),
-                        ("url", strSchema("Optional github.com repository URL when repo is omitted.")),
+                        ("url", strSchema("Optional github.com link (repo, /tree/ or /blob/) when repo is omitted.")),
                         ("path", strSchema("Repository-relative file or directory path. Omit for root.")),
                         ("ref", strSchema("Optional branch, tag, or commit SHA.")),
                         ("max_characters", intSchema("Maximum text characters for a file, 1000-100000; default 30000.")),
@@ -763,14 +766,14 @@ extension BuiltInToolSchemaFactory {
                 name: "github_get_issue",
                 description: "Get one GitHub issue with its full native metadata, assignees, labels, milestone, timestamps, links, and pull-request marker when applicable.",
                 parametersJSON: params(properties: [
-                    ("repo", strSchema("Repository as owner/name.")), ("number", intSchema("Issue number.")),
+                    ("repo", strSchema("owner/name, owner/name#12, or the issue/PR link.")), ("number", intSchema("Issue number.")),
                 ], required: ["repo", "number"])
             ),
             requestedSchema(
                 name: "github_get_pull_request",
                 description: "Get one pull request plus bounded commits, reviews, derived review state, head checks/status, branches, mergeability, and URLs.",
                 parametersJSON: params(properties: [
-                    ("repo", strSchema("Repository as owner/name.")), ("number", intSchema("Pull request number.")),
+                    ("repo", strSchema("owner/name, owner/name#12, or the issue/PR link.")), ("number", intSchema("Pull request number.")),
                     ("limit", intSchema("Per-related-collection bound, 1-20.")),
                 ], required: ["repo", "number"])
             ),
@@ -778,7 +781,7 @@ extension BuiltInToolSchemaFactory {
                 name: "github_pull_request_files",
                 description: "Inspect paginated pull-request changed files and patches with an explicit total patch-character bound.",
                 parametersJSON: params(properties: [
-                    ("repo", strSchema("Repository as owner/name.")), ("number", intSchema("Pull request number.")),
+                    ("repo", strSchema("owner/name, owner/name#12, or the issue/PR link.")), ("number", intSchema("Pull request number.")),
                     ("limit", intSchema("Files per page, 1-100.")), ("page", intSchema("Pagination page.")),
                     ("max_patch_characters", intSchema("Total patch text bound, 0-250000; default 80000.")),
                 ], required: ["repo", "number"])
@@ -787,7 +790,7 @@ extension BuiltInToolSchemaFactory {
                 name: "github_pull_request_activity",
                 description: "Inspect paginated PR issue comments, inline review comments, reviews, and timeline/status events.",
                 parametersJSON: params(properties: [
-                    ("repo", strSchema("Repository as owner/name.")), ("number", intSchema("Pull request number.")),
+                    ("repo", strSchema("owner/name, owner/name#12, or the issue/PR link.")), ("number", intSchema("Pull request number.")),
                     ("limit", intSchema("Compact rows per activity collection, 1-20.")), ("page", intSchema("Pagination page.")),
                 ], required: ["repo", "number"])
             ),
@@ -817,7 +820,7 @@ extension BuiltInToolSchemaFactory {
                 description: "Create/update/comment/review/close/reopen GitHub issues or PRs, request reviewers, or merge. External write: always uses the native approval/policy path before execution.",
                 parametersJSON: params(properties: [
                     ("operation", strSchema("create_issue|update_issue|close_issue|reopen_issue|comment_issue|create_pull_request|update_pull_request|close_pull_request|reopen_pull_request|comment_pull_request|review_pull_request|request_reviewers|merge_pull_request")),
-                    ("repo", strSchema("Repository as owner/name.")), ("number", intSchema("Issue/PR number where required.")),
+                    ("repo", strSchema("owner/name, owner/name#12, or the issue/PR link.")), ("number", intSchema("Issue/PR number where required.")),
                     ("title", strSchema("Issue/PR title.")), ("body", strSchema("Body or comment text.")),
                     ("state", strSchema("open or closed.")), ("state_reason", strSchema("Issue state reason.")),
                     ("head", strSchema("PR head branch.")), ("base", strSchema("PR base branch.")), ("draft", boolSchema("Create PR as draft.")),
@@ -889,7 +892,7 @@ extension BuiltInToolSchemaFactory {
             // tool_load(category:"agentmail") or explicit tool_load by name.
             requestedSchema(
                 name: "agentmail_list",
-                description: "List recent messages in the configured AgentMail inbox. Read-only. Returns sender, subject, date, snippet, and message_id.",
+                description: "List my AgentMail inbox, newest first: sender, subject, date, snippet, unread, message_id. Read one with agentmail_read. Read-only.",
                 parametersJSON: params(
                     properties: [
                         ("limit", intSchema("Maximum messages to return (1-50, default 20).")),
@@ -1000,7 +1003,7 @@ extension BuiltInToolSchemaFactory {
             ),
             requestedSchema(
                 name: "contacts_create_or_update",
-                description: "Create a new contact or update an existing one in the user's Mac Contacts. If 'identifier' is provided, the matching contact is updated; otherwise a new contact is created. Requires Contacts -> Write permission (off by default).",
+                description: "Create a Mac contact, or update one: by identifier, or the single existing contact with the same full name. Phones and emails are added, never replaced. Requires Contacts -> Write permission.",
                 parametersJSON: params(
                     properties: [
                         ("given_name", strSchema("First name (optional).")),
@@ -1008,14 +1011,14 @@ extension BuiltInToolSchemaFactory {
                         ("organization", strSchema("Organization / company (optional).")),
                         ("phones", stringArraySchema("Optional list of phone numbers.")),
                         ("emails", stringArraySchema("Optional list of email addresses.")),
-                        ("identifier", strSchema("If set, update the contact with this CNContact identifier instead of creating a new one.")),
+                        ("identifier", strSchema("Contact to update: identifier from contacts_search, or its exact full name.")),
                     ],
                     required: []
                 )
             ),
             requestedSchema(
                 name: "mail_list_recent",
-                description: "List current metadata from Apple Mail's primary inbox (sender, subject, date, exact identity); open an exact message to read its body. Read-only; requires Mail → Read permission.",
+                description: "List Apple Mail's inbox (sender, subject, date, unread, message_id + expected_message_id, inbox totals); pass message_id + expected_message_id to read one message's body. Read-only; requires Mail → Read permission.",
                 parametersJSON: params(
                     properties: [
                         ("limit", intSchema("Maximum messages to return (1-50, default 10).")),
@@ -1023,6 +1026,8 @@ extension BuiltInToolSchemaFactory {
                         ("message_id", intSchema("Exact positive inbox message ID from a prior read; returns up to 16000 characters of body.")),
                         ("body_offset", intSchema("Exact detail continuation offset from body_end, up to 2000000; omit initially.")),
                         ("expected_message_id", strSchema("Exact RFC message identifier paired with message_id in the prior read.")),
+                        ("expected_account", strSchema("expected_account from the same row, when it has one.")),
+                        ("position", intSchema("position from the same row: finds the message fast.")),
                     ],
                     required: []
                 )
@@ -1070,7 +1075,7 @@ extension BuiltInToolSchemaFactory {
                 description: "Send a text message (iMessage/SMS) to an explicit recipient, or reply to an exact observed Messages thread with its expected participants. Choose exactly one of to or thread_id. Requires Messages write authority.",
                 parametersJSON: params(
                     properties: [
-                        ("to", strSchema("Recipient phone number or email for a new message. Omit when replying by thread_id.")),
+                        ("to", strSchema("Phone number or email for a new message (a name: find it with contacts_search). Omit when replying by thread_id.")),
                         ("thread_id", strSchema("Exact observed Messages thread. Requires expected_participants; do not use a thread ID as to.")),
                         ("expected_participants", stringArraySchema("Exact participant handles from the latest thread read, checked again before sending.")),
                         ("body", strSchema("Message body (required).")),
@@ -1080,13 +1085,15 @@ extension BuiltInToolSchemaFactory {
             ),
             requestedSchema(
                 name: "notes_search",
-                description: "Search Apple Notes by query and return matching note titles, folders, modification dates, and snippets. Read-only; requires Notes → Read permission.",
+                description: "Find and read Apple Notes: blank query lists recent notes, query matches title or text, title (exact) returns that note's full text. Read-only; requires Notes → Read permission.",
                 parametersJSON: params(
                     properties: [
-                        ("query", strSchema("Search string applied across note titles and bodies.")),
+                        ("query", strSchema("Words to find in titles or text; blank lists recent notes.")),
+                        ("title", strSchema("Exact note title: returns its full text.")),
+                        ("id", strSchema("A note's id from an earlier result: returns its full text.")),
                         ("limit", intSchema("Maximum notes to return (1-50, default 10).")),
                     ],
-                    required: ["query"]
+                    required: []
                 )
             ),
             requestedSchema(
@@ -1262,7 +1269,7 @@ extension BuiltInToolSchemaFactory {
             ),
             requestedSchema(
                 name: "music_control",
-                description: "Control Apple Music playback. Supported actions: 'play', 'pause', 'toggle', 'next', 'previous'. Requires Music → Write permission (off by default).",
+                description: "Play, pause or skip in Apple Music, or play a playlist or song by name in one call (playlist / track). Returns what is playing after. Requires Music → Write permission.",
                 parametersJSON: params(
                     properties: [
                         ("action", obj([
@@ -1274,10 +1281,13 @@ extension BuiltInToolSchemaFactory {
                                 .string("next"),
                                 .string("previous"),
                             ])),
-                            ("description", .string("Playback control verb — one of play / pause / toggle / next / previous.")),
+                            ("description", .string("play / pause / toggle / next / previous. Default play when playlist or track is given; with nothing given it only reports what's playing.")),
                         ])),
+                        ("playlist", strSchema("Playlist name to play.")),
+                        ("track", strSchema("Exact song name to play; several with that name play nothing and are listed.")),
+                        ("artist", strSchema("Artist, to pick among songs with the same name.")),
                     ],
-                    required: ["action"]
+                    required: []
                 )
             ),
             // Sensitive writes default off; scheduler.write defaults on with no read axis.
@@ -1338,45 +1348,58 @@ extension BuiltInToolSchemaFactory {
             ),
             requestedSchema(
                 name: "mac_reminders_complete",
-                description: "Mark a Mac Reminder as complete by its EKReminder.calendarItemIdentifier (returned by mac_reminders_list_due_today). Requires Reminders → Write permission (off by default).",
+                description: "Mark a Mac Reminder done by its title (or id from mac_reminders_list_due_today). Requires Reminders → Write permission.",
                 parametersJSON: params(
                     properties: [
-                        ("id", strSchema("EKReminder.calendarItemIdentifier (required).")),
+                        ("title", strSchema("The reminder's exact title (case aside).")),
+                        ("id", strSchema("Reminder id from mac_reminders_list_due_today, when known.")),
                     ],
-                    required: ["id"]
+                    required: []
                 )
             ),
             requestedSchema(
                 name: "mail_mark_read",
-                description: "Mark a Mail message read by subject (and optional sender). Requires Mail → Write permission (off by default).",
+                description: "Mark an inbox message read by message_id + expected_message_id from mail_list_recent (or every message with a subject). Requires Mail → Write permission.",
                 parametersJSON: params(
                     properties: [
-                        ("subject", strSchema("Subject of the message to mark read (required).")),
-                        ("sender", strSchema("Optional sender filter — disambiguates when multiple messages share the subject.")),
+                        ("message_id", intSchema("Inbox message_id from mail_list_recent.")),
+                        ("expected_message_id", strSchema("expected_message_id from the same row.")),
+                        ("expected_account", strSchema("expected_account from the same row, when it has one.")),
+                        ("position", intSchema("position from the same row: finds the message fast.")),
+                        ("subject", strSchema("Or the message's subject, when there's no message_id.")),
+                        ("sender", strSchema("Optional sender filter with subject.")),
                     ],
-                    required: ["subject"]
+                    required: []
                 )
             ),
             requestedSchema(
                 name: "mail_archive",
-                description: "Archive a Mail message by subject (and optional sender). Requires Mail → Write permission (off by default).",
+                description: "Archive one inbox message by message_id + expected_message_id from mail_list_recent, or a subject only one message has. Requires Mail → Write permission.",
                 parametersJSON: params(
                     properties: [
-                        ("subject", strSchema("Subject of the message to archive (required).")),
-                        ("sender", strSchema("Optional sender filter — disambiguates when multiple messages share the subject.")),
+                        ("message_id", intSchema("Inbox message_id from mail_list_recent.")),
+                        ("expected_message_id", strSchema("expected_message_id from the same row.")),
+                        ("expected_account", strSchema("expected_account from the same row, when it has one.")),
+                        ("position", intSchema("position from the same row: finds the message fast.")),
+                        ("subject", strSchema("Or the message's subject, when there's no message_id.")),
+                        ("sender", strSchema("Optional sender filter with subject.")),
                     ],
-                    required: ["subject"]
+                    required: []
                 )
             ),
             requestedSchema(
                 name: "mail_delete",
-                description: "Delete a Mail message by subject (and optional sender). Requires Mail → Write permission (off by default).",
+                description: "Delete one inbox message (to Trash) by message_id + expected_message_id from mail_list_recent, or a subject only one message has. Requires Mail → Write permission.",
                 parametersJSON: params(
                     properties: [
-                        ("subject", strSchema("Subject of the message to delete (required).")),
-                        ("sender", strSchema("Optional sender filter — disambiguates when multiple messages share the subject.")),
+                        ("message_id", intSchema("Inbox message_id from mail_list_recent.")),
+                        ("expected_message_id", strSchema("expected_message_id from the same row.")),
+                        ("expected_account", strSchema("expected_account from the same row, when it has one.")),
+                        ("position", intSchema("position from the same row: finds the message fast.")),
+                        ("subject", strSchema("Or the message's subject, when there's no message_id.")),
+                        ("sender", strSchema("Optional sender filter with subject.")),
                     ],
-                    required: ["subject"]
+                    required: []
                 )
             ),
             requestedSchema(
@@ -1387,6 +1410,8 @@ extension BuiltInToolSchemaFactory {
                         ("subject", strSchema("Subject for legacy matching; omit when using the exact message locator.")),
                         ("message_id", intSchema("Exact positive inbox message ID from the latest read.")),
                         ("expected_message_id", strSchema("Exact RFC message identifier paired with message_id.")),
+                        ("expected_account", strSchema("expected_account from the same row, when it has one.")),
+                        ("position", intSchema("position from the same row: finds the message fast.")),
                         ("body", strSchema("Reply body (required).")),
                         ("sender", strSchema("Optional sender filter — disambiguates when multiple messages share the subject.")),
                         ("reply_all", boolSchema("Reply to all recipients. Defaults to false.")),
@@ -1396,15 +1421,16 @@ extension BuiltInToolSchemaFactory {
             ),
             requestedSchema(
                 name: "notes_update",
-                description: "Update an existing Apple Note identified by title — set the body, append to the body, or rename it. At least one of 'body', 'append', or 'new_title' must be provided. Requires Notes → Write permission (off by default).",
+                description: "Update one Apple Note by id (from notes_search) or a title only one note has — set the body, append to the body, or rename it. At least one of 'body', 'append', or 'new_title' must be provided. Requires Notes → Write permission (off by default).",
                 parametersJSON: params(
                     properties: [
-                        ("title", strSchema("Title of the note to update (required).")),
+                        ("id", strSchema("The note's id from notes_search; use it when two notes share a title.")),
+                        ("title", strSchema("Exact title of the note to update (as notes_search shows it).")),
                         ("body", strSchema("Replace the note's body with this content.")),
                         ("append", strSchema("Append this content to the note's existing body.")),
                         ("new_title", strSchema("Rename the note to this title.")),
                     ],
-                    required: ["title"]
+                    required: []
                 )
             ),
             requestedSchema(
@@ -1451,10 +1477,10 @@ extension BuiltInToolSchemaFactory {
             ),
             requestedSchema(
                 name: "contacts_delete",
-                description: "Delete a contact from the user's Mac Contacts by CNContact.identifier (returned by contacts_search). Requires Contacts -> Write permission (off by default).",
+                description: "Delete a Mac contact by its identifier from contacts_search or its exact full name. Requires Contacts -> Write permission.",
                 parametersJSON: params(
                     properties: [
-                        ("identifier", strSchema("CNContact.identifier of the contact to delete (required).")),
+                        ("identifier", strSchema("identifier from contacts_search, or the exact full name.")),
                     ],
                     required: ["identifier"]
                 )
@@ -1616,14 +1642,14 @@ extension BuiltInToolSchemaFactory {
             // always-on catalog block, LAZY-LOADED (NOT alwaysOnCoreNames).
             requestedSchema(
                 name: "desk_read",
-                description: "Read your Desk — the durable, compact view of what the user told you to track (watches, plans, projects, GitHub items, standing concerns) with status, cadence, and key refs. The default projection is bounded and reports when rows are omitted. Use handle for one exact live item (stable handle or visible alias) — that read also appends the item's full record: summary, every ref, what it depends on and what it blocks, its parts, and its notes in order — or query to search title, summary, project, alias, and handle across the full live store. Set include_archived to append closed-out archived items. Read-only.",
+                description: "Read your Desk — the durable, compact view of what the user told you to track (watches, plans, projects, GitHub items, standing concerns) with status, cadence, and key refs. Item numbers are permanent. The default board lists open items most recently active first, capped, and says what it omitted. Use handle for one exact live item (stable handle or visible alias) — that read also appends the item's full record: summary, every ref, what it depends on and what it blocks, its parts, and its notes in order — or query to search title, summary, project, alias, and handle across the full live store. Set include_archived to append closed-out archived items. Read-only.",
                 parametersJSON: params(
                     properties: [
                         ("include_archived", boolSchema("Also append a compact list of archived (closed-out) items. Default false.")),
                         ("handle", strSchema("Optional exact live Desk handle or visible alias; returns that item's full record (notes, refs, dependencies) as well as the board. Mutually exclusive with query.")),
                         ("query", strSchema("Optional case-insensitive text search across the full live Desk. Mutually exclusive with handle; returns at most 25 matches.")),
                         ("structured", boolSchema("Return selectable canonical rows and evidence, with bounded page continuations. Used by workspace; default false retains the rendered board.")),
-                        ("sort", strSchema("Set \"stale\" to list ALL open top-level items oldest-touched first as lean rows (id, title, status, updated date) for triage. Ignored with handle or query.")),
+                        ("sort", strSchema("Set \"stale\" to list ALL open top-level items oldest-touched first as lean rows (id = desk number, title, status, updated date) for triage. Ignored with handle or query.")),
                         ("offset", intSchema("Structured view continuation: row offset; omit initially.")),
                         ("notes_offset", intSchema("Structured selected-record continuation: note offset; omit initially.")),
                         ("refs_offset", intSchema("Structured selected-record continuation: linked-evidence offset; omit initially.")),
@@ -1655,7 +1681,7 @@ extension BuiltInToolSchemaFactory {
                 description: "status: watch|flag|now|next|todo|done|blocked|canceled (US spelling). Close only on fresh evidence for that exact item. blocked: add blocked_reason or waiting_on. Set a Desk item's status. When fresh canonical evidence proves the exact tracked defect or outcome resolved, update that exact item in the same turn; never close from fuzzy title similarity, a merely completed execution, or an unattributed commit. status: watch | flag | now | next | todo | done | blocked | canceled. For blocked, pass blocked_reason and/or waiting_on. When assigning or updating a delegated task, include assignee and lane_of; omitted metadata preserves its current value. When reporting concrete batch progress, include progress={done,total,note?}; omit it when no honest progress exists (the Desk never invents 0%). Returns the refreshed alias + status + title.",
                 parametersJSON: params(
                     properties: [
-                        ("handle", strSchema("The item's stable handle.")),
+                        ("handle", strSchema("The item's desk number (4, 2.1, desk.4) or stable handle.")),
                         ("status", strSchema("New status: watch | flag | now | next | todo | done | blocked | canceled.")),
                         ("blocked_reason", strSchema("Why it's blocked (when status=blocked).")),
                         ("waiting_on", strSchema("What/who it's waiting on (when status=blocked).")),
@@ -1687,7 +1713,7 @@ extension BuiltInToolSchemaFactory {
                 description: "Update a Desk item's title and/or summary. Provide at least one of title/summary.",
                 parametersJSON: params(
                     properties: [
-                        ("handle", strSchema("The item's stable handle.")),
+                        ("handle", strSchema("The item's desk number (4, 2.1, desk.4) or stable handle.")),
                         ("title", strSchema("New title (optional).")),
                         ("summary", strSchema("New one-line summary (optional).")),
                     ],
@@ -1699,7 +1725,7 @@ extension BuiltInToolSchemaFactory {
                 description: "Append a timestamped note to a Desk item — progress, context, a decision.",
                 parametersJSON: params(
                     properties: [
-                        ("handle", strSchema("The item's stable handle.")),
+                        ("handle", strSchema("The item's desk number (4, 2.1, desk.4) or stable handle.")),
                         ("text", strSchema("The note text.")),
                     ],
                     required: ["handle", "text"]
@@ -1710,7 +1736,7 @@ extension BuiltInToolSchemaFactory {
                 description: "Attach a reference to a Desk item. ref_kind selects the shape and which fields apply: file (path[,line,label]) | commit (sha[,repo,label,status]) | gh_issue (repo,number[,title,status]) | gh_pr (repo,number[,title,status,checks]) | url (url[,title]) | agent (name[,handoff_id,session_id]) | approval (id[,status]) | trace (id[,trace_kind]) | note (text).",
                 parametersJSON: params(
                     properties: [
-                        ("handle", strSchema("The item's stable handle.")),
+                        ("handle", strSchema("The item's desk number (4, 2.1, desk.4) or stable handle.")),
                         ("ref_kind", strSchema("file | commit | gh_issue | gh_pr | url | agent | approval | trace | note.")),
                         ("path", strSchema("file: path.")),
                         ("line", intSchema("file: optional line number.")),
@@ -1737,7 +1763,7 @@ extension BuiltInToolSchemaFactory {
                 description: "Set how often you refresh a Desk item. mode: manual | on_ask | tick | event | daily | weekly | blocked_watch. Optionally set interval, stale_after, and refresh_sources (comma-separated).",
                 parametersJSON: params(
                     properties: [
-                        ("handle", strSchema("The item's stable handle.")),
+                        ("handle", strSchema("The item's desk number (4, 2.1, desk.4) or stable handle.")),
                         ("mode", strSchema("manual | on_ask | tick | event | daily | weekly | blocked_watch.")),
                         ("interval", strSchema("Optional refresh interval (e.g. \"1h\", \"1d\").")),
                         ("stale_after", strSchema("Optional staleness window after which the item is considered stale.")),
@@ -1751,7 +1777,7 @@ extension BuiltInToolSchemaFactory {
                 description: "Set when a Desk item should surface to the user. level: quiet | digest | direct | urgent. Optionally set on (comma-separated triggers: state_change | user_next | blocked | unblocked | big_diff | due | explicit) and a cooldown.",
                 parametersJSON: params(
                     properties: [
-                        ("handle", strSchema("The item's stable handle.")),
+                        ("handle", strSchema("The item's desk number (4, 2.1, desk.4) or stable handle.")),
                         ("level", strSchema("quiet | digest | direct | urgent.")),
                         ("on", strSchema("Optional comma-separated triggers: state_change | user_next | blocked | unblocked | big_diff | due | explicit.")),
                         ("cooldown", strSchema("Optional notify cooldown (e.g. \"6h\").")),
@@ -1764,9 +1790,10 @@ extension BuiltInToolSchemaFactory {
                 description: "Close out an exact Desk item after fresh canonical evidence verifies its tracked outcome. Include the specific commit, receipt, or observed result in outcome_summary; never close from fuzzy title similarity, execution completion alone, or an unattributed commit. Sets status to done (or canceled when canceled=true). The item stays visible briefly, then becomes archive-eligible.",
                 parametersJSON: params(
                     properties: [
-                        ("handle", strSchema("The item's stable handle.")),
+                        ("handle", strSchema("The item's desk number (4, 2.1, desk.4) or stable handle.")),
                         ("outcome_summary", strSchema("What the outcome was.")),
                         ("canceled", boolSchema("Close as canceled instead of done. Default false.")),
+                        ("subtree", boolSchema("Also close every open descendant in this call. Returns closed count + handles. Default false.")),
                         ("expected_updated_at", strSchema("Optional row version from a just-read Desk projection. When supplied, refuses if the item changed before this close.")),
                     ],
                     required: ["handle", "outcome_summary"]
@@ -1777,7 +1804,7 @@ extension BuiltInToolSchemaFactory {
                 description: "Archive a closed-out Desk item — removes it from the live view and writes a permanent archive record. Refuses if the item (or any descendant) is not terminal (done/canceled), or if it's a standing item.",
                 parametersJSON: params(
                     properties: [
-                        ("handle", strSchema("The item's stable handle.")),
+                        ("handle", strSchema("The item's desk number (4, 2.1, desk.4) or stable handle.")),
                     ],
                     required: ["handle"]
                 )
@@ -1795,7 +1822,7 @@ extension BuiltInToolSchemaFactory {
             ),
             requestedSchema(
                 name: "desk_breakdown",
-                description: "Break a big idea into a numbered plan in one call: creates a parent Desk item plus its sub-items in order, wires blocked-on edges between them, and can park children until a date. children is an array of objects {title, summary?, blocked_on?, defer_until?}. In a child's blocked_on CSV, a bare integer means the 1-based position of a sibling in this call (e.g. \"1,2\" = blocked on the first two sub-items); a dotted desk number (\"3.1\") or desk_ handle references an existing item — top-level items can't be referenced by bare number here (ambiguous with positions), wire those afterward with desk_blocked_on. Pass parent to graft new sub-items onto an existing item instead of creating a new parent (project/title/kind are then ignored). Returns the numbered plan plus which sub-items are ready right now. A mid-batch refusal returns status \"partial\" listing what was created.",
+                description: "Break a big idea into a numbered plan in one call: creates a parent Desk item plus its sub-items in order, wires blocked-on edges between them, and can park children until a date. children is an array of objects {title, summary?, blocked_on?, defer_until?}. In a child's blocked_on CSV, a bare integer means the 1-based position of a sibling in this call (e.g. \"1,2\" = blocked on the first two sub-items); a dotted desk number (\"3.1\") or desk_ handle references an existing item — top-level items can't be referenced by bare number here (ambiguous with positions), wire those afterward with desk_blocked_on. Pass parent to graft new sub-items onto an existing item instead of creating a new parent (project/title/kind are then ignored). Returns the numbered plan plus which sub-items are ready right now. A live campaign of the same kind, project and title is reused: status \"existing\", only missing steps added. A mid-batch refusal returns status \"partial\" listing what was created.",
                 parametersJSON: params(
                     properties: [
                         ("project", strSchema("Project bucket for a new plan's parent item. Required unless parent is given.")),

@@ -118,8 +118,8 @@ struct TrustGuardrailSummaryTests {
         let rows = TrustGuardrailSummary.rows(policy: p, accessMode: "full")
         let autonomy = row(rows, "autonomy")
         #expect(autonomy.value == "Full Mac autonomy active")
-        #expect(autonomy.detail.contains("trusted remote surfaces"))
-        #expect(autonomy.detail.contains("including external messages"))
+        #expect(autonomy.detail.contains("without asking"))
+        #expect(autonomy.detail.contains("macOS permissions and account setup still ask"))
         // The reach row states reach; the approval row states approval. Neither
         // repeats the other's sentence (Agent copy pass 2026-09-10).
         #expect(!autonomy.detail.contains(row(rows, "files").detail))

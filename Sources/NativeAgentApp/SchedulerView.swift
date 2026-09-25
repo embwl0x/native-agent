@@ -191,6 +191,7 @@ struct SchedulerView: View {
                             ))
                             .labelsHidden()
                             .toggleStyle(.switch)
+                            .hazeTinted()
                             .disabled(togglingJobIDs.contains(job.id))
                             .accessibilityLabel("\(job.name) enabled")
                         }

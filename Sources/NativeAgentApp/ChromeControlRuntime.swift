@@ -35,11 +35,18 @@ enum ChromeControlRuntimeError: Error, LocalizedError, Sendable, Equatable {
         case .disabled: return "Chrome control is off in Trust Center."
         case .unavailable: return "Chrome control authority could not be verified."
         case .disconnected: return "I have connected to the Chrome extension before, but Chrome is closed or not connected right now. Open Chrome with the extension enabled."
-        case .extensionNotLoaded: return "I have not connected to the Chrome extension on this Mac yet. In Trust, press Set up Chrome, turn on Developer mode, then choose Load unpacked and select the extension folder."
+        case .extensionNotLoaded: return "I have not connected to the Chrome extension on this Mac yet. In Trust, press Set up Chrome, turn on Chrome's Developer mode, then choose Load unpacked and select the extension folder."
         case .invalidResponse: return "Chrome returned an invalid control response."
         case .requestTimedOut: return "Chrome did not answer before the control deadline."
         case .extensionRejected(let code, let message):
-            return "Chrome refused the control request (\(code)): \(message)"
+            // 09-24: the one next call, where there is one.
+            let next: String = switch code {
+            case "top_frame_unavailable": " This tab has no readable page yet (blank or still loading): browser.chrome_navigate{url}."
+            case "lease_not_found", "lease_expired": " That tab is gone: browser.chrome_navigate{url} opens a fresh one."
+            case "snapshot_stale", "node_stale": " The page changed since that read: use the newest page's row numbers, or the row's label."
+            default: ""
+            }
+            return "Chrome refused the control request (\(code)): \(message)" + next
         case .outcomeUnknown(let action, let reason):
             return "Chrome did not confirm \(action) after dispatch. \(reason) The action may have completed; do not automatically repeat it. Observe the page before retrying."
         case .socketFailure(let code): return "Chrome control socket failed (errno \(code))."
@@ -49,8 +56,8 @@ enum ChromeControlRuntimeError: Error, LocalizedError, Sendable, Equatable {
         case .conversationContext(let message): return message
         case .leaseEnded(let leaseID, let event, let reason):
             return "\(ChromeLeaseEndReason.words(event: event, reason: reason)) The Chrome tab lease "
-                + "\(leaseID) is gone, so nothing was sent. Acquire a fresh lease and take a new "
-                + "snapshot before acting again — the old node ids are stale."
+                + "\(leaseID) is gone, so nothing was sent. Open the page again with browser.chrome_navigate{url}: "
+                + "it opens a fresh tab and returns the page; the old row numbers are stale."
         }
     }
 }
@@ -346,8 +353,14 @@ actor ChromeControlChannel {
 
     func activeLeaseCount() -> Int { activeLeaseIDs.count }
 
-    /// Work renews a still-live lease near its deadline. No heartbeat keeps an
-    /// idle tab alive, and neither an expired lease nor a user yield is reclaimed.
+    func activeLeases() -> Set<String> { activeLeaseIDs.subtracting(endedLeases.keys) }
+
+    func leaseHasEnded(_ leaseID: String) -> Bool { endedLeases[leaseID] != nil }
+
+    /// Work renews a still-live lease: 09-24, sliding — any call 30 s or more
+    /// after the last renewal renews it for its full duration, so a live task
+    /// never loses its tab. No heartbeat keeps an idle tab alive, and neither
+    /// an expired lease nor a user yield is reclaimed.
     func activityRenewalPayload(
         for effect: ChromeControlEffect, payload: [String: JSONValue], now: Date = Date()
     ) -> [String: JSONValue]? {
@@ -356,7 +369,7 @@ actor ChromeControlChannel {
               activeLeaseIDs.contains(id), endedLeases[id] == nil,
               let window = leaseActivityWindows[id] else { return nil }
         let remaining = window.expiresAt.timeIntervalSince(now)
-        guard remaining > 0, remaining <= min(60, Double(window.durationMS) / 2_000) else { return nil }
+        guard remaining > 0, remaining <= Double(window.durationMS) / 1_000 - 30 else { return nil }
         return [
             "leaseId": .string(id),
             "expectedUserSequence": payload["expectedUserSequence"] ?? .int(window.userSequence),
@@ -927,6 +940,7 @@ actor ChromeControlRuntime {
     }
 
     private func publishConnectionState() {
+        BrowserConnectionMirror.set(connected: connectionState == .connected)
         for observer in connectionObservers.values { observer.yield(connectionState) }
     }
 
@@ -1005,6 +1019,66 @@ actor ChromeControlRuntime {
         }
     }
 
+    /// Leases Chrome opened in the visible work window, and background leases
+    /// whose page is now an X/Twitter post. The extension picks the visible
+    /// window only from the URL given at creation, so a background tab that
+    /// navigates or is redirected to a post must not act on it (Sol, 09-23).
+    private var visibleLeases: Set<String> = []
+    private var postOnBackgroundLeases: Set<String> = []
+
+    func noteAcquired(_ result: JSONValue) {
+        guard case .object(let lease) = result, case .string(let id)? = lease["leaseId"] else { return }
+        if lease["renderingMode"] == .string("visible_work_window") {
+            if visibleLeases.count > 256 { visibleLeases.removeAll() }
+            visibleLeases.insert(id)
+        } else if case .object(let tab)? = lease["originalTab"], case .string(let url)? = tab["url"] {
+            notePage(url: url, leaseID: id) // a claimed tab may already be on a post
+        }
+    }
+
+    /// Records where a lease's page is now; true when it is a post on a
+    /// background lease, so actions on it are refused.
+    @discardableResult
+    func notePage(url: String, leaseID: String) -> Bool {
+        guard Self.isXPostURL(url), !visibleLeases.contains(leaseID) else {
+            postOnBackgroundLeases.remove(leaseID)
+            return false
+        }
+        if postOnBackgroundLeases.count > 256 { postOnBackgroundLeases.removeAll() }
+        postOnBackgroundLeases.insert(leaseID)
+        return true
+    }
+
+    /// The lease an action would use (explicit, else this chat's tab) shows a
+    /// post from a background lease.
+    func actionBlockedOnPost(leaseID: String?, verifiedSessionID: String?) -> Bool {
+        var lease = leaseID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let session = verifiedSessionID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if lease.isEmpty, !session.isEmpty, case .string(let current)? = conversationTabs[session]?.leaseID {
+            lease = current
+        }
+        return !lease.isEmpty && postOnBackgroundLeases.contains(lease)
+    }
+
+    /// The extension's `isXPostURL` (lease-manager.js), in Swift.
+    static func isXPostURL(_ raw: String) -> Bool {
+        guard let url = URLComponents(string: raw), ["http", "https"].contains(url.scheme?.lowercased() ?? ""),
+              url.user == nil, url.password == nil, url.port == nil,
+              ["x.com", "www.x.com", "twitter.com", "www.twitter.com"].contains(url.host?.lowercased() ?? "")
+        else { return false }
+        return url.path.range(of: #"^/[A-Za-z0-9_]{1,15}/status/[0-9]+/?$"#, options: .regularExpression) != nil
+    }
+
+    /// Phase 3: whether this chat still holds a tab Chrome has not ended, so
+    /// `chrome_navigate` knows to open one itself. Unknown (no channel) counts
+    /// as live: the ordinary path then reconnects or reports why.
+    func conversationTabIsLive(_ verifiedSessionID: String?) async -> Bool {
+        guard let session = verifiedSessionID?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !session.isEmpty, let tab = conversationTabs[session] else { return false }
+        guard case .string(let lease) = tab.leaseID, let channel else { return true }
+        return await !channel.leaseHasEnded(lease)
+    }
+
     func performInConversation(
         _ effect: ChromeControlEffect, payload: [String: JSONValue], verifiedSessionID: String?
     ) async throws -> JSONValue {
@@ -1015,8 +1089,11 @@ actor ChromeControlRuntime {
                 "Another Chrome action is still running in this conversation. Nothing was sent; wait for its result before continuing.")
         }
         defer { busyConversations.remove(session) }
+        // Every lease a shortened id could also name: other chats' tabs and the channel's live leases.
+        var known = Set(conversationTabs.values.compactMap { if case .string(let id) = $0.leaseID { id } else { nil } })
+        if let channel { known.formUnion(await channel.activeLeases()) }
         let resolved = try ChromeConversationTab.resolve(
-            effect: effect, payload: payload, current: conversationTabs[session])
+            effect: effect, payload: payload, current: conversationTabs[session], knownLeases: known)
         let generation = installationGeneration
         do {
             let response = try await perform(effect, payload: resolved)
@@ -1037,7 +1114,10 @@ actor ChromeControlRuntime {
             }
             return response
         } catch {
-            if case ChromeControlRuntimeError.leaseEnded = error {
+            // Only the chat's own tab: an old lease id she passed ending must
+            // not forget the live one.
+            if case ChromeControlRuntimeError.leaseEnded = error,
+               conversationTabs[session]?.leaseID == resolved["leaseId"] {
                 conversationTabs.removeValue(forKey: session)
             }
             throw error
@@ -1315,16 +1395,25 @@ struct ChromeConversationTab: Sendable {
     }
 
     static func resolve(
-        effect: ChromeControlEffect, payload: [String: JSONValue], current: Self?
+        effect: ChromeControlEffect, payload: [String: JSONValue], current: Self?, knownLeases: Set<String> = []
     ) throws -> [String: JSONValue] {
         guard effect != .acquire else { return payload }
         var resolved = payload
         if resolved["leaseId"] == .string("") || resolved["leaseId"] == nil {
             guard let current else {
                 throw ChromeControlRuntimeError.conversationContext(
-                    "This conversation has no current Chrome tab. Open one with browser.chrome_acquire; later calls retain it automatically. Nothing was sent.")
+                    "This conversation has no Chrome tab yet. browser.chrome_navigate with a url opens one in the same call; later calls reuse it. Nothing was sent.")
             }
             resolved["leaseId"] = current.leaseID
+        } else if case .string(let given)? = resolved["leaseId"], case .string(let live)? = current?.leaseID,
+                  given != live, given.count >= 8, live.hasPrefix(given) {
+            // 09-24: a model cut the id short ("862091ca-9a33-4"): it names this
+            // chat's tab only when no other known lease shares the prefix.
+            guard !knownLeases.contains(where: { $0 != live && $0.hasPrefix(given) }) else {
+                throw ChromeControlRuntimeError.conversationContext(
+                    "That tab is gone: browser.chrome_navigate{url} opens a fresh one. Nothing was sent.")
+            }
+            resolved["leaseId"] = .string(live)
         }
         if effect != .snapshot, effect != .release,
            resolved["expectedUserSequence"] == nil,

@@ -140,7 +140,7 @@ struct AgentWorkspaceDesktopStore: Sendable {
             case "task_ledger_list": keys = ["task_id"]; required = []
             case "delegation_status": keys = ["task_id"]; required = []
             case "mail_search": keys = ["query"]; required = keys
-            case "mail_list_recent": keys = ["expected_message_id"]; required = []
+            case "mail_list_recent": keys = ["expected_message_id", "expected_account"]; required = []
             case "messages_recent_threads": keys = ["thread_id"]; required = []
             case "screen": keys = ["app", "part"]; required = []
             case "bot_list": keys = ["id"]; required = []
@@ -188,7 +188,7 @@ struct AgentWorkspaceDesktopStore: Sendable {
             case "recall_memory": numericKeys = arguments["memory_id"] != nil ? ["offset", "max_characters"] : []
             case "desk_read": numericKeys = ["offset", "notes_offset", "refs_offset", "detail_offset", "limit"]
             case "work_context": numericKeys = ["desk_offset", "history_offset", "limit"]
-            case "mail_list_recent": numericKeys = ["body_offset", "offset"]
+            case "mail_list_recent": numericKeys = ["body_offset", "offset", "position"]
             case "mail_search": numericKeys = ["offset"]
             case "messages_recent_threads": numericKeys = ["before_message_id", "limit"]
             case "mac_calendar_list_upcoming": numericKeys = ["hours_ahead", "limit"]

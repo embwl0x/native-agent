@@ -218,13 +218,17 @@ extension AppChatToolDispatcher {
             "page": .string(page),
             "page_read": .bool(true),
             "page_shown_by_this_call": .bool(false),
-            "summary": .string("Read \(page) in the background; it was not opened or shown. To show it, use interaction_act(target: composer, verb: set_page, value: \(page))."),
+            "summary": .string("Read \(page) in the background; it was not opened or shown. " + (SimpleViewMode.isShowing
+                ? SimpleViewMode.noPagesNote
+                : "To show it, use interaction_act(target: composer, verb: set_page, value: \(page)).")),
         ]) { _, receipt in receipt })
     }
 
     @MainActor
     private func runAppPageRead(input: [String: JSONValue]) async -> JSONValue {
         let requested = Self.text(input["page"])
+        if requested.lowercased() == "context" { return await runContextReceiptRead(input: input) }
+        if requested.lowercased() == "agent" { return await runAgentViewRead(input: input) }
         let current = requested.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "current"
         guard let page = current ? NativeAgentAppCoordinator.shared.currentPage : QuietPages.page(named: requested) else {
             if current {
@@ -268,9 +272,58 @@ extension AppChatToolDispatcher {
             "trust_mode": .string(posture?.name ?? "unreadable"),
             "changes_allowed": .bool(posture?.changesAllowed ?? false),
             "note": .string(
-                "The page was read in the background, not opened or shown. To show it, use interaction_act(target: composer, verb: set_page, value: \(page.id)). `content` is the page in words, built from the "
+                "The page was read in the background, not opened or shown. " + (SimpleViewMode.isShowing
+                    ? SimpleViewMode.noPagesNote
+                    : "To show it, use interaction_act(target: composer, verb: set_page, value: \(page.id)).")
+                + " `content` is the page in words, built from the "
                 + "same records the page renders; `elements` is its accessibility tree. Nothing came "
                 + "forward, moved, or made a sound, and the window on screen was not touched."),
+        ])
+    }
+
+    /// `app_page_read page=context [session_id]`: the composer's context
+    /// receipt for a conversation, read from the turn traces by the same code
+    /// the popover uses, line for line — the popover need not be open.
+    /// Defaults to the conversation on screen.
+    @MainActor
+    private func runContextReceiptRead(input: [String: JSONValue]) async -> JSONValue {
+        guard let appModel = QuietSelfAdmin.shared.appModel else { return Self.unattachedFailure() }
+        let sessionId = [Self.text(input["session_id"]), Self.text(input["__session_id"])]
+            .first { !$0.isEmpty } ?? appModel.activeChatSessionId
+        let state = await ComposerContextReceiptReader.load(
+            sessionId: sessionId, selectedModel: appModel.chatModel
+        )
+        let lines = ComposerContextReceiptPresentation.lines(state)
+        return Self.pageReadResult(page: "context", fields: [
+            "status": .string("ok"),
+            "title": .string("Context"),
+            "session_id": .string(sessionId),
+            "content": .array(lines.map { .string($0.label) }),
+            "rows": .array(lines.map { .object(["id": .string($0.id), "label": .string($0.label)]) }),
+        ])
+    }
+
+    /// `app_page_read page=agent [room] [session_id]`: one Agent-view tab's
+    /// text, from the pane's own render (read-only: nothing marked seen or
+    /// written, no tool run); no room lists the tabs. Defaults to the
+    /// conversation on screen, as the pane does.
+    @MainActor
+    private func runAgentViewRead(input: [String: JSONValue]) async -> JSONValue {
+        guard let appModel = QuietSelfAdmin.shared.appModel else { return Self.unattachedFailure() }
+        let tabs = JSONValue.array(AgentScreenView.tabs.map { .string($0) })
+        let room = Self.text(input["room"]).lowercased()
+        guard !room.isEmpty else {
+            return Self.pageReadResult(page: "agent", fields: ["status": .string("ok"), "title": .string("Agent"), "tabs": tabs])
+        }
+        guard AgentScreenView.tabs.contains(room) else {
+            return Self.failure("unknown_room", "The Agent view has no tab called that.", extra: ["requested": .string(room), "tabs": tabs])
+        }
+        let named = Self.text(input["session_id"])
+        let scope = named.isEmpty ? appModel.activeChatSessionId : named
+        let root = appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        return Self.pageReadResult(page: "agent", fields: [
+            "status": .string("ok"), "title": .string("Agent"), "room": .string(room), "session_id": .string(scope),
+            "content": .string(await AgentScreenView.paneText(room, root: root, scope: scope)),
         ])
     }
 
@@ -279,12 +332,42 @@ extension AppChatToolDispatcher {
     @MainActor
     private func runAppPageScreenshot(input: [String: JSONValue]) async -> JSONValue {
         let requested = Self.text(input["page"])
-        guard let page = QuietPages.page(named: requested) else {
+        guard let page = QuietPages.page(named: requested)
+                ?? QuietPages.drawOnly.first(where: { $0.id == requested.lowercased() }) else {
             return Self.unknownPageFailure(requested)
         }
         guard let appModel = QuietSelfAdmin.shared.appModel else { return Self.unattachedFailure() }
-        guard let rendered = await QuietSelfAdminRender.pageImagePNG(for: page, appModel: appModel) else {
+        var size = QuietSelfAdminRender.defaultSize
+        switch input["height"] {
+        case .int(let value)?: size.height = CGFloat(value)
+        case .double(let value)?: size.height = CGFloat(value)
+        case .string(let value)?: size.height = Double(value).map { CGFloat($0) } ?? size.height
+        default: break
+        }
+        size.height = min(max(size.height, 400), 2400)
+        guard let rendered = await QuietSelfAdminRender.pageImagePNG(for: page, appModel: appModel, size: size) else {
             return Self.failure("render_failed", "The page could not be drawn offscreen.")
+        }
+        // A text-only call (the Claude bridge) has no turn to show pixels in:
+        // the PNG goes to a file and the path comes back instead.
+        if LocalToolImage.sink == nil {
+            let folder = (appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot())
+                .appendingPathComponent("diagnostics/page_shots", isDirectory: true)
+            let stamp = ISO8601DateFormatter.string(
+                from: Date(), timeZone: .current, formatOptions: [.withYear, .withMonth, .withDay, .withTime])
+            let file = folder.appendingPathComponent("\(page.id)-\(stamp).png")
+            do {
+                try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+                try rendered.data.write(to: file, options: .atomic)
+            } catch {
+                return Self.failure("write_failed", "The picture could not be saved: \(error.localizedDescription)")
+            }
+            return .object([
+                "status": .string("ok"), "page": .string(page.id), "title": .string(page.title),
+                "path": .string(file.path),
+                "width": .int(Int64(rendered.width)), "height": .int(Int64(rendered.height)),
+                "note": .string("An offscreen drawing saved as a PNG; this call has no turn to show pixels in."),
+            ])
         }
         guard case .object(var delivery) = LocalToolImage.deliverPNG(
             rendered.data, name: "\(page.id).png",

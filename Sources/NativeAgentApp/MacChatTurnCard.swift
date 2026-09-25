@@ -520,7 +520,9 @@ struct MacChatTurnCard: View {
 
     private var tint: Color {
         switch model.tone {
-        case .working: return NativeAgentBrand.accent
+        // A running turn is not "waiting on you", so it never wears the
+        // teal accent (2026-09-23): a neutral dot on untinted glass.
+        case .working: return NativeAgentShell.secondary
         case .attention: return NativeAgentTheme.warn
         case .failed: return NativeAgentTheme.fail
         // Unresolved and canceled are deliberately chromatic-neutral: an
@@ -532,7 +534,7 @@ struct MacChatTurnCard: View {
     var body: some View {
         // lightweight: the card floats over the transcript in the main window;
         // clear glass keeps any text it momentarily overlaps legible.
-        GlassCard(tint: tint, scrollRow: materialForSnapshot, lightweight: true) {
+        GlassCard(tint: model.tone == .working ? nil : tint, scrollRow: materialForSnapshot, lightweight: true) {
             HStack(alignment: .center, spacing: NativeAgentSpacing.md) {
             VStack(alignment: .leading, spacing: 3) {
                 HStack(alignment: .firstTextBaseline, spacing: NativeAgentSpacing.sm) {
@@ -838,9 +840,11 @@ struct MacChatTurnCardMetaText: View {
     }
 
     private func label(visible: String, spoken: String) -> some View {
+        // The shell's secondary token, not the system's tertiary: the
+        // readout must clear 4.5:1 on the card's glass.
         Text(visible)
             .font(NativeAgentFont.tag)
-            .foregroundStyle(.tertiary)
+            .foregroundStyle(NativeAgentShell.secondary)
             .monospacedDigit()
             .lineLimit(1)
             .accessibilityLabel(spoken)

@@ -18,6 +18,7 @@ struct SkillsToolsView: View {
                 }
             }
             .pickerStyle(.segmented)
+            .hazeTinted(.segments)
             .labelsHidden()
             .frame(maxWidth: 360)
             .accessibilityIdentifier("skills-tools-section-picker")

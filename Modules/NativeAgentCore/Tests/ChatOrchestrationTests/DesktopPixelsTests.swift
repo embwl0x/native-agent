@@ -9,12 +9,9 @@ import PersistenceCore
     #expect(try SwiftToolDispatcher.desktopPixelsRequested(["pixels": .bool(true), "app": .null, "part": .string(" \n ")]))
     #expect(try !SwiftToolDispatcher.desktopPixelsRequested(["pixels": .null]))
     #expect(try !SwiftToolDispatcher.desktopPixelsRequested([:]))
-    #expect(throws: (any Error).self) {
-        try SwiftToolDispatcher.desktopPixelsRequested(["pixels": .bool(true), "app": .string("Mail")])
-    }
-    #expect(throws: (any Error).self) {
-        try SwiftToolDispatcher.desktopPixelsRequested(["pixels": .bool(true), "part": .string("toolbar")])
-    }
+    // With app or part, pixels:true is that window's image, not the desktop.
+    #expect(try !SwiftToolDispatcher.desktopPixelsRequested(["pixels": .bool(true), "app": .string("Mail")]))
+    #expect(try !SwiftToolDispatcher.desktopPixelsRequested(["pixels": .bool(true), "part": .string("toolbar")]))
     #expect(throws: (any Error).self) {
         try SwiftToolDispatcher.desktopPixelsRequested(["pixels": .string("true")])
     }

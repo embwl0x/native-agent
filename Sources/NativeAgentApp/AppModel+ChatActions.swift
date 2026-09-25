@@ -810,7 +810,7 @@ extension AppModel {
         // Recheck at admission so a competing turn cannot queue the greeting
         // behind itself; its task would not prove the greeting's delivery.
         if requireIdleAndEmpty && (sessionIsRunning || queueDrainIsStarting
-            || !existingQueue.isEmpty || !chatMessages(for: targetSessionId).isEmpty) {
+            || !existingQueue.isEmpty || Self.hasConversationRows(chatMessages(for: targetSessionId))) {
             return _StartedChatTurn(
                 acceptance: .rejected(message: "The greeting's conversation is no longer idle and empty"),
                 task: nil
@@ -1242,7 +1242,7 @@ extension AppModel {
                 resumable: attachments.isEmpty,
                 dataRoot: root
             )
-            statusText = "No AI provider connected — connect one in the Providers tab in the sidebar."
+            statusText = "No AI provider connected — connect one with Open Providers in the chat."
             _ = await settleChatTurnLifecycle(
                 identity: activityIdentity,
                 kind: .failed(reason: "No AI provider is connected."),
@@ -1332,6 +1332,7 @@ extension AppModel {
         busySessions.insert(requestSessionId)
         defer {
             busySessions.remove(requestSessionId)
+            replyingSessions.remove(requestSessionId)
             streamingTexts[requestSessionId] = nil
             streamingBubbleIds[requestSessionId] = nil
             streamingUserTurnIds[requestSessionId] = nil
@@ -1391,6 +1392,9 @@ extension AppModel {
                 // The per-session live buffer is what a switch-back restores,
                 // so it moves with the published snapshots, not per delta.
                 streamingTexts[requestSessionId] = snapshot
+                if !snapshot.isEmpty, !replyingSessions.contains(requestSessionId) {
+                    replyingSessions.insert(requestSessionId)
+                }
                 updateChatMessageContent(id: bubbleId, in: requestSessionId, content: snapshot)
                 _ = recordChatTurnStreamProgress(
                     identity: activityIdentity,
@@ -1563,6 +1567,9 @@ extension AppModel {
                     if busySessions.contains(requestSessionId) {
                         busySessions.remove(requestSessionId)
                         busySessions.insert(sid)
+                    }
+                    if replyingSessions.remove(requestSessionId) != nil {
+                        replyingSessions.insert(sid)
                     }
                     if let t = chatTasks.removeValue(forKey: requestSessionId) {
                         chatTasks[sid] = t

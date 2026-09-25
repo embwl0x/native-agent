@@ -118,7 +118,7 @@ enum TrustSafetyBoundariesPresentation {
         if fullMacActive {
             return TrustSafetyBoundaryRow(
                 id: "external_send", title: "External messages",
-                detail: "Admitted Full Mac actions can send messages without an additional app approval. Connected accounts and external-agent safeguards still apply.",
+                detail: "Admitted Full Mac actions can send messages without an additional app approval. Your connected accounts' own limits still apply, and requests from other assistants still need your permission.",
                 systemImage: "paperplane.fill", tone: .caution
             )
         }
@@ -164,12 +164,12 @@ enum TrustSafetyBoundariesPresentation {
         let unguarded = grantedRiskCategories(mac).filter { !mac.approvalRequiredFor.contains($0.key) }
         if unguarded.isEmpty {
             return TrustSafetyBoundaryRow(
-                id: "mac_control", title: "Mac control", detail: "Enabled categories: \(granted.joined(separator: ", ")). Every enabled risky category requires approval.",
+                id: "mac_control", title: "Mac control", detail: "Enabled categories: \(TrustGuardrailSummary.sentenceList(granted)). Every enabled risky category requires approval.",
                 systemImage: "macbook", tone: .caution
             )
         }
         return TrustSafetyBoundaryRow(
-            id: "mac_control", title: "Mac control", detail: "Enabled categories: \(granted.joined(separator: ", ")). These can run without an approval stop: \(unguarded.map(\.title).joined(separator: "; ")).",
+            id: "mac_control", title: "Mac control", detail: "Enabled categories: \(TrustGuardrailSummary.sentenceList(granted)). These can run without an approval stop: \(unguarded.map(\.title).joined(separator: "; ")).",
             systemImage: "macbook.badge.exclamationmark", tone: .danger
         )
     }

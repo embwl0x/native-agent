@@ -482,7 +482,7 @@ public struct SwiftNativeDeskStore: Sendable {
         }
     }
 
-    private static func equivalentDeskText(_ value: String?) -> String {
+    public static func equivalentDeskText(_ value: String?) -> String {
         let folded = (value ?? "")
             .folding(
                 options: [.caseInsensitive, .diacriticInsensitive],
@@ -1307,6 +1307,21 @@ public struct SwiftNativeDeskStore: Sendable {
         }
     }
 
+    /// `liveState()` without the file lock, for a glance that must not wait:
+    /// the feed's stamp is taken before and after the read, and a read that
+    /// raced a write throws instead of returning a torn view.
+    public func liveStateUnlocked() async throws -> DeskState {
+        let key = Self.memoKey(opsPath)
+        let before = Self.feedStamp(opsPath: opsPath, basePath: basePath)
+        if let cached = await liveStateMemo.lookup(key: key, stamp: before) { return cached }
+        let feed = try await readFeedUnlocked()
+        let state = Self.compact(base: feed.base, feed.ops)
+        guard let before, Self.feedStamp(opsPath: opsPath, basePath: basePath) == before else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        return state
+    }
+
     /// Process-wide `liveState()` memo. Keyed on the ops path so alternate data
     /// roots (tests, secondary roots, the sweep CLI's root) never collide.
     static let sharedLiveStateMemo = DeskLiveStateMemo()
@@ -1336,7 +1351,7 @@ public struct SwiftNativeDeskStore: Sendable {
 
     /// Every descendant of `handle` (children, grandchildren, …) in `state`,
     /// breadth-first. Cycle-safe: each handle is visited at most once.
-    static func descendants(of handle: String, in state: DeskState) -> [DeskItem] {
+    public static func descendants(of handle: String, in state: DeskState) -> [DeskItem] {
         var out: [DeskItem] = []
         var seen: Set<String> = [handle]
         var frontier = state.children(of: handle).filter { seen.insert($0.handle).inserted }

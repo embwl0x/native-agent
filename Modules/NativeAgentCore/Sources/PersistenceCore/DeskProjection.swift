@@ -10,7 +10,7 @@ import Foundation
 //   Line 1: `desk · owner · rev <ISO> · stale ok`
 //   Line 2: `status: watch · flag · now · next · todo · done · blocked`
 //
-// TOP-LEVEL ITEM (alias order)
+// TOP-LEVEL ITEM (open, most recently active first)
 //   `<alias> <token2> <project> · <title>[ · <summary>][ · <now|next child>]`
 //   `[ · refs:N][ · ⚑ drift:<kind>][ · stale:<dur>][ · archives in <dur>]`
 //   `[ · <level>/event]`
@@ -150,27 +150,29 @@ public enum DeskProjection {
 
     // MARK: - Top-level selection + caps
 
-    /// Top-level items in alias order, with the terminal-cap and 25-item cap
-    /// applied.
+    /// Top-level items for the board: OPEN items most-recently-active first,
+    /// then the ≤3 most recently closed, capped at 25. Lowest-number-first
+    /// hid all new work once the desk passed 25 open items (Agent, 2026-09-24).
     ///
     /// The recency cap counts TERMINAL items (done AND canceled), not `.done`
-    /// alone. Canceled rows are closed work with the same zero live signal as
-    /// done rows; when only `.done` was capped, canceled top-level items were
-    /// unbounded here, sat at the lowest aliases, and `prefix(topLevelCap)`
-    /// filled with them until live work fell off the desk entirely.
-    static func cappedTopLevel(_ state: DeskState) -> [DeskItem] {
-        let top = state.topLevel  // already in alias order from compact
-        // Keep all non-terminal; among terminal keep the ≤3 most-recent (by closedAt).
-        let terminal = top.filter { $0.status.isTerminal }
-        let keepTerminal: Set<String>
-        if terminal.count > doneCap {
-            let recent = terminal.sorted { ($0.closedAt ?? $0.updatedAt) > ($1.closedAt ?? $1.updatedAt) }.prefix(doneCap)
-            keepTerminal = Set(recent.map { $0.handle })
-        } else {
-            keepTerminal = Set(terminal.map { $0.handle })
-        }
-        let filtered = top.filter { !$0.status.isTerminal || keepTerminal.contains($0.handle) }
-        return Array(filtered.prefix(topLevelCap))
+    /// alone — canceled rows are closed work with the same zero live signal.
+    public static func cappedTopLevel(_ state: DeskState) -> [DeskItem] {
+        let top = state.topLevel
+        let open = top.filter { !$0.status.isTerminal }
+            .map { (item: $0, active: lastActive($0, in: state)) }
+            .sorted { $0.active != $1.active ? $0.active > $1.active : $0.item.handle < $1.item.handle }
+            .map(\.item)
+        let closed = top.filter { $0.status.isTerminal }
+            .sorted { ($0.closedAt ?? $0.updatedAt) > ($1.closedAt ?? $1.updatedAt) }
+            .prefix(doneCap)
+        return Array((open + closed).prefix(topLevelCap))
+    }
+
+    /// Newest `updatedAt` across the item and its whole subtree — a campaign
+    /// whose steps are being worked is active even if its own row is not.
+    public static func lastActive(_ item: DeskItem, in state: DeskState) -> String {
+        SwiftNativeDeskStore.descendants(of: item.handle, in: state).map(\.updatedAt).max()
+            .map { max($0, item.updatedAt) } ?? item.updatedAt
     }
 
     // MARK: - One top-level line

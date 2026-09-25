@@ -139,7 +139,9 @@ extension ClaudeBridge {
                 handleContactMessage(conn: conn, body: message, tasks: tasks ?? AgentContactRuntime.tasks,
                               peer: peerTurnContext(principal: principal, protocolName: "mcp",
                                                     messageID: Self.mcpRequestID(message),
-                                                    requestBody: body),
+                                                    // The message, not the JSON-RPC envelope: a retry under
+                                                    // the same request_id carries a new JSON-RPC id.
+                                                    requestBody: message),
                               responseProjection: project)
             case .reply(let request, let session, let offset, let project):
                 Task {

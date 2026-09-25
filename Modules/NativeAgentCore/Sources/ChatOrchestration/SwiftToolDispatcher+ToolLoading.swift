@@ -17,14 +17,19 @@ import WorkshopExecution
 
 extension SwiftToolDispatcher {
     func impl_tool_catalog(input: [String: JSONValue], surface: String = "chat") async throws -> JSONValue {
-        if input["load"] == .bool(true) {
+        if ToolCatalogSelection.wantsLoad(input) {
             let result = try await impl_tool_catalog(input: ToolCatalogSelection.searchInput(input), surface: surface)
-            let selected = ToolCatalogSelection.selectedName(in: result)
+            var selected = ToolCatalogSelection.selectedNames(in: result)
+            // A plain query loads only into free room: never evict a preload.
+            if !ToolCatalogSelection.loadWasAsked(input),
+               await !activeToolsStore.fitsWithoutEvicting(sessionId: Self.extractSessionId(from: input), names: Set(selected)) {
+                selected = []
+            }
             let loading: JSONValue?
-            if let selected {
+            if !selected.isEmpty {
                 loading = try await impl_tool_load(input: [
                     "session_id": .string(Self.extractSessionId(from: input)),
-                    "names": .array([.string(selected)]),
+                    "names": .array(selected.map(JSONValue.string)),
                 ], surface: surface)
             } else { loading = nil }
             return ToolCatalogSelection.finish(result, selected: selected, loading: loading)
@@ -33,12 +38,12 @@ extension SwiftToolDispatcher {
         if let error = selection.error { return error }
         let group = selection.category.flatMap { ToolPreloadHeuristics.loadGroup(forCategory: $0) }
         if let category = selection.category, group == nil {
-            return .object([
-                "status": .string("failed"), "reason": .string("unknown_category"),
-                "category": .string(category),
-                "known_categories": .array(ToolPreloadHeuristics.knownLoadCategories.map(JSONValue.string)),
-                "fix": .string("Choose a category from known_categories or omit category to browse all tools."),
-            ])
+            // A category word that is not one of ours ("bots", "system") is
+            // what she is looking for: search every tool for it.
+            var search = input
+            search["category"] = .null
+            search["query"] = .string([jsonString(input["query"]) ?? "", category].joined(separator: " ").trimmingCharacters(in: .whitespaces))
+            return try await impl_tool_catalog(input: search, surface: surface)
         }
         let fullDetail = jsonString(input["detail"])?
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -155,6 +160,14 @@ extension SwiftToolDispatcher {
                 if let groups = groupsByTool[hit.schema.name], !groups.isEmpty {
                     row["groups"] = .array(groups.sorted().map { .string($0) })
                 }
+                // The arguments travel with the name, so the next call needs no
+                // schema lookup; the best match also says what each one means.
+                row["call"] = .string(ToolSignature.call(hit.schema.name, hit.schema.parametersJSON))
+                if fullDetail, let parameters = try? JSONValue.parse(hit.schema.parametersJSON) {
+                    row["parameters"] = parameters
+                } else if hit.score == bestScore {
+                    row["params"] = .array(ToolSignature.params(hit.schema.parametersJSON).map(JSONValue.string))
+                }
                 return .object(row)
             }
             // A ready best match is already a complete discovery answer.
@@ -192,7 +205,7 @@ extension SwiftToolDispatcher {
                     "names": .array(names),
                 ])
             }
-            envelope["note"] = .string("Search returns a relevance shortlist capped by limit, not an availability inventory. match_count includes all lexical matches; shortlist_omitted includes weaker and over-limit matches. load_next suggests only unloaded best matches. Omit query for the full compact catalog.")
+            envelope["note"] = .string("A relevance shortlist capped by limit, not an inventory. Each match's call is its argument list (* = required); call the tool by name directly. Omit query for the full compact catalog.")
             return .object(envelope)
         }
         let rows: [JSONValue] = schemas.filter { modelNameSet.contains($0.name) }.map { schema in
@@ -533,7 +546,10 @@ extension SwiftToolDispatcher {
         })
         let schemaNames = Set(allSchemas.map(\.name))
         let registryUnavailable = requested.intersection(customRegistryNames).subtracting(schemaNames)
-        let validNames = requested.intersection(allTools).subtracting(registryUnavailable)
+        // A tool brings its family (browser, mail, music…) when there is room.
+        let validNames = await activeToolsStore.withFamily(sessionId: sessionId,
+            names: requested.intersection(allTools).subtracting(registryUnavailable),
+            available: allTools.subtracting(registryUnavailable).subtracting(unloadedThisTurn))
         let notInCatalog = requested.subtracting(allTools).sorted()
         let revived = validNames.intersection(unloadedThisTurn)
         let alreadyActive = validNames.intersection(effectiveExisting).subtracting(revived).sorted()

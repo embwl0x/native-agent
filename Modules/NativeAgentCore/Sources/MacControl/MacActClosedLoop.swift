@@ -329,6 +329,18 @@ public enum MacActClosedLoop {
     ///
     /// `active` is measured, never assumed: false ⇒ no refusal, so this cannot
     /// become a standing block on typing.
+    /// Her-screen Phase 4 — one line on why a background act needs the app in
+    /// front, by the mechanism that would have had to reach the window server.
+    public static func needsFrontReason(_ requestedAction: String) -> String {
+        switch requestedAction {
+        case "AXPress": return "that control doesn't answer an accessibility press, so it needs a real click"
+        case "AXOpen": return "opening it needs a double-click or the app's Open command"
+        case "type": return "the field takes neither inserted text nor keys sent to the app while it's in the back"
+        case "scroll": return "scrolling it needs the wheel over the window"
+        default: return "it needs real input to the window in front"
+        }
+    }
+
     public static func secureInputRefusal(active: Bool) -> SecureInputRefusal? {
         guard active else { return nil }
         return SecureInputRefusal(
@@ -1266,6 +1278,9 @@ public enum MacActClosedLoop {
     ) -> Bool? {
         guard let typed, !typed.isEmpty else { return nil }
         guard let valueAfter, !valueAfter.isEmpty else { return nil }
+        // The field reads exactly what was typed: that is the edit, even when
+        // it retyped the same text (a replace of "hello.txt" with itself).
+        if valueAfter == typed { return true }
         // `contains`, not `==`: replace mode leaves exactly the text, append
         // mode leaves it at the end of what was already there. Both are the
         // edit landing.

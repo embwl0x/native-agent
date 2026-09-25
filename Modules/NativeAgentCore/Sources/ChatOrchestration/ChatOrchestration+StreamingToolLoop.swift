@@ -334,7 +334,7 @@ extension SwiftNativeTurnEngine {
                     // completion burning provider tokens. Mirror streamTurn's poll.
                     if let flag = cancelFlagPath,
                        streamEventIndex % 8 == 0,
-                       FileManager.default.fileExists(atPath: flag.path) {
+                       ChatCancelFlag.isRaised(flag) {
                         throw CancellationError()
                     }
                     switch event {
@@ -399,8 +399,7 @@ extension SwiftNativeTurnEngine {
                 // stop signals at EOF before treating visible prose as complete
                 // or dispatching any tool calls buffered by this iteration.
                 try Task.checkCancellation()
-                if let flag = cancelFlagPath,
-                   FileManager.default.fileExists(atPath: flag.path) {
+                if ChatCancelFlag.isRaised(cancelFlagPath) {
                     throw CancellationError()
                 }
             } catch is CancellationError {
@@ -490,7 +489,7 @@ extension SwiftNativeTurnEngine {
             } // ConversationPrefixShape.$override.withValue
 
             if reachedLengthLimit {
-                if Task.isCancelled || cancelFlagPath.map({ FileManager.default.fileExists(atPath: $0.path) }) == true {
+                if Task.isCancelled || ChatCancelFlag.isRaised(cancelFlagPath) {
                     throw TurnEngineError.streamCancelled(
                         partial: ToolCallParser.visiblePrefix(in: visibleText),
                         underlying: CancellationError()
@@ -528,8 +527,7 @@ extension SwiftNativeTurnEngine {
                 // Cancellation outranks recovery — the same two signals the
                 // stream body polls, checked before anything is re-issued.
                 if Task.isCancelled { throw stopCarryingPartial() }
-                if let flag = cancelFlagPath,
-                   FileManager.default.fileExists(atPath: flag.path) {
+                if ChatCancelFlag.isRaised(cancelFlagPath) {
                     throw stopCarryingPartial()
                 }
                 await progress?(.notice(
@@ -587,8 +585,7 @@ extension SwiftNativeTurnEngine {
             // Cancellation outranks recovery — same two signals the stream body
             // polls, checked before the backoff so a Stop lands immediately.
             if Task.isCancelled { throw stopCarryingPartial() }
-            if let flag = cancelFlagPath,
-               FileManager.default.fileExists(atPath: flag.path) {
+            if ChatCancelFlag.isRaised(cancelFlagPath) {
                 throw stopCarryingPartial()
             }
             // Same status line as the non-streaming loop, same ordering rules:
@@ -607,8 +604,7 @@ extension SwiftNativeTurnEngine {
             // A Stop written during the backoff must not start one more
             // provider call: re-check both signals after the wait.
             if Task.isCancelled { throw stopCarryingPartial() }
-            if let flag = cancelFlagPath,
-               FileManager.default.fileExists(atPath: flag.path) {
+            if ChatCancelFlag.isRaised(cancelFlagPath) {
                 throw stopCarryingPartial()
             }
             // Same rule as the non-streaming ladder: no attempt starts after
@@ -821,9 +817,7 @@ extension SwiftNativeTurnEngine {
             // instead of as a cancel. Here the cancellation carries the prose
             // the user already watched render, exactly like a Stop inside the
             // stream does.
-            if Task.isCancelled || cancelFlagPath.map({
-                FileManager.default.fileExists(atPath: $0.path)
-            }) == true {
+            if Task.isCancelled || ChatCancelFlag.isRaised(cancelFlagPath) {
                 let safePartial = ToolCallParser.visiblePrefix(in: visibleText)
                 throw TurnEngineError.streamCancelled(
                     partial: safePartial, underlying: CancellationError()

@@ -231,13 +231,9 @@ extension ChatView {
         // User, 2026-09-03: one sheet. The list sits on the room's own
         // material and coat, and keeps a hairline on its trailing edge.
         // The sheet is the window's (ShellFrame); the list is transparent over
-        // it and keeps only its hairline.
-        .overlay(alignment: .trailing) {
-            Rectangle()
-                .fill(NativeAgentShell.hairline)
-                .frame(width: 1)
-                .ignoresSafeArea()
-        }
+        // it. Alive glass, 2026-09-23: the trailing hairline is gone too — the
+        // haze stopped at it and the list read as a slab. Its gutter is the
+        // only separation from the room; the rail is the one plate.
     }
 
     /// One row. While a rename is in flight the classic `SessionRow` renders
@@ -387,17 +383,6 @@ extension ChatView {
         }
         .environment(\.inlineCardAction) { [inlineCards, appModel] card, action in
             inlineCards.handle(card: card, action: action, appModel: appModel)
-        }
-        // Connectors' own setup, opened on the connector the card named. It is
-        // the existing control, presented where the person already is.
-        .sheet(item: Binding(
-            get: { inlineCards.connectorSheet },
-            set: { if $0 == nil { Task { await inlineCards.connectorSheetClosed() } } }
-        )) { request in
-            ConnectorWizardView(provider: request.provider) {
-                Task { await inlineCards.connectorSheetClosed() }
-            }
-            .environment(appModel)
         }
     }
 

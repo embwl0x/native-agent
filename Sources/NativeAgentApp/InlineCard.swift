@@ -193,12 +193,19 @@ struct InlineCardField: Sendable, Equatable {
     var placeholder: String
     var helper: String?
     var isSecret: Bool
+    /// The key the value travels under when a card collects several.
+    var id: String
+    /// An optional field never holds the primary back.
+    var isOptional: Bool
 
-    init(label: String, placeholder: String, helper: String? = nil, isSecret: Bool = true) {
+    init(label: String, placeholder: String, helper: String? = nil, isSecret: Bool = true,
+         id: String = "value", isOptional: Bool = false) {
         self.label = label
         self.placeholder = placeholder
         self.helper = helper
         self.isSecret = isSecret
+        self.id = id
+        self.isOptional = isOptional
     }
 }
 
@@ -221,7 +228,14 @@ struct InlineCardModel: Identifiable, Sendable, Equatable {
     var state: InlineCardState
     /// "Stays on until you turn it off in Trust." — required on permissions.
     var persistenceNote: String?
-    var field: InlineCardField?
+    /// What the card collects, in order. Values never become transcript content.
+    var fields: [InlineCardField]
+    var field: InlineCardField? { fields.first }
+    /// "Sign in with ChatGPT": what the primary does while every field is
+    /// empty. Typing into a field turns the primary back into the paste.
+    var signInLabel: String?
+    /// A quiet link to the full setup sheet, for what the card can't express.
+    var fullSetupLabel: String?
     var choices: [InlineCardChoice]
     /// Scope, paths, recipients — the consequential detail, on the face of the
     /// card rather than behind the fold.
@@ -254,6 +268,9 @@ struct InlineCardModel: Identifiable, Sendable, Equatable {
         state: InlineCardState = .pending,
         persistenceNote: String? = nil,
         field: InlineCardField? = nil,
+        fields: [InlineCardField] = [],
+        signInLabel: String? = nil,
+        fullSetupLabel: String? = nil,
         choices: [InlineCardChoice] = [],
         scopeLines: [String] = [],
         identifier: String? = nil,
@@ -276,7 +293,9 @@ struct InlineCardModel: Identifiable, Sendable, Equatable {
         self.consequence = consequence
         self.state = state
         self.persistenceNote = persistenceNote
-        self.field = field
+        self.fields = fields.isEmpty ? (field.map { [$0] } ?? []) : fields
+        self.signInLabel = signInLabel
+        self.fullSetupLabel = fullSetupLabel
         self.choices = choices
         self.scopeLines = scopeLines
         self.identifier = identifier
@@ -305,8 +324,11 @@ struct InlineCardModel: Identifiable, Sendable, Equatable {
 /// What the person did. Resolution belongs to the mechanism; the view only
 /// says which command was taken and with what.
 enum InlineCardAction: Sendable, Equatable {
-    /// The primary command, carrying whatever the card collected.
-    case primary(value: String?, choice: String?)
+    /// The primary command, carrying whatever the card collected: `value` is
+    /// the first field, `values` every field by id.
+    case primary(value: String?, choice: String?, values: [String: String] = [:])
+    /// The quiet "Open full setup" link.
+    case fullSetup
     /// The quiet secondary: "Not now", "Don't send", "Decide later".
     case secondary
     /// Retry after a safe failure.
@@ -735,13 +757,8 @@ struct InlineCardView: View {
     let model: InlineCardModel
     let action: InlineCardActionHandler
 
-    @State private var fieldValue = ""
+    @State private var fieldValues: [String: String] = [:]
     @State private var selection: String?
-    /// A secret field is a row the card does not need until the person has
-    /// said yes. The primary opens it, focused, and then submits it (Agent,
-    /// 2026-09-13: fewer rows before the buttons).
-    @State private var fieldOpen = false
-    @FocusState private var fieldFocused: Bool
 
     /// A card that collects something keeps its controls while it submits: the
     /// primary takes the spinner and the busy label ("Connecting…"), the quiet
@@ -749,23 +766,64 @@ struct InlineCardView: View {
     /// merely showing work in flight has nothing to submit, so it gets the busy
     /// line and its Stop instead.
     private var collectsInput: Bool {
-        model.field != nil || !model.choices.isEmpty
+        !model.fields.isEmpty || !model.choices.isEmpty
+    }
+
+    private func typed(_ field: InlineCardField) -> String {
+        (fieldValues[field.id] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Nothing typed and a sign-in offered: the primary signs in.
+    private var signsIn: Bool {
+        model.signInLabel != nil && model.fields.allSatisfy { typed($0).isEmpty }
     }
 
     private var primaryEnabled: Bool {
         if !model.choices.isEmpty && selection == nil { return false }
-        // A card that asks for a value stays disabled until it has one: the
-        // primary command must never submit an empty key. Before the field is
-        // open the primary's job is to OPEN it, so it is live.
-        if model.field != nil, fieldOpen {
-            return !fieldValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        if signsIn { return true }
+        // The fields are there from the start (User, 2026-09-23: no reveal
+        // click), and the primary stays disabled until the required ones are
+        // filled: it must never submit an empty key.
+        return model.fields.allSatisfy { $0.isOptional || !typed($0).isEmpty }
+    }
+
+    private func fieldBinding(_ id: String) -> Binding<String> {
+        Binding(get: { fieldValues[id] ?? "" }, set: { fieldValues[id] = $0 })
+    }
+
+    /// Every field the card shows, before its buttons in the key-view order.
+    private var fieldRows: some View {
+        ForEach(model.fields, id: \.id) { field in
+            InlineCardSecretField(field: field, value: fieldBinding(field.id))
         }
-        return true
+    }
+
+    /// Values travel in the action, never in the transcript.
+    private func submit() {
+        var values: [String: String] = [:]
+        for field in model.fields where !typed(field).isEmpty { values[field.id] = typed(field) }
+        action(.primary(value: model.field.flatMap { values[$0.id] },
+                        choice: selection, values: values))
+    }
+
+    @ViewBuilder
+    private var fullSetupLink: some View {
+        if let label = model.fullSetupLabel {
+            // Secondary text, underlined: a link without system blue, which
+            // would be a second accent on the card.
+            Button { action(.fullSetup) } label: {
+                Text(label).underline().foregroundStyle(NativeAgentShell.secondary)
+            }
+            .buttonStyle(.plain)
+            .font(ShellType.label)
+            .accessibilityIdentifier("inline-card.full-setup")
+        }
     }
 
     /// The outcome the primary buys. With a list on the card that is the row
     /// the person picked — "Use GPT-5.6 Sol" — and otherwise the card's own.
     private var primaryLabel: String {
+        if signsIn, let signIn = model.signInLabel { return signIn }
         if let picked = selection,
            let choice = model.choices.first(where: { $0.id == picked }),
            let label = choice.actionLabel, !label.isEmpty {
@@ -775,16 +833,19 @@ struct InlineCardView: View {
     }
 
     var body: some View {
+        // 2026-09-25: a card becomes its receipt in place, no crossfade — the
+        // two share a spot and drew over each other for a frame.
         switch model.state {
         case .pending, .running:
-            liveCard
+            liveCard.transition(.identity)
         case .failed:
-            failedCard
+            failedCard.transition(.identity)
         case .settled, .declined, .unknown:
-            receipt
+            receipt.transition(.identity)
         case .superseded:
             InlineCardSupersededLine()
                 .accessibilityIdentifier("inline-card.\(model.kind.rawValue).superseded")
+                .transition(.identity)
         }
     }
 
@@ -797,11 +858,7 @@ struct InlineCardView: View {
                    reason: model.why) {
             VStack(alignment: .leading, spacing: NativeAgentSpacing.md) {
                 scope
-                if let field = model.field, fieldOpen {
-                    InlineCardSecretField(field: field, value: $fieldValue)
-                        .focused($fieldFocused)
-                        .disabled(model.state == .running)
-                }
+                fieldRows.disabled(model.state == .running)
                 if !model.choices.isEmpty {
                     InlineCardChoiceList(choices: model.choices, selection: $selection)
                         .disabled(model.state == .running)
@@ -816,19 +873,10 @@ struct InlineCardView: View {
                         busy: model.state == .running,
                         secondary: model.secondaryLabel,
                         consequence: model.consequence,
-                        onPrimary: {
-                            // First press opens the field and puts the cursor
-                            // in it; the second press is the one that submits.
-                            if model.field != nil, !fieldOpen {
-                                fieldOpen = true
-                                fieldFocused = true
-                                return
-                            }
-                            action(.primary(value: fieldValue.isEmpty ? nil : fieldValue,
-                                            choice: selection))
-                        },
+                        onPrimary: submit,
                         onSecondary: { action(.secondary) }
                     )
+                    fullSetupLink
                 }
                 details
             }
@@ -856,10 +904,7 @@ struct InlineCardView: View {
                    title: model.outcome ?? model.title,
                    reason: model.outcomeMeta ?? model.why) {
             VStack(alignment: .leading, spacing: NativeAgentSpacing.md) {
-                if let field = model.field {
-                    InlineCardSecretField(field: field, value: $fieldValue)
-                        .onAppear { fieldOpen = true }
-                }
+                fieldRows
                 // A failure keeps what the card COLLECTS, not just what was
                 // typed into it: a remount has no selection, so a failed
                 // choice card with no list has nothing to answer with and
@@ -878,8 +923,7 @@ struct InlineCardView: View {
                         // rather than re-entered from nothing.
                         onPrimary: {
                             if collectsInput {
-                                action(.primary(value: fieldValue.isEmpty ? nil : fieldValue,
-                                                choice: selection))
+                                submit()
                             } else {
                                 action(.retry)
                             }
@@ -887,6 +931,7 @@ struct InlineCardView: View {
                         onSecondary: { action(.secondary) }
                     )
                 }
+                fullSetupLink
                 details
             }
         }

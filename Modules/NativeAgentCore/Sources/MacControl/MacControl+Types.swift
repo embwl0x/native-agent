@@ -682,6 +682,30 @@ public enum MacWakeGuard {
     }
 }
 
+/// Her-screen — the ONE lock answer the reads, the acts and home's MAC line
+/// share: the login session's `CGSSessionScreenIsLocked`. While it is set, AX
+/// publishes no app windows at all, so "no window" means "locked", not
+/// "minimized". (It is also set under a plain screensaver, which hides windows
+/// just the same.)
+public enum MacScreenLock {
+    public static let reply = "The screen is asleep or locked and I couldn't wake it; nothing was touched."
+
+    /// User (09-24): "the Mac is never locked, it's just a screen saver." The
+    /// flag is set under both, so the reads first try the wake nudge; this
+    /// records whether the LAST try failed, so home says "locked" only then.
+    nonisolated(unsafe) public static var wakeFailed = false
+
+    public static func isLocked() -> Bool {
+        #if canImport(CoreGraphics) && os(macOS)
+        guard let session = CGSessionCopyCurrentDictionary() as? [String: Any] else { return false }
+        if let number = session["CGSSessionScreenIsLocked"] as? NSNumber { return number.boolValue }
+        return (session["CGSSessionScreenIsLocked"] as? Bool) ?? false
+        #else
+        return false
+        #endif
+    }
+}
+
 #if canImport(CoreGraphics) && os(macOS)
 
 /// Live session probe.

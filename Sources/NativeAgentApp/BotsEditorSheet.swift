@@ -157,6 +157,7 @@ struct BotsEditorSheet: View {
                             if selectedModel?.supportsFast == true {
                                 Toggle("Fast", isOn: Binding(get: { fast ?? false }, set: { fast = $0 }))
                                     .toggleStyle(.switch)
+                                    .hazeTinted()
                             }
                         }
                         if !provider.isEmpty, let caption = ProviderToolCapability.caption(providerID: provider) {

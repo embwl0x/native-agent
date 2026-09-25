@@ -3212,11 +3212,11 @@ func editLandedRefusesStaleUnchangedContent() {
     #expect(MacActClosedLoop.editLandedInField(
         typed: "abc", valueBefore: "abc xyz", valueAfter: "abc xyz"
     ) == false)
-    // Replace-mode retyping the field's exact current text is indistinguishable
-    // from an inert field from here — conservative refusal is the contract.
+    // A field that reads exactly what was typed is the wanted end state, even
+    // if it already held it (her-screen 09-24: a correct field read unverified).
     #expect(MacActClosedLoop.editLandedInField(
         typed: "abc", valueBefore: "abc", valueAfter: "abc"
-    ) == false)
+    ) == true)
     // The value changed SOMEWHERE ELSE while a pre-existing occurrence sat
     // still: occurrence count did not grow, so nothing this act typed landed.
     #expect(MacActClosedLoop.editLandedInField(

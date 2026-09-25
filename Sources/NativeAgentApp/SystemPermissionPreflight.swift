@@ -21,6 +21,7 @@ import ApplicationServices
 import CoreGraphics
 import EventKit
 import Contacts
+import NativeAgentShared
 import OSLog
 
 /// A macOS privacy (TCC) capability the app depends on.
@@ -316,5 +317,92 @@ enum SystemPermissionPreflight {
             "speech-recognition preflight: prompt resolved \(mapped.rawValue, privacy: .public)"
         )
         return mapped
+    }
+}
+
+// MARK: - Setup cards
+
+extension SystemPermissionPreflight {
+    /// The macOS privacy switch a card's grant also needs, where a cheap
+    /// non-prompting read exists. The app-side grant alone does not reach it,
+    /// so a card must not settle while macOS still says no.
+    static func cardGate(_ id: String, mode: InlineInteraction.AccessMode?) -> SystemPermissionCapability? {
+        switch id {
+        case "calendar": return .calendars
+        case "reminders": return .reminders
+        case "contacts": return .contacts
+        case "accessibility": return .accessibility
+        case "screen_capture": return .screenRecording
+        default: return nil
+        }
+    }
+
+    /// The first macOS switch still off for these ids, as the one sentence of
+    /// what to click; nil when macOS has nothing against it.
+    static func cardBlockReason(_ ids: [String], mode: InlineInteraction.AccessMode?) -> String? {
+        for id in ids {
+            guard let gate = cardGate(id, mode: mode) else { continue }
+            let current = cardStatus(gate, mode: mode)
+            if current == .granted { continue }
+            if current == .notDetermined {
+                return "macOS hasn\u{2019}t allowed \(gate.displayName) yet: tap the card and choose Allow when macOS asks."
+            }
+            return "macOS is still blocking \(gate.displayName): in System Settings \u{2192} "
+                + "Privacy & Security \u{2192} \(cardPaneName(gate)), turn NativeAgent on"
+                + (gate == .screenRecording ? " (macOS may ask to reopen NativeAgent)." : ".")
+        }
+        return nil
+    }
+
+    /// From a card tap, with the person there: fire macOS's own prompt where
+    /// it has one, and open the right System Settings pane for what is still
+    /// off. True when the card should wait for that pane.
+    @MainActor
+    static func askMacOSForCard(_ ids: [String], mode: InlineInteraction.AccessMode?) async -> Bool {
+        for id in ids {
+            guard let gate = cardGate(id, mode: mode), cardStatus(gate, mode: mode) != .granted else { continue }
+            switch gate {
+            case .calendars where mode == .write:
+                if cardStatus(gate, mode: mode) == .notDetermined {
+                    _ = try? await EKEventStore().requestWriteOnlyAccessToEvents()
+                }
+            case .calendars: _ = await MacPIMConnectorActions.requestCalendarAccess()
+            case .reminders: _ = await MacPIMConnectorActions.requestReminderAccess()
+            case .contacts where status(gate) == .notDetermined:
+                _ = try? await CNContactStore().requestAccess(for: .contacts)
+            // These two list the app in their pane on first ask, so the
+            // person has a switch to turn on.
+            case .accessibility:
+                _ = AXIsProcessTrustedWithOptions(["AXTrustedCheckOptionPrompt": true] as CFDictionary)
+            case .screenRecording: _ = CGRequestScreenCaptureAccess()
+            default: break
+            }
+            guard cardStatus(gate, mode: mode) != .granted, let url = settingsURL(for: gate) else { continue }
+            NSWorkspace.shared.open(url)
+            return true
+        }
+        return false
+    }
+
+    /// Only a real grant counts. A Calendar WRITE card is satisfied by
+    /// macOS's write-only access as well as full access.
+    private static func cardStatus(
+        _ gate: SystemPermissionCapability, mode: InlineInteraction.AccessMode?
+    ) -> SystemPermissionStatus {
+        guard gate == .calendars, mode == .write else { return status(gate) }
+        switch EKEventStore.authorizationStatus(for: .event) {
+        case .writeOnly, .fullAccess, .authorized: return .granted
+        case .notDetermined: return .notDetermined
+        case .restricted: return .restricted
+        default: return .denied
+        }
+    }
+
+    private static func cardPaneName(_ capability: SystemPermissionCapability) -> String {
+        switch capability {
+        case .calendars: return "Calendars"
+        case .screenRecording: return "Screen & System Audio Recording"
+        default: return capability.displayName
+        }
     }
 }

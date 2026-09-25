@@ -5,6 +5,7 @@ import Context
 import MacControl
 import MacIntegration
 import NativeAgentCore
+import NativeAgentShared
 import PersistenceCore
 import PersonaEngine
 import ProviderRouting
@@ -543,6 +544,19 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
             break
         }
         let result = try await inner.dispatch(tool: tool, input: input, surface: surface)
+        // An ask for something already set up raises no card: a card that
+        // reads as its receipt from the start would leave the turn waiting on
+        // nobody. The owner's answer goes back instead, and she carries on.
+        if includeAppOwnedTools, tool == InlineInteractionWire.toolName,
+           let need = InlineInteractionNeed.interaction(in: result),
+           let done = await InlineInteractionResolver.liveProjection(need, dataRoot: NativeAgentPaths.dataRoot).state.outcome {
+            return .object([
+                "status": .string("ok"),
+                "already_done": .bool(true),
+                "summary": .string(done.summary),
+                "note": .string("Already set up, so no card was shown. Carry on."),
+            ])
+        }
         if includeAppOwnedTools, ["agent_connect", "agent_message"].contains(tool),
            case .object(let plan) = result,
            [JSONValue.string("grok_setup"), .string("grok_disconnect"), .string("grok_send")].contains(plan["status"] ?? .null) {
@@ -553,6 +567,10 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
             return await DesktopChatRoute.perform(plan: plan, dataRoot: NativeAgentPaths.dataRoot)
         }
         if includeAppOwnedTools, ["act", "go", "screen"].contains(tool) {
+            // Her-screen 09-24: a workspace call never takes the self route; it
+            // would read her own pages, the Chat page among them.
+            if WorkspaceMacCall.active, case .object(let payload) = result, case .object(let detail)? = payload["detail"],
+               detail["status"] == .string("in_process_route") { return WorkspaceMacCall.refusal }
             return await Self.performMacSelfAppRoute(result) { tool, input in
                 await self.runQuietSelfAdminTool(tool: tool, input: input, surface: surface)
             }
@@ -627,20 +645,253 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
         return .object(obj)
     }
 
+    /// Page actions whose result carries the fresh page (Phase 3).
+    private static let chromePageActions: Set<String> = [
+        "browser.chrome_navigate", "browser.chrome_click", "browser.chrome_fill", "browser.chrome_type",
+        "browser.chrome_select", "browser.chrome_keypress", "browser.chrome_set_checked",
+        "browser.chrome_double_click", "browser.chrome_drag", "browser.chrome_scroll",
+    ]
+    /// Acts that can start a navigation: wait for it to settle before reading.
+    private static let chromeMayNavigate: Set<String> = [
+        "browser.chrome_click", "browser.chrome_keypress", "browser.chrome_double_click",
+    ]
+
     private func runBrowserTool(actionId: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
         let dryRun = Self.inputBool(input["dryRun"] ?? input["dry_run"], default: false)
-        let result = try await ChromeControlInvocationContext.$origin.withValue(Self.securityOrigin(input: input, surface: surface)) {
-            try await ChromeControlInvocationContext.$tool.withValue(actionId) {
-                try await browserActionRunner(actionId, dryRun, input)
+        // 09-24: a key pressed at no row. Page keys mean "move the page": that
+        // is a scroll (verified by how far it moved); any other key needs a row.
+        if actionId == "browser.chrome_keypress", (Self.inputString(input["node_id"]) ?? "").isEmpty {
+            let key = Self.inputString(input["key"]) ?? ""
+            let steps: [String: Int] = ["PageDown": 1_200, "Space": 1_200, " ": 1_200, "PageUp": -1_200, "ArrowDown": 120, "ArrowUp": -120]
+            guard let delta = steps[key], await chromeFollowUpAllowed("browser.chrome_scroll", input: input, surface: surface) else {
+                return .object(["ok": .bool(false), "error": .string("key_needs_row"),
+                    "reason": .string("A key is pressed in a row: add node_id (its number or label, like the search box). "
+                        + "To move down the page, call browser.chrome_scroll{delta_y: 1200}. Nothing was sent.")])
             }
+            var scroll: [String: JSONValue] = ["delta_x": .int(0), "delta_y": .int(Int64(delta))]
+            if let lease = input["lease_id"] { scroll["lease_id"] = lease }
+            return try await runBrowserTool(actionId: "browser.chrome_scroll", input: scroll, surface: surface)
+        }
+        let origin = Self.securityOrigin(input: input, surface: surface)
+        func run(_ id: String, _ input: [String: JSONValue]) async throws -> JSONValue {
+            try await ChromeControlInvocationContext.$origin.withValue(origin) {
+                try await ChromeControlInvocationContext.$tool.withValue(id) {
+                    try await browserActionRunner(id, dryRun, input)
+                }
+            }
+        }
+        // Her-screen Phase 3 (2026-09-23): one call instead of acquire →
+        // navigate → snapshot → release. The workspace projects from the
+        // structured snapshot and reads back after its own acts, so it keeps
+        // the raw results.
+        let direct = !dryRun && MacLookFrameStore.source != "workspace"
+        var input = input
+        // No tab yet (or its lease lapsed): open one for this navigate. Same
+        // lease model — Chrome owns the lease, and it lapses (closing this
+        // untouched tab) ~60s after the last call, so no release call is
+        // needed. An X/Twitter post is given at creation: the extension opens
+        // posts in its unfocused work window only from the creation URL
+        // (09-24: X profiles were refused here and she had to acquire by hand).
+        func openTab() async throws -> JSONValue? {
+            let url = Self.inputString(input["url"]) ?? ""
+            var create: [String: JSONValue] = ["mode": .string("create")]
+            if ChromeControlRuntime.isXPostURL(url) { create["initial_url"] = .string(url) }
+            let lease = try await run("browser.chrome_acquire", create)
+            await ChromeControlRuntime.shared.noteAcquired(lease)
+            guard case .object(let granted) = lease, case .string(let id)? = granted["leaseId"] else { return lease }
+            input["lease_id"] = .string(id)
+            input["expected_user_sequence"] = granted["userSequence"] ?? .int(0)
+            return nil
+        }
+        // 09-24: the workspace's `browser.go` / `tab.N.go` open a tab the same way.
+        if !dryRun, actionId == "browser.chrome_navigate", (Self.inputString(input["lease_id"]) ?? "").isEmpty,
+           await !ChromeControlRuntime.shared.conversationTabIsLive(ChatToolSessionContext.verifiedSessionId) {
+            // Opening the tab clears acquire's own gate; when that would ask,
+            // say so instead of "navigate with a url opens one" to a navigate with a url.
+            guard await chromeFollowUpAllowed("browser.chrome_acquire", input: input, surface: surface) else {
+                return .object(["ok": .bool(false), "error": .string("tab_needs_approval"),
+                    "reason": .string("This conversation has no Chrome tab, and opening one needs approval here: "
+                        + "call browser.chrome_acquire, then browser.chrome_navigate{url}. Nothing was sent.")])
+            }
+            if let refused = try await openTab() { return refused }
+        }
+        if direct, actionId == "browser.chrome_snapshot", input["max_nodes"] == nil || input["max_nodes"] == .null {
+            input["max_nodes"] = .int(150)
+        }
+        // Never act on an X/Twitter post from a background lease (Sol, 09-23):
+        // the page may have navigated or redirected there after creation.
+        if Self.chromePageActions.contains(actionId), actionId != "browser.chrome_navigate",
+           await ChromeControlRuntime.shared.actionBlockedOnPost(
+               leaseID: Self.inputString(input["lease_id"]), verifiedSessionID: ChatToolSessionContext.verifiedSessionId) {
+            return .object(["ok": .bool(false), "error": .string("post_needs_visible_window"),
+                            "reason": .string(Self.postOnBackgroundNote + " Nothing was sent.")])
+        }
+        // 09-24: a row by its label, a missing snapshot_id, option labels —
+        // from the last page read on this tab; a form in one call (fields).
+        if let refusal = Self.resolveChromeTarget(actionId, &input) { return refusal }
+        if !dryRun, ["browser.chrome_fill", "browser.chrome_navigate"].contains(actionId), let fields = Self.chromeFields(input) {
+            return try await runChromeFieldsCall(actionId: actionId, input: input, fields: fields, direct: direct, surface: surface, run: run)
+        }
+        // A keypress is judged by what it did: the page it acted on, as read.
+        // and a scroll shows only the rows it brought into view.
+        let lastRead = ChromePageMirror.page(lease: Self.inputString(input["lease_id"]), session: ChatToolSessionContext.verifiedSessionId)
+        let before = ["browser.chrome_keypress", "browser.chrome_click", "browser.chrome_double_click"].contains(actionId)
+            ? lastRead.flatMap { $0.snapshotID == Self.inputString(input["snapshot_id"]) ? $0 : nil }
+            : actionId == "browser.chrome_scroll" ? lastRead : nil
+        var result: JSONValue
+        do { result = try await run(actionId, input) }
+        catch {
+            // The tab's lease lapsed mid-task: open a fresh tab and go there
+            // instead of failing — a navigate's own url, or for a re-read the
+            // address this chat last read on that tab.
+            let reread = actionId == "browser.chrome_snapshot" ? lastRead?.url : nil
+            guard !dryRun, actionId == "browser.chrome_navigate" || !(reread ?? "").isEmpty, Self.chromeLeaseGone(error),
+                  await chromeFollowUpAllowed("browser.chrome_acquire", input: input, surface: surface) else { throw error }
+            if let reread { input["url"] = .string(reread) }
+            if let refused = try await openTab() { return refused }
+            if reread != nil {
+                _ = try await run("browser.chrome_navigate", input)
+                input.removeValue(forKey: "url")
+            }
+            result = try await run(actionId, input)
+        }
+        if actionId == "browser.chrome_snapshot" { result = try await Self.wholePageIfNoMain(result, input: input, run: run) }
+        Self.mirrorChromePage(result, releasedBy: actionId, input: input)
+        if actionId == "browser.chrome_acquire" { await ChromeControlRuntime.shared.noteAcquired(result) }
+        if !dryRun, ["browser.chrome_navigate", "browser.chrome_acquire"].contains(actionId) {
+            await preloadBrowserTools(input)
         }
         guard case .object(var obj) = result else {
             return result
+        }
+        // Navigate and snapshot results carry the page's current URL.
+        var postWarning = ""
+        if case .string(let url)? = obj["url"], case .string(let lease)? = obj["leaseId"],
+           await ChromeControlRuntime.shared.notePage(url: url, leaseID: lease) {
+            postWarning = "\n" + Self.postOnBackgroundNote
+        }
+        if direct, actionId == "browser.chrome_snapshot", let page = ChromePageText.render(result) {
+            return .string(page + postWarning)
+        }
+        if direct, Self.chromePageActions.contains(actionId), case .object(let receipt)? = obj["receipt"],
+           case .string(let lease)? = receipt["leaseId"] {
+            var page = await freshChromePage(after: actionId, lease: lease,
+                sequence: receipt["userSequence"], input: input, surface: surface, run: run)
+            if actionId == "browser.chrome_scroll", let before {
+                // A feed can lag the scroll: a move that shows nothing new
+                // re-reads for up to 1.5 s before saying so.
+                let moved: Bool = switch obj["movedY"] { case .int(let n)?: n != 0; case .double(let n)?: n != 0; default: false }
+                var diff = Self.onlyNewRows(page, before: before.text)
+                for _ in 0..<3 where moved && diff.new == 0 {
+                    try? await Task.sleep(nanoseconds: 500_000_000)
+                    page = await freshChromePage(after: actionId, lease: lease,
+                        sequence: receipt["userSequence"], input: input, surface: surface, run: run)
+                    diff = Self.onlyNewRows(page, before: before.text)
+                }
+                page = moved && diff.new == 0 ? Self.onlyNewRows(page, before: before.text, stalled: true, personHere: !Self.macPersonAway()).text : diff.text
+            }
+            // A plain success reads as the receipt line then the page; any
+            // other outcome keeps its object so failure classing still sees it.
+            if obj["outcome"] == .string("succeeded") {
+                if actionId != "browser.chrome_scroll", let before, Self.chromePageUnchanged(before: before.text, after: page) {
+                    let verb = actionId.replacingOccurrences(of: "browser.chrome_", with: "").replacingOccurrences(of: "_", with: " ")
+                    // The read is the main content in view: a cart count or toast
+                    // elsewhere may have changed, so never an invitation to repeat.
+                    return .string(verb + " unverified: it reached the page but nothing in the part read moved or changed; "
+                        + "it may have acted elsewhere, so check before repeating it"
+                        + (actionId == "browser.chrome_keypress" ? ". To move down the page, call browser.chrome_scroll{delta_y}." : ".") + "\n\n" + page)
+                }
+                return .string(Self.chromeReceiptLine(actionId, obj) + "\n\n" + page)
+            }
+            // The page is attached: "take a fresh snapshot" no longer applies.
+            if !page.hasPrefix("No page attached"), !page.hasPrefix("The fresh page could not"),
+               case .object(var receipt)? = obj["receipt"], receipt["retry"] == .string("fresh_snapshot_required") {
+                receipt.removeValue(forKey: "retry"); obj["receipt"] = .object(receipt)
+            }
+            obj["page"] = .string(page)
         }
         obj["tool"] = .string(actionId)
         obj["provider_alias"] = .string(Self.providerAlias(for: actionId))
         obj["surface"] = .string(surface)
         return .object(obj)
+    }
+
+    /// The slim page after an act, read on the same lease.
+    func freshChromePage(
+        after actionId: String, lease: String, sequence: JSONValue?, input: [String: JSONValue], surface: String,
+        run: (String, [String: JSONValue]) async throws -> JSONValue
+    ) async -> String {
+        guard await chromeFollowUpAllowed("browser.chrome_snapshot", input: input, surface: surface) else {
+            return "No page attached: reading the page needs your approval here. Call browser.chrome_snapshot."
+        }
+        if Self.chromeMayNavigate.contains(actionId),
+           await chromeFollowUpAllowed("browser.chrome_wait", input: input, surface: surface) {
+            // Twice at most: a quiet window can close before a slow load starts.
+            for _ in 0..<2 {
+                let waited = try? await run("browser.chrome_wait", [
+                    "lease_id": .string(lease), "expected_user_sequence": sequence ?? .null,
+                    "condition": .string("navigation_settled"), "settle_ms": .int(400), "timeout_ms": .int(8_000),
+                ])
+                guard case .object(let wait)? = waited, wait["outcome"] == .string("not_settled") else { break }
+            }
+        }
+        do {
+            // 09-24: the page's main content by default (the benches re-read
+            // it after every navigate); the whole page when it has none.
+            let read: [String: JSONValue] = ["lease_id": .string(lease), "max_nodes": .int(150),
+                "scope": .string(Self.inputString(input["scope"]) == "page" ? "page" : "main_content")]
+            func readPage() async throws -> JSONValue {
+                if let main = try? await run("browser.chrome_snapshot", read) {
+                    return try await Self.wholePageIfNoMain(main, input: read, run: run)
+                }
+                return try await run("browser.chrome_snapshot", read.merging(["scope": .string("page")]) { _, new in new })
+            }
+            var snapshot = try await readPage()
+            // 09-24 (X profile): a first read that is only a spinner waits for
+            // real content, 3 s at most.
+            for _ in 0..<4 where Self.chromeStillLoading(snapshot) {
+                try? await Task.sleep(nanoseconds: 750_000_000)
+                snapshot = try await readPage()
+            }
+            Self.mirrorChromePage(snapshot)
+            guard let page = ChromePageText.render(snapshot) else {
+                return "The fresh page could not be read. Call browser.chrome_snapshot."
+            }
+            if case .object(let read) = snapshot, case .string(let url)? = read["url"],
+               await ChromeControlRuntime.shared.notePage(url: url, leaseID: lease) {
+                return page + "\n" + Self.postOnBackgroundNote
+            }
+            return page
+        } catch {
+            return "The fresh page could not be read (" + ChromePageText.safe(error.localizedDescription)
+                + "). Call browser.chrome_snapshot."
+        }
+    }
+
+    static let postOnBackgroundNote = "This background tab is now on an X/Twitter post; actions on it are refused. "
+        + "To act on the post, open it with browser.chrome_acquire (mode create, initial_url = the post), "
+        + "which uses the visible work window."
+
+    /// A read the app makes on her behalf clears the same Trust gate her own
+    /// call would; anything that would ask or is blocked is simply not made.
+    func chromeFollowUpAllowed(_ tool: String, input: [String: JSONValue], surface: String) async -> Bool {
+        let envelope = await securityCenter.evaluateTool(
+            tool: tool, input: [:], origin: Self.securityOrigin(input: input, surface: surface),
+            enforceAutonomy: enforceAutonomySecurity)
+        try? await securityCenter.record(envelope)
+        return envelope.decision != .block && !envelope.requiresApproval
+    }
+
+    /// A page is open: its hands (click/fill/type/select/keypress) load now, so
+    /// the next reply can use them without a tool_load call.
+    func preloadBrowserTools(_ input: [String: JSONValue]) async {
+        let session = [ChatToolSessionContext.verifiedSessionId, LLMCallContext.sessionId]
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first { !$0.isEmpty } ?? Self.extractSessionId(input)
+        guard !session.isEmpty, let group = ToolPreloadHeuristics.loadGroup(forCategory: "browser") else { return }
+        _ = try? await toolLoad(input: [
+            "session_id": .string(session), "names": .array(group.tools.sorted().map { .string($0) }),
+        ])
     }
 
     private func runHealthStatusTool(tool: String, surface: String) async throws -> JSONValue {
@@ -720,17 +971,21 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
     }
 
     private func toolCatalog(input: [String: JSONValue], surface: String) async throws -> JSONValue {
-        if input["load"] == .bool(true) {
+        if ToolCatalogSelection.wantsLoad(input) {
             // Select after app/core merging; the inner catalog must not load
             // its local winner before the app-owned candidates are ranked.
             let result = try await toolCatalog(input: ToolCatalogSelection.searchInput(input), surface: surface)
-            let selected = ToolCatalogSelection.selectedName(in: result)
+            var selected = ToolCatalogSelection.selectedNames(in: result)
+            // A plain query loads only into free room: never evict a preload.
+            if !ToolCatalogSelection.loadWasAsked(input),
+               await !activeToolsStore.fitsWithoutEvicting(sessionId: Self.extractSessionId(input), names: Set(selected)) {
+                selected = []
+            }
             let loading: JSONValue?
-            if let selected {
+            if !selected.isEmpty {
                 var loadInput = input
-                loadInput.removeValue(forKey: "category")
-                loadInput.removeValue(forKey: "name")
-                loadInput["names"] = .array([.string(selected)])
+                for key in ["category", "name", "query", "load", "limit", "detail"] { loadInput.removeValue(forKey: key) }
+                loadInput["names"] = .array(selected.map(JSONValue.string))
                 loading = try await dispatch(tool: "tool_load", input: loadInput, surface: surface)
             } else { loading = nil }
             return ToolCatalogSelection.finish(result, selected: selected, loading: loading)
@@ -760,7 +1015,8 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
                 rawQuery: rawQuery,
                 input: input,
                 inner: innerCatalog,
-                availableNames: names
+                availableNames: names,
+                surface: surface
             )
         }
         var obj: [String: JSONValue]
@@ -916,15 +1172,16 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
             base = try await inner.dispatch(tool: "tool_catalog", input: input, surface: surface)
             if case .object(let result) = base, result["status"] == .string("failed") { return base }
         } else {
-            return .object([
-                "status": .string("failed"), "reason": .string("unknown_category"), "category": .string(category),
-                "known_categories": .array(Set(ToolPreloadHeuristics.knownLoadCategories + Self.appCatalogCategoryNames).sorted().map(JSONValue.string)),
-                "fix": .string("Choose a category from known_categories or omit category to browse all tools."),
-            ])
+            // A category word that is not one of ours ("bots", "system") is
+            // what she is looking for: search every tool for it.
+            var search = input
+            search["category"] = .null
+            search["query"] = .string([Self.inputString(input["query"]) ?? "", category].joined(separator: " ").trimmingCharacters(in: .whitespaces))
+            return try await toolCatalog(input: search, surface: surface)
         }
         let names = SwiftToolDispatcher.modelVisibleCatalogToolNames(Set(try await listAvailableTools())).intersection(declared).sorted()
         if let query = Self.inputString(input["query"])?.trimmingCharacters(in: .whitespacesAndNewlines), !query.isEmpty {
-            let result = await toolCatalogSearch(rawQuery: query, input: input, inner: base, availableNames: names)
+            let result = await toolCatalogSearch(rawQuery: query, input: input, inner: base, availableNames: names, surface: surface)
             guard case .object(var object) = result else { return result }
             object["category"] = .string(canonical)
             object["category_available_count"] = .int(Int64(names.count))
@@ -982,7 +1239,8 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
         rawQuery: String,
         input: [String: JSONValue],
         inner innerCatalog: JSONValue,
-        availableNames: [String]
+        availableNames: [String],
+        surface: String
     ) async -> JSONValue {
         var innerObj: [String: JSONValue] = [:]
         if case .object(let base) = innerCatalog { innerObj = base }
@@ -1026,6 +1284,12 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
         // something the answer shortened.
         var appLinesCut: Set<String> = []
         for schema in Self.appToolSchemas() where visibleNames.contains(schema.name) {
+            // Trust decides first, as the compact catalog's available_now does:
+            // a blocked app tool is neither ranked nor loaded.
+            let trust = await securityCenter.evaluateTool(
+                tool: Self.canonicalAppToolName(schema.name) ?? schema.name, input: [:],
+                origin: Self.securityOrigin(input: [:], surface: surface), enforceAutonomy: enforceAutonomySecurity)
+            if trust.decision == .block { continue }
             let score = SwiftToolDispatcher.catalogSearchScore(
                 name: schema.name,
                 description: schema.description,
@@ -1051,6 +1315,12 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
             if let groups = groupsByTool[schema.name], !groups.isEmpty {
                 row["groups"] = .array(groups.sorted().map { .string($0) })
             }
+            row["call"] = .string(ToolSignature.call(schema.name, schema.parametersJSON))
+            if Self.inputString(input["detail"])?.lowercased() == "full", let parameters = try? JSONValue.parse(schema.parametersJSON) {
+                row["parameters"] = parameters
+            } else {
+                row["params"] = .array(ToolSignature.params(schema.parametersJSON).map(JSONValue.string))
+            }
             appRanked.append((name: schema.name, score: score, row: .object(row)))
         }
 
@@ -1073,7 +1343,12 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
         merged.removeAll {
             !SwiftToolDispatcher.catalogSearchIsShortlisted(score: $0.score, bestScore: bestScore)
         }
-        let shown = Array(merged.prefix(limit))
+        // Argument meanings only on the best rows; the rest keep their call line.
+        let shown = merged.prefix(limit).map { entry -> (name: String, score: Int, row: JSONValue) in
+            guard entry.score != bestScore, case .object(var row) = entry.row, row["params"] != nil else { return entry }
+            row.removeValue(forKey: "params")
+            return (entry.name, entry.score, .object(row))
+        }
         var innerMatchCount = 0
         if case .int(let value)? = innerObj["match_count"] { innerMatchCount = Int(value) }
         let matchCount = innerMatchCount + appRanked.count
@@ -1115,7 +1390,7 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
             ])
         }
         envelope["note"] = innerObj["note"] ?? .string(
-            "Search returns a relevance shortlist capped by limit, not an availability inventory. match_count includes all lexical matches; shortlist_omitted includes weaker and over-limit matches. load_next suggests only unloaded best matches. Omit query for the full compact catalog."
+            "A relevance shortlist capped by limit, not an inventory. Each match's call is its argument list (* = required); call the tool by name directly. Omit query for the full compact catalog."
         )
         return .object(envelope)
     }
@@ -1123,9 +1398,16 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
     private func toolLoad(input: [String: JSONValue]) async throws -> JSONValue {
         let requested = Self.appToolLoadNames(input)
         let available = Set(try await listAvailableTools())
-        let loaded = requested.filter { available.contains($0) }.sorted()
+        var loaded = requested.filter { available.contains($0) }.sorted()
         let unavailable = requested.filter { !available.contains($0) }.sorted()
         let sessionId: String? = Self.extractSessionId(input)
+        // A browser tool brings the rest of the browser when there is room
+        // (05652ED6: scroll never loaded, so she scrolled with PageDown).
+        if let sessionId, !sessionId.isEmpty, !loaded.isEmpty {
+            let unloadedNow = await activeToolsStore.turnUnloadedNames(sessionId: sessionId)
+            loaded = await activeToolsStore.withFamily(sessionId: sessionId, names: Set(loaded),
+                                                       available: available.subtracting(unloadedNow)).sorted()
+        }
         guard let sessionId, !sessionId.isEmpty else {
             return .object([
                 "status": .string("preview"),
@@ -1943,6 +2225,7 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
         case .extensionNotLoaded: connection = "not_yet_connected"
         }
         return [
+            "next": state == .connected ? .null : .string("raise request_interaction kind=connector target=chrome"),
             "connection": .string(connection),
             "connected": .bool(state == .connected),
             "chrome_control_enabled": .bool(enabled),
@@ -1969,7 +2252,7 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
            (inputString(input["expected_url"]) ?? "").isEmpty {
             return .object([
                 "ok": .bool(false), "error": .string("invalid_payload"),
-                "reason": .string("claim needs expected_url"),
+                "reason": .string("Claiming a tab needs expected_url, that tab's exact address. To just open a page, use browser.chrome_navigate{url}; nothing was sent."),
             ])
         }
         let (effect, requestPayload) = try chromeControlRequest(actionId: actionId, input: input)
@@ -1999,7 +2282,17 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
     ) throws -> (ChromeControlEffect, [String: JSONValue]) {
         let effect: ChromeControlEffect
         var payload: [String: JSONValue] = [:]
-        func string(_ key: String) -> String? { inputString(input[key]) }
+        func string(_ key: String) -> String? {
+            // Phase 3: the slim page numbers rows by node id, so `12` (or
+            // "12") names node "n12". Anything else passes through unchanged.
+            if key.hasSuffix("node_id") {
+                if case .int(let row)? = input[key] { return "n\(row)" }
+                if let raw = inputString(input[key]), !raw.isEmpty, raw.allSatisfy(\.isASCII), raw.allSatisfy(\.isNumber) {
+                    return "n" + raw
+                }
+            }
+            return inputString(input[key])
+        }
         func integer(_ key: String) -> Int? {
             switch input[key] {
             case .int(let value): return Int(value)
@@ -2013,14 +2306,25 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
             effect = .acquire
             let mode = string("mode") ?? "create"
             payload["mode"] = .string(mode)
-            if let value = string("initial_url") { payload["initialUrl"] = .string(value) }
+            // 09-24: acquire{url} opened a blank tab (the page agent then had no
+            // top frame); `url` is the address she means. An empty pair is absent.
+            if let value = [string("initial_url"), string("url")].compactMap({ $0 }).first(where: { !$0.isEmpty }) {
+                payload["initialUrl"] = .string(value)
+                // Only initial_url takes the X-post visible window by default;
+                // `url` stays a background tab unless she asks for a visible one.
+                if (string("initial_url") ?? "").isEmpty, mode == "create" {
+                    payload["renderingMode"] = .string("grouped_background")
+                }
+            }
             if let value = string("rendering_mode"),
                !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 // Preserve nonempty values exactly: the extension owns enum
                 // validation and must still reject invalid explicit choices.
                 payload["renderingMode"] = .string(value)
             }
-            if let value = integer("lease_duration_ms") { payload["leaseDurationMs"] = .int(Int64(value)) }
+            // 09-24: five minutes, sliding (every call renews it), so a live
+            // task never loses its tab; an idle tab still lapses on its own.
+            payload["leaseDurationMs"] = .int(Int64(integer("lease_duration_ms") ?? 300_000))
             if mode == "claim" {
                 if let value = integer("tab_id") { payload["tabId"] = .int(Int64(value)) }
                 payload["expectedTab"] = .object([
@@ -2047,7 +2351,9 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
             payload["leaseId"] = .string(string("lease_id") ?? "")
             // 2026-09-22: sent explicitly so an already-installed extension
             // (old 500 / 50,000 defaults) also gets the smaller page.
-            payload["maxNodes"] = .int(Int64(min(integer("max_nodes") ?? 80, 80)))
+            // 2026-09-23 (Phase 3): up to 200 for the slim text page (~90
+            // bytes a row); a caller that omits it still gets 80.
+            payload["maxNodes"] = .int(Int64(min(integer("max_nodes") ?? 80, 200)))
             payload["maxTextChars"] = .int(Int64(min(integer("max_text_chars") ?? 12_000, 40_000)))
             if let value = string("scope") { payload["scope"] = .string(value) }
         case "browser.chrome_click":
@@ -2135,11 +2441,15 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
             if let value = string("snapshot_id") { payload["snapshotId"] = .string(value) }
             if let value = string("node_id") { payload["nodeId"] = .string(value) }
             if let value = string("state") { payload["state"] = .string(value) }
-            if let value = integer("timeout_ms") { payload["timeoutMs"] = .int(Int64(value)) }
-            if let value = integer("settle_ms") { payload["settleMs"] = .int(Int64(value)) }
+            // 09-24: a long wait asked for is the longest one allowed, not a refusal.
+            if let value = integer("timeout_ms") { payload["timeoutMs"] = .int(Int64(min(max(value, 100), 10_000))) }
+            if let value = integer("settle_ms") { payload["settleMs"] = .int(Int64(min(max(value, 0), 2_000))) }
         case "browser.chrome_scroll":
             effect = .scroll
             payload = [
+                // 09-24 (User): a background tab renders for a scroll only while
+                // he is away — its debugging bar never shows while he works.
+                "renderHidden": .bool(macPersonAway()),
                 "leaseId": .string(string("lease_id") ?? ""),
                 "expectedUserSequence": .int(Int64(integer("expected_user_sequence") ?? -1)),
                 "deltaX": .int(Int64(integer("delta_x") ?? 0)),
@@ -2316,7 +2626,7 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
         case false: "not_ready"
         case nil: "unknown"
         }
-        return .object([
+        var envelope: [String: JSONValue] = [
             "status": .string(report.status),
             "active_path_status": .string(activePathStatus),
             "maintenance_status": .string(maintenanceStatus),
@@ -2329,7 +2639,12 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
             "maintenance_check_count": .int(Int64(maintenanceChecks.count)),
             "maintenance_check_ids": .array(maintenanceChecks.map { .string($0.id) }),
             "checks": .array(checks),
-        ])
+        ]
+        if activeProviderReady == false, let activeProviderID {
+            let target = InlineInteractionRegistry.canonicalProviderID(activeProviderID)
+            envelope["next"] = .string("raise request_interaction kind=api_key target=\(target)")
+        }
+        return .object(envelope)
     }
 
     private static func defaultTelegramStatusProvider() async throws -> JSONValue {
@@ -2382,6 +2697,9 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
             "poll_retry_transient": .bool(status.isTransientPollInterruption),
             "consecutive_poll_failures": .int(Int64(status.pollBackoffFailures ?? 0)),
         ]
+        if !status.tokenConfigured {
+            object["next"] = .string("raise request_interaction kind=connector target=telegram")
+        }
         object["model"] = status.model.map { .string($0) } ?? .null
         object["reasoning_effort"] = status.reasoningEffort.map { .string($0) } ?? .null
         object["last_seen_at"] = status.lastSeenAt.map { .string($0) } ?? .null
@@ -2418,7 +2736,7 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
         return (try JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
     }
 
-    private static func inputString(_ raw: JSONValue?) -> String? {
+    static func inputString(_ raw: JSONValue?) -> String? {
         switch raw {
         case .string(let s):
             return s

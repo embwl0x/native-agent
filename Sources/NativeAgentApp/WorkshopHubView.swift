@@ -59,6 +59,7 @@ struct DeskHubView: View {
                 }
             }
             .pickerStyle(.segmented)
+            .hazeTinted(.segments)
             .labelsHidden()
             .padding(.horizontal)
             .padding(.top)
@@ -152,6 +153,7 @@ struct NewWorkshopTaskSheet: View {
                     submit()
                 }
                 .buttonStyle(.borderedProminent)
+                .hazeTinted(.button)
                 .keyboardShortcut(.defaultAction)
                 .disabled(submitting || title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }

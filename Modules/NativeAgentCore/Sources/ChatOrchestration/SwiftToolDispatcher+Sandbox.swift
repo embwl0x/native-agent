@@ -637,8 +637,9 @@ extension SwiftToolDispatcher {
     func filePathMissEnvelope(
         tool: String,
         input: [String: JSONValue],
-        resultObject obj: [String: JSONValue]
-    ) -> JSONValue? {
+        resultObject obj: [String: JSONValue],
+        fullMac: Bool = false
+    ) async -> JSONValue? {
         guard case .string(let code)? = obj["error_code"], code == "file_not_found" else {
             return nil
         }
@@ -655,8 +656,49 @@ extension SwiftToolDispatcher {
                   let suggestion = Self.suggestedFullMacPathCorrection(for: rawPath) {
             out["suggested_path"] = .string(suggestion)
             hint = "This is a path lookup miss, not a Full Mac or Trust Center denial. Retry once with suggested_path."
+        } else if case .string(let error)? = obj["error"], let colon = error.range(of: ": /") {
+            // 2026-09-24: say what IS there, so a miss needs no list_dir to follow.
+            let missing = URL(fileURLWithPath: String(error[error.index(before: colon.upperBound)...]))
+            let folder = missing.deletingLastPathComponent()
+            var isDirectory: ObjCBool = false
+            // Only a folder the read itself could open is named from:
+            // Full Mac reads any non-sensitive folder; otherwise a trusted root.
+            var readable = fullMac
+            if !readable { readable = (try? await resolveTrustedFilePath(folder.path)) != nil }
+            var isFolder: ObjCBool = false
+            if FileManager.default.fileExists(atPath: missing.path, isDirectory: &isFolder) {
+                // "Not a directory" / "Not a file": it is there, only the wrong
+                // kind; naming it from its own folder said "X is not there, but X is".
+                hint = isFolder.boolValue ? "\(missing.path) is a folder, not a file. Use list_dir on it."
+                    : "\(missing.path) is a file, not a folder. Use read_file on it."
+            } else if !FileManager.default.fileExists(atPath: folder.path, isDirectory: &isDirectory) || !isDirectory.boolValue {
+                hint = "Not found, and its folder \(folder.path) does not exist either. Check the folder path."
+            } else if !connectorPathIsSensitiveData(folder, dataRoot: dataRoot),
+                      readable,
+                      let names = try? FileManager.default.contentsOfDirectory(atPath: folder.path) {
+                let stem = missing.deletingPathExtension().lastPathComponent.lowercased()
+                let near = names.filter { name in
+                    let other = (name as NSString).deletingPathExtension.lowercased()
+                    return !name.hasPrefix(".") && stem.count >= 3 && other.count >= 3 && (other.contains(stem) || stem.contains(other))
+                }.sorted().prefix(5)
+                // One same-named file with another extension is the answer.
+                let same = near.filter { ($0 as NSString).deletingPathExtension.lowercased() == stem }
+                let pick = same.count == 1 ? same.first : near.count == 1 ? near.first : nil
+                if let pick {
+                    let found = folder.appendingPathComponent(pick).path
+                    out["suggested_path"] = .string(found)
+                    out["nearby"] = .array(near.map { .string($0) })
+                    hint = "\(missing.lastPathComponent) is not there, but \(pick) is: \(found). Read suggested_path."
+                } else if !near.isEmpty {
+                    out["nearby"] = .array(near.map { .string($0) })
+                    hint = "\(missing.lastPathComponent) is not there. Close names in \(folder.path): " + near.joined(separator: ", ") + "."
+                } else {
+                    hint = "Not found. \(folder.path) has \(names.filter { !$0.hasPrefix(".") }.count) items, none named like that; list_dir with name_contains narrows it."
+                }
+            }
         }
         out["hint"] = .string(hint)
+        if out["suggested_path"] != nil || out["nearby"] != nil { out["message"] = .string(hint); out["reason"] = .string(hint) }
         return .object(out)
     }
 
@@ -787,19 +829,28 @@ extension SwiftToolDispatcher {
         if let publish = MacScreenPreviewBus.publish, let previewCaption {
             await publish(MacScreenPreviewUpdate(image: nil, caption: previewCaption, at: Date()))
         }
-        let verbs = MacFourVerbs(
+        // Her-screen Phase 6 — only `screen` may attach a window image.
+        let pixels = tool == "screen"
+            ? FourVerbPixelAttachment(part: str("part"), forced: input["pixels"] == .bool(true)) : nil
+        var verbs = MacFourVerbs(
             host: host,
             clock: SystemMacFourVerbsClock(),
             supplementalSource: SwiftToolDispatcherFourVerbPerceptionSource(
                 host: host,
                 liveScene: fourVerbLiveScene,
-                previewCaption: previewCaption
+                previewCaption: previewCaption,
+                pixels: pixels
             )
         )
+        let sighted = MacSightRecorder()
+        verbs.sightRecorder = sighted
         let reply: MacFourVerbsReply
         switch tool {
         case "screen":
-            reply = await verbs.screen(part: str("part"), app: str("app"), structured: input["structured"] == .bool(true))
+            let seen = await verbs.screen(part: str("part"), app: str("app"), structured: input["structured"] == .bool(true))
+            reply = seen.ok ? pixels?.attach().map {
+                MacFourVerbsReply(ok: true, text: seen.text + "\n" + $0, detail: seen.detail)
+            } ?? seen : seen
         case "act":
             // 2026-09-22: models send "" for unused fields; empty is absent, not a selection.
             let absent: [JSONValue?] = [nil, .null, .string("")]
@@ -811,6 +862,36 @@ extension SwiftToolDispatcher {
                 reply = await verbs.actSelection(verb: verb, handle: handle, frameID: frame,
                     text: input["text"].flatMap { if case .string(let text) = $0 { return text }; return nil },
                     direction: str("direction"))
+                break
+            }
+            // Her-screen Phase 5 — `steps`: a short ordered batch in one call.
+            // A plain string is shorthand for press (a key/chord → key, a
+            // name → click); an object is {verb, target, text?}.
+            if case .array(let rawSteps)? = input["steps"], !rawSteps.isEmpty {
+                let steps: [MacActStep] = try rawSteps.map { raw in
+                    switch raw {
+                    case .string(let name) where !name.trimmingCharacters(in: .whitespaces).isEmpty:
+                        return MacActStep(verb: "press", target: name)
+                    case .object(let rawStep):
+                        // "" is absent here too, so it never hides the field beside it.
+                        let step = rawStep.filter { $0.value != .string("") && $0.value != .null }
+                        // {verb:"key", text:"cmd+s"}: a key's chord may ride in text.
+                        guard case .string(let verb)? = step["verb"],
+                              case .string(let target)? = step["target"]
+                                ?? (["key", "press"].contains(verb) ? step["text"] : nil),
+                              !target.trimmingCharacters(in: .whitespaces).isEmpty else { break }
+                        var text: String?
+                        // `value` is the word the screen shows (`Save As text = …`).
+                        if case .string(let value)? = step["text"] ?? step["value"], !value.isEmpty { text = value }
+                        return MacActStep(verb: verb, target: target, text: text)
+                    default: break
+                    }
+                    throw AutonomyGateError.toolDenied(
+                        reason: "each step is a name (\"9\") or {verb, target, text?}; nothing was run"
+                    )
+                }
+                reply = await verbs.act(verb: "", target: "", app: str("app"),
+                                        front: input["front"] == .bool(true), steps: steps)
                 break
             }
             guard let verb = str("verb"), let target = str("target") else {
@@ -856,7 +937,11 @@ extension SwiftToolDispatcher {
                 interval: num("interval"),
                 holding: str("holding"),
                 button: str("button"),
-                scrollAmount: scrollAmount
+                scrollAmount: scrollAmount,
+                // Her-screen Phase 4 — act in that app's window in the back;
+                // `front: true` brings it forward briefly and puts it back.
+                app: str("app"),
+                front: input["front"] == .bool(true)
             )
         case "go":
             guard let name = str("name") ?? str("target") else {
@@ -879,6 +964,14 @@ extension SwiftToolDispatcher {
         if let publish = MacScreenPreviewBus.publish,
            let settled = MacScreenPreviewCaption.settled(tool: tool, input: input, ok: reply.ok) {
             await publish(MacScreenPreviewUpdate(image: nil, caption: settled, at: Date()))
+        }
+        // Her-screen 09-24 — a window she acted in shows on her home as one of
+        // "my windows". A look claims nothing (desk walk: `mac.look Calculator`
+        // made Calculator hers); it only refreshes a window already hers.
+        if let seen = sighted.last, tool == "act"
+            || (tool == "screen" && str("app") != nil
+                && HerScreen.touched(dataRoot: dataRoot, now: Date()).contains { $0.app == HerScreen.clip(seen.app, 40) }) {
+            HerScreen.touch(dataRoot: dataRoot, app: seen.app, kind: seen.kind, readouts: seen.readouts, before: seen.before)
         }
         var payload: [String: JSONValue] = [
             "ok": .bool(reply.ok),
@@ -1373,7 +1466,7 @@ extension SwiftToolDispatcher {
            ["file_changed", "bad_input", "window_too_small", "continuation_unavailable", "read_failed", "unsupported_file_type"].contains(code) {
             return result
         }
-        if let pathMiss = filePathMissEnvelope(tool: "read_file", input: input, resultObject: obj) {
+        if let pathMiss = await filePathMissEnvelope(tool: "read_file", input: input, resultObject: obj, fullMac: true) {
             return pathMiss
         }
         if case .string(let error)? = obj["error"] {
@@ -1389,7 +1482,7 @@ extension SwiftToolDispatcher {
         if case .string(let code)? = obj["error_code"], ["directory_changed", "bad_input"].contains(code) {
             return result
         }
-        if let pathMiss = filePathMissEnvelope(tool: "list_dir", input: input, resultObject: obj) {
+        if let pathMiss = await filePathMissEnvelope(tool: "list_dir", input: input, resultObject: obj, fullMac: true) {
             return pathMiss
         }
         if case .string(let error)? = obj["error"] {

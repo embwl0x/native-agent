@@ -32,6 +32,7 @@ public enum AgentMailActions {
                     "date": .string(string(message["received_at"]) ?? string(message["timestamp"]) ?? string(message["created_at"]) ?? ""),
                     "snippet": .string(String((string(message["preview"]) ?? string(message["snippet"]) ?? "").prefix(240))),
                     "thread_id": string(message["thread_id"]).map(JSONValue.string) ?? .null,
+                    "unread": .bool(stringList(message["labels"]).contains("unread")),
                 ])
             }
             return completed(actionId: "agentmail.list_inbox", fields: [
@@ -53,7 +54,7 @@ public enum AgentMailActions {
             let messageID = (string(input["message_id"]) ?? string(input["messageId"]) ?? string(input["id"]) ?? "")
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             guard !messageID.isEmpty else {
-                throw AgentMailError("missing_input", detail: "agentmail_read requires message_id.")
+                throw AgentMailError("missing_input", detail: "Say which message: pass the message_id from agentmail_list.")
             }
             let data = try await api(
                 method: "GET",
@@ -73,9 +74,9 @@ public enum AgentMailActions {
                 "cc": data["cc"] ?? .null,
                 "subject": .string(string(data["subject"]) ?? ""),
                 "date": .string(string(data["received_at"]) ?? string(data["timestamp"]) ?? string(data["created_at"]) ?? ""),
+                // One copy of the message: the plain text, else the HTML
+                // (the text/html duplicates doubled every read, 2026-09-24).
                 "body": .string(text.isEmpty ? html : text),
-                "text": .string(text),
-                "html": .string(html),
                 "labels": data["labels"] ?? .array([]),
             ])
         }
@@ -240,7 +241,7 @@ public enum AgentMailActions {
             .appendingPathComponent("secrets", isDirectory: true)
             .appendingPathComponent("agentmail.json")
         guard FileManager.default.fileExists(atPath: path.path) else {
-            throw AgentMailError("agentmail_not_configured", detail: "Missing data/secrets/agentmail.json.")
+            throw AgentMailError("agentmail_not_configured", detail: "AgentMail is not set up yet (no data/secrets/agentmail.json); ask the person to add its key.")
         }
         let raw = try Data(contentsOf: path)
         let parsed = try JSONValue.parse(raw)

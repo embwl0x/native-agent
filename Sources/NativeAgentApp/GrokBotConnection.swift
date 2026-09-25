@@ -359,7 +359,8 @@ enum GrokBotConnection {
                 guard case .string(let text)? = plan["text"], case .string(let id)? = plan["message_id"],
                       case .string(let conversation)? = plan["conversation_id"] else { return result("invalid", "Missing message.") }
                 return try await GrokBotRoute.send(peer: contact, text: text, conversation: conversation,
-                    messageID: id, dataRoot: dataRoot, credential: GrokLinkCredential.read(peer: peerID))
+                    messageID: id, dataRoot: dataRoot, credential: GrokLinkCredential.read(peer: peerID),
+                    quiet: PersonInitiatedSend.current?.admitted == true)
             case .string("grok_disconnect"):
                 guard contact.grokBootstrapConfirmed == true, contact.grokConversation != nil else {
                     _ = try store.remove(peerID)

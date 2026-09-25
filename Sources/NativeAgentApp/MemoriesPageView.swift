@@ -46,6 +46,12 @@
 //
 // MemoryView is untouched: the classic shell still renders it, and the
 // consolidate / hygiene / Spotlight-reindex menu lives there.
+//
+// Alive glass (2026-09-23), from AlivePageKit like Today and the Desk: the
+// rail page's frame draws the serif "Memories" and one counts sentence for
+// both tabs; the proposals sit in one waiting group card; the kept rows, the
+// search results and each fold's rows are group cards with hairlines between
+// rows. Same data, same actions, same ids.
 
 import SwiftUI
 import NativeAgentShared
@@ -188,6 +194,33 @@ enum MemoriesPageContent {
         }
     }
 
+    /// The serif header's one sentence (alive glass, 2026-09-23): numerals,
+    /// and the proposals named for what they are, memories to look at, never
+    /// "waiting on you" (Today and the Desk own that count). Nil until the
+    /// memories have been read: a page that has not looked says nothing.
+    static func headerLine(loaded: Bool, failed: Bool, kept: Int, toLookAt: Int) -> String? {
+        guard loaded else { return nil }
+        if failed { return "I couldn't refresh all my memories just now." }
+        let keep: String
+        switch kept {
+        case 0: keep = "I haven't kept anything yet."
+        case 1: keep = "I keep 1 memory."
+        default: keep = "I keep \(kept) memories."
+        }
+        guard toLookAt > 0 else { return keep }
+        return "\(keep) \(toLookAt) \(toLookAt == 1 ? "memory" : "memories") to look at."
+    }
+
+    @MainActor
+    static func headerLine(_ appModel: AppModel) -> String? {
+        let status = appModel.panelRefreshStatus[.memories]
+        return headerLine(
+            loaded: status != nil,
+            failed: status?.failedEndpoints.contains("memories") == true,
+            kept: appModel.memories.count,
+            toLookAt: appModel.memoryProposals.filter { $0.status == "pending" }.count)
+    }
+
     /// Pinned first, then newest. The same order the conversations list keeps.
     static func ordered(_ memories: [NativeAgentShared.MemoryRecord]) -> [NativeAgentShared.MemoryRecord] {
         memories.sorted { lhs, rhs in
@@ -288,8 +321,10 @@ struct MemoriesPageView: View {
 
     var body: some View {
         ScrollView {
-            LazyVStack(alignment: .leading, spacing: TodayMetrics.sectionSpacing) {
-                header
+            LazyVStack(alignment: .leading, spacing: AliveMetrics.sectionSpacing) {
+                // Under the rail page the frame draws the serif header (both
+                // tabs share its sentence); a bare page draws its own.
+                if !embedded { header }
 
                 MemoriesSearchField(text: $query)
 
@@ -313,7 +348,7 @@ struct MemoriesPageView: View {
                 if snapshot.memoryUnreadable {
                     Text("I couldn't read my memory just now.")
                         .font(.system(size: MemoriesPageMetrics.lineSize, weight: .medium))
-                        .foregroundStyle(NativeAgentShell.tertiary)
+                        .foregroundStyle(NativeAgentShell.secondary)
                         .padding(.top, 4)
                         .accessibilityIdentifier("memories.memory-trouble")
                 }
@@ -370,19 +405,15 @@ struct MemoriesPageView: View {
     private var memories: [NativeAgentShared.MemoryRecord] { appModel.memories }
 
     private var header: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            if !embedded {
-                Text("Memories")
-                    .font(ShellType.display)
-            }
-            Text(!snapshot.loaded ? "Reading my memories…"
-                 : snapshot.memoryUnreadable || appModel.panelRefreshStatus[.memories]?.failedEndpoints.contains("memories") == true
-                    ? "I couldn't refresh all my memories just now."
-                    : MemoriesPageContent.keptLine(memories.count))
-                .font(.system(size: MemoriesPageMetrics.lineSize, weight: .medium))
-                .foregroundStyle(NativeAgentShell.secondary)
-                .accessibilityIdentifier("memories.kept-line")
-        }
+        AlivePageHeader(
+            title: "Memories",
+            line: MemoriesPageContent.headerLine(
+                loaded: snapshot.loaded,
+                failed: snapshot.memoryUnreadable
+                    || appModel.panelRefreshStatus[.memories]?.failedEndpoints.contains("memories") == true,
+                kept: memories.count,
+                toLookAt: pendingProposals.count),
+            lineID: "memories.kept-line")
     }
 
     // MARK: search
@@ -420,30 +451,34 @@ struct MemoriesPageView: View {
 
     @ViewBuilder
     private var searchSection: some View {
-        DeskPageSectionLabel("What I found")
-        switch searchState {
-        case .searching:
-            Text("Looking\u{2026}")
-                .font(.system(size: MemoriesPageMetrics.lineSize, weight: .medium))
-                .foregroundStyle(NativeAgentShell.secondary)
-        case .unavailable:
-            // The reason is a backend sentence; the page says what it means.
-            Text("I couldn't search by meaning just now, and nothing matched the words either.")
-                .font(.system(size: MemoriesPageMetrics.lineSize, weight: .medium))
-                .foregroundStyle(NativeAgentShell.tertiary)
-                .accessibilityIdentifier("memories.search-trouble")
-        case .empty:
-            Text("Nothing I've kept matches that.")
-                .font(.system(size: MemoriesPageMetrics.lineSize, weight: .medium))
-                .foregroundStyle(NativeAgentShell.secondary)
-        case .results, .allMemories:
-            if found.isEmpty {
+        VStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
+            AliveEyebrow("What I found")
+            switch searchState {
+            case .searching:
+                Text("Looking\u{2026}")
+                    .font(.system(size: MemoriesPageMetrics.lineSize, weight: .medium))
+                    .foregroundStyle(NativeAgentShell.secondary)
+            case .unavailable:
+                // The reason is a backend sentence; the page says what it means.
+                Text("I couldn't search by meaning just now, and nothing matched the words either.")
+                    .font(.system(size: MemoriesPageMetrics.lineSize, weight: .medium))
+                    .foregroundStyle(NativeAgentShell.secondary)
+                    .accessibilityIdentifier("memories.search-trouble")
+            case .empty:
                 Text("Nothing I've kept matches that.")
                     .font(.system(size: MemoriesPageMetrics.lineSize, weight: .medium))
                     .foregroundStyle(NativeAgentShell.secondary)
-            } else {
-                ForEach(found, id: \.id) { memory in
-                    keptRow(memory)
+            case .results, .allMemories:
+                if found.isEmpty {
+                    Text("Nothing I've kept matches that.")
+                        .font(.system(size: MemoriesPageMetrics.lineSize, weight: .medium))
+                        .foregroundStyle(NativeAgentShell.secondary)
+                } else {
+                    AliveGroupCard {
+                        ForEach(found, id: \.id) { memory in
+                            keptRow(memory)
+                        }
+                    }
                 }
             }
         }
@@ -455,41 +490,24 @@ struct MemoriesPageView: View {
         appModel.memoryProposals.filter { $0.status == "pending" }
     }
 
-    /// Today's teal card, and only when something is actually pending.
+    /// Today's waiting card, and only when something is actually pending.
     private var waitingCard: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Text("Waiting for you")
-                .font(.system(size: MemoriesPageMetrics.metaSize, weight: .semibold))
-                .textCase(.uppercase)
-                .kerning(0.6)
-                .foregroundStyle(TodayPalette.accent)
-
-            ForEach(pendingProposals) { proposal in
-                if proposal.id != pendingProposals.first?.id {
-                    Divider().overlay(TodayPalette.hairline)
+        VStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
+            AliveEyebrow("Waiting for you")
+            AliveGroupCard(waiting: true) {
+                ForEach(pendingProposals) { proposal in
+                    MemoriesProposalRow(
+                        line: MemoriesPageContent.proposalLine(proposal),
+                        meta: MemoriesPageContent.proposalMeta(
+                            quote: snapshot.momentQuotes[proposal.proposal_id],
+                            staged: "staged \(MemoriesWhen.words(proposal.staged_at, now: now))"),
+                        onKeep: { decide(proposal, keep: true) },
+                        onNotNow: { decide(proposal, keep: false) }
+                    )
                 }
-                MemoriesProposalRow(
-                    line: MemoriesPageContent.proposalLine(proposal),
-                    meta: MemoriesPageContent.proposalMeta(
-                        quote: snapshot.momentQuotes[proposal.proposal_id],
-                        staged: "staged \(MemoriesWhen.words(proposal.staged_at, now: now))"),
-                    onKeep: { decide(proposal, keep: true) },
-                    onNotNow: { decide(proposal, keep: false) }
-                )
             }
+            .accessibilityIdentifier("memories.waiting-for-you")
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.vertical, 16)
-        .padding(.horizontal, 18)
-        .background(
-            RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
-                .fill(TodayPalette.waitingFill)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
-                .strokeBorder(TodayPalette.waitingStroke, lineWidth: 1)
-        )
-        .accessibilityIdentifier("memories.waiting-for-you")
     }
 
     // MARK: what I've kept
@@ -509,20 +527,21 @@ struct MemoriesPageView: View {
                     .padding(.top, 8)
             }
         } else {
-            DeskPageSectionLabel("What I've kept")
-            let shown = Array(ordered.prefix(MemoriesPageMetrics.keptShown))
-            ForEach(shown, id: \.id) { memory in
-                keptRow(memory)
+            VStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
+                AliveEyebrow("What I've kept")
+                AliveGroupCard {
+                    ForEach(Array(ordered.prefix(MemoriesPageMetrics.keptShown)), id: \.id) { memory in
+                        keptRow(memory)
+                    }
+                }
             }
             let rest = Array(ordered.dropFirst(MemoriesPageMetrics.keptShown))
             if !rest.isEmpty {
-                DeskPageFoldRow(
-                    title: "\(DeskPageWords.spelled(rest.count)) more",
-                    meta: nil,
-                    isOpen: binding(Fold.showAll)
-                ) {
-                    ForEach(rest, id: \.id) { memory in
-                        keptRow(memory)
+                MemoriesFold(title: "\(rest.count) more", isOpen: binding(Fold.showAll)) {
+                    AliveGroupCard {
+                        ForEach(rest, id: \.id) { memory in
+                            keptRow(memory)
+                        }
                     }
                 }
                 .accessibilityIdentifier("memories.show-all")
@@ -547,20 +566,20 @@ struct MemoriesPageView: View {
     private var deletedFold: some View {
         if !rejectedProposals.isEmpty {
             let count = rejectedProposals.count
-            DeskPageFoldRow(
-                title: "\(DeskPageWords.spelled(count)) \(DeskPageWords.plural(count, "thing I let go", "things I let go"))",
-                meta: nil,
+            MemoriesFold(
+                title: "\(count) \(DeskPageWords.plural(count, "thing I let go", "things I let go"))",
                 isOpen: binding(Fold.deleted)
             ) {
                 // Read-only on purpose: the classic page's Deleted tab has no
                 // restore, and MemoryV2 has no un-reject. A "Bring it back"
                 // button here would be a button that cannot do anything.
-                MemoriesRejectedHistory(proposals: rejectedProposals, shown: $rejectedShown) { proposal in
-                    fullText = MemoriesFullText(
-                        id: proposal.id, text: proposal.display_text ?? proposal.fact_text)
+                AliveGroupCard {
+                    MemoriesRejectedHistory(proposals: rejectedProposals, shown: $rejectedShown) { proposal in
+                        fullText = MemoriesFullText(
+                            id: proposal.id, text: proposal.display_text ?? proposal.fact_text)
+                    }
                 }
             }
-            .padding(.top, 4)
             .accessibilityIdentifier("memories.deleted")
         }
     }
@@ -660,19 +679,25 @@ struct MemoriesFullText: Identifiable, Equatable {
     var memoryID: String? = nil
 }
 
-/// The page's search box, in the shell's quiet fill rather than a system
-/// rounded-border field that belongs to a different app.
+/// The page's search box: a rounded quiet field on the card's fill and rim,
+/// not a system rounded-border field that belongs to a different app. Its
+/// glyphs are secondary: tertiary grey fails 4.5:1 where the haze peaks.
 struct MemoriesSearchField: View {
     @Binding var text: String
+    @FocusState private var focused: Bool
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
     var body: some View {
-        HStack(spacing: 8) {
+        let shape = RoundedRectangle(cornerRadius: 12, style: .continuous)
+        HStack(spacing: 10) {
             Image(systemName: "magnifyingglass")
-                .font(ShellType.labelMedium)
-                .foregroundStyle(NativeAgentShell.tertiary)
+                .font(.system(size: 14, weight: .medium))
+                .foregroundStyle(NativeAgentShell.secondary)
+                .accessibilityHidden(true)
             TextField("Search what I remember", text: $text)
                 .textFieldStyle(.plain)
-                .font(.system(size: MemoriesPageMetrics.lineSize))
+                .font(.system(size: 14))
+                .focused($focused)
                 .accessibilityIdentifier("memories.search")
             if !text.isEmpty {
                 Button {
@@ -680,27 +705,60 @@ struct MemoriesSearchField: View {
                 } label: {
                     Image(systemName: "xmark.circle.fill")
                         .font(ShellType.label)
-                        .foregroundStyle(NativeAgentShell.tertiary)
+                        .foregroundStyle(NativeAgentShell.secondary)
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel("Clear the search")
             }
         }
-        .padding(.vertical, 9)
-        .padding(.horizontal, 12)
-        .background(
-            RoundedRectangle(cornerRadius: MemoriesPageMetrics.rowRadius, style: .continuous)
-                .fill(NativeAgentShell.quietFill)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: MemoriesPageMetrics.rowRadius, style: .continuous)
-                .strokeBorder(NativeAgentShell.hairline, lineWidth: 1)
-        )
+        .padding(.horizontal, 14)
+        .frame(height: 38)
+        .background(shape.fill(reduceTransparency ? TodayPalette.cardFill : NativeAgentShell.quietFill))
+        // A focused field lifts its rim to the hairline; nothing animates.
+        .overlay(shape.strokeBorder(focused ? NativeAgentShell.hairline : AlivePalette.rim, lineWidth: 1))
+    }
+}
+
+/// A fold on the page: one quiet line (a count and a chevron) that opens its
+/// card beneath it. One gesture: one fade, one height change.
+struct MemoriesFold<Content: View>: View {
+    let title: String
+    @Binding var isOpen: Bool
+    @ViewBuilder let content: () -> Content
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
+            Button {
+                withAnimation(NativeAgentMotion.respecting(NativeAgentMotion.quick, reduceMotion: reduceMotion)) {
+                    isOpen.toggle()
+                }
+            } label: {
+                HStack(spacing: 6) {
+                    Text(title)
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(isOpen ? NativeAgentShell.text : NativeAgentShell.secondary)
+                    Image(systemName: "chevron.right")
+                        .font(ShellType.captionSemibold)
+                        .foregroundStyle(NativeAgentShell.secondary)
+                        .rotationEffect(.degrees(isOpen ? 90 : 0))
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityValue(isOpen ? "Open" : "Folded")
+            if isOpen {
+                content()
+                    .transition(NativeAgentMotion.reveal(reduceMotion: reduceMotion))
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
 /// One kept memory. A line and a meta line, uniform height; Read, Pin and
 /// Delete appear on hover, the way the conversations list reveals its pin.
+/// A row inside the group card: the card carries the chrome.
 struct MemoriesRowCard: View {
     let line: String
     let meta: String
@@ -713,19 +771,20 @@ struct MemoriesRowCard: View {
     @State private var confirmingDelete = false
 
     var body: some View {
-        HStack(alignment: .top, spacing: 10) {
+        HStack(alignment: .center, spacing: 10) {
             VStack(alignment: .leading, spacing: 3) {
                 Text(line.isEmpty ? "An empty note" : line)
-                    .font(.system(size: MemoriesPageMetrics.titleSize, weight: .medium))
+                    .font(.system(size: 15, weight: .medium))
                     .foregroundStyle(NativeAgentShell.text)
                     .lineLimit(1)
                     .truncationMode(.tail)
                 Text(meta)
-                    .font(.system(size: MemoriesPageMetrics.metaSize))
-                    .foregroundStyle(NativeAgentShell.tertiary)
+                    .font(.system(size: 13))
+                    .foregroundStyle(NativeAgentShell.secondary)
                     .lineLimit(1)
                     .truncationMode(.tail)
             }
+            .frame(height: TodayMetrics.rowContentHeight, alignment: .leading)
             Spacer(minLength: 8)
             HStack(spacing: 2) {
                 iconButton("doc.text.magnifyingglass", help: "Read the whole thing", action: onRead)
@@ -742,16 +801,7 @@ struct MemoriesRowCard: View {
             .opacity(hovering || isPinned ? 1 : 0)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.vertical, 12)
-        .padding(.horizontal, 14)
-        .background(
-            RoundedRectangle(cornerRadius: MemoriesPageMetrics.rowRadius, style: .continuous)
-                .fill(NativeAgentShell.quietFill)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: MemoriesPageMetrics.rowRadius, style: .continuous)
-                .strokeBorder(NativeAgentShell.hairline, lineWidth: 1)
-        )
+        .contentShape(Rectangle())
         .onHover { hovering = $0 }
         // The classic row's confirmation, kept: a delete cannot be undone.
         .confirmationDialog(
@@ -776,7 +826,7 @@ struct MemoriesRowCard: View {
         Button(action: action) {
             Image(systemName: symbol)
                 .font(ShellType.labelMedium)
-                .foregroundStyle(tint ?? NativeAgentShell.tertiary)
+                .foregroundStyle(tint ?? NativeAgentShell.secondary)
                 .frame(width: 22, height: 22)
                 .contentShape(Rectangle())
         }
@@ -795,25 +845,32 @@ struct MemoriesProposalRow: View {
     let onNotNow: () -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text(line)
-                .font(.system(size: MemoriesPageMetrics.lineSize, weight: .medium))
-                .fixedSize(horizontal: false, vertical: true)
-            Text(meta)
-                .font(.system(size: MemoriesPageMetrics.metaSize))
-                .foregroundStyle(NativeAgentShell.tertiary)
+        HStack(alignment: .center, spacing: 12) {
+            AliveWaitingDot()
+            VStack(alignment: .leading, spacing: 3) {
+                // The memory is read whole before it is kept: it wraps.
+                Text(line)
+                    .font(.system(size: 15, weight: .medium))
+                    .foregroundStyle(NativeAgentShell.text)
+                    .fixedSize(horizontal: false, vertical: true)
+                Text(meta)
+                    .font(.system(size: 13))
+                    .foregroundStyle(NativeAgentShell.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 12)
             HStack(spacing: 8) {
-                Button("Keep", action: onKeep)
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.small)
-                    .tint(TodayPalette.accent)
-                    .accessibilityIdentifier("memories.waiting.keep")
                 Button("Don't keep", action: onNotNow)
                     .buttonStyle(.bordered)
                     .controlSize(.small)
                     .accessibilityIdentifier("memories.waiting.not-now")
-                Spacer(minLength: 0)
+                Button("Keep", action: onKeep)
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .hazeTinted(.button)
+                    .accessibilityIdentifier("memories.waiting.keep")
             }
+            .fixedSize()
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
@@ -834,7 +891,7 @@ struct MemoriesRejectedHistory: View {
                         title: MemoriesPageContent.line(proposal.display_text ?? proposal.fact_text),
                         line: "", meta: "I didn't keep this")
                     Image(systemName: "doc.text.magnifyingglass")
-                        .foregroundStyle(NativeAgentShell.tertiary)
+                        .foregroundStyle(NativeAgentShell.secondary)
                 }
                 .contentShape(Rectangle())
             }

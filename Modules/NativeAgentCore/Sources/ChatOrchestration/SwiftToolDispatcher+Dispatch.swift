@@ -609,7 +609,7 @@ extension SwiftToolDispatcher {
                 mode: .read,
                 fixHint: "Toggle Read ON for Calendar in Settings → Mac Integration.",
                 input: input,
-                run: { bridge, input in try await bridge.calendarListUpcoming(input: input) }
+                run: { bridge, input in HerLifePulse.noted("calendar", try await bridge.calendarListUpcoming(input: input)) }
             )
         case "mac_reminders_list_due_today":
             return try await dispatchMacIntegrationTool(
@@ -618,7 +618,7 @@ extension SwiftToolDispatcher {
                 mode: .read,
                 fixHint: "Toggle Read ON for Reminders in Settings → Mac Integration.",
                 input: input,
-                run: { bridge, input in try await bridge.remindersListDueToday(input: input) }
+                run: { bridge, input in HerLifePulse.noted("reminders", try await bridge.remindersListDueToday(input: input)) }
             )
         case "mac_notify":
             return try await dispatchMacIntegrationTool(
@@ -708,7 +708,7 @@ extension SwiftToolDispatcher {
                 run: { bridge, input in try await bridge.contactsCreateOrUpdate(input: input) }
             )
         case "mail_list_recent":
-            return try await dispatchMacIntegrationTool(
+            let inbox = try await dispatchMacIntegrationTool(
                 tool: tool, surface: surface,
                 integration: MacIntegrationID.mail,
                 mode: .read,
@@ -716,6 +716,8 @@ extension SwiftToolDispatcher {
                 input: input,
                 run: { bridge, input in try await bridge.mailListRecent(input: input) }
             )
+            HerMailStatus.shared.note(inbox) // home's mail count, no read of its own
+            return inbox
         case "mail_search":
             return try await dispatchMacIntegrationTool(
                 tool: tool, surface: surface,

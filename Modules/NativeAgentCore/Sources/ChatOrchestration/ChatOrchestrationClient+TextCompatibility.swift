@@ -1,5 +1,6 @@
 import Foundation
 import CryptoKit
+import Context
 import NativeAgentCore
 import PersistenceCore
 import PersonaEngine
@@ -105,6 +106,16 @@ extension SwiftNativeChatOrchestrationClient {
         let runId = runIdOverride ?? UUID().uuidString
         ChatTurnExecution.current?.bindHistoryRunID(runId)
         func persistCompatibilityPartial(_ text: String, cancelled: Bool) async {
+            // Every Stop on this lane ends here. Only the rarely-taken thrown
+            // CancellationError catch used to trace it, so a stopped turn read
+            // as running until the reconciler called it abandoned hours later
+            // (telegram 65cac0c6 / 3d47175a, 09-23: 403 minutes).
+            if cancelled {
+                TurnTraceBus.fireFromContext(
+                    kind: "turn.cancelled", surface: surface,
+                    payload: .object(["where": .string("text_compat.persist_partial")])
+                )
+            }
             await persistPartialIfNeeded(
                 sessionId: resolvedSession,
                 runId: runId,
@@ -115,6 +126,19 @@ extension SwiftNativeChatOrchestrationClient {
                 onNotice: { kind, text in continuation.yield(.notice(kind: kind, text: text)) }
             )
         }
+        // The exits before the tool loop (user row, history prep, context
+        // build) end the turn too. A Telegram steer during the context build
+        // left no terminal row, so the turn read as running until the
+        // reconciler called it abandoned (telegram d84d1e7d, 09-24: 411 min).
+        func traceEarlyExit(_ stage: String, _ error: Error) {
+            let stopped = error is CancellationError || Task.isCancelled
+            var payload: [String: JSONValue] = ["where": .string("text_compat.\(stage)")]
+            if !stopped { payload["reason"] = .string(String(String(describing: error).prefix(200))) }
+            TurnTraceBus.fireFromContext(
+                kind: stopped ? "turn.cancelled" : "turn.failed", surface: surface,
+                payload: .object(payload)
+            )
+        }
         let outputMilestoneGate = TurnLifecycleFirstOutputGate()
         TurnLifecycleTelemetry.emit(
             .turnAccepted,
@@ -122,16 +146,11 @@ extension SwiftNativeChatOrchestrationClient {
             sessionId: resolvedSession,
             observedBy: "text_compat.entry"
         )
-        let cancelFlagPath = dataRoot
-            .appendingPathComponent("chat", isDirectory: true)
-            .appendingPathComponent("sessions", isDirectory: true)
-            .appendingPathComponent(resolvedSession, isDirectory: true)
-            .appendingPathComponent("cancelled.flag")
-        // Clear only the marker inherited from a PRIOR turn, at the same
-        // acceptance boundary as the structured provider lane. A Stop written
-        // after acceptance must remain observable while persistence/context
-        // work is in flight; clearing it later can erase a real remote Stop.
-        try? FileManager.default.removeItem(at: cancelFlagPath)
+        // The session's Stop marker, keyed by this run: a Stop names the runs
+        // in flight, so a PRIOR turn's Stop cannot kill this one and a turn
+        // accepted right after a Stop no longer erases it (ChatCancelFlag).
+        let cancelFlagPath = ChatCancelFlag.accept(dataRoot: dataRoot, sessionId: resolvedSession, runId: runId)
+        defer { ChatCancelFlag.finish(cancelFlagPath) }
         // Native vision: image attachments become per-turn DYNAMIC image blocks
         // on the CURRENT user message; the model sees the RAW message text (no
         // stringified suffix). Empty → byte-identical wire shape.
@@ -160,10 +179,12 @@ extension SwiftNativeChatOrchestrationClient {
                     mechanicalRow: ChatTurnExecution.transcriptRowKind
                 )
             } catch is CancellationError {
+                traceEarlyExit("persist_user", CancellationError())
                 continuation.yield(.error("cancelled"))
                 continuation.finish()
                 return
             } catch {
+                traceEarlyExit("persist_user", error)
                 continuation.yield(.error("persist user turn failed: \(error)"))
                 continuation.finish()
                 return
@@ -182,6 +203,7 @@ extension SwiftNativeChatOrchestrationClient {
                 runId: runId
             )
         } catch {
+            traceEarlyExit("history_prep", error)
             continuation.yield(.error("cancelled"))
             continuation.finish()
             return
@@ -440,8 +462,15 @@ extension SwiftNativeChatOrchestrationClient {
         final class TurnContextBox: @unchecked Sendable {
             private let lock = NSLock()
             private var value: TurnContext?
-            func set(_ ctx: TurnContext) { lock.lock(); if value == nil { value = ctx }; lock.unlock() }
+            private var latestFluid: ContextPreparedTurn?
+            func set(_ ctx: TurnContext) {
+                lock.lock(); if value == nil { value = ctx }; latestFluid = ctx.fluidContextTurn; lock.unlock()
+            }
             func get() -> TurnContext? { lock.lock(); defer { lock.unlock() }; return value }
+            /// The packet the model was last shown — `context_expand` reads
+            /// its pointers. This lane never bound it, so every expand on the
+            /// Claude/Kimi text lane said context_generation_unavailable.
+            func fluidTurn() -> ContextPreparedTurn? { lock.lock(); defer { lock.unlock() }; return latestFluid }
         }
         let turnContextBox = TurnContextBox()
         // User, 2026-09-06: the typed error behind an engine-yielded
@@ -467,8 +496,9 @@ extension SwiftNativeChatOrchestrationClient {
         // iteration (QA2/QA3/QA6 pin that carrier byte-for-byte). Kimi
         // native lane exempt for its tools-array refresh.
         let reuseTurnContext = !ridesNativeTools && appendOnlyEligible
-        let onTurnContextBuilt: (@Sendable (TurnContext) -> Void)? =
-            reuseTurnContext ? { @Sendable ctx in turnContextBox.set(ctx) } : nil
+        // Always recorded (the fluid packet feeds context_expand); only the
+        // reuse lane reads the context itself back.
+        let onTurnContextBuilt: (@Sendable (TurnContext) -> Void)? = { @Sendable ctx in turnContextBox.set(ctx) }
 
         // v2Prefix (2026-09-01) — the conversation-prefix shape FOR THIS TURN.
         //
@@ -590,10 +620,12 @@ extension SwiftNativeChatOrchestrationClient {
                         .toolSchemaFingerprint(seed.context.toolSchemas)
                 )
             } catch is CancellationError {
+                traceEarlyExit("context_build", CancellationError())
                 continuation.yield(.error("cancelled"))
                 continuation.finish()
                 return
             } catch {
+                traceEarlyExit("context_build", error)
                 // Same terminal shape streamTurn's own build failure produces —
                 // an honest error event, not a silent degrade to a shape the
                 // caller did not ask for.
@@ -812,8 +844,10 @@ extension SwiftNativeChatOrchestrationClient {
                             ?? LLMError.providerError(message: m)
                         if case .outputLengthLimit = classified as? LLMError {
                             reachedLengthLimit = true
-                            accumulated = ToolCallParser.visiblePrefix(in: accumulated + iterAccumulated, invoke: true)
-                            loopRecoveryReply = LLMError.outputLengthLimitNotice
+                            // 2026-09-23: keep the prose (loop tail trimmed), then the notice.
+                            let cut = RunawayOutputDetector.cutoffReply(accumulated + iterAccumulated)
+                            accumulated = ToolCallParser.visiblePrefix(in: ToolCallParser.stripToolUseMarkers(cut.kept), invoke: true)
+                            loopRecoveryReply = cut.notice
                             exhaustedToolLoop = true
                             break toolLoop
                         }
@@ -903,11 +937,8 @@ extension SwiftNativeChatOrchestrationClient {
                     }
                 }
             } catch is CancellationError {
+                // Traced as turn.cancelled by the didCancel persist below.
                 didCancel = true
-                TurnTraceBus.fireFromContext(
-                    kind: "turn.cancelled", surface: surface,
-                    payload: .object(["where": .string("text_compat.\(#line)")])
-                )
                 continuation.yield(.error("cancelled"))
             } catch {
                 // Same ladder as the engine-yielded sibling above, on a TYPED
@@ -916,8 +947,10 @@ extension SwiftNativeChatOrchestrationClient {
                 // (User, 2026-09-06).
                 if case .outputLengthLimit = error as? LLMError {
                     reachedLengthLimit = true
-                    accumulated = ToolCallParser.visiblePrefix(in: accumulated + iterAccumulated, invoke: true)
-                    loopRecoveryReply = LLMError.outputLengthLimitNotice
+                    // 2026-09-23: keep the prose (loop tail trimmed), then the notice.
+                    let cut = RunawayOutputDetector.cutoffReply(accumulated + iterAccumulated)
+                    accumulated = ToolCallParser.visiblePrefix(in: ToolCallParser.stripToolUseMarkers(cut.kept), invoke: true)
+                    loopRecoveryReply = cut.notice
                     exhaustedToolLoop = true
                     break toolLoop
                 }
@@ -1018,7 +1051,7 @@ extension SwiftNativeChatOrchestrationClient {
                 // so a Stop sets didCancel and falls into the persistence
                 // block below instead of unwinding.
                 let stopped = { Task.isCancelled
-                    || FileManager.default.fileExists(atPath: cancelFlagPath.path) }
+                    || ChatCancelFlag.isRaised(cancelFlagPath) }
                 if stopped() {
                     didCancel = true
                 } else {
@@ -1316,6 +1349,7 @@ extension SwiftNativeChatOrchestrationClient {
                     prepared: preparedCalls,
                     modelId: model,
                     surface: surface,
+                    fluidContextTurn: turnContextBox.fluidTurn(),
                     tools: gated,
                     progress: { event in
                         if case .notice(let kind, let text) = event {
@@ -1362,7 +1396,12 @@ extension SwiftNativeChatOrchestrationClient {
                     input: call.dispatchInput,
                     result: slot.result
                 ))
-                let resultJSON = (try? redactedResult.serialize(pretty: false)) ?? "null"
+                // A text result is shown as text, as the native lane does (her
+                // home screen is laid-out lines; JSON quoting flattens it). Its
+                // lines cannot pose as another result block or a tool call.
+                let resultJSON: String
+                if case .string(let text) = redactedResult { resultJSON = UntrustedText.neutralized(text) }
+                else { resultJSON = (try? redactedResult.serialize(pretty: false)) ?? "null" }
                 let providerResultJSON = await ProviderToolResultProjection.project(
                     toolName: call.internalName,
                     content: resultJSON,
@@ -1374,7 +1413,7 @@ extension SwiftNativeChatOrchestrationClient {
                 let toolResultBlock = """
 
                 NativeAgent tool result #\(index + 1) for \(call.internalName)\(ok ? "" : " (failed)"):
-                \(providerResultJSON)
+                \(providerResultJSON)\(index < calls.count && calls[index].wroteResult ? Self.modelWrittenResultNote : "")
                 """
                 if ridesNativeTools {
                     if index < nativeCalls.count {
@@ -1501,7 +1540,7 @@ extension SwiftNativeChatOrchestrationClient {
             if stopForNoProgress { break toolLoop }
         }
 
-        if reachedLengthLimit && (Task.isCancelled || FileManager.default.fileExists(atPath: cancelFlagPath.path)) {
+        if reachedLengthLimit && (Task.isCancelled || ChatCancelFlag.isRaised(cancelFlagPath)) {
             await persistCompatibilityPartial(accumulated, cancelled: true)
             continuation.yield(.error("cancelled"))
             continuation.finish()

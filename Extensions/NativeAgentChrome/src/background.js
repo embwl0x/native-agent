@@ -702,16 +702,53 @@ async function scrollPage(payload, actionId) {
     ...payload,
     nodeId: payload.targetNodeId,
   }) : { frameId: 0, localSnapshotId: payload.snapshotId, localNodeId: undefined };
-  return performSnapshotMutation({
-    lease, route, payload, actionId, action: "scroll",
-    pageMessage: {
-      type: "nativeagent.page.scroll",
-      snapshotId: route.localSnapshotId,
-      targetNodeId: route.localNodeId,
-      deltaX: payload.deltaX,
-      deltaY: payload.deltaY,
-    },
-  });
+  // Only when the host says the person is away (idle or locked): the
+  // debugging bar must never appear while they are using the Mac.
+  const stopRendering = payload.renderHidden === true ? await renderWhileHidden(lease.tabId) : async () => {};
+  try {
+    return await performSnapshotMutation({
+      lease, route, payload, actionId, action: "scroll",
+      pageMessage: {
+        type: "nativeagent.page.scroll",
+        snapshotId: route.localSnapshotId,
+        targetNodeId: route.localNodeId,
+        deltaX: payload.deltaX,
+        deltaY: payload.deltaY,
+      },
+    });
+  } finally {
+    await stopRendering();
+  }
+}
+
+// 2026-09-24: a background tab never renders, so an infinite feed (X) never
+// sees its scroll, intersection or animation-frame callbacks and stops
+// loading. For the length of one scroll, DevTools focus emulation makes the
+// hidden tab render as if shown (Chrome counts it as captured) while it stays
+// a background tab, off the person's screen. Chrome shows its "started
+// debugging this browser" bar while attached; it goes when this detaches. A
+// tab with DevTools or another debugger already attached keeps the old path.
+async function renderWhileHidden(tabId) {
+  const none = async () => {};
+  if (!chrome.debugger) return none;
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    if (tab.active) {
+      const window = await chrome.windows.get(tab.windowId);
+      if (window.state !== "minimized") return none;
+    }
+    const target = { tabId };
+    await chrome.debugger.attach(target, "1.3");
+    try {
+      await chrome.debugger.sendCommand(target, "Emulation.setFocusEmulationEnabled", { enabled: true });
+    } catch {
+      await chrome.debugger.detach(target).catch(() => {});
+      return none;
+    }
+    return async () => { await chrome.debugger.detach(target).catch(() => {}); };
+  } catch {
+    return none;
+  }
 }
 
 async function sendPageMessage(tabId, message, options = undefined) {
@@ -803,7 +840,9 @@ async function waitForTabComplete(tabId, timeoutMs, requireCurrent = () => {}) {
       try {
         requireCurrent();
         if (tab.id !== tabId) throw new ProtocolError("tab_identity_changed", "Chrome returned a different tab identity.");
-        if (tab.status === "complete") finish(null, tab);
+        // A pending URL means the old page (a new tab's about:blank) still
+        // reads complete before the new one commits: not this navigation's end.
+        if (tab.status === "complete" && !tab.pendingUrl) finish(null, tab);
       } catch (error) { finish(error); }
     }
     function listener(updatedTabId, changeInfo, tab) {

@@ -8,9 +8,17 @@ enum AgentWorkspaceHumanProjection {
             return .init(title: "Conversations with you", content: result, items: [], actions: [])
         }
         if case .array(let conversations)? = row["conversations"] {
-            let items = conversations.compactMap { value -> AgentWorkspaceItem? in
-                guard case .object(let item) = value, case .string(let id)? = item["conversation_session_id"] else { return nil }
-                let title = text(item["title"]) ?? "Conversation with you"
+            // 2026-09-23 (her screen): titles from content, not raw bridge
+            // text; two that read the same get who and when.
+            let rows = conversations.compactMap { value -> [String: JSONValue]? in
+                guard case .object(let item) = value, item["conversation_session_id"] != nil else { return nil }
+                return item
+            }
+            let named = rows.map { HerScreen.humanTitle(text($0["title"]) ?? "Conversation with you", agentName: nil) }
+            let titles = HerScreen.disambiguate(named.map(\.title), who: named.map(\.who),
+                at: rows.map { text($0["updated_at"]).flatMap(HerScreen.date) })
+            let items = zip(rows, titles).compactMap { item, title -> AgentWorkspaceItem? in
+                guard case .string(let id)? = item["conversation_session_id"] else { return nil }
                 let location = AgentWorkspaceLocation.record(tool: "chat_conversations",
                     input: ["conversation_session_id": .string(id)], title: title)
                 let previous = AgentWorkspaceChanges.identity(location: location).flatMap { key in observations.first { $0.identity == key } }
@@ -37,7 +45,8 @@ enum AgentWorkspaceHumanProjection {
         }
         actions.append(.init(label: "Read latest exchange", action: .open(.record(tool: "chat_conversations",
             input: input, title: text(row["title"]) ?? "Conversation with you"))))
-        return .init(title: text(row["title"]) ?? "Conversation with you", content: result, items: [], actions: actions)
+        return .init(title: text(row["title"]).map { HerScreen.humanTitle($0, agentName: nil).title } ?? "Conversation with you",
+                     content: result, items: [], actions: actions)
     }
 
     private static func text(_ value: JSONValue?) -> String? {

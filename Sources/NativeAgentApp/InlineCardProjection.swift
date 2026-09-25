@@ -74,10 +74,22 @@ enum InlineCardProjection {
             // comment: the scoped model choice's own second label is an
             // affirmative and is surfaced in `scopeLines` instead.
             secondaryLabel: "Not now",
-            consequence: interaction.declineConsequence,
+            // Something to connect says what skipping costs in one plain line,
+            // whatever words the ask arrived with.
+            consequence: [.connector, .apiKey].contains(interaction.kind)
+                ? "If you skip, \(descriptor.displayName) stays off."
+                : interaction.declineConsequence,
             state: cardState,
             persistenceNote: interaction.persistenceNote,
-            field: field(descriptor),
+            fields: fields(descriptor),
+            signInLabel: InlineInteractionRegistry.providerSignIn(for: descriptor.target)
+                .flatMap { descriptor.control == .providerAPIKey ? "Sign in with \($0.displayShort)" : nil }
+                // GitHub signs in by device flow in Connectors' sheet; the
+                // token field stays as the alternative.
+                ?? (isGitHubSignIn(descriptor) ? "Connect with GitHub" : nil),
+            // Slack's mention rule, Telegram's users list and the like live on
+            // the full page; the card never pretends to hold them.
+            fullSetupLabel: descriptor.control == .connectorManualToken ? "Open full setup" : nil,
             choices: interaction.options.map {
                 InlineCardChoice(
                     id: $0.id, title: $0.label, note: $0.detail,
@@ -101,8 +113,9 @@ enum InlineCardProjection {
             detailsBody: rendersAsReceipt(cardState)
                 ? nil : details(interaction, descriptor)?.body,
             busyLabel: busyLabel(interaction.kind),
-            outcome: outcome(interaction, deadControl: deadControl, repeatCount: repeatCount).text,
-            outcomeMeta: outcome(interaction, deadControl: deadControl, repeatCount: repeatCount).meta
+            busyNote: busyNote(descriptor.control),
+            outcome: outcome(interaction, deadControl: deadControl, repeatCount: repeatCount, name: descriptor.displayName).text,
+            outcomeMeta: outcome(interaction, deadControl: deadControl, repeatCount: repeatCount, name: descriptor.displayName).meta
                 ?? (deadControl ? descriptor.unavailableReason : nil),
             // The working card owns Stop; a need is waiting on a person, and
             // there is nothing running to stop.
@@ -161,18 +174,27 @@ enum InlineCardProjection {
         }
     }
 
-    /// The only value a card collects itself. A key typed here is written
-    /// through Providers' own configure call and then VERIFIED with Providers,
-    /// so the field is a real control, not a decoration. Every other control
-    /// opens the sheet or writer that already owns the value.
-    private static func field(_ descriptor: InlineInteractionDescriptor) -> InlineCardField? {
-        guard descriptor.control == .providerAPIKey else { return nil }
-        return InlineCardField(
-            label: "\(descriptor.displayName) API key",
-            placeholder: "Paste the key",
-            helper: "Stored in your Mac's Keychain, never in this conversation.",
-            isSecret: true
-        )
+    /// The values a card collects itself: a provider's key (or Claude's setup
+    /// token), and a manual-token connector's own setup fields. Each is
+    /// written through its owner's own save and then VERIFIED with that owner,
+    /// so a field is a real control, not a decoration.
+    private static func fields(_ descriptor: InlineInteractionDescriptor) -> [InlineCardField] {
+        switch descriptor.control {
+        case .connectorManualToken:
+            return InlineConnectorSetup.fields(for: descriptor.target)
+        case .providerAPIKey:
+            let signIn = InlineInteractionRegistry.providerSignIn(for: descriptor.target)
+            // Signing in is the only way into this one: no field at all.
+            if signIn != nil, signIn?.pasteLabel == nil { return [] }
+            return [InlineCardField(
+                label: signIn?.pasteLabel ?? "\(descriptor.displayName) API key",
+                placeholder: "Paste the key",
+                helper: "Your key stays on this Mac. It never goes into the chat.",
+                isSecret: true
+            )]
+        default:
+            return []
+        }
     }
 
     /// The consequential detail, on the face of the card: exactly what a grant
@@ -261,10 +283,22 @@ enum InlineCardProjection {
         switch descriptor.control {
         case .internetAccounts:
             return ("What happens", "Internet Accounts opens so you can add and enable a Mail account.")
+        case .chromeSetup:
+            return ("What happens",
+                    "Chrome control is switched on in Trust, the extension folder shows in Finder "
+                    + "and Chrome opens its extensions page. There, " + chromeSteps)
+        case .pairDevice:
+            return ("What happens",
+                    "The pairing page opens. Open NativeAgent on your iPhone, then choose Pair "
+                    + "here when the codes match.")
+        case .connectorManualToken where isGitHubSignIn(descriptor):
+            return ("What happens",
+                    "GitHub opens in your browser with a code to approve; nothing is connected "
+                    + "until GitHub says so. A pasted token works too. The chat never sees either.")
         case .connectorManualToken:
             return ("What happens",
-                    "\(name)'s own setup opens here, with its token field. "
-                    + "The token goes to Connectors; this conversation never sees it.")
+                    "What you paste is checked with \(name) and saved by Connectors, the same "
+                    + "as its setup page does. The chat never sees it.")
         case .connectorOAuth:
             return ("What happens",
                     "Your browser opens to sign in to \(name). "
@@ -281,9 +315,14 @@ enum InlineCardProjection {
             return ("What happens",
                     "Providers opens on the \(name) group so you can pick the model there.")
         case .providerAPIKey:
+            if InlineInteractionRegistry.providerSignIn(for: descriptor.target) != nil {
+                return ("What happens",
+                        "Signing in opens your browser, the same sign-in as onboarding. "
+                        + "Nothing counts as done until \(name) is ready in Providers.")
+            }
             return ("What happens",
-                    "The key is saved to \(name) in Providers, then checked. "
-                    + "A key \(name) rejects does not count as done.")
+                    "The key is checked with \(name), then saved in Providers. "
+                    + "A key \(name) rejects is not saved and does not count as done.")
         case .capabilityFlag:
             return ("What happens",
                     "\(name) is switched on in Trust, the same switch as the one on that page.")
@@ -292,12 +331,33 @@ enum InlineCardProjection {
         }
     }
 
+    private static func isGitHubSignIn(_ descriptor: InlineInteractionDescriptor) -> Bool {
+        descriptor.control == .connectorManualToken
+            && InlineInteractionRegistry.canonicalConnectorID(descriptor.target) == "github"
+    }
+
+    /// The one thing to click, for a card that waits on the person
+    /// somewhere else and settles by itself when the owner says done.
+    static let chromeSteps = "turn on Developer mode, click Load unpacked and choose the "
+        + "\u{201C}\(ChromeExtensionFolder.visible.lastPathComponent)\u{201D} folder in your home folder."
+
+    private static func busyNote(_ control: InlineInteractionDescriptor.Control) -> String? {
+        switch control {
+        case .internetAccounts: return "Add and turn on a Mail account in Internet Accounts."
+        case .chromeSetup: return "In Chrome\u{2019}s extensions page, " + chromeSteps
+        case .pairDevice: return "Open NativeAgent on your iPhone, then choose Pair when the codes match."
+        case .macPermissionGrant, .capabilityFlag:
+            return "If System Settings opened, turn NativeAgent on there."
+        default: return nil
+        }
+    }
+
     private static func busyLabel(_ kind: InlineInteraction.Kind) -> String {
         switch kind {
         case .connector: return "Connecting…"
         case .permission: return "Allowing…"
         case .modelChoice: return "Switching…"
-        case .apiKey: return "Saving…"
+        case .apiKey: return "Connecting…"
         case .capability: return "Turning on…"
         case .choose, .unknown: return "Working…"
         }
@@ -309,7 +369,8 @@ enum InlineCardProjection {
     private static func outcome(
         _ interaction: InlineInteraction,
         deadControl: Bool,
-        repeatCount: Int = 1
+        repeatCount: Int = 1,
+        name: String = ""
     ) -> (text: String?, meta: String?) {
         // The same ask, answered the same way, several times in a row is ONE
         // thing that happened — not five. The count rides on the receipt line
@@ -323,6 +384,9 @@ enum InlineCardProjection {
         case .settled(let settled):
             return (counted(settled.summary.isEmpty ? interaction.title : settled.summary),
                     settled.scope == .thisRequestOnly ? "This request only" : nil)
+        case .declined where [.connector, .apiKey].contains(interaction.kind) && !name.isEmpty:
+            // Something to connect, skipped: the account's name, one word.
+            return (counted("\(name) skipped"), nil)
         case .declined:
             // ONE gray line: the mark, "Not now", and what that cost. NEVER
             // the title - "Connect Notion" beside a cross reads as a thing

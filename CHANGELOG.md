@@ -4,6 +4,35 @@ Reverse-chronological. Each phase: 1–2 lines.
 
 ---
 
+## 0.4.18 — a desktop of its own, and a simpler way in (2026-09-25)
+
+- First run: opens in Simple view; the agent asks what it should be and how it should sound (energetic, calm, playful, blunt, or like someone you name) and saves both; its first hello offers card-led setup by talking. The agent's name holds across relaunch; a failed first hello retries.
+
+### Look
+- Drifting coloured light behind the window with a colour setting; every page rebuilt in one calmer style; Simple view (the agent, its agents and helpers beside the chat) with a gear menu; Agent view shows the agent's desktop read-only.
+
+### The agent's desktop
+- Everything it can reach opens by name as a readable page; one Home with what changed and what waits on you; names open, never act; saved windows survive a restart.
+
+### One-call flows
+- Batched Mac steps checked one by one, real menu presses, never over the app you switched to; leaner browser reads, scroll shows only new rows, a page and a form in one step; music, reminders, calendar, quotes and mail answer in one call; X through the browser in a background tab; a web search from its desktop no longer opens a Google tab in your Chrome; a closed tab leaves the agent's desktop.
+
+### Tools
+- Natural inputs accepted with plain next steps; one-step tool discovery with families; clearer misses for files, GitHub, calendar and unconnected services; Gmail HTML, Notion truncation and reconnect.
+
+### Cards and connectors
+- In-chat cards for providers, connectors, Chrome, iPhone and macOS grants that settle on the real grant; GitHub sign-in by device flow with token paste kept; a network blip no longer ends the sign-in.
+
+### Context
+- Context window setting (Model default or Custom): 60% of the model's window, capped by Custom, used by every budget and the meter; the meter counts provider tokens and follows a bot's model.
+
+### Speech
+- Recollections no longer mint verbal habits; a repeated form is named across every session.
+
+### Reliability
+- Runaway replies stop early and keep their prose; first greeting retries honestly; Telegram chunks and connected-agent slots, retries and attachments hardened; bounded Mail lookups; lower idle CPU.
+- Stop stops the turn it was meant for, even one that started right after. Grok Bot follows up after 2 minutes, not 10, and a late answer still lands in the chat that asked. A desktop agent's conversation opens and continues after an unconfirmed send, and your own lines in an agent's thread show as yours. The people list no longer reads the Keychain on every row.
+
 ## 0.4.17 — a steadier agent that works well with others (2026-09-23)
 
 ### Other agents

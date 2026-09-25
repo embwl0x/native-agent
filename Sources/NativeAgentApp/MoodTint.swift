@@ -67,8 +67,11 @@ final class MoodTintWeather {
     static let timeConstantHours: Double = 4
 
     /// The clock the value moves on. Never faster: the damping is measured in
-    /// hours, so a faster sample buys nothing and costs a wake.
-    static let sampleSeconds: TimeInterval = 60
+    /// hours, so a faster sample buys nothing and costs a wake. Five minutes,
+    /// 2026-09-24: each reading walks the whole inner state (~165 ms CPU), which
+    /// at one a minute was most of the app's idle cost; at τ = 4 h a 5-minute
+    /// step moves the tint by ≤2% of the gap, still below anything visible.
+    static let sampleSeconds: TimeInterval = 300
 
     private static let levelKey = "uiMoodTintLevel"
 

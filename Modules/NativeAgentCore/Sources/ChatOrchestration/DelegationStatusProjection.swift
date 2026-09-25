@@ -113,6 +113,36 @@ final class DelegationDeliveryCache: @unchecked Sendable {
     }
 }
 
+/// Process-local parse reuse for job files and inbox tails: a file whose
+/// inode, size and modification time are unchanged is not read or parsed
+/// again. Projection (which depends on `now`) still runs on every read.
+final class DelegationFileCache: @unchecked Sendable {
+    private let lock = NSLock()
+    private var jobs: [String: [String: (stamp: String, object: [String: JSONValue])]] = [:]
+    private var tails: [String: (stamp: String, found: [String: String])] = [:]
+
+    static func stamp(_ url: URL) -> String? {
+        guard let a = try? FileManager.default.attributesOfItem(atPath: url.resolvingSymlinksInPath().path),
+              let inode = a[.systemFileNumber] as? NSNumber, let size = a[.size] as? NSNumber,
+              let modified = a[.modificationDate] as? Date else { return nil }
+        return "\(inode) \(size) \(modified.timeIntervalSinceReferenceDate) \((a[.posixPermissions] as? NSNumber)?.intValue ?? -1)"
+    }
+
+    /// The directory's last parsed files, handed over to be replaced whole.
+    func takeJobs(_ directory: String) -> [String: (stamp: String, object: [String: JSONValue])] {
+        lock.withLock { jobs.removeValue(forKey: directory) ?? [:] }
+    }
+    func putJobs(_ directory: String, _ files: [String: (stamp: String, object: [String: JSONValue])]) {
+        lock.withLock { jobs[directory] = files }
+    }
+    func tail(_ key: String, stamp: String) -> [String: String]? {
+        lock.withLock { tails[key].flatMap { $0.stamp == stamp ? $0.found : nil } }
+    }
+    func putTail(_ key: String, stamp: String, _ found: [String: String]) {
+        lock.withLock { tails[key] = (stamp, found) }
+    }
+}
+
 // MARK: - Delegation status projection (W2, upgrade campaign 2026-08 Track A)
 //
 // THE PROBLEM this closes: Agent delegates repo work to Claude (Claude Code)
@@ -595,6 +625,20 @@ public struct DelegationStatusProjector: Sendable {
 
     /// Inbox `field` for the given message ids, read from the file's last 512 KiB.
     public static func requestTexts(inbox url: URL, ids: Set<String>, field: String = "text") -> [String: String] {
+        // Every id's `field` in the tail, parsed once per file version.
+        let key = url.standardizedFileURL.path + "#" + field
+        let stamp = DelegationFileCache.stamp(url)
+        let all: [String: String]
+        if let stamp, let cached = fileCache.tail(key, stamp: stamp) {
+            all = cached
+        } else {
+            all = tailTexts(inbox: url, field: field)
+            if let stamp { fileCache.putTail(key, stamp: stamp, all) }
+        }
+        return all.filter { ids.contains($0.key) }
+    }
+
+    private static func tailTexts(inbox url: URL, field: String) -> [String: String] {
         guard let file = try? FileHandle(forReadingFrom: url) else { return [:] }
         defer { try? file.close() }
         let size = (try? file.seekToEnd()) ?? 0
@@ -607,7 +651,7 @@ public struct DelegationStatusProjector: Sendable {
             guard let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
                   let text = object[field] as? String, !text.isEmpty else { continue }
             for key in ["id", "messageId"] {
-                if let id = object[key] as? String, ids.contains(id) { found[id] = text }
+                if let id = object[key] as? String { found[id] = text }
             }
         }
         return found
@@ -623,6 +667,7 @@ public struct DelegationStatusProjector: Sendable {
     }
 
     private static let deliveryCache = DelegationDeliveryCache()
+    private static let fileCache = DelegationFileCache()
 
     /// Earliest future crossing of the same deadline/stall-seconds rules used
     /// by `stalled`. File events trigger immediate rereads while work moves;
@@ -661,9 +706,23 @@ public struct DelegationStatusProjector: Sendable {
         do { names = try FileManager.default.contentsOfDirectory(atPath: directory.path) }
         catch { availability.status = "unavailable"; return ([], availability) }
         var objects: [(URL, [String: JSONValue])] = []
+        let previous = fileCache.takeJobs(directory.path)
+        var parsedFiles: [String: (stamp: String, object: [String: JSONValue])] = [:]
         for name in names.filter({ $0.hasSuffix(".json") && !$0.hasPrefix(".") }).sorted() {
             let url = directory.appendingPathComponent(name)
-            guard sourceStatus(url, expected: .typeRegular) == "available", let data = try? Data(contentsOf: url) else {
+            guard sourceStatus(url, expected: .typeRegular) == "available" else {
+                availability.unreadableFiles += 1
+                continue
+            }
+            // Unchanged since the last read: reuse its parse.
+            let stamp = DelegationFileCache.stamp(url)
+            if let stamp, let cached = previous[name], cached.stamp == stamp {
+                parsedFiles[name] = cached
+                availability.readableRecords += 1
+                objects.append((url, cached.object))
+                continue
+            }
+            guard let data = try? Data(contentsOf: url) else {
                 availability.unreadableFiles += 1
                 continue
             }
@@ -671,9 +730,11 @@ public struct DelegationStatusProjector: Sendable {
                 availability.malformedRecords += 1
                 continue
             }
+            if let stamp { parsedFiles[name] = (stamp, object) }
             availability.readableRecords += 1
             objects.append((url, object))
         }
+        fileCache.putJobs(directory.path, parsedFiles)
         if availability.unreadableFiles > 0 || availability.malformedRecords > 0 { availability.status = "partial" }
         return (objects, availability)
     }
@@ -1013,6 +1074,9 @@ public struct DelegationStatusProjector: Sendable {
         row.recencyKey = firstDate(completedAt, liveness, startedAt, createdAt)
         Self.retainReply(string(job, "reply"), truncated: false, in: &row)
         row.acceptedMessageIDs = Set([Self.recordedLookupID(job["messageId"])].compactMap { $0 })
+        // What was sent, and why a failed run failed (a provider's error, else the runner's reason).
+        row.requestTextHead = head(string(payload, "text"))
+        if status == "failed" { row.executionError = head(string(job, "assistantError") ?? string(job, "reason")) }
         if delivery == "blocked", string(bridge, "reason") == "missing_origin_session" {
             row.deliveryReason = "missing_origin_session"
         }
@@ -1220,11 +1284,18 @@ public struct DelegationStatusProjector: Sendable {
     /// record still parses.
     static func date(_ iso: String?) -> Date? {
         guard let iso, !iso.isEmpty else { return nil }
-        let withFraction = ISO8601DateFormatter()
-        withFraction.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         if let d = withFraction.date(from: iso) { return d }
-        return ISO8601DateFormatter().date(from: iso)
+        return plainISO.date(from: iso)
     }
+
+    // ISO8601DateFormatter is documented thread-safe; configured once, never
+    // mutated. Building two per date call dominated each projection.
+    nonisolated(unsafe) private static let withFraction: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f
+    }()
+    nonisolated(unsafe) private static let plainISO = ISO8601DateFormatter()
 
     static func laterISO(_ a: String?, _ b: String?) -> String? {
         switch (date(a), date(b)) {

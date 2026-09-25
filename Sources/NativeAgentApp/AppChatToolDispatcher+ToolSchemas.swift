@@ -48,6 +48,12 @@ extension AppChatToolDispatcher {
                 ("description", .string(desc)),
             ])
         }
+        // 09-24: a form in one call; snapshot_id defaults to the last page read.
+        let fieldsSchema = obj([("type", .array([.string("object"), .string("string")])),
+            ("description", .string("Form fields to fill: {\"Email\": \"a@b.com\", \"Country\": \"Canada\", \"Remember me\": true}, keyed by the label or row number the page shows; or \"Email: a@b.com; Country: Canada\"."))])
+        let submitSchema = obj([("type", .array([.string("string"), .string("boolean")])),
+            ("description", .string("After filling: the button to click (label or row), or true to press Enter in the last field."))])
+        let snapshotDefault = "Optional: defaults to the page last read on this tab."
         func params(properties: [(String, JSONValue)], required: [String]) -> Data {
             let v = obj([
                 ("type", .string("object")),
@@ -103,9 +109,10 @@ extension AppChatToolDispatcher {
                 parametersJSON: params(
                     properties: [
                         ("page", enumStringSchema(
-                            QuietPages.ids,
-                            "Which page to draw, by the name on the rail."
+                            QuietPages.ids + QuietPages.drawOnly.map(\.id),
+                            "Which page to draw, by the name on the rail; simple is the Simple view, simple_settings_menu the same with its settings menu open."
                         )),
+                        ("height", intSchema("Height to draw at, 400 to 2400 points; 860 when omitted. A short height shows how the page behaves in a small window.")),
                     ],
                     required: ["page"]
                 )
@@ -148,7 +155,7 @@ extension AppChatToolDispatcher {
                             ["primary", "decline", "retry"],
                             "Required with an interaction_id, and only then: primary takes the card's own action, decline says \"not now\", retry re-runs a failed one. With target=composer the verb says what to do, so leave action out."
                         )),
-                        ("value", strSchema("The secret the card collects — an API key or a connector token. Never echoed back; the receipt says [redacted].")),
+                        ("value", strSchema("Never ask for a secret in chat: the person types keys and tokens into the card itself. Pass one here only if it reached you outside the conversation. Never echoed back; the receipt says [redacted].")),
                         ("choice", strSchema("The id of the option picked, for a choose or model_choice card. With target=composer and verb=set_model, the model id.")),
                         ("target", enumStringSchema(
                             ["composer"],
@@ -225,7 +232,7 @@ extension AppChatToolDispatcher {
             ),
             LLMToolSchema(
                 name: "browser.chrome_status",
-                description: "Check the real Chrome extension connection and Chrome control permission without opening apps or changing settings. A prepared folder or past connection is not proof the extension is currently loaded.",
+                description: "Whether the Chrome extension is connected right now and Chrome control is on. Navigate needs neither checked first: it says when Chrome is not connected.",
                 parametersJSON: params(properties: [], required: [])
             ),
             LLMToolSchema(
@@ -235,7 +242,7 @@ extension AppChatToolDispatcher {
             ),
             LLMToolSchema(
                 name: "browser.chrome_acquire",
-                description: "Open a real Chrome tab for this conversation. Creates an inactive background tab by default; claiming requires an exact tab id, URL, and title. Later Chrome calls can omit lease_id and expected_user_sequence to use this conversation's current tab. Routine activity renews its live lease automatically; expired or user-yielded tabs are never reclaimed. Chrome control must be on in Trust Center.",
+                description: "Rarely needed: browser.chrome_navigate{url} opens and manages its own tab. Use to claim an exact existing tab (mode claim, tab_id, expected_url) or to open an X post in the visible work window. Leases slide: each call keeps the tab for five more idle minutes.",
                 parametersJSON: params(
                     properties: [
                         ("mode", enumStringSchema(["create", "claim"], "Create an inactive tab in the purple NativeAgent group alongside the user's tabs in their existing Chrome window, or claim an exact existing user tab. Defaults create; never claim a user tab just to start ordinary browsing.")),
@@ -251,10 +258,10 @@ extension AppChatToolDispatcher {
             ),
             LLMToolSchema(
                 name: "browser.chrome_renew",
-                description: "Explicitly extend a live Chrome tab lease. Normal browsing already renews the lease near its deadline; routine work does not require renewal calls. Idle expiry and user takeover are respected. Omit lease_id and expected_user_sequence for this conversation's current tab.",
+                description: "Rarely needed: every Chrome call already keeps its tab alive (five idle minutes, sliding). Extends this conversation's tab lease now.",
                 parametersJSON: params(
                     properties: [
-                        ("lease_id", nullable(strSchema("Optional exact lease; omit to use this verified conversation’s current Chrome tab."))),
+                        ("lease_id", nullable(strSchema("Optional; omit for this chat's tab."))),
                         ("expected_user_sequence", nullable(intSchema("Optional observed user sequence; omit for this conversation's current tab. Renewal refuses user takeover."))),
                         ("lease_duration_ms", intSchema("New lease duration from 30000 through 300000 milliseconds. Defaults 60000.")),
                     ],
@@ -263,23 +270,26 @@ extension AppChatToolDispatcher {
             ),
             LLMToolSchema(
                 name: "browser.chrome_navigate",
-                description: "Navigate this conversation's current Chrome tab without activating it. Omit lease_id and expected_user_sequence to retain the tab opened or read in this conversation; explicit IDs still select a specific tab.",
+                description: "Open a web page and read it in one call: loads the URL in this conversation's own background Chrome tab (opened and kept for you) and returns its main content as numbered rows. Move down with browser.chrome_scroll. Add fields and submit to fill and send a form in the same call.",
                 parametersJSON: params(
                     properties: [
-                        ("lease_id", nullable(strSchema("Optional exact lease; omit to use this verified conversation’s current Chrome tab."))),
-                        ("expected_user_sequence", nullable(intSchema("Optional exact sequence; omit for this conversation's current tab."))),
+                        ("lease_id", nullable(strSchema("Optional; omit for this chat's tab."))),
+                        ("expected_user_sequence", nullable(intSchema("Optional; omit."))),
                         ("url", strSchema("HTTP(S) destination.")),
+                        ("fields", fieldsSchema),
+                        ("submit", submitSchema),
+                        ("scope", enumStringSchema(["main_content", "page"], "Returned page: main_content (default) or page to include the site's nav.")),
                     ],
                     required: ["url"]
                 )
             ),
             LLMToolSchema(
                 name: "browser.chrome_snapshot",
-                description: "Read a fresh structured Chrome page: bounded text, article/container hierarchy and actionable node IDs. Choose main_content to read visible semantic main/article regions without navigation and sidebar links consuming the budget; page reads the whole viewport. Neither scope claims offscreen content is loaded. Use parentNodeId to distinguish repeated controls under different posts/articles; aria-labelledby names are resolved. Layout-only wrappers and password values are omitted. After navigation or a stale-node refusal, read again; never guess IDs or repeat a possibly dispatched external action. Page text comes only from returned nodes; use main_content to read an article.",
+                description: "Rarely needed: navigate, scroll and every act already return the page. Re-reads the current Chrome page as numbered rows `n role label [state]`; act on a row by its number or label. scope page adds the site's nav; only what is on screen is read, so move with browser.chrome_scroll.",
                 parametersJSON: params(
                     properties: [
-                        ("lease_id", nullable(strSchema("Optional exact lease; omit to use this verified conversation’s current Chrome tab."))),
-                        ("max_nodes", intSchema("Maximum structured nodes, 1 through 80. Defaults 80.")),
+                        ("lease_id", nullable(strSchema("Optional; omit for this chat's tab."))),
+                        ("max_nodes", intSchema("Maximum rows, 1 through 200. Defaults 150.")),
                         ("max_text_chars", intSchema("Maximum readable text characters, 1 through 40000. Defaults 12000.")),
                         ("scope", enumStringSchema(["page", "main_content"], "Page viewport or semantic main/article content within it. A main_content read reports when no semantic content region was found; use page to retain surrounding controls.")),
                     ],
@@ -288,24 +298,24 @@ extension AppChatToolDispatcher {
             ),
             LLMToolSchema(
                 name: "browser.chrome_click",
-                description: "Click one actionable node from the exact structured Chrome snapshot that exposed it.",
+                description: "Click one row of the current Chrome page by its number or label (\"Sign in\"). Waits for any navigation it starts and returns the fresh page; no snapshot call needed.",
                 parametersJSON: params(
                     properties: [
-                        ("lease_id", nullable(strSchema("Optional exact lease; omit to use this verified conversation’s current Chrome tab."))),
-                        ("expected_user_sequence", nullable(intSchema("Optional exact sequence; omit to retain the sequence observed for this conversation’s current tab."))),
-                        ("snapshot_id", strSchema("Exact snapshot id.")),
-                        ("node_id", strSchema("Exact actionable node id.")),
+                        ("lease_id", nullable(strSchema("Optional; omit for this chat's tab."))),
+                        ("expected_user_sequence", nullable(intSchema("Optional; omit."))),
+                        ("snapshot_id", strSchema(snapshotDefault)),
+                        ("node_id", strSchema("Row number from the page, or the row's label.")),
                     ],
-                    required: ["snapshot_id", "node_id"]
+                    required: ["node_id"]
                 )
             ),
             LLMToolSchema(
                 name: "browser.chrome_scroll",
-                description: "Scroll the leased real Chrome page or a scrollable node from a structured snapshot without activation. Reports actual movedX/movedY, scrolled=false when unchanged, and vertical remainingUp/remainingDown plus atTop/atBottom. These are immediate position observations, not proof a dynamic feed finished loading. Read a fresh snapshot after scrolling; use the named scrollable container for nested feeds.",
+                description: "The way to move on a Chrome page: scrolls it (or a scrollable row) by delta_y pixels and returns only the rows that came into view, with how far it moved and what is left below. Nothing moved says so.",
                 parametersJSON: params(
                     properties: [
-                        ("lease_id", nullable(strSchema("Optional exact lease; omit to use this verified conversation’s current Chrome tab."))),
-                        ("expected_user_sequence", nullable(intSchema("Optional exact sequence; omit to retain the sequence observed for this conversation’s current tab."))),
+                        ("lease_id", nullable(strSchema("Optional; omit for this chat's tab."))),
+                        ("expected_user_sequence", nullable(intSchema("Optional; omit."))),
                         ("snapshot_id", strSchema("Snapshot id when targeting a node. For page scrolling omit both optional IDs or supply both as empty strings.")),
                         ("target_node_id", strSchema("Optional scrollable node id. Node scrolling requires both exact IDs from a fresh snapshot.")),
                         ("delta_x", intSchema("Horizontal scroll delta.")),
@@ -316,99 +326,97 @@ extension AppChatToolDispatcher {
             ),
             LLMToolSchema(
                 name: "browser.chrome_fill",
-                description: "Replace the value of an editable non-password node from the exact current Chrome snapshot. Returns one outcome receipt and never retries an ambiguous dispatch.",
+                description: "Fill a form on the current Chrome page in one call: fields {label or row: value} sets text boxes, selects and checkboxes in page order, then submit clicks the button (or true presses Enter). Every field is found before anything is typed. Or one row: node_id + value. Returns what was filled plus the fresh page; never retries an ambiguous dispatch.",
                 parametersJSON: params(
                     properties: [
-                        ("lease_id", nullable(strSchema("Optional exact lease; omit to use this verified conversation’s current Chrome tab."))),
-                        ("expected_user_sequence", nullable(intSchema("Optional exact sequence; omit to retain the sequence observed for this conversation’s current tab."))),
-                        ("snapshot_id", strSchema("Exact current snapshot id.")),
-                        ("node_id", strSchema("Editable node id that advertised fill.")),
-                        ("value", strSchema("Replacement text, at most 50000 characters.")),
+                        ("lease_id", nullable(strSchema("Optional; omit for this chat's tab."))),
+                        ("expected_user_sequence", nullable(intSchema("Optional; omit."))),
+                        ("fields", fieldsSchema),
+                        ("submit", submitSchema),
+                        ("snapshot_id", strSchema(snapshotDefault)),
+                        ("node_id", strSchema("One editable row: its number or label.")),
+                        ("value", strSchema("Replacement text for node_id, at most 50000 characters.")),
                     ],
-                    required: ["snapshot_id", "node_id", "value"]
+                    required: []
                 )
             ),
             LLMToolSchema(
                 name: "browser.chrome_type",
-                description: "Append text sequentially to an editable non-password node from the exact current Chrome snapshot. Runs up to 20 seconds or the remaining lease and returns exact Unicode progress. For partial completion, observe a fresh snapshot and continue only the remaining text; never resend the original full text blindly.",
+                description: "Append text to an editable row (number or label), up to 20 s; returns typed progress and the fresh page. On partial progress send only the rest, never the whole text again.",
                 parametersJSON: params(
                     properties: [
-                        ("lease_id", nullable(strSchema("Optional exact lease; omit to use this verified conversation’s current Chrome tab."))),
-                        ("expected_user_sequence", nullable(intSchema("Optional exact sequence; omit to retain the sequence observed for this conversation’s current tab."))),
-                        ("snapshot_id", strSchema("Exact current snapshot id.")),
-                        ("node_id", strSchema("Editable node id that advertised type.")),
+                        ("lease_id", nullable(strSchema("Optional; omit for this chat's tab."))),
+                        ("expected_user_sequence", nullable(intSchema("Optional; omit."))),
+                        ("snapshot_id", strSchema(snapshotDefault)),
+                        ("node_id", strSchema("Editable row: its number or label.")),
                         ("text", strSchema("Text to append, at most 50000 characters.")),
                         ("delay_ms", intSchema("Optional delay between characters, 0 through 250 milliseconds.")),
                     ],
-                    required: ["snapshot_id", "node_id", "text"]
+                    required: ["node_id", "text"]
                 )
             ),
             LLMToolSchema(
                 name: "browser.chrome_select",
-                description: "Select one or more exact option values from the select.options list in a fresh Chrome snapshot. That list includes labels, values, selected/disabled state and option groups (up to 100, with explicit truncation). Disabled or changed choices refuse. Form controls expose formState.required, valid and failures; correct invalid fields and observe again before submission. Returns one outcome receipt.",
+                description: "Choose options in a select row by value or label (shown as label=value, * selected). Returns the fresh page.",
                 parametersJSON: params(
                     properties: [
-                        ("lease_id", nullable(strSchema("Optional exact lease; omit to use this verified conversation’s current Chrome tab."))),
-                        ("expected_user_sequence", nullable(intSchema("Optional exact sequence; omit to retain the sequence observed for this conversation’s current tab."))),
-                        ("snapshot_id", strSchema("Exact current snapshot id.")),
-                        ("node_id", strSchema("Select node id that advertised select.")),
-                        ("values", stringArraySchema("One or more exact option values; single-select nodes require exactly one.")),
+                        ("lease_id", nullable(strSchema("Optional; omit for this chat's tab."))),
+                        ("expected_user_sequence", nullable(intSchema("Optional; omit."))),
+                        ("snapshot_id", strSchema(snapshotDefault)),
+                        ("node_id", strSchema("Select row: its number or label.")),
+                        ("values", stringArraySchema("Option values or labels; single-select rows take exactly one.")),
                     ],
-                    required: ["snapshot_id", "node_id", "values"]
+                    required: ["node_id", "values"]
                 )
             ),
             LLMToolSchema(
                 name: "browser.chrome_keypress",
-                description: "Press one bounded key or chord on a non-password node from the exact current frame-aware Chrome snapshot. Returns one outcome receipt and never retries an ambiguous dispatch.",
+                description: "Press a key or chord in a row (number or label): Enter, Tab, Escape, arrows, a single character like j or /. To move down the page use browser.chrome_scroll. Verified by what changed; returns the fresh page.",
                 parametersJSON: params(
                     properties: [
-                        ("lease_id", nullable(strSchema("Optional exact lease; omit to use this verified conversation’s current Chrome tab."))),
-                        ("expected_user_sequence", nullable(intSchema("Optional exact sequence; omit to retain the sequence observed for this conversation’s current tab."))),
-                        ("snapshot_id", strSchema("Exact current snapshot id.")),
-                        ("node_id", strSchema("Node id that advertised keypress.")),
-                        ("key", enumStringSchema([
-                            "Enter", "Tab", "Shift+Tab", "Escape", "ArrowDown", "ArrowUp",
-                            "ArrowLeft", "ArrowRight", "Home", "End", "PageUp", "PageDown",
-                            "Backspace", "Delete", "Space", "Control+A", "Meta+A"
-                        ], "Bounded key or chord.")),
+                        ("lease_id", nullable(strSchema("Optional; omit for this chat's tab."))),
+                        ("expected_user_sequence", nullable(intSchema("Optional; omit."))),
+                        ("snapshot_id", strSchema(snapshotDefault)),
+                        ("node_id", strSchema("Row to press in: its number or label.")),
+                        ("key", strSchema("Enter, Tab, Shift+Tab, Escape, ArrowDown/Up/Left/Right, Home, End, PageUp, PageDown, Backspace, Delete, Space, Control+A, Meta+A, or one character (j, k, /).")),
                     ],
-                    required: ["snapshot_id", "node_id", "key"]
+                    required: ["node_id", "key"]
                 )
             ),
             LLMToolSchema(
                 name: "browser.chrome_set_checked",
-                description: "Idempotently set a checkbox, radio, or switch node from the exact current frame-aware Chrome snapshot. Returns one outcome receipt.",
+                description: "Set a checkbox, radio or switch row on or off (idempotent). Returns the fresh page.",
                 parametersJSON: params(
                     properties: [
-                        ("lease_id", nullable(strSchema("Optional exact lease; omit to use this verified conversation’s current Chrome tab."))),
-                        ("expected_user_sequence", nullable(intSchema("Optional exact sequence; omit to retain the sequence observed for this conversation’s current tab."))),
-                        ("snapshot_id", strSchema("Exact current snapshot id.")),
-                        ("node_id", strSchema("Checkable node id that advertised set_checked.")),
+                        ("lease_id", nullable(strSchema("Optional; omit for this chat's tab."))),
+                        ("expected_user_sequence", nullable(intSchema("Optional; omit."))),
+                        ("snapshot_id", strSchema(snapshotDefault)),
+                        ("node_id", strSchema("Checkable row: its number or label.")),
                         ("checked", boolSchema("Exact checked state to apply.")),
                     ],
-                    required: ["snapshot_id", "node_id", "checked"]
+                    required: ["node_id", "checked"]
                 )
             ),
             LLMToolSchema(
                 name: "browser.chrome_double_click",
-                description: "Double-click one node that advertised double_click in the exact current frame-aware Chrome snapshot. Returns one outcome receipt and never retries an ambiguous dispatch.",
+                description: "Double-click a row (number or label). Verified by what changed; returns the fresh page.",
                 parametersJSON: params(
                     properties: [
-                        ("lease_id", nullable(strSchema("Optional exact lease; omit to use this verified conversation’s current Chrome tab."))),
-                        ("expected_user_sequence", nullable(intSchema("Optional exact sequence; omit to retain the sequence observed for this conversation’s current tab."))),
-                        ("snapshot_id", strSchema("Exact current snapshot id.")),
-                        ("node_id", strSchema("Node id that advertised double_click.")),
+                        ("lease_id", nullable(strSchema("Optional; omit for this chat's tab."))),
+                        ("expected_user_sequence", nullable(intSchema("Optional; omit."))),
+                        ("snapshot_id", strSchema(snapshotDefault)),
+                        ("node_id", strSchema("Row: its number or label.")),
                     ],
-                    required: ["snapshot_id", "node_id"]
+                    required: ["node_id"]
                 )
             ),
             LLMToolSchema(
                 name: "browser.chrome_drag",
-                description: "Drag a node advertising drag onto a node advertising drop from one exact fresh Chrome snapshot and frame. Uses synthetic HTML drag events and the page's DataTransfer handlers without activating the tab. Target must accept dragover; dropDispatched is not proof of a successful move: read a fresh snapshot. Does not implement OS/file dragging or pointer-only canvas gestures; never retry an unknown outcome automatically.",
+                description: "Drag a node advertising drag onto a node advertising drop from one exact fresh Chrome snapshot and frame. Uses synthetic HTML drag events and the page's DataTransfer handlers without activating the tab. Target must accept dragover; dropDispatched is not proof of a successful move: check the returned page. Does not implement OS/file dragging or pointer-only canvas gestures; never retry an unknown outcome automatically.",
                 parametersJSON: params(
                     properties: [
-                        ("lease_id", nullable(strSchema("Optional exact source and target lease; omit for this conversation's current tab."))),
-                        ("expected_user_sequence", nullable(intSchema("Optional exact sequence; omit to retain the sequence observed for this conversation’s current tab."))),
+                        ("lease_id", nullable(strSchema("Optional; omit for this chat's tab."))),
+                        ("expected_user_sequence", nullable(intSchema("Optional; omit."))),
                         ("snapshot_id", strSchema("Fresh snapshot containing both endpoints.")),
                         ("node_id", strSchema("Source node advertising drag.")),
                         ("target_node_id", strSchema("Target node advertising drop; acceptance is checked during the operation.")),
@@ -418,11 +426,11 @@ extension AppChatToolDispatcher {
             ),
             LLMToolSchema(
                 name: "browser.chrome_wait",
-                description: "Wait a bounded time for a current snapshot node state or for leased-tab navigation to settle. Returns one observational outcome receipt.",
+                description: "Wait up to 10 s for the tab to settle or a row to become visible/hidden/enabled/disabled. Rarely needed: acts already wait for navigation.",
                 parametersJSON: params(
                     properties: [
-                        ("lease_id", nullable(strSchema("Optional exact lease; omit to use this verified conversation’s current Chrome tab."))),
-                        ("expected_user_sequence", nullable(intSchema("Optional exact sequence; omit to retain the sequence observed for this conversation’s current tab."))),
+                        ("lease_id", nullable(strSchema("Optional; omit for this chat's tab."))),
+                        ("expected_user_sequence", nullable(intSchema("Optional; omit."))),
                         ("condition", enumStringSchema(["element_state", "navigation_settled"], "Wait condition.")),
                         ("snapshot_id", strSchema("Exact current snapshot id for element_state.")),
                         ("node_id", strSchema("Node id that advertised wait for element_state.")),
@@ -435,10 +443,10 @@ extension AppChatToolDispatcher {
             ),
             LLMToolSchema(
                 name: "browser.chrome_release",
-                description: "Release a real Chrome tab lease. Claimed and active tabs remain open; an untouched inactive agent-created tab closes by default.",
+                description: "Optional: an idle tab closes on its own after five minutes. Closes this conversation's tab now (a claimed or active tab stays open).",
                 parametersJSON: params(
                     properties: [
-                        ("lease_id", nullable(strSchema("Optional exact lease; omit to release this conversation's current tab."))),
+                        ("lease_id", nullable(strSchema("Optional; omit for this chat's tab."))),
                         ("close_created_tab", obj([("type", .array([.string("boolean"), .string("null")])),
                                                    ("description", .string("Close an inactive agent-created tab. Defaults true."))])),
                     ],

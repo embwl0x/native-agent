@@ -2,16 +2,17 @@
 //
 // SetupView used to end in a door ("All settings") that pushed the old grouped
 // Form in SlimSettingsView. The door is going away, so the sections that were
-// behind it come onto the page in the page's own card format — the exact shape
-// of `SetupView.appearanceRow` (SetupView.swift:573-592): a semibold title and
-// one 13pt sentence pinned to `SetupMetrics.restCardContentHeight`, a spacer,
-// and the control on the trailing edge, inside `SetupCardShell`.
+// behind it come onto the page in the page's own row format (`SetupRow`,
+// SetupView.swift): a 14pt title and one 12pt sentence pinned to
+// `SetupMetrics.rowContentHeight`, a spacer, and the control on the trailing
+// edge. Alive glass (2026-09-23): the rows sit inside group cards —
+// `.everyday` joins the "And the rest" card, `.app` is its own section.
 //
 // NOTHING IS FORKED. Every card here reads and writes the SAME storage, the
 // SAME controller and the SAME presentation types the Form rows used, so the
 // two surfaces can never disagree:
 //   Global shortcut   → HotkeyControlView          (SlimSettingsView.swift:325)
-//   Chat compaction   → nativeagent.compactionThresholdTokens
+//   Context window    → nativeagent.contextWindowMode + nativeagent.compactionThresholdTokens
 //                                                  (SlimSettingsView.swift:330-359)
 //   Updates           → UpdateController.shared + SoftwareUpdateRowPresentation
 //                                                  (SlimSettingsView.swift:405-415)
@@ -28,24 +29,39 @@ import SwiftUI
 import NativeAgentCore
 
 struct SetupRestRows: View {
-    /// The gap between cards on the Settings page (`SetupView.body`, the
-    /// `VStack(alignment: .leading, spacing: 22)`).
-    private static let cardSpacing: CGFloat = 22
+    enum Part { case everyday, app }
+    /// `.everyday` is bare rows for a group card the page owns; `.app` is a
+    /// whole section of its own.
+    let part: Part
 
     // The app menu and every Settings surface share one Sparkle scheduler.
     @State private var updateController = UpdateController.shared
     @State private var tourReplayCoordinator = OnboardingTourReplayCoordinator.shared
     @AppStorage("nativeagent.showTour") private var showTour = false
-    // User-selected transcript threshold ceiling. The shared compactor clamps
-    // this to 60% of the active model window, so a smaller-window model still
-    // compacts before the configured ceiling becomes unsafe.
+    // Her context window (ChatSessionAutocompactionConfig.effectiveWindowTokens):
+    // the model's default is 60% of its window; Custom is this size, still never
+    // past 60% of the active model's window. An empty mode reads as Custom once
+    // a size is saved, the same rule `productionDefault` applies.
     @AppStorage("nativeagent.compactionThresholdTokens") private var compactionThresholdTokens = 200_000
+    @AppStorage("nativeagent.contextWindowMode") private var contextWindowMode = ""
+    @Environment(AppModel.self) private var appModel
     @State private var dataLimitsFailure: String?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: Self.cardSpacing) {
+        switch part {
+        case .everyday:
+            // Bare rows, no container and no modifiers: the caller's group
+            // card takes each one as its own row.
+            hazeRow
             shortcutRow
             compactionRow
+        case .app:
+            appSection
+        }
+    }
+
+    private var appSection: some View {
+        SetupSection(title: "Updates and help") {
             updatesRow
             helpRow
             aboutRow
@@ -60,6 +76,18 @@ struct SetupRestRows: View {
             Button("OK", role: .cancel) {}
         } message: {
             Text(dataLimitsFailure ?? "The data-limits reference is unavailable.")
+        }
+    }
+
+    // MARK: Haze
+
+    private var hazeRow: some View {
+        SetupRestCard(
+            title: "Haze",
+            detail: "The colour of the soft light drifting behind the window.",
+            identifier: "setup.rest.haze"
+        ) {
+            HazeSwatches()
         }
     }
 
@@ -79,7 +107,7 @@ struct SetupRestRows: View {
             Toggle("Global shortcut", isOn: $hotkeyEnabled)
                 .labelsHidden()
                 .toggleStyle(.switch)
-                .tint(NativeAgentBrand.accent)
+                .hazeTinted()
                 .onChange(of: hotkeyEnabled) { _, newValue in
                     GlobalHotkeyManager.shared.setEnabled(newValue)
                 }
@@ -87,33 +115,55 @@ struct SetupRestRows: View {
         }
     }
 
-    // MARK: Chat compaction
+    // MARK: Context window
+
+    /// The name this install's agent goes by, never a fixed one.
+    private var agentName: String { AgentVoice(name: appModel.agentDisplayName).name }
+
+    private var isCustomWindow: Binding<Bool> {
+        Binding(
+            get: {
+                contextWindowMode == "custom" || (contextWindowMode.isEmpty
+                    && UserDefaults.standard.integer(forKey: "nativeagent.compactionThresholdTokens") > 0)
+            },
+            set: { contextWindowMode = $0 ? "custom" : "model" }
+        )
+    }
 
     private var compactionRow: some View {
         SetupRestCard(
-            title: "Chat compaction",
-            detail: "The largest a transcript grows before it is compacted; a smaller context window compacts earlier.",
+            title: "Context window",
+            detail: "How much \(agentName) keeps in mind before compacting. On a model with a smaller window, \(agentName) uses 60% of that model's window.",
             identifier: "setup.rest.compaction"
         ) {
             HStack(spacing: 8) {
-                Text(Self.formatThresholdTokens(compactionThresholdTokens))
-                    .font(ShellType.label.monospaced())
-                    .foregroundStyle(NativeAgentShell.secondary)
-                    .accessibilityHidden(true)
-                // Same range, same step, same clamp story as the Form row.
-                Stepper("Auto-compact threshold",
-                        value: $compactionThresholdTokens,
-                        in: 50_000...500_000,
-                        step: 10_000)
-                    .labelsHidden()
-                    // NSStepper exposes its two visual arrows as separate,
-                    // unnamed AX buttons unless SwiftUI is told to present the
-                    // control as one adjustable element. VoiceOver then lands
-                    // once, announces the setting and value, and can adjust it.
-                    .accessibilityElement(children: .ignore)
-                    .accessibilityLabel("Auto-compact threshold")
-                    .accessibilityValue(Self.formatThresholdTokens(compactionThresholdTokens))
-                    .accessibilityHint("Adjusts the maximum chat transcript size before automatic compaction")
+                Picker("Context window", selection: isCustomWindow) {
+                    Text("Model default").tag(false)
+                    Text("Custom").tag(true)
+                }
+                .pickerStyle(.segmented)
+                .hazeTinted(.segments)
+                .labelsHidden()
+                .fixedSize()
+                if isCustomWindow.wrappedValue {
+                    Text(Self.formatThresholdTokens(compactionThresholdTokens))
+                        .font(ShellType.label)
+                        .foregroundStyle(NativeAgentShell.secondary)
+                        .accessibilityHidden(true)
+                    Stepper("Custom size",
+                            value: $compactionThresholdTokens,
+                            in: 50_000...500_000,
+                            step: 10_000)
+                        .labelsHidden()
+                        // NSStepper exposes its two visual arrows as separate,
+                        // unnamed AX buttons unless SwiftUI is told to present the
+                        // control as one adjustable element. VoiceOver then lands
+                        // once, announces the setting and value, and can adjust it.
+                        .accessibilityElement(children: .ignore)
+                        .accessibilityLabel("Custom context window size")
+                        .accessibilityValue(Self.formatThresholdTokens(compactionThresholdTokens))
+                        .accessibilityHint("Adjusts how much \(agentName) keeps in mind before compacting")
+                }
             }
         }
     }
@@ -215,17 +265,14 @@ struct SetupRestRows: View {
     }
 
     private static func formatThresholdTokens(_ n: Int) -> String {
-        if n >= 1_000_000 { return String(format: "%.1fM", Double(n) / 1_000_000) }
-        if n >= 1_000     { return String(format: "%dk",  n / 1_000) }
-        return "\(n)"
+        if n >= 1_000_000 { return String(format: "%.1fM tokens", Double(n) / 1_000_000) }
+        if n >= 1_000     { return String(format: "%dK tokens",  n / 1_000) }
+        return "\(n) tokens"
     }
 }
 
-/// One card, in the page's rest-card shape: `SetupCardShell`, a semibold title
-/// over one 13pt sentence held to `SetupMetrics.restCardContentHeight`, and the
-/// control on the trailing edge. Identical to `SetupView.appearanceRow`
-/// (SetupView.swift:573-592) — a second spelling of that shape is how a column
-/// starts reading ragged.
+/// One row, in the page's one row shape (`SetupRow`) — a second spelling of
+/// that shape is how a column starts reading ragged.
 private struct SetupRestCard<Control: View>: View {
     let title: String
     let detail: String
@@ -233,21 +280,38 @@ private struct SetupRestCard<Control: View>: View {
     @ViewBuilder var control: Control
 
     var body: some View {
-        SetupCardShell {
-            HStack {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(title).fontWeight(.semibold).lineLimit(1)
-                    Text(detail)
-                        .font(ShellType.labelMedium)
-                        .foregroundStyle(NativeAgentShell.secondary)
-                        .lineLimit(2)
-                        .truncationMode(.tail)
+        SetupRow(title: title, detail: detail) { control }
+            .accessibilityIdentifier(identifier)
+    }
+}
+
+/// The haze palette as a row of small swatches, the chosen one ringed.
+/// Setup's Haze card and Simple view's settings share it.
+struct HazeSwatches: View {
+    @AppStorage(HazeColor.key) private var hazeColor = HazeColor.teal.rawValue
+
+    var body: some View {
+        let selected = HazeColor(stored: hazeColor)
+        HStack(spacing: 8) {
+            ForEach(HazeColor.allCases) { color in
+                Button {
+                    hazeColor = color.rawValue
+                } label: {
+                    Circle()
+                        .fill(color.swatch)
+                        .frame(width: 16, height: 16)
+                        .padding(3)
+                        .overlay {
+                            Circle().strokeBorder(
+                                color == selected ? NativeAgentShell.text : .clear,
+                                lineWidth: 1.5)
+                        }
+                        .contentShape(Circle())
                 }
-                .frame(height: SetupMetrics.restCardContentHeight, alignment: .topLeading)
-                Spacer(minLength: 12)
-                control
+                .buttonStyle(.plain)
+                .accessibilityLabel(color.name)
+                .accessibilityAddTraits(color == selected ? .isSelected : [])
             }
         }
-        .accessibilityIdentifier(identifier)
     }
 }

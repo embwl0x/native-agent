@@ -21,6 +21,11 @@ public struct InlineInteractionDescriptor: Codable, Sendable, Equatable {
         /// Connectors' native OAuth flow.
         case connectorOAuth = "connector_oauth"
         case internetAccounts = "internet_accounts"
+        /// Trust's Chrome switch, the extension folder and Chrome's extensions
+        /// page, settled when the extension connects.
+        case chromeSetup = "chrome_setup"
+        /// The iPhone pairing page, settled when a phone is paired.
+        case pairDevice = "pair_device"
         /// Trust's Mac Control switch plus the per-capability grant.
         case macPermissionGrant = "mac_permission_grant"
         /// The Trust POSTURE forbids this capability outright, so no card may

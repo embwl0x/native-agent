@@ -75,15 +75,16 @@ struct MacPairingView: View {
 
                 // The operating requirement, said before he leaves the house:
                 // the phone is a window onto this Mac, not a second brain.
-                Text("The agent runs on your Mac. Keep it awake with NativeAgent running for replies and actions from your phone.")
+                Text("I run on your Mac. Keep it awake with NativeAgent running for replies and actions from your phone.")
                     .font(ShellType.label)
                     .foregroundStyle(NativeAgentShell.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                     .accessibilityIdentifier("pairing.mac-dependence")
 
-                PairingCard {
-                    VStack(alignment: .leading, spacing: 8) {
-                        PairingSectionLabel(text: "iCloud status")
+                // Alive glass (2026-09-23): eyebrow over one card.
+                VStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
+                    PairingSectionLabel(text: "iCloud status")
+                    AliveGroupCard {
                         Text(bridge.syncStatus)
                             .font(ShellType.label)
                             .foregroundStyle(NativeAgentShell.secondary)
@@ -95,30 +96,44 @@ struct MacPairingView: View {
                     PairingNoticeCard(text: pairingError, systemImage: "exclamationmark.shield.fill")
                 }
 
-                PairingCard {
-                    VStack(alignment: .leading, spacing: 12) {
-                        PairingSectionLabel(text: "Paired devices")
-                        Text("Match the phone’s code before choosing Pair. Removing a phone stops it from deciding approvals.")
-                            .font(ShellType.label)
+                // One group card, a row per phone with its status pill.
+                VStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
+                    PairingSectionLabel(text: "Paired devices")
+                    Text("Match the phone’s code before choosing Pair. Removing a phone stops it from deciding approvals.")
+                        .font(ShellType.label)
+                        .foregroundStyle(NativeAgentShell.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    AliveGroupCard {
                         if pairedPhones.phones.filter({ $0.status != .removed }).isEmpty {
                             Text("No phones paired yet. Open the companion app to request pairing.")
+                                .font(ShellType.label)
+                                .foregroundStyle(NativeAgentShell.secondary)
                         }
                         ForEach(pairedPhones.phones.filter { $0.status != .removed }) { phone in
-                            HStack {
-                                VStack(alignment: .leading) {
+                            HStack(spacing: 8) {
+                                VStack(alignment: .leading, spacing: 3) {
                                     Text(phone.status == .paired ? "iPhone or iPad" : "Phone waiting to pair")
-                                    Text(phone.id).font(PairingType.code).textSelection(.enabled)
+                                        .font(.system(size: 14, weight: .medium))
+                                        .foregroundStyle(NativeAgentShell.text)
+                                    Text(phone.id)
+                                        .font(PairingType.code)
+                                        .foregroundStyle(NativeAgentShell.secondary)
+                                        .textSelection(.enabled)
                                 }
                                 Spacer()
+                                // A pending phone is waiting on you: the teal's one job.
+                                ConnectorsStatusPill(
+                                    text: phone.status == .paired ? "Paired" : "Waiting",
+                                    tone: phone.status == .paired ? NativeAgentShell.calm : NativeAgentShell.needsYou)
                                 if phone.status == .pending {
                                     Button("Pair") { pairedPhones.setStatus(.paired, id: phone.id) }
                                 }
                                 Button("Remove", role: .destructive) { pairedPhones.setStatus(.removed, id: phone.id) }
                             }
                         }
-                        if let message = pairedPhones.message {
-                            Text(message).foregroundStyle(NativeAgentShell.trouble)
-                        }
+                    }
+                    if let message = pairedPhones.message {
+                        Text(message).foregroundStyle(NativeAgentShell.trouble)
                     }
                 }
 
@@ -154,7 +169,7 @@ struct MacPairingView: View {
                                     } else {
                                         Text(String(repeating: "•", count: 40))
                                             .font(PairingType.code)
-                                            .foregroundStyle(NativeAgentShell.tertiary)
+                                            .foregroundStyle(NativeAgentShell.secondary)
                                             .lineLimit(1)
                                     }
                                     Spacer(minLength: 8)
@@ -334,11 +349,7 @@ private struct PairingSectionLabel: View {
     let text: String
 
     var body: some View {
-        Text(text)
-            .font(ShellType.labelSemibold)
-            .textCase(.uppercase)
-            .kerning(0.6)
-            .foregroundStyle(NativeAgentShell.secondary)
+        AliveEyebrow(text)
     }
 }
 
@@ -348,7 +359,9 @@ private struct PairingCard<Content: View>: View {
     var body: some View {
         content
             .padding(16)
-            .settingsCardSurface()
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .aliveCard()
+            .accessibilityElement(children: .contain)
     }
 }
 

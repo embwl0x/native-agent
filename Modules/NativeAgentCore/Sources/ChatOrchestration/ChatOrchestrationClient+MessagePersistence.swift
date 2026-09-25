@@ -1717,6 +1717,12 @@ extension SwiftNativeChatOrchestrationClient {
             // reply. Carry only that bounded count; never duplicate content.
             metadata[CognitiveSubstrate.replyCharacterCountMetadataKey] =
                 .int(Int64(redactedSummary.count))
+            // The summary keeps the head; a long reply's sign-off is where a
+            // form of address lives, so the Sound rut detector gets the tail.
+            if redactedSummary.count > 500 {
+                metadata[CognitiveSubstrate.replyTailMetadataKey] =
+                    .string(String(redactedSummary.suffix(300)))
+            }
         }
         // Carried onto the node so the READ side can recognise the row later
         // without re-deriving anything — and so a stored node says which

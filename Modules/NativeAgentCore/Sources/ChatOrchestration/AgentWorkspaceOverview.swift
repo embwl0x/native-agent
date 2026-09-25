@@ -85,33 +85,6 @@ extension AgentWorkspaceNavigation {
         ]), items: items, actions: [])
     }
 
-    /// Home exposes only meaningful continuation controls, not a duplicate
-    /// list of every recent place. It neither moves selection nor reads owners.
-    func workspaceHomeOverview(key: String) -> (content: JSONValue, actions: [AgentWorkspaceButton]) {
-        let session = sessions[key] ?? Session()
-        let all = recognizedOpenPlaces(key: key).items
-        let important = all.filter { item in
-            guard case .object(let row) = item.content else { return false }
-            return row["group"] != .string("Recent places")
-        }
-        let actions = important.prefix(3).compactMap { item -> AgentWorkspaceButton? in
-            guard var action = item.actions.first else { return nil }
-            action.label += ": " + String(item.title.prefix(100))
-            return action
-        }
-        var content: [String: JSONValue] = [
-            "open_places": .int(Int64(all.count)),
-            "unfinished_drafts": .int(Int64(session.drafts.count)),
-            "drafts_needing_attention": .int(Int64(session.drafts.filter { $0.needsOutcomeReview || $0.schemaIssue != nil }.count))
-        ]
-        if let topic = session.workTopic { content["work_topic"] = .string(String(topic.prefix(160))) }
-        if let returning = session.arrivalReturn?.path.last,
-           let valid = Self.recognizedPlaces(session).first(where: { Self.samePlace($0, returning) }) {
-            content["return_to"] = .string(String(valid.title.prefix(160)))
-        }
-        return (.object(content), actions)
-    }
-
     static func recognizedPlaces(_ session: Session) -> [AgentWorkspaceLocation] {
         var places: [AgentWorkspaceLocation] = []
         func append(_ location: AgentWorkspaceLocation) {

@@ -46,7 +46,7 @@ extension SwiftToolDispatcher {
             throw AutonomyGateError.toolDenied(reason: "read_file has no Swift local connector implementation")
         }
         if case .object(let object) = result,
-           let pathMiss = filePathMissEnvelope(tool: "read_file", input: input, resultObject: object) {
+           let pathMiss = await filePathMissEnvelope(tool: "read_file", input: input, resultObject: object) {
             return pathMiss
         }
         return Self.fileReadPresentation(result, callerPath: path, continuing: jsonString(input["version"])?.isEmpty == false)

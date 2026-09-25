@@ -153,7 +153,7 @@ public extension GitHubConnectorActions {
     static func mutate(input: [String: JSONValue], dataRoot: URL = PersistenceCore.defaultDataRoot()) async throws -> JSONValue {
         let operation = try required(input, "operation").lowercased()
         let repo = try repository(input)
-        let number = int(input["number"], default: 0)
+        let number = int(input["number"], default: 0) > 0 ? int(input["number"], default: 0) : linkedNumber(input) ?? 0
         let request: (path: String, method: String, body: [String: Any])
         switch operation {
         case "create_issue":
@@ -1815,10 +1815,34 @@ private extension GitHubConnectorActions {
 
     static func repository(_ input: [String: JSONValue]) throws -> String {
         let input = input.filter { $0.value != .null && $0.value != .string("") }
-        let raw = normalized(input["repo"] ?? input["repository"] ?? input["full_name"])
         let owner = normalized(input["owner"])
-        guard let raw else { throw GitHubConnectorError.invalidInput("GitHub action requires repo as owner/name.") }
-        return try canonicalRepository(raw.contains("/") ? raw : "\(owner ?? "")/\(raw)")
+        // The handles other GitHub results show: an html_url, or owner/name#12.
+        func name(_ raw: String) throws -> String {
+            if raw.lowercased().hasPrefix("http") { return try repositoryIdentity(["repo": .string(raw)]).fullName }
+            let bare = raw.firstIndex(of: "#").map { String(raw[..<$0]) } ?? raw
+            return try canonicalRepository(bare.contains("/") ? bare : "\(owner ?? "")/\(bare)")
+        }
+        let named = try normalized(input["repo"] ?? input["repository"] ?? input["full_name"]).map(name)
+        let linked = try normalized(input["url"]).map(name)
+        // A link's number belongs to its own repository, never another one's.
+        if let named, let linked, named.caseInsensitiveCompare(linked) != .orderedSame {
+            throw GitHubConnectorError.invalidInput("The url is for \(linked) but repo is \(named); give one of them. Nothing was run.")
+        }
+        guard let repo = named ?? linked else { throw GitHubConnectorError.invalidInput("GitHub action requires repo as owner/name.") }
+        return repo
+    }
+
+    /// An issue or PR number from a link (/pull/12, /issues/12) or owner/name#12.
+    static func linkedNumber(_ input: [String: JSONValue]) -> Int? {
+        for key in ["number", "repo", "url", "repository"] {
+            guard let raw = normalized(input[key]) else { continue }
+            if let hash = raw.lastIndex(of: "#"), let n = Int(raw[raw.index(after: hash)...]), n > 0 { return n }
+            let path = raw.lowercased().hasPrefix("http") ? URL(string: raw)?.path ?? "" : raw
+            let parts = path.split(separator: "/")
+            if let at = parts.lastIndex(where: { ["pull", "pulls", "issues"].contains($0) }), at + 1 < parts.count,
+               let n = Int(parts[at + 1]), n > 0 { return n }
+        }
+        return nil
     }
 
     static func canonicalRepository(_ raw: String) throws -> String {
@@ -1829,7 +1853,8 @@ private extension GitHubConnectorActions {
     }
 
     static func positiveNumber(_ input: [String: JSONValue]) throws -> Int {
-        let value = int(input["number"], default: 0)
+        var value = int(input["number"], default: 0)
+        if value <= 0, let linked = linkedNumber(input) { value = linked }
         try requirePositive(value)
         return value
     }

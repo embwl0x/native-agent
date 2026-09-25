@@ -479,6 +479,9 @@ extension SwiftToolDispatcher {
                 }
             }
         }
+        // A wake that failed admitted nothing to act on the row; "queued" would
+        // tell her the answer is coming (the Claude lane already says so).
+        if Self.claudeReceiptStatus(response["wakeup"]) == "failed" { response["status"] = .string("failed") }
         return .object(response)
     }
 

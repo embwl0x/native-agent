@@ -562,6 +562,7 @@ private struct ApprovalRequestPanel: View {
                         Label("Approve", systemImage: "checkmark")
                     }
                     .buttonStyle(.borderedProminent)
+                    .hazeTinted(.button)
                     .controlSize(.small)
                     .disabled(isDeciding || !ApprovalPayloadPreviewPresentation.canResolve(approval))
                     Button {

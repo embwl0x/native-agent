@@ -68,13 +68,79 @@ extension SwiftNativeMacControl {
         case .refused(let refusal): return refusal
         case .app(let hit): app = hit
         }
-        let reading = MacMenuBar.read(source: accessibilitySource, pid: app.processIdentifier)
+        // Her-screen 09-24 — `find` walks menu by menu and stops at the first
+        // item of that name, so a long menu can't hide a later one.
+        // A path ("Format › Make Plain Text") finds that item under that menu.
+        // A bare name ("Find/Replace") is never split.
+        let wantedLevels = body.stringValue("find").map {
+            (MacMenuBar.isPath($0) ? MacMenuBar.components($0) : [$0]).map(MacMenuBar.normalized)
+        } ?? []
+        let wanted = wantedLevels.last.flatMap { $0.isEmpty ? nil : $0 }
+        func isWanted(_ item: MacMenuBar.Item) -> Bool {
+            let levels = item.titlePath.map(MacMenuBar.normalized)
+            guard levels.last == wanted else { return false }
+            return wantedLevels.count == 1
+                || (levels.count == wantedLevels.count && zip(levels, wantedLevels).allSatisfy { $0.hasPrefix($1) })
+        }
+        // `chord` ("cmd+s"): the item whose key equivalent that is, so a key
+        // step can press the command itself.
+        let wantedChord = body.stringValue("chord")
+            .flatMap { try? MacKeySyntax.parseChords($0) }.flatMap { $0.count == 1 ? $0.first : nil }
+        func hasChord(_ item: MacMenuBar.Item) -> Bool {
+            guard let wantedChord, !item.hasSubmenu,
+                  case .resolved(let element) = accessibilityActSource.resolve(menuPath: item.path, inAppPid: app.processIdentifier),
+                  let shortcut = accessibilityActSource.menuShortcut(element),
+                  let chord = try? MacKeySyntax.parseChords(shortcut.chord).first else { return false }
+            return chord.keyCode == wantedChord.keyCode && chord.modifiers == wantedChord.modifiers
+        }
+        // A path walks its named menus whole, so an exact level can beat a
+        // prefix one ("Edit" over "Editor"); a bare name or chord stops at the first.
+        let reading = MacMenuBar.read(
+            source: accessibilitySource, pid: app.processIdentifier,
+            top: wantedLevels.count > 1 ? wantedLevels.first : nil,
+            until: wanted != nil ? (wantedLevels.count > 1 ? nil : isWanted) : (wantedChord != nil ? hasChord : nil)
+        )
+        // A background app's menus report stale enabled states (File › Save
+        // "disabled" on an edited document), so they are not claimed.
+        let statesKnown = accessibilitySource.frontmostApp()?.processIdentifier == app.processIdentifier
         var output: [String: JSONValue] = [:]
-        if case .object(let menuJSON) = MacMenuBar.json(reading) {
+        if case .object(let menuJSON) = MacMenuBar.json(reading, statesKnown: statesKnown) {
             output = menuJSON
         }
         output["trusted"] = .bool(true)
         output["app"] = app.toJSON()
+        // Her-screen Phase 5 — `find`: where a command a window read could not
+        // name lives in the menus, with its key equivalent when it has one.
+        // One read of the matched items only; nothing is opened or pressed.
+        if wanted != nil || wantedChord != nil {
+            // Exact titles first, level by level from the top; prefix only
+            // where no exact one exists.
+            func exact(_ item: MacMenuBar.Item) -> [Bool] {
+                zip(item.titlePath.map(MacMenuBar.normalized), wantedLevels).map { $0 == $1 }
+            }
+            let hits = wanted == nil
+                ? reading.items.suffix(1).filter(hasChord)
+                : reading.items.filter(isWanted).enumerated().sorted {
+                    exact($0.element) != exact($1.element)
+                        ? exact($0.element).lexicographicallyPrecedes(exact($1.element)) { $0 && !$1 }
+                        : $0.offset < $1.offset
+                }.map(\.element)
+            output["found"] = .array(hits.prefix(3).map { item in
+                var row: [String: JSONValue] = [
+                    "path": MacScreenViewTextRedaction.redactedLegendString(
+                        item.display, valueChars: MacMenuBar.maxTitleChars * MacMenuBar.maxPathDepth
+                    ),
+                ]
+                if statesKnown { row["enabled"] = .bool(item.enabled) }
+                if case .resolved(let element) = accessibilityActSource.resolve(
+                    menuPath: item.path, inAppPid: app.processIdentifier
+                ), let shortcut = accessibilityActSource.menuShortcut(element) {
+                    row["shortcut"] = .string(shortcut.glyphs)
+                    row["chord"] = .string(shortcut.chord)
+                }
+                return .object(row)
+            })
+        }
         if let unavailable = reading.unavailable {
             output["message"] = .string(
                 unavailable == "no_menu_bar"
@@ -139,14 +205,25 @@ extension SwiftNativeMacControl {
         case .refused(let refusal): return refusal
         case .app(let hit): app = hit
         }
-        let reading = MacMenuBar.read(source: accessibilitySource, pid: app.processIdentifier)
+        // Her-screen 09-24 — a path walks only its own top-level menu.
+        let reading = MacMenuBar.read(
+            source: accessibilitySource, pid: app.processIdentifier,
+            top: MacMenuBar.components(requested).first
+        )
         if let unavailable = reading.unavailable {
             return refuse(
                 unavailable,
                 "\(app.name) publishes no menu bar I can press through."
             )
         }
-        let resolution = MacMenuBar.resolve(requested, among: reading.items)
+        // A background app's enabled states are stale: let its own handler
+        // decide instead of refusing on them. A front:true press (just raised)
+        // judges enabled below, after the app has revalidated.
+        let requireFront = body["require_front"] == .bool(true)
+        let statesKnown = !requireFront && accessibilitySource.frontmostApp()?.processIdentifier == app.processIdentifier
+        let resolution = MacMenuBar.resolve(requested, among: statesKnown ? reading.items : reading.items.map {
+            MacMenuBar.Item(titlePath: $0.titlePath, path: $0.path, enabled: true, hasSubmenu: $0.hasSubmenu)
+        })
         guard case .matched(let item) = resolution else {
             let code: String = {
                 switch resolution {
@@ -165,7 +242,7 @@ extension SwiftNativeMacControl {
         // Resolved from the MENU BAR, never from a window root: a menu bar is
         // not under any window, so a window-relative resolve of this index
         // chain would land on an unrelated element inside the document.
-        let target: MacAXActTarget
+        var target: MacAXActTarget
         switch accessibilityActSource.resolve(
             menuPath: item.path,
             inAppPid: app.processIdentifier
@@ -183,6 +260,35 @@ extension SwiftNativeMacControl {
                 "app_gone",
                 "\(app.name)'s menu bar is not reachable any more."
             )
+        }
+        // A front-only press (act with front:true): re-checked at the last
+        // moment, so a person who switched apps during the walk wins.
+        if requireFront, accessibilitySource.frontmostApp()?.processIdentifier != app.processIdentifier {
+            return refuse("front_changed", "\(app.name) is no longer in front, so nothing was pressed.")
+        }
+        // Right after a raise an item can still read greyed out from its last
+        // (background) validation. Opening its menu makes the app revalidate,
+        // as a person's click does; then it is read again. Still greyed out:
+        // the menu is closed and nothing is pressed.
+        if requireFront, !target.enabled, let top = item.path.first,
+           case .resolved(let bar) = accessibilityActSource.resolve(menuPath: [top], inAppPid: app.processIdentifier) {
+            _ = accessibilityActSource.perform(bar, action: "AXPress")
+            usleep(150_000)
+            if case .resolved(let fresh) = accessibilityActSource.resolve(menuPath: item.path, inAppPid: app.processIdentifier) {
+                target = fresh
+            }
+            if !target.enabled {
+                if case .resolved(let menu) = accessibilityActSource.resolve(
+                    menuPath: Array(item.path.prefix(2)), inAppPid: app.processIdentifier
+                ) {
+                    _ = accessibilityActSource.perform(menu, action: "AXCancel")
+                }
+                return refuse(
+                    "menu_item_disabled",
+                    MacMenuBar.words(for: .disabled(item), requested: requested) ?? "\"\(item.display)\" is greyed out.",
+                    ["requested_path": .string(requested)]
+                )
+            }
         }
         let outcome = accessibilityActSource.perform(target, action: "AXPress")
         guard outcome == .performed else {

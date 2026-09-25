@@ -37,7 +37,7 @@ struct MCPHubConsentSection: View {
         MCPSection(label: "Consent log") {
             switch presentation {
             case .loading:
-                MCPNote("Reading the consent decisions the agent has been given.")
+                MCPNote("Reading the consent decisions I've been given.")
             case .empty:
                 MCPNote("No consent decisions yet. Granting a tool records one here.")
             case .unavailable:
@@ -61,8 +61,10 @@ struct MCPHubConsentSection: View {
 
     @ViewBuilder
     private var consentRows: some View {
-        ForEach(appModel.mcpConsent) { consent in
-            MCPHubConsentRow(consent: consent)
+        AliveGroupCard {
+            ForEach(appModel.mcpConsent) { consent in
+                MCPHubConsentRow(consent: consent)
+            }
         }
     }
 }
@@ -73,14 +75,12 @@ private struct MCPHubConsentRow: View {
 
     var body: some View {
         MCPCard {
-            HStack(alignment: .firstTextBaseline, spacing: 8) {
+            HStack(alignment: .center, spacing: 8) {
                 Text("\(consent.serverId ?? "Unknown server") · \(consent.toolName ?? "Unknown tool")")
                     .font(ShellType.labelSemibold.monospaced())
                     .foregroundStyle(NativeAgentShell.text)
                 Spacer(minLength: 8)
-                Text(MCPHubWords.consentStatus(consent.status))
-                    .font(ShellType.captionSemibold)
-                    .foregroundStyle(color(consent.status))
+                ConnectorsStatusPill(text: MCPHubWords.consentStatus(consent.status), tone: color(consent.status))
             }
             HStack(spacing: 12) {
                 if let granted = consent.grantedAt, !granted.isEmpty {
@@ -95,7 +95,7 @@ private struct MCPHubConsentRow: View {
                 Spacer(minLength: 0)
             }
             .font(ShellType.caption)
-            .foregroundStyle(NativeAgentShell.tertiary)
+            .foregroundStyle(NativeAgentShell.secondary)
             if (consent.status ?? "") == "granted" {
                 HStack {
                     Spacer(minLength: 0)
@@ -113,7 +113,7 @@ private struct MCPHubConsentRow: View {
         switch status {
         case "granted": NativeAgentShell.calm
         case "revoked", "denied": NativeAgentShell.trouble
-        default: NativeAgentShell.tertiary
+        default: NativeAgentShell.secondary
         }
     }
 }
@@ -217,7 +217,7 @@ struct MCPHubView: View {
                 refresh: appModel.panelRefreshStatus[.mcp]
             ) {
             case .loading:
-                MCPNote("Reading the tool servers the agent can call.")
+                MCPNote("Reading the tool servers I can call.")
                     .accessibilityIdentifier("mcp.servers.loading")
             case .unavailable:
                 MCPNote("The servers are unavailable. Refresh MCP Hub to retry.", tone: NativeAgentShell.trouble)
@@ -235,10 +235,11 @@ struct MCPHubView: View {
         }
     }
 
-    @ViewBuilder
     private var serverRows: some View {
-        ForEach(appModel.mcpServers) { server in
-            serverRow(server)
+        AliveGroupCard {
+            ForEach(appModel.mcpServers) { server in
+                serverRow(server)
+            }
         }
     }
 
@@ -257,14 +258,12 @@ struct MCPHubView: View {
             reportedCount: server.resourceCount
         )
         return MCPCard(selected: isSelected) {
-            HStack(alignment: .firstTextBaseline, spacing: 8) {
+            HStack(alignment: .center, spacing: 8) {
                 Text(server.name)
-                    .font(ShellType.bodySemibold)
+                    .font(.system(size: 14, weight: .medium))
                     .foregroundStyle(NativeAgentShell.text)
                 Spacer(minLength: 8)
-                Text(MCPHubWords.health(server.healthStatus))
-                    .font(ShellType.captionSemibold)
-                    .foregroundStyle(healthColor(server.healthStatus))
+                ConnectorsStatusPill(text: MCPHubWords.health(server.healthStatus), tone: healthColor(server.healthStatus))
             }
 
             HStack(spacing: 12) {
@@ -284,13 +283,13 @@ struct MCPHubView: View {
             if let endpoint = server.endpoint, !endpoint.isEmpty {
                 Text(endpoint)
                     .font(ShellType.caption.monospaced())
-                    .foregroundStyle(NativeAgentShell.tertiary)
+                    .foregroundStyle(NativeAgentShell.secondary)
                     .lineLimit(1)
                     .truncationMode(.middle)
             } else if let command = server.command, !command.isEmpty {
                 Text(command)
                     .font(ShellType.caption.monospaced())
-                    .foregroundStyle(NativeAgentShell.tertiary)
+                    .foregroundStyle(NativeAgentShell.secondary)
                     .lineLimit(1)
                     .truncationMode(.middle)
             }
@@ -321,7 +320,7 @@ struct MCPHubView: View {
                 if let updated = server.updatedAt, !updated.isEmpty {
                     Text(updated)
                         .font(ShellType.caption)
-                        .foregroundStyle(NativeAgentShell.tertiary)
+                        .foregroundStyle(NativeAgentShell.secondary)
                 }
             }
             .buttonStyle(.bordered)
@@ -342,7 +341,7 @@ struct MCPHubView: View {
         switch status {
         case "ok": return NativeAgentShell.calm
         case "fail", "error", "needs_setup": return NativeAgentShell.trouble
-        default: return NativeAgentShell.tertiary
+        default: return NativeAgentShell.secondary
         }
     }
 
@@ -362,9 +361,11 @@ struct MCPHubView: View {
                 )
                 .accessibilityIdentifier(notice.isFailure ? "mcp.tools.unavailable" : "mcp.tools.empty-or-loading")
             }
-            if notice.showsTools {
-                ForEach(appModel.mcpTools) { tool in
-                    toolRow(tool)
+            if notice.showsTools, !appModel.mcpTools.isEmpty {
+                AliveGroupCard {
+                    ForEach(appModel.mcpTools) { tool in
+                        toolRow(tool)
+                    }
                 }
             }
         }
@@ -471,6 +472,7 @@ struct MCPHubView: View {
                     resourceCount: appModel.mcpResources.count
                 )!.text)
             case .current:
+                AliveGroupCard {
                 ForEach(appModel.mcpResources) { resource in
                     MCPCard {
                         Text(resource.name ?? resource.uri)
@@ -481,7 +483,7 @@ struct MCPHubView: View {
                         if resource.name != nil {
                             Text(resource.uri)
                                 .font(ShellType.caption.monospaced())
-                                .foregroundStyle(NativeAgentShell.tertiary)
+                                .foregroundStyle(NativeAgentShell.secondary)
                                 .lineLimit(1)
                                 .truncationMode(.middle)
                         }
@@ -491,6 +493,7 @@ struct MCPHubView: View {
                                 .foregroundStyle(NativeAgentShell.secondary)
                         }
                     }
+                }
                 }
             }
         }
@@ -543,15 +546,14 @@ struct MCPHubView: View {
 
     @ViewBuilder
     private func recentCallRow(_ call: MCPCallResult, provenance: String) -> some View {
+        AliveGroupCard {
         MCPCard {
-            HStack(alignment: .firstTextBaseline, spacing: 8) {
+            HStack(alignment: .center, spacing: 8) {
                 Text("\(call.serverId) · \(call.toolName)")
                     .font(ShellType.labelSemibold.monospaced())
                     .foregroundStyle(NativeAgentShell.text)
                 Spacer(minLength: 8)
-                Text(MCPHubWords.callStatus(call.status))
-                    .font(ShellType.captionSemibold)
-                    .foregroundStyle(callStatusColor(call.status))
+                ConnectorsStatusPill(text: MCPHubWords.callStatus(call.status), tone: callStatusColor(call.status))
             }
             HStack(spacing: 12) {
                 if let createdAt = call.createdAt, !createdAt.isEmpty {
@@ -563,7 +565,7 @@ struct MCPHubView: View {
                 Spacer(minLength: 0)
             }
             .font(ShellType.caption)
-            .foregroundStyle(NativeAgentShell.tertiary)
+            .foregroundStyle(NativeAgentShell.secondary)
             Text(provenance)
                 .font(ShellType.caption)
                 .foregroundStyle(NativeAgentShell.secondary)
@@ -597,13 +599,14 @@ struct MCPHubView: View {
                     .help(call.evidenceError ?? "The MCP result could not be appended to Activity.")
             }
         }
+        }
     }
 
     private func callStatusColor(_ status: String) -> Color {
         switch status {
         case "ok", "success": return NativeAgentShell.calm
         case "error", "failed": return NativeAgentShell.trouble
-        default: return NativeAgentShell.tertiary
+        default: return NativeAgentShell.secondary
         }
     }
 }
@@ -649,20 +652,17 @@ private struct MCPSection<Content: View>: View {
     var body: some View {
         // Lazy because a server's tool list can run to dozens of rows, and the
         // `List` this page used to be built them lazily too.
-        LazyVStack(alignment: .leading, spacing: 8) {
-            Text(label)
-                .font(ShellType.labelSemibold)
-                .textCase(.uppercase)
-                .kerning(0.6)
-                .foregroundStyle(NativeAgentShell.secondary)
-                .padding(.horizontal, 2)
+        LazyVStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
+            AliveEyebrow(label)
             content
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
-/// One card: a group of controls or one row of a list.
+/// One row of a list. Alive glass (2026-09-23): rows carry no chrome; the
+/// list's `AliveGroupCard` is the card. A selected row takes the next fill
+/// rung, reaching out into the card's row inset.
 private struct MCPCard<Content: View>: View {
     var selected: Bool = false
     @ViewBuilder var content: Content
@@ -671,16 +671,16 @@ private struct MCPCard<Content: View>: View {
         VStack(alignment: .leading, spacing: 8) {
             content
         }
-        .padding(16)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(
-            RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
-                .fill(selected ? NativeAgentShell.softFill : NativeAgentShell.quietFill)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
-                .strokeBorder(NativeAgentShell.hairline, lineWidth: 1)
-        )
+        .background {
+            if selected {
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(NativeAgentShell.softFill)
+                    .padding(.horizontal, -12)
+                    .padding(.vertical, -8)
+                    .accessibilityHidden(true)
+            }
+        }
     }
 }
 

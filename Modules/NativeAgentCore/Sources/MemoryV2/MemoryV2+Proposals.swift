@@ -487,6 +487,15 @@ extension SwiftNativeMemoryV2 {
     /// The successor id `supersedeProposal` wrote into a row's metadata, if any.
     /// Present on a pending row means the supersession started and did not
     /// reach its status flip.
+    /// A pending statement waits on the owner's review when nothing has
+    /// superseded it and it passes the durable-candidate gate. The Today page
+    /// ("Waiting on you") and the agent's home count by this one rule.
+    public static func awaitsReview(content: String, source: String?, metadata: JSONValue?) -> Bool {
+        guard supersededByMarker(in: metadata) == nil else { return false }
+        let kind: String? = if case .object(let meta)? = metadata, case .string(let value)? = meta["kind"] { value } else { nil }
+        return MemoryCandidateQuality.isDurableCandidate(text: content, source: source, kind: kind)
+    }
+
     public static func supersededByMarker(in metadata: JSONValue?) -> String? {
         guard case .object(let meta)? = metadata,
               case .string(let successor)? = meta["supersededBy"],

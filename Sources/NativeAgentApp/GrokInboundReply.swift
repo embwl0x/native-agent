@@ -17,13 +17,15 @@ enum GrokInboundReply {
         let run: String
         do {
             if let deliver { run = try await deliver(pending, reply.text, peer) }
+            // The person asked from Grok's thread: the answer settles there, no agent turn.
+            else if pending.quiet == true { run = "" }
             else { run = try await enqueue(pending, text: reply.text, peer: peer, dataRoot: dataRoot) }
         } catch {
             // Queuing failed: put the claim back so the reply can still land.
             _ = try? store.update(reply.message_id, peer: peer.id) { $0.state = "accepted" }
             throw error
         }
-        try store.update(reply.message_id, peer: peer.id) { $0.state = "answered"; $0.runID = run }
+        try store.update(reply.message_id, peer: peer.id) { $0.state = "answered"; $0.runID = run.isEmpty ? nil : run }
         // 2026-09-22 WHY: no background read covers Grok, so its conversation
         // row stayed "waiting" forever. Settle the exact row that sent this id.
         let conversations = AgentConversationStore(dataRoot: dataRoot)

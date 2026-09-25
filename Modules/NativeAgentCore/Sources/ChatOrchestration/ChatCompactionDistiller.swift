@@ -65,11 +65,19 @@ struct ChatCompactionDistiller: Sendable {
     Quote 3 to 6 lines VERBATIM — the lines that actually carried the meaning (a \
     decision, a correction, a turn in the mood, something said that mattered). \
     Put each in quotation marks and say who said it. Everything else is in your \
-    own words.
+    own words. Never choose a line for the nickname or pet name in it.
+
+    Record what happened, what was decided, how it felt, and the facts that \
+    matter. Never record what people call each other — nicknames, pet names, \
+    terms of address, catchphrases, sign-offs or verbal tics — as a trait or a \
+    fact about anyone, and drop any such line the earlier recollection carries. \
+    How you talk to each other is lived fresh each time; a note that files a \
+    habit teaches you to repeat it.
 
     Carry these through the chain rather than filing them under headings:
     - Durable facts about the user (identity, preferences, constraints, ongoing \
-    situation) that stay true past this conversation.
+    situation) that stay true past this conversation — never what they call you \
+    or what you call them.
     - Decisions that were made AND the reasoning behind them — not just the \
     outcome, the "why".
     - Open threads and commitments, with their current state (what's done, what's \
@@ -560,7 +568,9 @@ struct ChatCompactionDistiller: Sendable {
                 // newly summarised history was cut off at the very moment it
                 // entered the prompt. Keep the newest, as the mechanical
                 // fallback and the in-turn fold both now do.
-                pinnedLines.append(String(body.suffix(summaryCap)))
+                pinnedLines.append(String(
+                    ChatSessionRecollections.droppingAddressTraits(body).suffix(summaryCap)
+                ))
                 continue
             }
             pinning = false

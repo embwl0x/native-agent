@@ -67,6 +67,7 @@ test("manifest is MV3 and declares the bounded Chrome transport permissions", as
   assert.equal(manifest.background.type, "module");
   assert.deepEqual(new Set(manifest.permissions), new Set([
     "alarms",
+    "debugger",
     "nativeMessaging",
     "storage",
     "tabs",

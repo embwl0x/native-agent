@@ -121,6 +121,11 @@ extension SwiftToolDispatcher {
             let args = input.filter { !["__session_id", "session_id"].contains($0.key) }
             switch tool {
             case "bot_ask":
+                // "message", "text" and "prompt" are what a message is called everywhere else.
+                var args = args
+                if args["question"] == nil, let key = ["message", "text", "prompt"].first(where: { args[$0] != nil }) {
+                    args["question"] = args.removeValue(forKey: key)
+                }
                 try botKeys(args, allowed: Set(botReferenceKeys + ["question"]))
                 guard allowsCanonicalBodyTools else { throw BotRunnerError.notPermitted }
                 guard let standingBotSession else { throw StandingBotsError.invalidValue("Bot chat is unavailable.") }

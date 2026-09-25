@@ -26,7 +26,7 @@ import PersistenceCore
         ]])
         let dispatcher = SwiftToolDispatcher(dataRoot: root)
         let session = UUID().uuidString
-        let names = mixedBuiltIn ? [id, "market_status"] : [id]
+        let names = mixedBuiltIn ? [id, "workshop_status"] : [id]
         #expect(try await dispatcher.listAvailableTools().contains(id), "name-only discovery remains available")
         let result = try await dispatcher.impl_tool_load(input: [
             "session_id": .string(session), "names": .array(names.map(JSONValue.string)),
@@ -35,7 +35,7 @@ import PersistenceCore
             Issue.record("missing tool-load receipt")
             return
         }
-        let expected = (state == "active" ? [id] : []) + (mixedBuiltIn ? ["market_status"] : [])
+        let expected = (state == "active" ? [id] : []) + (mixedBuiltIn ? ["workshop_status"] : [])
         #expect(payload["loaded"] == .array(expected.sorted().map(JSONValue.string)))
         #expect(payload["loaded_now"] == .array(expected.sorted().map(JSONValue.string)))
         #expect(payload["not_in_catalog"] == .array([]))
@@ -45,7 +45,7 @@ import PersistenceCore
         #expect(active == Set(expected), "unavailable names must not become persisted readiness")
         let nextSchemas = try await dispatcher.listAvailableToolSchemas(activeTools: active)
         #expect(nextSchemas.contains { $0.name == id } == (state == "active"))
-        if mixedBuiltIn { #expect(nextSchemas.contains { $0.name == "market_status" }) }
+        if mixedBuiltIn { #expect(nextSchemas.contains { $0.name == "workshop_status" }) }
     }
 
     @Test func toolDisabledAfterEarlierLoadIsNotReportedAlreadyActive() async throws {

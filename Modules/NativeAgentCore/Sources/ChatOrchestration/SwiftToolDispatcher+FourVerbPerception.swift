@@ -1,5 +1,9 @@
 import Foundation
 import CoreGraphics
+import CryptoKit
+import ImageIO
+import UniformTypeIdentifiers
+import Dispatcher
 import MacControl
 import NativeAgentCore
 import PersistenceCore
@@ -94,22 +98,29 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
     /// caption and a frame can never come from different verbs. `nil` means
     /// "name the app you resolved", which is what a bare `screen` wants.
     let previewCaption: String?
+    /// Her-screen Phase 6 — set by `screen` only. Records the frame this look
+    /// already captured and why its words are thin; the dispatcher attaches it.
+    let pixels: FourVerbPixelAttachment?
 
     init(
         host: any MacFourVerbsHost,
         liveScene: SwiftToolDispatcherFourVerbLiveScene = SwiftToolDispatcherFourVerbLiveScene(),
         obstructionProbe: any MacVisualObstructionProbing = SystemMacVisualObstructionProbe(),
-        previewCaption: String? = nil
+        previewCaption: String? = nil,
+        pixels: FourVerbPixelAttachment? = nil
     ) {
         self.host = host
         self.liveScene = liveScene
         self.obstructionProbe = obstructionProbe
         self.previewCaption = previewCaption
+        self.pixels = pixels
     }
 
     func observe() async -> MacFourVerbsSupplement? {
         await observe(app: nil)
     }
+
+    func rejected() { pixels?.discard() }
 
     func observe(app requestedApp: String?) async -> MacFourVerbsSupplement? {
         let observationStartedNs = DispatchTime.now().uptimeNanoseconds
@@ -195,6 +206,29 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
             targetPID > 0 && output["capture_isolated_window"] != .bool(true)
                 ? obstructionProbe.obstructions(over: $0, targetPID: targetPID) : []
         } ?? []
+        if let pixels {
+            let title = displayText(output["window_title"]) ?? ""
+            let windowFrame = visibleFrame.map { "\(Int($0.x)),\(Int($0.y)),\(Int($0.w))x\(Int($0.h))" } ?? ""
+            pixels.record(
+                reason: Self.thinAccessibilityReason(
+                    accessibilityTrusted: accessibilityTrusted,
+                    marks: marks,
+                    texts: array(output["text"]),
+                    windowArea: visibleFrame.map { $0.w * $0.h } ?? 0,
+                    canvasFraction: dominantImageFraction
+                ),
+                screenRecording: bool(output["screen_recording_trusted"]) ?? false,
+                png: string(output["image"]),
+                unavailable: string(output["image_unavailable_reason"]),
+                origin: (number(imageOriginObject["x"] ?? originObject["x"]) ?? 0,
+                         number(imageOriginObject["y"] ?? originObject["y"]) ?? 0),
+                logicalSize: (number(imageLogicalObject["w"] ?? logicalObject["w"]) ?? 0,
+                              number(imageLogicalObject["h"] ?? logicalObject["h"]) ?? 0),
+                wholeWindow: output["semantic_focus_frame"] == nil || output["semantic_focus_frame"] == .null,
+                background: output["capture_isolated_window"] == .bool(true),
+                window: [bundleIdentifier ?? "", appName ?? "", title, windowFrame].joined(separator: "|")
+            )
+        }
         guard Self.shouldCompilePixelPerception(
             accessibilityTrusted: accessibilityTrusted,
             markCount: marks.count,
@@ -282,6 +316,10 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
                 // Check the final motor frame too: motion lead may move a
                 // clear observed object under a foreground window.
                 return obstructions.contains { $0.covers(target.frame) } ? nil : target
+            }
+            if let pixels, let part = pixels.part,
+               let region = FourVerbPixelAttachment.region(named: part, in: vision.targets) {
+                pixels.focus(name: region.name, frame: region.frame)
             }
             let blockedPhysicalLabels = Set(vision.targets.filter { target in
                 target.physicalOnly && obstructions.contains { $0.covers(target.frame) }
@@ -389,6 +427,48 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
         !accessibilityTrusted
             || markCount <= 6
             || (dominantImageFraction ?? 0) >= 0.03
+    }
+
+    /// Her-screen Phase 6 — WHEN WORDS FAIL. Nil means the accessibility read
+    /// carries the window and no pixels are attached. A reason means the
+    /// window is a canvas, a game, video, or an app that publishes almost
+    /// nothing, and one small image of it earns its bytes. Real AppKit
+    /// windows publish named controls or text and never reach a reason.
+    static func thinAccessibilityReason(
+        accessibilityTrusted: Bool,
+        marks: [JSONValue],
+        texts: [JSONValue],
+        windowArea: Double,
+        canvasFraction: Double?
+    ) -> String? {
+        guard accessibilityTrusted else { return "no accessibility read" }
+        // AXImage/AXCanvas, or a childless AXWebArea, covering half the window.
+        if (canvasFraction ?? 0) >= 0.5 { return "canvas" }
+        let unnamedRoles: Set<String> = ["AXGroup", "AXScrollArea", "AXSplitGroup",
+                                         "AXLayoutArea", "AXUnknown", "AXWebArea"]
+        let roles = marks.compactMap { value -> (role: String, named: Bool)? in
+            guard case .object(let mark) = value, case .string(let role)? = mark["role"] else { return nil }
+            let labeled: Bool = {
+                switch mark["label"] {
+                case .string(let text)?: return !text.trimmingCharacters(in: .whitespaces).isEmpty
+                case .object?: return true
+                default: return false
+                }
+            }()
+            return (role, labeled && !unnamedRoles.contains(role))
+        }
+        let named = roles.filter(\.named).count
+        let characters = texts.reduce(0) { total, value in
+            guard case .object(let item) = value else { return total }
+            if case .string(let text)? = item["text"] { return total + text.count }
+            return total + 20
+        }
+        // One meaningful thing per ~100k pt² (a 1400×900 window wants ~12),
+        // never fewer than four; any real paragraph of text is not thin.
+        let floor = max(4, Int(windowArea / 100_000))
+        guard named + texts.count < floor, characters < 80 else { return nil }
+        if named == 0, texts.isEmpty { return roles.isEmpty ? "no controls or words" : "only unnamed groups" }
+        return "few controls or words for its size"
     }
 
     private func structuralSupplement(
@@ -589,6 +669,176 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
         case .object?: return MacScreenText("⟨withheld⟩", redacted: value)
         default: return nil
         }
+    }
+}
+
+/// Her-screen Phase 6 — PIXELS ONLY WHERE WORDS FAIL. One per `screen` call.
+/// The perception source records the frame the look already captured (no
+/// second capture) and the thin-AX reason; the dispatcher calls `attach()`
+/// after the verb. A background `screen app:` frame is ScreenCaptureKit's
+/// desktop-independent window capture, so nothing is raised. Screen
+/// Recording is only preflighted, never requested: when missing, it is said.
+final class FourVerbPixelAttachment: @unchecked Sendable {
+    static let maxLongSide = 1024
+    static let maxBytes = 150_000
+
+    let part: String?
+    let forced: Bool
+    private let lock = NSLock()
+    private var recorded = false
+    private var reason: String?
+    private var screenRecording = false
+    private var png: String?
+    private var unavailable: String?
+    private var origin: (x: Double, y: Double) = (0, 0)
+    private var logicalSize: (width: Double, height: Double) = (0, 0)
+    private var wholeWindow = true
+    private var background = false
+    private var window = ""
+    private var region: (name: String, frame: MacAXFrame)?
+
+    init(part: String?, forced: Bool) {
+        self.part = part
+        self.forced = forced
+    }
+
+    func record(reason: String?, screenRecording: Bool, png: String?, unavailable: String?,
+                origin: (x: Double, y: Double), logicalSize: (width: Double, height: Double),
+                wholeWindow: Bool, background: Bool, window: String) {
+        lock.lock(); defer { lock.unlock() }
+        recorded = true
+        discarded = false
+        self.reason = reason
+        self.screenRecording = screenRecording
+        self.png = png
+        self.unavailable = unavailable
+        self.origin = origin
+        self.logicalSize = logicalSize
+        self.wholeWindow = wholeWindow
+        self.background = background
+        self.window = window
+        region = nil
+    }
+
+    func focus(name: String, frame: MacAXFrame) {
+        lock.lock(); defer { lock.unlock() }
+        region = (name, frame)
+    }
+
+    /// The look rejected this capture as not its own window: drop its pixels.
+    private var discarded = false
+    func discard() {
+        lock.lock(); defer { lock.unlock() }
+        discarded = true
+        png = nil
+        region = nil
+    }
+
+    /// A numbered pixel region by its rendered name ("visual region 3"),
+    /// "region 3", "3", or the OCR label a pixel target carries.
+    static func region(named part: String, in targets: [MacFourVerbsSupplementalTarget]) -> (name: String, frame: MacAXFrame)? {
+        func normalize(_ text: String) -> String {
+            text.lowercased().split(whereSeparator: \.isWhitespace).joined(separator: " ")
+                .trimmingCharacters(in: CharacterSet(charactersIn: "#\"'"))
+        }
+        let wanted = normalize(part)
+        let words = wanted.split(separator: " ")
+        let number = words.last.flatMap { Int($0) }
+        let prefix = words.dropLast().joined(separator: " ")
+        for target in targets where target.sourceAXPath == nil {
+            guard let label = target.label?.display else { continue }
+            let name = normalize(label)
+            if name == wanted || target.aliases.map(normalize).contains(wanted)
+                || (number.map { name == "visual region \($0)" } ?? false
+                    && ["", "region", "visual region"].contains(prefix)) {
+                return (label, target.observedFrame)
+            }
+        }
+        return nil
+    }
+
+    /// The one line `screen` adds, or nil when nothing about pixels needs
+    /// saying (an AX-rich window she did not ask pixels of).
+    func attach() -> String? {
+        lock.lock(); defer { lock.unlock() }
+        guard recorded, reason != nil || forced else { return nil }
+        let why = reason.map { "thin accessibility: \($0)" } ?? "pixels:true"
+        guard screenRecording else {
+            return "Pixels (\(why)): needs Screen Recording permission (the person's call). No capture was attempted and no prompt was opened; the words above are all I have."
+        }
+        guard !discarded else {
+            return "Pixels (\(why)): the window changed while I looked, so that capture was dropped and no image was attached; look again."
+        }
+        guard let png else {
+            return "Pixels (\(why)): the window capture was unavailable (\(unavailable ?? "capture failed")); the words above are all I have."
+        }
+        guard LocalToolImage.sink != nil else {
+            return "Pixels (\(why)): this call cannot carry an image, so none was attached; the words above are all I have."
+        }
+        var scope = wholeWindow ? "the window" : "the window's main picture area"
+        if let region { scope = "\(region.name), cropped at higher detail" }
+        // Same window, same region, byte-identical source frame → the image
+        // already in her context stands. Checked before any decode or encode.
+        let key = window + "|" + (region?.name ?? "")
+        let fingerprint = SHA256.hash(data: Data(png.utf8)).map { String(format: "%02x", $0) }.joined()
+        let turn = forced ? nil : ChatTurnExecution.current
+        if turn?.pixelsAlreadyAttached(window: key, fingerprint: fingerprint) == true {
+            return "Pixels (\(why)): \(scope) is unchanged since its image was attached earlier this turn; not sent again."
+        }
+        guard let data = Data(base64Encoded: png), let image = VisionImageDecoder.decode(data) else {
+            return "Pixels (\(why)): the window capture could not be decoded; the words above are all I have."
+        }
+        var source = image
+        if let region, logicalSize.width > 0, logicalSize.height > 0 {
+            let padX = max(24, region.frame.w * 0.25), padY = max(24, region.frame.h * 0.25)
+            source = VisionImageCropper.crop(
+                image,
+                to: MacAXFrame(x: region.frame.x - padX, y: region.frame.y - padY,
+                               w: region.frame.w + padX * 2, h: region.frame.h + padY * 2),
+                origin: origin, logicalSize: logicalSize
+            ).image
+        }
+        guard let jpeg = Self.boundedJPEG(source) else {
+            return "Pixels (\(why)): the image could not be fitted under \(Self.maxBytes / 1000) KB; none was attached."
+        }
+        let delivered = LocalToolImage.deliverPNG(jpeg.data, name: "screen-window.jpg",
+            width: jpeg.width, height: jpeg.height, mediaType: "image/jpeg")
+        guard case .object(let result) = delivered, result["status"] == .string("ok") else {
+            return "Pixels (\(why)): this result already carries its image limit; none was attached."
+        }
+        ChatTurnExecution.current?.notePixelsAttached(window: key, fingerprint: fingerprint)
+        let placement = background ? "captured where it sits, nothing raised" : "the front window as shown"
+        return "Pixels attached (\(why)): one \(jpeg.width)×\(jpeg.height) JPEG, \(max(1, jpeg.data.count / 1000)) KB, of \(scope) (\(placement)). It follows this result."
+    }
+
+    /// Long side ≤ 1024 px and ≤ 150 KB: quality steps first, then 3/4 scale.
+    static func boundedJPEG(_ image: CGImage) -> (data: Data, width: Int, height: Int)? {
+        let longest = max(image.width, image.height)
+        guard longest > 0, let space = CGColorSpace(name: CGColorSpace.sRGB) else { return nil }
+        var side = min(maxLongSide, longest)
+        while side >= 128 {
+            let scale = Double(side) / Double(longest)
+            let width = max(1, Int((Double(image.width) * scale).rounded()))
+            let height = max(1, Int((Double(image.height) * scale).rounded()))
+            guard let context = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8,
+                                          bytesPerRow: 0, space: space,
+                                          bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else { return nil }
+            context.interpolationQuality = .high
+            context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+            guard let scaled = context.makeImage() else { return nil }
+            for quality in [0.8, 0.65, 0.5, 0.4] {
+                let encoded = NSMutableData()
+                guard let destination = CGImageDestinationCreateWithData(
+                    encoded, UTType.jpeg.identifier as CFString, 1, nil) else { return nil }
+                CGImageDestinationAddImage(destination, scaled,
+                    [kCGImageDestinationLossyCompressionQuality: quality] as CFDictionary)
+                if CGImageDestinationFinalize(destination), encoded.length > 0, encoded.length <= maxBytes {
+                    return (encoded as Data, width, height)
+                }
+            }
+            side = side * 3 / 4
+        }
+        return nil
     }
 }
 

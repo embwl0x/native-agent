@@ -36,7 +36,10 @@ extension AgentWorkspaceProjection {
             if tool == "agent_read" { return AgentWorkspaceConversation.project(input: input, title: title, result: result) }
             if var projection = AgentWorkspaceKnowledge.project(tool: tool, input: input, result: result)
                 ?? AgentWorkspaceApps.project(tool: tool, input: input, result: result)
-                ?? AgentWorkspaceActivity.project(tool: tool, input: input, result: result) {
+                ?? AgentWorkspaceActivity.project(tool: tool, input: input, result: result)
+                ?? HerScreen.commsProjection(tool: tool, input: input, result: result)
+                ?? AgentWorkspaceLife.project(tool: tool, input: input, result: result)
+                ?? HerScreen.coreProjection(tool: tool, input: input, result: result) {
                 projection.title = title
                 return projection
             }
@@ -97,7 +100,7 @@ extension AgentWorkspaceProjection {
             links.append(.init(title: title, content: .object(["kind": .string("link_in_document"), "url": .string(url.absoluteString)]), actions: [
                 .init(label: "Read source", action: .open(.record(tool: "read_page", input: ["url": .string(url.absoluteString)], title: title))),
                 .init(label: "Open in background browser", action: .perform(tool: "browser.chrome_acquire",
-                    input: ["mode": .string("create"), "initial_url": .string(url.absoluteString)], title: title, textField: nil, isEffect: true))
+                    input: ["mode": .string("create"), "url": .string(url.absoluteString)], title: title, textField: nil, isEffect: true))
             ]))
             if links.count == 6 { break }
         }
@@ -174,24 +177,28 @@ extension AgentWorkspaceProjection {
         return .init(title: "Documents: " + query, content: .object(content), items: items, actions: [])
     }
 
-    private static func workspaceContacts(result: JSONValue, page: Int = 0) -> Self {
+    /// `page` nil is every contact (connections: its text room pages them).
+    private static func workspaceContacts(result: JSONValue, page: Int? = nil) -> Self {
         guard var content = workspaceObject(result), case .array(let contacts)? = content["contacts"] else {
             return .init(title: "People", content: result, items: [], actions: [])
         }
-        let offset = max(0, page) * 8
-        let items = contacts.dropFirst(offset).prefix(8).map { contact -> AgentWorkspaceItem in
+        let offset = max(0, page ?? 0) * 8
+        let items = contacts.dropFirst(offset).prefix(page == nil ? contacts.count : 8).map { contact -> AgentWorkspaceItem in
             let row = workspaceObject(contact) ?? [:]
             let title = workspaceText(row["name"]) ?? workspaceText(row["agent"]) ?? "Contact"
             var actions: [AgentWorkspaceButton] = []
-            if let agent = workspaceText(row["agent"]), workspaceExactAgent(agent),
-               case .array(let capabilities)? = row["capabilities"] {
-                if capabilities.contains(.string("read")) {
-                    actions.append(.init(label: "Open conversation", action: .open(.record(
-                        tool: "agent_read", input: ["agent": .string(agent)], title: title))))
-                }
-                if capabilities.contains(.string("message")), row["can_start_turn"] != .bool(false) {
+            if let agent = workspaceText(row["agent"]), workspaceExactAgent(agent) {
+                // 2026-09-24 desk walk: every contact opens to its conversation
+                // (a read-only room, its last exchange), send-only ones too.
+                actions.append(.init(label: "Open conversation", action: .open(.record(
+                    tool: "agent_read", input: ["agent": .string(agent)], title: title))))
+                if case .array(let capabilities)? = row["capabilities"], capabilities.contains(.string("message")),
+                   row["can_start_turn"] != .bool(false) {
                     actions.append(.init(label: "Message", action: .message(agent: agent, conversation: nil, name: title), needsText: true))
                 }
+            } else if row["state"] == .string(AgentPeerContactState.listed.rawValue) {
+                actions.append(.init(label: "Connect", action: .perform(tool: "agent_connect", input: ["name": .string(title)],
+                                                                      title: "Connect " + title, textField: nil, isEffect: true)))
             }
             // Readiness, route limits and declared capabilities remain the
             // contact owner's words. A button is never a presence assertion.
@@ -205,8 +212,9 @@ extension AgentWorkspaceProjection {
         // They are not necessary for choosing a person and talking.
         content = content.filter { ["status", "detail"].contains($0.key) }
         content["total_contacts"] = .int(Int64(contacts.count))
-        content["page"] = .int(Int64(page))
         var actions: [AgentWorkspaceButton] = []
+        guard let page else { return .init(title: "People", content: .object(content), items: items, actions: actions) }
+        content["page"] = .int(Int64(page))
         if offset + 8 < contacts.count {
             actions.append(.init(label: "More people", action: .open(.people(page: page + 1))))
         }

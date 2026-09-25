@@ -34,6 +34,9 @@ extension CognitiveSubstrate {
     /// summary remains capped; this count lets observation telemetry measure
     /// the actual redacted reply without retaining another copy of it.
     public static let replyCharacterCountMetadataKey = "replyCharacterCount"
+    /// The last ~300 characters of a reply longer than the summary cap — the
+    /// part the summary drops, read only by the Sound rut detector.
+    public static let replyTailMetadataKey = "replyTail"
 
     /// The envelope the mechanism WOULD have chosen: a target reply-length band
     /// and a one-beat flag. Non-lexical, bounded, and inert.

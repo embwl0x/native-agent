@@ -576,7 +576,10 @@
     const spec = parseKeySpec(message.key);
     focusWithoutActivation(element);
     const downAccepted = dispatchKeyboardEvent(element, "keydown", spec);
-    if (downAccepted) applyKeyDefault(element, spec);
+    // 2026-09-24: a synthetic key never runs the browser's own default, so
+    // page keys (PageDown, Space, arrows, Home/End outside a field) scroll
+    // here and say how far; the host judges every other key by its effect.
+    const moved = downAccepted ? applyKeyDefault(element, spec) : null;
     dispatchKeyboardEvent(element, "keyup", spec);
     return {
       snapshotId: message.snapshotId,
@@ -584,6 +587,7 @@
       keypressed: true,
       key: message.key,
       defaultPrevented: !downAccepted,
+      ...(moved ? moved : {}),
     };
   }
 
@@ -764,9 +768,19 @@
     }
     // Let ordinary scroll handlers and virtualized feeds render before the
     // caller's next read. No activation, fabricated intersection events, or
-    // promise that the site's network request completed.
+    // promise that the site's network request completed. 2026-09-24: waits on
+    // the page itself — at least 300 ms, then until it has been quiet for
+    // 300 ms after growing, 1.5 s at most.
     const generation = domGeneration;
-    if (movedX !== 0 || movedY !== 0) await new Promise((resolve) => setTimeout(resolve, 750));
+    if (movedX !== 0 || movedY !== 0) {
+      const started = Date.now();
+      let seen = domGeneration, quietSince = Date.now();
+      while (Date.now() - started < 1_500) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        if (domGeneration !== seen) { seen = domGeneration; quietSince = Date.now(); continue; }
+        if (Date.now() - started >= 300 && (domGeneration === generation ? Date.now() - started >= 750 : Date.now() - quietSince >= 300)) break;
+      }
+    }
     return {
       snapshotId: message.snapshotId ?? null,
       targetNodeId: message.targetNodeId ?? null,
@@ -1163,9 +1177,39 @@
       deleteFromEditable(element, spec.key === "Backspace");
       return;
     }
+    // Page keys scroll only outside anything that moves its own selection or
+    // caret with them (fields, selects, list/combo boxes, sliders, menus).
+    const ownsKeys = isEditable(element) || element.isContentEditable
+      || ["input", "select", "textarea"].includes(element.tagName.toLowerCase())
+      || ["listbox", "combobox", "menu", "menubar", "slider", "spinbutton", "radiogroup", "tree", "grid", "tablist", "option"]
+        .includes(element.getAttribute("role") ?? implicitRole(element));
+    if (!ownsKeys && ["PageDown", "PageUp", " ", "ArrowDown", "ArrowUp", "Home", "End"].includes(spec.key)) {
+      return scrollForKey(element, spec);
+    }
     if (["ArrowLeft", "ArrowRight", "Home", "End"].includes(spec.key)) {
       moveEditableCaret(element, spec.key);
     }
+  }
+
+  // The nearest scrollable box around the element, else the page, moved the
+  // way the key would move it natively.
+  function scrollForKey(element, spec) {
+    let box = element;
+    while (box && box !== document.body && box !== document.documentElement && !isScrollable(box)) box = composedParent(box);
+    const page = !box || box === document.body || box === document.documentElement;
+    const scroller = page ? (document.scrollingElement ?? document.documentElement) : box;
+    const view = page ? window.innerHeight : scroller.clientHeight;
+    const beforeY = scroller.scrollTop;
+    const step = { PageDown: view * 0.875, PageUp: -view * 0.875, " ": (spec.shiftKey ? -1 : 1) * view * 0.875, ArrowDown: 40, ArrowUp: -40 };
+    if (spec.key === "Home") scroller.scrollTop = 0;
+    else if (spec.key === "End") scroller.scrollTop = scroller.scrollHeight;
+    else scroller.scrollTop = beforeY + Math.round(step[spec.key] ?? 0);
+    const movedY = Math.round(scroller.scrollTop - beforeY);
+    // A hidden tab defers native scroll events; tell the feed, as scrollPage does.
+    if (movedY !== 0 && document.visibilityState === "hidden") {
+      (page ? document : box).dispatchEvent(new Event("scroll", { bubbles: page }));
+    }
+    return { movedX: 0, movedY };
   }
 
   function moveFocus(element, direction) {

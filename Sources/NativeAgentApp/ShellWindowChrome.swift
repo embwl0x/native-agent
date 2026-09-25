@@ -42,6 +42,9 @@ struct ShellWindowChrome: NSViewRepresentable {
 /// and the content side by side itself, so no system pane draws corners.
 struct ShellFrame<Sidebar: View, Detail: View>: View {
     @State private var keyboardOrder = ShellKeyboardOrder()
+    /// The haze is drawn only without Reduce Transparency, and where it is
+    /// drawn it replaces the warm lamp: the two mixed to olive-khaki.
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     var classic: Bool
     @ViewBuilder var sidebar: () -> Sidebar
     @ViewBuilder var detail: () -> Detail
@@ -63,12 +66,17 @@ struct ShellFrame<Sidebar: View, Detail: View>: View {
                 // User, 2026-09-03: one sheet of glass. Agent, same day: drawn ONCE,
                 // here, under all three columns — per-column copies of the same
                 // material still read as three plates. The columns are transparent
-                // over it; the lamp is drawn once over all of them.
+                // over it; the lamp is drawn once over all of them. User,
+                // 2026-09-23: the one exception is the rail, which floats on
+                // this sheet as a rounded glass plate (ShellSidebarRail).
                 .background {
                     ShellSheet().contentShape(Rectangle()).gesture(WindowDragGesture())
-                        .overlay { if shellLampUnderContent { ShellLamp() } }
+                        // Alive glass, 2026-09-23: the one drifting haze, over
+                        // the sheet and under every column. See WindowHaze.swift.
+                        .overlay { WindowHaze() }
+                        .overlay { if reduceTransparency && shellLampUnderContent { ShellLamp() } }
                 }
-                .overlay { if !shellLampUnderContent { ShellLamp() } }
+                .overlay { if reduceTransparency && !shellLampUnderContent { ShellLamp() } }
                 // Mood in the tint, 2026-09-14: one masked colour-blend pass
                 // over the whole sheet, so the rail, the room ground and the
                 // composer warm together and the transcript's prose does not.
@@ -179,6 +187,10 @@ private struct ShellKeyboardTarget: ViewModifier {
                 }
             } else {
                 content.focused($focused)
+                    // The rail draws its own rounded ring in the haze's edge
+                    // light instead of the square system one.
+                    .focusEffectDisabled(region == .rail)
+                    .overlay { if region == .rail, focused { ShellRailFocusRing() } }
                     .onKeyPress(keys: [.tab]) { press in
                         guard !press.modifiers.contains(.option) else { return .ignored }
                         return order?.move(from: id, backwards: press.modifiers.contains(.shift)) == true

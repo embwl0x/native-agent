@@ -629,7 +629,11 @@ public struct SwiftNativeAgentSwarmExecutor: AgentSwarmExecuting {
         let startedDate = now()
         let createdAt = AgentSwarmClock.nowISO(startedDate)
         let startNs = DispatchTime.now().uptimeNanoseconds
-        let workerResults = await executeWorkers(request: request, runId: runId)
+        let live = SwarmLiveBoard(runsPath: runsPath, persistence: persistence, id: runId,
+                                  objective: request.objective, createdAt: createdAt,
+                                  pending: request.workers.enumerated().map { $0.element.pendingJSON(index: $0.offset) })
+        await live.put(settled: [:])
+        let workerResults = await executeWorkers(request: request, runId: runId, live: live)
         let synthesis = await synthesizeIfNeeded(request: request, workerResults: workerResults, runId: runId)
         let completedAt = AgentSwarmClock.nowISO(now())
         let elapsedMs = Int((DispatchTime.now().uptimeNanoseconds &- startNs) / 1_000_000)
@@ -727,17 +731,21 @@ public struct SwiftNativeAgentSwarmExecutor: AgentSwarmExecuting {
             do {
                 try await terminalPersistence.value
             } catch {
+                await live.remove()
                 throw AgentSwarmReceiptPersistenceError(
                     runID: runId, runStatus: runStatus, summary: summary, underlyingError: error
                 )
             }
         }
+        // Off the board only once the receipt holds it, so a reader never sees it vanish.
+        await live.remove()
         return result
     }
 
     private func executeWorkers(
         request: AgentSwarmRunRequest,
-        runId: String
+        runId: String,
+        live: SwarmLiveBoard
     ) async -> [AgentSwarmWorkerResult] {
         var results = Array<AgentSwarmWorkerResult?>(repeating: nil, count: request.workers.count)
         await withTaskGroup(of: (Int, AgentSwarmWorkerResult).self) { group in
@@ -751,8 +759,11 @@ public struct SwiftNativeAgentSwarmExecutor: AgentSwarmExecuting {
                     return (idx, await self.runWorker(index: idx, worker: worker, request: request, runId: runId))
                 }
             }
+            var settled: [Int: JSONValue] = [:]
             while let (idx, result) = await group.next() {
                 results[idx] = result
+                settled[idx] = result.json
+                await live.put(settled: settled)
                 if Task.isCancelled {
                     group.cancelAll()
                 } else if nextIndex < request.workers.count {
@@ -1293,7 +1304,55 @@ public enum AgentSwarmClock {
     }
 }
 
+/// `swarms/live.json`: crews still working, for the Simple view's "Working
+/// now" row. Written when a run starts and as each worker settles; a run leaves
+/// once its receipt is in runs.json. Progress only, never evidence: runs.json
+/// is the record. `pid` lets a reader, and the next write, drop a run whose
+/// process died mid-run.
+struct SwarmLiveBoard: Sendable {
+    let runsPath: URL
+    let persistence: any PersistenceCoreProtocol
+    let id: String
+    let objective: String
+    let createdAt: String
+    let pending: [JSONValue]
+
+    private var path: URL { runsPath.deletingLastPathComponent().appendingPathComponent("live.json") }
+
+    func put(settled: [Int: JSONValue]) async {
+        let workers = pending.enumerated().map { settled[$0.offset] ?? $0.element }
+        await write(.object([
+            "id": .string(id), "status": .string("running"), "objective": .string(objective),
+            "createdAt": .string(createdAt), "pid": .int(Int64(getpid())), "workers": .array(workers),
+        ]))
+    }
+
+    func remove() async { await write(nil) }
+
+    private func write(_ record: JSONValue?) async {
+        let path = path, persistence = persistence, id = id
+        // Its own task: a cancelled run must still take itself off the board.
+        await Task {
+            try? await persistence.withFileLock(path, waitingAtMost: 5) {
+                var rows: [JSONValue] = []
+                if let data = try? Data(contentsOf: path), case .array(let saved)? = try? JSONValue.parse(data) { rows = saved }
+                rows.removeAll { row in
+                    guard case .object(let object) = row, object["id"] != .string(id),
+                          case .int(let pid)? = object["pid"] else { return true }
+                    return kill(pid_t(pid), 0) != 0 && errno == ESRCH
+                }
+                if let record { rows.append(record) }
+                try await persistence.writeJSON(.array(rows), to: path)
+            }
+        }.value
+    }
+}
+
 private extension AgentSwarmWorkerSpec {
+    func pendingJSON(index: Int) -> JSONValue {
+        .object(["index": .int(Int64(index + 1)), "name": .string(name), "role": .string(role), "status": .string("working")])
+    }
+
     func planJSON(index: Int) -> JSONValue {
         var obj: [String: JSONValue] = [
             "index": .int(Int64(index + 1)),

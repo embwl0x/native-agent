@@ -23,8 +23,14 @@ extension SwiftToolDispatcher {
                 request,
                 connector: "gmail"
             )
+            // The inbox's own counts: what "how much mail do I have" asks.
+            var inboxRequest = URLRequest(url: URL(string: "https://gmail.googleapis.com/gmail/v1/users/me/labels/INBOX")!)
+            inboxRequest.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+            let inbox = (try? await cloudConnectorJSONObject(inboxRequest, connector: "gmail")) ?? [:]
             return .object([
                 "status": .string("ok"),
+                "inbox_total": Self.cloudInt(inbox["messagesTotal"]).map { .int(Int64($0)) } ?? .null,
+                "inbox_unread": Self.cloudInt(inbox["messagesUnread"]).map { .int(Int64($0)) } ?? .null,
                 "email": Self.cloudString(object["emailAddress"]).map(JSONValue.string) ?? .null,
                 "messagesTotal": Self.cloudInt(object["messagesTotal"]).map {
                     .int(Int64($0))
@@ -93,7 +99,7 @@ extension SwiftToolDispatcher {
             return Self.cloudFailure(
                 connector: "gmail",
                 code: "invalid_input",
-                detail: "gmail_read requires a message id."
+                detail: "Say which message: pass the id from a gmail_search row."
             )
         }
         return await cloudConnectorRead(connector: "gmail") { token in
@@ -135,12 +141,26 @@ extension SwiftToolDispatcher {
     func impl_google_calendar_list(input: [String: JSONValue]) async -> JSONValue {
         let input = input.filter { $0.value != .string("") }
         let limit = max(1, min(Self.cloudInputInt(input["limit"]) ?? 20, 50))
-        let now = Date()
-        let end = now.addingTimeInterval(7 * 24 * 60 * 60)
-        let timeMin = Self.cloudInputString(input["time_min"] ?? input["timeMin"])
-            ?? Self.cloudISO8601(now)
-        let timeMax = Self.cloudInputString(input["time_max"] ?? input["timeMax"])
-            ?? Self.cloudISO8601(end)
+        var now = Date()
+        var end = now.addingTimeInterval(7 * 24 * 60 * 60)
+        // A bare day ("today", "tomorrow", "2026-09-25") is that local day;
+        // Google refuses anything short of a full RFC 3339 time.
+        func localDay(_ raw: String?) -> Date? {
+            guard let raw = raw?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() else { return nil }
+            let calendar = Calendar.current, today = calendar.startOfDay(for: Date())
+            if raw == "today" { return today }
+            if raw == "tomorrow" { return calendar.date(byAdding: .day, value: 1, to: today) }
+            let formatter = DateFormatter()
+            formatter.locale = Locale(identifier: "en_US_POSIX"); formatter.timeZone = .current; formatter.dateFormat = "yyyy-MM-dd"
+            return raw.count == 10 ? formatter.date(from: raw) : nil
+        }
+        if let day = localDay(Self.cloudInputString(input["day"])) {
+            now = day; end = Calendar.current.date(byAdding: .day, value: 1, to: day) ?? day.addingTimeInterval(86_400)
+        }
+        let rawMin = Self.cloudInputString(input["time_min"] ?? input["timeMin"])
+        let rawMax = Self.cloudInputString(input["time_max"] ?? input["timeMax"])
+        let timeMin = localDay(rawMin).map(Self.cloudISO8601) ?? rawMin ?? Self.cloudISO8601(now)
+        let timeMax = localDay(rawMax).map(Self.cloudISO8601) ?? rawMax ?? Self.cloudISO8601(end)
         return await cloudConnectorRead(connector: "calendar") { token in
             var components = URLComponents(
                 string: "https://www.googleapis.com/calendar/v3/calendars/primary/events"
@@ -224,16 +244,39 @@ extension SwiftToolDispatcher {
 
     func impl_notion_read_page(input: [String: JSONValue]) async -> JSONValue {
         let input = input.filter { $0.value != .null && $0.value != .string("") }
-        guard let id = Self.cloudInputString(
-            input["id"] ?? input["page_id"] ?? input["pageId"]
-        ), !id.isEmpty else {
+        guard let given = Self.cloudInputString(
+            input["id"] ?? input["page_id"] ?? input["pageId"] ?? input["url"] ?? input["title"]
+        ), !given.isEmpty else {
             return Self.cloudFailure(
                 connector: "notion",
                 code: "invalid_input",
-                detail: "notion_read_page requires a page id."
+                detail: "Give the page's title, link or id."
             )
         }
+        // A link's or id's 32 hex digits are the id; anything else is a title.
+        let stripped = given.replacingOccurrences(of: "-", with: "")
+        let hex = stripped.range(of: #"[0-9a-fA-F]{32}(?=$|[?#])"#, options: .regularExpression).map { String(stripped[$0]) }
         return await cloudConnectorRead(connector: "notion") { token in
+            var id = hex ?? given
+            if hex == nil {
+                var search = URLRequest(url: URL(string: "https://api.notion.com/v1/search")!)
+                search.httpMethod = "POST"
+                search.httpBody = try JSONSerialization.data(withJSONObject: [
+                    "query": given, "page_size": 10, "filter": ["property": "object", "value": "page"]])
+                Self.applyNotionHeaders(token: token, to: &search)
+                search.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                let pages = try await cloudConnectorJSONObject(search, connector: "notion")["results"] as? [[String: Any]] ?? []
+                // Exactly one page with exactly that title; never a nearest hit.
+                let exact = pages.filter { Self.notionTitle($0).caseInsensitiveCompare(given) == .orderedSame }
+                guard exact.count == 1, let found = exact[0]["id"] as? String else {
+                    let shown = (exact.isEmpty ? pages : exact).prefix(5)
+                        .map { "\"\(Self.notionTitle($0))\" (\(($0["id"] as? String) ?? "?"))" }.joined(separator: ", ")
+                    return Self.cloudFailure(connector: "notion", code: exact.isEmpty ? "not_found" : "ambiguous",
+                        detail: (exact.isEmpty ? "No page is titled exactly \"\(given)\"." : "\(exact.count) pages are titled \"\(given)\"; pass one id.")
+                            + (shown.isEmpty ? " notion_search lists what the integration can see." : " Candidates: \(shown)."))
+                }
+                id = found
+            }
             var pageRequest = URLRequest(
                 url: URL(string: "https://api.notion.com/v1/pages/\(Self.cloudPath(id))")!
             )
@@ -259,6 +302,8 @@ extension SwiftToolDispatcher {
             let projection = Self.notionObjectProjection(page)
             guard case .object(var output) = projection else { return projection }
             output["text"] = .string(Self.cloudClip(text, limit: 20_000))
+            // Only the first 100 blocks are read; say so rather than read as the whole page.
+            if blocks["has_more"] as? Bool == true { output["truncated"] = .bool(true) }
             return .object(output)
         }
     }
@@ -334,7 +379,9 @@ extension SwiftToolDispatcher {
                 ))
             }
         } catch {
-            return needingReconnect(Self.cloudReadFailure(error, connector: connector))
+            // Notion has no refresh: its 401 is a revoked token, so it offers Connect.
+            return needingReconnect(Self.cloudReadFailure(error, connector: connector,
+                reauthenticate: connector == "notion" && (error as? CloudConnectorHTTPError)?.statusCode == 401))
         }
     }
 
@@ -534,17 +581,35 @@ extension SwiftToolDispatcher {
                 .string(cloudClip($0, limit: 1_000))
             } ?? .null,
         ]
+        if let labels = message["labelIds"] as? [String] { output["unread"] = .bool(labels.contains("UNREAD")) }
         if includeBody {
             output["body"] = .string(
-                cloudClip(gmailBodyText(payload), limit: 20_000)
+                cloudClip(gmailReadableBody(payload), limit: 20_000)
             )
         }
         return .object(output)
     }
 
-    private static func gmailBodyText(_ payload: [String: Any]) -> String {
+    /// Plain text when the mail has it; an HTML-only mail (receipts,
+    /// newsletters) read as an empty body before, so its HTML is flattened.
+    private static func gmailReadableBody(_ payload: [String: Any]) -> String {
+        let plain = gmailBodyText(payload)
+        guard plain.isEmpty else { return plain }
+        var text = gmailBodyText(payload, mimeType: "text/html")
+        for pattern in ["(?is)<(script|style|head)\\b.*?</\\1>", "(?i)<br\\s*/?>|</(p|div|tr|li|h[1-6])>", "(?s)<[^>]+>"] {
+            text = text.replacingOccurrences(of: pattern, with: pattern.hasPrefix("(?i)<br") ? "\n" : " ", options: .regularExpression)
+        }
+        for (entity, character) in [("&nbsp;", " "), ("&amp;", "&"), ("&lt;", "<"), ("&gt;", ">"), ("&quot;", "\""), ("&#39;", "'")] {
+            text = text.replacingOccurrences(of: entity, with: character)
+        }
+        return text.replacingOccurrences(of: "[ \t]+", with: " ", options: .regularExpression)
+            .replacingOccurrences(of: "\\s*\n\\s*", with: "\n", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func gmailBodyText(_ payload: [String: Any], mimeType wanted: String = "text/plain") -> String {
         let mimeType = cloudString(payload["mimeType"]) ?? ""
-        if mimeType == "text/plain",
+        if mimeType == wanted,
            let body = payload["body"] as? [String: Any],
            let encoded = cloudString(body["data"]),
            let data = cloudBase64URLDecode(encoded),
@@ -552,7 +617,7 @@ extension SwiftToolDispatcher {
             return text
         }
         let parts = payload["parts"] as? [[String: Any]] ?? []
-        let plain = parts.map(gmailBodyText).filter { !$0.isEmpty }
+        let plain = parts.map { gmailBodyText($0, mimeType: wanted) }.filter { !$0.isEmpty }
         return plain.joined(separator: "\n\n")
     }
 

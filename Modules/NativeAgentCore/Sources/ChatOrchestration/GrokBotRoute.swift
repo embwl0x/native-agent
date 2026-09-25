@@ -10,6 +10,8 @@ public struct GrokPendingRequest: Codable, Sendable {
     public let expiresAt: Date
     public var state: String
     public var runID: String?
+    /// The person sent this from Grok's thread: the answer lands there only.
+    public var quiet: Bool?
 }
 
 public struct GrokRequestStore: Sendable {
@@ -20,13 +22,13 @@ public struct GrokRequestStore: Sendable {
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         return root.appendingPathComponent(id + ".json")
     }
-    public func create(id: String, peer: String, conversation: String, now: Date = Date()) throws -> GrokPendingRequest {
+    public func create(id: String, peer: String, conversation: String, quiet: Bool = false, now: Date = Date()) throws -> GrokPendingRequest {
         guard NativeAgentChatSessionID.normalizedPathComponent(conversation) == conversation else { throw GrokLinkCredential.Failure.invalid }
         let file = try url(id)
         return try CredentialFileLock.withLock(file) {
             guard !FileManager.default.fileExists(atPath: file.path) else { throw GrokLinkCredential.Failure.invalid }
             let request = GrokPendingRequest(messageID: id, peerID: peer, conversationID: conversation,
-                expiresAt: now.addingTimeInterval(600), state: "sending")
+                expiresAt: now.addingTimeInterval(600), state: "sending", quiet: quiet ? true : nil)
             try SwiftNativePersistenceCore.writeDataAtomicDurable(JSONEncoder().encode(request), to: file)
             return request
         }
@@ -93,12 +95,12 @@ public enum GrokBotRoute {
                 : pending.state)])
     }
     public static func send(peer: AgentPeerContact, text: String, conversation: String, messageID: String,
-                            dataRoot: URL, credential: GrokLinkCredential,
+                            dataRoot: URL, credential: GrokLinkCredential, quiet: Bool = false,
                             post: @Sendable (URLRequest) async throws -> Int = postOnce) async throws -> JSONValue {
         guard peer.grokSetup == "set up", let address = credential.webhookURL,
               let key = credential.webhookKey, let url = URL(string: address) else { throw GrokLinkCredential.Failure.unavailable }
         let store = GrokRequestStore(dataRoot: dataRoot)
-        _ = try store.create(id: messageID, peer: peer.id, conversation: conversation)
+        _ = try store.create(id: messageID, peer: peer.id, conversation: conversation, quiet: quiet)
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("Bearer " + key, forHTTPHeaderField: "Authorization")

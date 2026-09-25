@@ -380,10 +380,9 @@ struct ChatTurnCardInset: View {
             if showThinkingRow {
                 // Desk 658.11: the one shared live-turn card. The
                 // detached window composes this exact host.
-                MacChatTurnCardHost(
-                    sessionId: appModel.activeChatSessionId,
-                    onStop: { appModel.stopChatStream() }
-                )
+                // No Stop here: the composer's Stop, in the send slot, is
+                // the one stop control (2026-09-23).
+                MacChatTurnCardHost(sessionId: appModel.activeChatSessionId)
                 // User, 2026-09-03: the working card shares the
                 // composer's frame in the new shell, edge to edge.
                 .padding(
@@ -475,6 +474,8 @@ struct ChatView: View {
     /// Chat stays mounted behind the page switch (ContentView, 2026-09-13), so
     /// this — not `onDisappear` — is how a hidden chat knows to stop acting.
     @Environment(\.chatPageIsVisible) var chatPageIsVisible
+    /// Simple view shows this page without its conversation list (SimpleViewMode).
+    @Environment(\.chatHidesConversationList) var hidesConversationList
     /// The conversation list's travelling selection bar (ChatView+ShellColumn).
     @Namespace var shellConversationBar
     /// The inline cards of the open conversation, read back from the
@@ -796,7 +797,7 @@ struct ChatView: View {
 
     var body: some View {
         HStack(spacing: 0) {
-            sessionSidebar
+            if !hidesConversationList { sessionSidebar }
             if classicShell { Divider() }
             chatColumn
             // D4: the three token-rate read-aloud triggers used to hang off
@@ -807,6 +808,9 @@ struct ChatView: View {
             ChatReadAloudObserver(onChanged: speakLatestAssistantIfReady)
         }
         .navigationTitle("Chat")
+        // Where a card's setup opens: the connector sheet, or in Simple view
+        // the floating glass panel (SimpleSetupPanel.swift).
+        .inlineCardSetup(inlineCards)
         .liveOnAppear {
             voiceOutput.nativeBaseURL = appModel.nativeBaseURL
             prunePinnedSessions()
@@ -816,6 +820,10 @@ struct ChatView: View {
             adoptDraft(for: appModel.activeChatSessionId)
             // A pending card survives relaunch because the transcript does.
             Task { await inlineCards.refresh(sessionID: appModel.activeChatSessionId) }
+            // 2026-09-23: the keyboard starts in the composer, not on the
+            // rail's first word. After this pass, so the window's own initial
+            // first responder has already been chosen.
+            DispatchQueue.main.async { if chatPageIsVisible { inputFocused = true } }
         }
         // The same read, for the copy a quiet read mounts offscreen.
         //
@@ -1337,8 +1345,7 @@ struct ChatView: View {
                                     // D1: never invite a message that can only
                                     // dead-end. Send the user to Providers first.
                                     ChatProviderConnectEmptyState {
-                                        _ = NativeAgentAppCoordinator.shared
-                                            .request(.sidebar(.providers))
+                                        inlineCards.openPage(.providers)
                                     }
                                     .frame(minHeight: 360)
                                 case .suggestions:
@@ -1406,8 +1413,7 @@ struct ChatView: View {
                                         showsNothingSentLine: !ChatShellTroubleState
                                             .tailTurnDispatchedTools(appModel.chatMessages),
                                         onOpenSettings: {
-                                            _ = NativeAgentAppCoordinator.shared
-                                                .request(.sidebar(.settings))
+                                            inlineCards.openPage(.settings)
                                         }
                                     )
                                 }
@@ -1524,15 +1530,20 @@ struct ChatView: View {
                     // over the transcript and the transcript scrolls under it,
                     // which is the only arrangement the scroll edge effect
                     // above can act on.
-                    .safeAreaInset(edge: .top, spacing: 0) {
+                    // Simple view: no sheet; the transcript is alpha-masked so
+                    // lines dissolve before the header (`roomTopChrome`).
+                    .roomTopChrome(masked: hidesConversationList) {
                         VStack(spacing: 0) {
                             if !classicShell {
                                 // ui-simplify 2026-09-02 (Lane A): her name in
                                 // the rounded display face and ONE status dot.
+                                // Simple drops the posture line: the composer
+                                // already says it.
                                 ShellRoomHeader(
                                     name: appModel.agentDisplayName,
                                     status: shellStatus,
-                                    trustPolicy: appModel.trustPolicy
+                                    trustPolicy: appModel.trustPolicy,
+                                    showsPosture: !hidesConversationList
                                 )
                                 // Agent, 2026-09-03: with the transcript
                                 // running under it the header needs material.
@@ -1550,8 +1561,12 @@ struct ChatView: View {
                                 // transcript sat above her name in the title
                                 // strip on every scroll (fcab4f85).
                                 .background {
-                                    ShellSheet()
-                                        .ignoresSafeArea(edges: .top)
+                                    // Simple: no sheet here; over the haze it
+                                    // read as a lighter band with a seam.
+                                    if !hidesConversationList {
+                                        ShellSheet()
+                                            .ignoresSafeArea(edges: .top)
+                                    }
                                 }
                                 InboxStripContainer()
                                     .environment(appModel)
@@ -1871,6 +1886,7 @@ struct ChatView: View {
                         placeholder: classicShell
                             ? "Ask \(appModel.agentDisplayName)"
                             : shellComposerPlaceholder,
+                        recipient: hidesConversationList ? appModel.agentAddressName : nil,
                         voiceInput: voiceInput,
                         capabilitiesStore: capabilitiesStore,
                         voiceSessionId: voiceSessionId,

@@ -106,22 +106,43 @@ public extension GitHubConnectorActions {
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) async throws -> JSONValue {
         let repository = try repositoryIdentity(input)
-        let path = try repositoryContentPath(input["path"])
+        // A pasted .../tree/<ref>/<path> or .../blob/<ref>/<path> link names
+        // the path and ref itself when those fields are blank. A ref can hold
+        // slashes (feature/login), so each split is tried, shortest ref first.
+        let linked = linkedLocations(input, repository: repository)
+        var tries: [(ref: String?, path: String)] = []
+        for candidate in linked.isEmpty ? [(ref: nil, path: nil)] : linked {
+            let path = try repositoryContentPath(normalized(input["path"]) == nil ? candidate.path.map(JSONValue.string) : input["path"])
+            let ref = try repositoryRef(normalized(input["ref"]) == nil ? candidate.ref.map(JSONValue.string) : input["ref"])
+            if !tries.contains(where: { $0.ref == ref && $0.path == path }) { tries.append((ref, path)) }
+        }
         let maxCharacters = clamp(
             int(input["max_characters"], default: 30_000),
             min: 1_000,
             max: 100_000
         )
-        var params: [String: String] = [:]
-        if let ref = try repositoryRef(input["ref"]) {
-            params["ref"] = ref
+        var params: [String: String] = [:], path = "", raw: Any?
+        for (index, attempt) in tries.enumerated() {
+            (params, path) = (attempt.ref.map { ["ref": $0] } ?? [:], attempt.path)
+            do {
+                raw = try await call(
+                    path: "repos/\(repository.fullName)/contents\(path.isEmpty ? "" : "/\(path)")",
+                    params: params,
+                    dataRoot: dataRoot
+                )
+                break
+            } catch GitHubConnectorError.http(let status, _, _, _) where status == 404 {
+                if index + 1 < tries.count { continue }
+                if tries.count > 1 {
+                    throw GitHubConnectorError.invalidInput("\(repository.fullName) has nothing at that link. Give ref (the branch or tag) and path separately.")
+                }
+                let parent = path.split(separator: "/").dropLast().joined(separator: "/")
+                throw GitHubConnectorError.invalidInput(
+                    "\(repository.fullName) has no \(path.isEmpty ? "readable root" : "'\(path)'")\(params["ref"].map { " at \($0)" } ?? ""). "
+                        + "Read path '\(parent.isEmpty ? "/" : parent)' to see what is there, or check the repo name and ref."
+                )
+            }
         }
-        let suffix = path.isEmpty ? "" : "/\(path)"
-        let raw = try await call(
-            path: "repos/\(repository.fullName)/contents\(suffix)",
-            params: params,
-            dataRoot: dataRoot
-        )
 
         var payload: [String: JSONValue] = [
             "actionId": .string("github.read_repository_content"),
@@ -281,6 +302,24 @@ extension GitHubConnectorActions {
             throw GitHubConnectorError.invalidInput("GitHub repository owner/name contains unsupported characters.")
         }
         return resolved
+    }
+
+    /// Ref and path splits from a github.com tree/blob link into this
+    /// repository (url, repo or repository): up to four, shortest ref first.
+    static func linkedLocations(_ input: [String: JSONValue], repository: RepositoryIdentity) -> [(ref: String?, path: String?)] {
+        for key in ["url", "repo", "repository"] {
+            guard let raw = normalized(input[key]), raw.lowercased().hasPrefix("http"),
+                  let url = URL(string: raw) else { continue }
+            let parts = url.path.split(separator: "/").map(String.init)
+            guard parts.count >= 4, ["tree", "blob"].contains(parts[2]),
+                  "\(parts[0])/\(parts[1])".caseInsensitiveCompare(repository.fullName) == .orderedSame else { continue }
+            let rest = Array(parts.dropFirst(3))
+            return (1...min(4, rest.count)).map { cut in
+                let path = rest.dropFirst(cut).joined(separator: "/")
+                return (rest.prefix(cut).joined(separator: "/"), path.isEmpty ? nil : path)
+            }
+        }
+        return []
     }
 
     static func repositoryContentPath(_ raw: JSONValue?) throws -> String {

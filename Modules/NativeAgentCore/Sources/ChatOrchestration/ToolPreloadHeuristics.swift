@@ -130,6 +130,13 @@ public enum ToolPreloadHeuristics {
         "browser.chrome_snapshot", "browser.chrome_scroll", "browser.chrome_release",
     ]
 
+    /// Her-screen Phase 3 (2026-09-23): the page's hands ride with the browser
+    /// group, so a click after a read never costs a `tool_load` call first.
+    static let chromeActTools: Set<String> = [
+        "browser.chrome_click", "browser.chrome_fill", "browser.chrome_type",
+        "browser.chrome_select", "browser.chrome_keypress",
+    ]
+
     /// The built-in SearXNG server's tools (MCPDispatcher default server).
     public static let webSearchTools: Set<String> = [
         "mcp__searxng-local__search", "mcp__searxng-local__fetch",
@@ -185,14 +192,17 @@ public enum ToolPreloadHeuristics {
             group: "browser",
             aliases: ["browsing", "visible_browser", "visible-browser", "web", "webpage", "page"],
             tokens: [
-                "browser", "web", "webpage", "website", "page", "url",
+                "browser", "chrome", "web", "webpage", "website", "page", "url",
                 "navigate", "screenshot",
+                // User, 2026-09-24: X is read in Chrome, not on his paid API.
+                "tweet", "tweets", "twitter", "retweet",
             ],
             phrases: [
                 "visible browser", "open url", "open website", "open webpage",
                 "read page", "read website", "browser screenshot",
+                "x.com", "on x", "search x", "x profile", "x feed",
             ],
-            tools: chromeReadTools
+            tools: chromeReadTools.union(chromeActTools)
         ),
         GroupEntry(
             group: "art",
@@ -315,9 +325,11 @@ public enum ToolPreloadHeuristics {
         ),
         GroupEntry(
             group: "x",
-            tokens: ["tweet", "tweets", "twitter", "retweet"],
-            phrases: ["x.com"],
-            tools: ["x_status", "x_me", "x_search", "x_timeline", "x_user_tweets"]
+            tokens: [],
+            phrases: [],
+            tools: ["x_status", "x_me", "x_search", "x_timeline", "x_user_tweets"],
+            // User's paid API: loadable by name, never preloaded (X words load the browser).
+            preloadable: false
         ),
         GroupEntry(
             group: "github",
@@ -574,7 +586,7 @@ public enum ToolPreloadHeuristics {
                 // structured API lane.
                 if hasGitHubAddress {
                     let explicitBrowserSignals: Set<String> = [
-                        "browser", "navigate", "screenshot", "visible browser",
+                        "browser", "chrome", "navigate", "screenshot", "visible browser",
                         "open url", "open website", "open webpage", "browser screenshot",
                     ]
                     hits.removeAll { !explicitBrowserSignals.contains($0) }
@@ -697,6 +709,25 @@ public enum ToolPreloadHeuristics {
     /// Swift tool-load paths. It is deliberately presentation-only: callers
     /// still intersect with their exact available inventory and every tool
     /// still revalidates policy at dispatch time.
+    /// The family a loaded tool brings along (2026-09-24, live 05652ED6: the
+    /// browser loaded one tool per search, chrome_scroll never came, and she
+    /// scrolled with PageDown for ten minutes). The smallest app-family group
+    /// holding it, twelve tools at most; cross-cutting groups (research,
+    /// pages, app, context, memory, persona, delegation, swarm) never expand.
+    public static func family(of name: String) -> Set<String> {
+        let crossCutting: Set<String> = ["research", "pages", "app", "context", "memory", "persona", "delegation", "swarm"]
+        return table.filter { !crossCutting.contains($0.group) && $0.loadTools.count <= 12 && $0.loadTools.contains(name) }
+            .min { $0.loadTools.count < $1.loadTools.count }?.loadTools ?? []
+    }
+
+    /// A family's reading tools, loaded alone when the whole family has no room.
+    public static func familyReads(_ tools: Set<String>) -> Set<String> {
+        // Whole words of the name: "mark" is mail_mark_read, never market_quote.
+        let acts: Set<String> = ["send", "create", "delete", "update", "modify", "mutate", "post", "write", "archive",
+                                 "complete", "control", "click", "fill", "type", "select", "keypress", "set", "reply", "mark", "rewrite"]
+        return tools.filter { name in acts.isDisjoint(with: name.split { $0 == "_" || $0 == "." }.map(String.init)) }
+    }
+
     public static func loadGroup(
         forCategory rawCategory: String
     ) -> (group: String, tools: Set<String>)? {

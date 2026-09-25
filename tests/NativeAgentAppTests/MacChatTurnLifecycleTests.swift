@@ -1216,7 +1216,7 @@ struct MacChatTurnLifecycleTests {
             ), encoding: .utf8
         )
         #expect(compatibilityEntry.contains("TurnTraceContext.turnId ?? TurnTraceContext.mintTurnId()"))
-        let markerClear = try #require(compatibility.range(of: "removeItem(at: cancelFlagPath)"))
+        let markerClear = try #require(compatibility.range(of: "ChatCancelFlag.accept(dataRoot: dataRoot, sessionId: resolvedSession, runId: runId)"))
         let userAppend = try #require(compatibility.range(of: "if !suppressUserAppend"))
         #expect(markerClear.lowerBound < userAppend.lowerBound)
     }

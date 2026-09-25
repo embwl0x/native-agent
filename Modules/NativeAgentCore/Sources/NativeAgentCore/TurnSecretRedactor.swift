@@ -37,7 +37,10 @@ public enum TurnSecretRedactor {
             // credential-shaped (eight or more unbroken characters).
             (
                 "NAMED_SECRET",
-                #"(?<![A-Za-z0-9])(?:[A-Za-z0-9]+[_-]){0,3}(?:api[_-]?key|key|token|secret|password|passwd|openai|anthropic|github)(?![A-Za-z0-9])\s*[=:]\s*[^\s"']{8,}"#,
+                // 2026-09-24: "view it on GitHub: https://github.com/…" in an
+                // email is a link, not a credential; a value that is a URL is
+                // left alone (a key inside its query still matches as `key=`).
+                #"(?<![A-Za-z0-9])(?:[A-Za-z0-9]+[_-]){0,3}(?:api[_-]?key|key|token|secret|password|passwd|openai|anthropic|github)(?![A-Za-z0-9])\s*[=:]\s*(?!(?:https?|ftp)://)[^\s"']{8,}"#,
                 [.caseInsensitive]
             ),
         ]

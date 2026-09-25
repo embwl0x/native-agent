@@ -39,26 +39,24 @@ struct AdvancedCard<Content: View>: View {
 struct AdvancedEyebrow: View {
     let text: String
 
+    // Alive glass (2026-09-23): the kit's eyebrow. Only Capabilities uses it.
     var body: some View {
-        Text(text)
-            .font(ShellType.labelSemibold)
-            .textCase(.uppercase)
-            .kerning(0.6)
-            .foregroundStyle(NativeAgentShell.secondary)
-            .padding(.horizontal, 2)
+        AliveEyebrow(text)
     }
 }
 
 /// An eyebrow and the card under it — what a panel becomes on these pages.
 struct AdvancedSection<Content: View>: View {
     let title: String
-    var spacing: CGFloat = 12
     @ViewBuilder var content: Content
 
+    /// Alive glass (2026-09-23): the kit's eyebrow over ONE group card, each
+    /// child a row with a hairline between. Only Capabilities uses it; the
+    /// plain `AdvancedCard` stays as it was for the classic knowledge graph.
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            AdvancedEyebrow(text: title)
-            AdvancedCard(spacing: spacing) { content }
+        VStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
+            AliveEyebrow(title)
+            AliveGroupCard { content }
         }
     }
 }
@@ -175,7 +173,7 @@ struct AdvancedMeta: View {
     var body: some View {
         Text(text)
             .font(ShellType.caption)
-            .foregroundStyle(NativeAgentShell.tertiary)
+            .foregroundStyle(NativeAgentShell.secondary)
             .lineLimit(1)
     }
 }
@@ -202,32 +200,11 @@ struct AdvancedStat: View {
             if !detail.isEmpty {
                 Text(AdvancedStatusWords.label(detail))
                     .font(ShellType.caption)
-                    .foregroundStyle(NativeAgentShell.tertiary)
+                    .foregroundStyle(NativeAgentShell.secondary)
                     .lineLimit(2)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-    }
-}
-
-/// A tile that DOES sit on the sheet — the five counts at the top of
-/// Capabilities — so it wears the card itself.
-struct AdvancedSummaryTile: View {
-    let title: String
-    let value: String
-
-    var body: some View {
-        AdvancedCard(spacing: 2) {
-            Text(value)
-                .font(ShellType.title)
-                .monospacedDigit()
-                .foregroundStyle(NativeAgentShell.text)
-                .lineLimit(1)
-            Text(title)
-                .font(ShellType.label)
-                .foregroundStyle(NativeAgentShell.secondary)
-                .lineLimit(1)
-        }
     }
 }
 
@@ -263,7 +240,7 @@ struct AdvancedFold<Content: View>: View {
                 HStack(alignment: .top, spacing: 8) {
                     Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
                         .font(ShellType.labelSemibold)
-                        .foregroundStyle(NativeAgentShell.tertiary)
+                        .foregroundStyle(NativeAgentShell.secondary)
                         .padding(.top, 2)
                     VStack(alignment: .leading, spacing: 2) {
                         Text(title)
@@ -277,8 +254,9 @@ struct AdvancedFold<Content: View>: View {
                         }
                     }
                     Spacer(minLength: 8)
+                    // Folded, the count is one quiet word, not an alarm.
                     if let attention {
-                        AdvancedStatusWord(status: "warn", text: attention)
+                        AdvancedStatusWord(status: nil, text: attention)
                             .padding(.top, 2)
                     }
                 }

@@ -41,6 +41,17 @@ enum ContextFillPresentation {
             isOverBudget: budget > 0 && usedTokens > budget
         )
     }
+
+    /// The status's own percent, which holds a previous model's receipt at
+    /// 100% on the smaller window just switched to instead of reading 250%.
+    static func usage(_ status: SessionContextStatus) -> Usage {
+        let percent = status.budget > 0 ? status.percent : 0
+        return Usage(
+            percent: percent,
+            fillFraction: min(1, max(0, percent / 100)),
+            isOverBudget: percent > 100
+        )
+    }
 }
 
 enum ContextFillCompactionPresentation {
@@ -81,6 +92,9 @@ struct ContextFillBar: View {
     @State private var lastError: String? = nil
     @State private var lastErrorWasCompaction = false
     @State private var refreshToken = 0
+    // Settings › Context window: a change re-sizes the window at once.
+    @AppStorage("nativeagent.contextWindowMode") private var windowMode = ""
+    @AppStorage("nativeagent.compactionThresholdTokens") private var windowSize = 0
 
     init(
         sessionId: String,
@@ -94,7 +108,7 @@ struct ContextFillBar: View {
 
     private var usage: ContextFillPresentation.Usage {
         guard let status else { return .init(percent: 0, fillFraction: 0, isOverBudget: false) }
-        return ContextFillPresentation.usage(usedTokens: status.used_tokens, budget: status.budget)
+        return ContextFillPresentation.usage(status)
     }
     private var pct: Double { usage.percent }
     private var compactButtonState: ContextFillCompactionPresentation.ButtonState {
@@ -217,7 +231,7 @@ struct ContextFillBar: View {
         .padding(.vertical, 4)
         .frame(maxWidth: .infinity, alignment: .leading)
         .help(status.map { contextHelp($0) } ?? "Loading context status…")
-        .task(id: "\(sessionId):\(appModel.chatModel):\(refreshToken)") { await refresh() }
+        .task(id: "\(sessionId):\(appModel.chatModel):\(refreshToken):\(windowMode):\(windowSize)") { await refresh() }
         .onReceive(NotificationCenter.default.publisher(for: .chatTurnCompleted)) { note in
             if let completedSessionId = note.object as? String, completedSessionId != sessionId {
                 return
@@ -257,7 +271,7 @@ struct ContextFillBar: View {
         } ?? ""
         let usageDescription = s.context_loaded == true
             ? "Exact last provider request: \(s.used_tokens) of \(s.budget) input tokens. Stored transcript estimate: \(transcript); remainder after that estimate: \(prompt).\(deltaDescription)"
-            : "No matching provider receipt yet. Transcript estimate: \(transcript) of a \(s.budget)-token model window."
+            : "No matching provider receipt yet. Transcript estimate: \(transcript) of your \(s.budget)-token window."
         return "\(usageDescription) Mode: \(mode). Compaction is based on reducible transcript growth and becomes available at \(s.auto_compact_threshold) transcript tokens. A lower provider-request count on a later turn does not by itself mean compaction occurred."
     }
 
@@ -273,12 +287,16 @@ struct ContextFillBar: View {
             // Thread the current chat model through so the budget reflects
             // whatever context_length the live model has (e.g. 200k for
             // Opus 4.8, 128k for GPT-5.4-mini).
+            let loaded: SessionContextStatus
             if let statusLoader {
-                status = try await statusLoader(sessionId, appModel.chatModel)
+                loaded = try await statusLoader(sessionId, appModel.chatModel)
             } else {
-                status = try await appModel
+                loaded = try await appModel
                     .getSessionContext(sessionId: sessionId, model: appModel.chatModel)
             }
+            // A conversation switched mid-read keeps the newer one's numbers.
+            guard !Task.isCancelled else { return }
+            status = loaded
             lastError = nil
             lastErrorWasCompaction = false
         } catch {
@@ -329,13 +347,19 @@ struct ContextFillBar: View {
 /// compaction control here — the row stays quiet.
 struct ComposerContextRing: View {
     let sessionId: String
+    /// A bot conversation's own model; nil is the chat model.
+    var model: String? = nil
+    private var windowModel: String { model ?? appModel.chatModel }
     @Environment(AppModel.self) private var appModel
     @State private var status: SessionContextStatus? = nil
     @State private var refreshToken = 0
+    // Settings › Context window: a change re-sizes the window at once.
+    @AppStorage("nativeagent.contextWindowMode") private var windowMode = ""
+    @AppStorage("nativeagent.compactionThresholdTokens") private var windowSize = 0
 
     private var usage: ContextFillPresentation.Usage {
         guard let status else { return .init(percent: 0, fillFraction: 0, isOverBudget: false) }
-        return ContextFillPresentation.usage(usedTokens: status.used_tokens, budget: status.budget)
+        return ContextFillPresentation.usage(status)
     }
 
     private var ringColor: Color {
@@ -373,7 +397,7 @@ struct ComposerContextRing: View {
         .help(helpText)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(helpText)
-        .task(id: "\(sessionId):\(appModel.chatModel):\(refreshToken)") { await refresh() }
+        .task(id: "\(sessionId):\(windowModel):\(refreshToken):\(windowMode):\(windowSize)") { await refresh() }
         .onReceive(NotificationCenter.default.publisher(for: .chatTurnCompleted)) { note in
             if let completed = note.object as? String, completed != sessionId { return }
             refreshToken += 1
@@ -386,7 +410,7 @@ struct ComposerContextRing: View {
 
     private func refresh() async {
         guard !sessionId.isEmpty else { status = nil; return }
-        let refreshed = try? await appModel.getSessionContext(sessionId: sessionId, model: appModel.chatModel)
+        let refreshed = try? await appModel.getSessionContext(sessionId: sessionId, model: windowModel)
         guard !Task.isCancelled else { return }
         status = refreshed
     }

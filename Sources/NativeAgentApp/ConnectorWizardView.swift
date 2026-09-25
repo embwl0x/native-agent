@@ -3,6 +3,7 @@ import SwiftUI
 import AppKit
 import TrustCenter
 import ChatOrchestration
+import GitHubConnector
 
 /// The GitHub token form must describe the registered capability set, never a
 /// hand-maintained list that can call a write tool "read-only" after a catalog
@@ -177,11 +178,17 @@ final class ConnectorWizardState {
 
 struct ConnectorWizardView: View {
     let provider: String
+    /// Opened from a chat card that already said "Connect with GitHub": start
+    /// the sign-in straight away rather than asking twice.
+    var startsSignIn = false
     let onDismiss: () -> Void
 
     @Environment(AppModel.self) private var appModel
     @State private var state = ConnectorWizardState()
     @State private var githubToken: String = ""
+    @State private var githubCode: GitHubOAuthDeviceFlow.DeviceCode?
+    @State private var githubLogin: String?
+    @State private var didCopyGitHubCode = false
     @State private var slackToken: String = ""
     @State private var slackAppToken: String = ""
     @State private var slackAllowedChannels: String = ""
@@ -338,7 +345,11 @@ struct ConnectorWizardView: View {
             notionTokenView
 
         case .deviceFlow:
-            deviceFlowView
+            if provider.lowercased() == "github" {
+                githubSignInView
+            } else {
+                deviceFlowView
+            }
 
         case .success:
             successView
@@ -406,6 +417,7 @@ struct ConnectorWizardView: View {
                             state.flowTask = Task { await saveOAuthAppAndContinue() }
                         }
                         .buttonStyle(.borderedProminent)
+                        .hazeTinted(.button)
                         .disabled(isSavingOAuthApp)
                     }
                 }
@@ -414,6 +426,7 @@ struct ConnectorWizardView: View {
                     showsGoogleCredentials = true
                 }
                 .buttonStyle(.borderedProminent)
+                .hazeTinted(.button)
             }
         }
     }
@@ -457,12 +470,14 @@ struct ConnectorWizardView: View {
                         Task { await startRegistration() }
                     }
                     .buttonStyle(.borderedProminent)
+                    .hazeTinted(.button)
                 } else if let portalUrl = state.registerAppResponse?.portalUrl,
                           let url = URL(string: portalUrl) {
                     Button("Open Portal") {
                         NSWorkspace.shared.open(url)
                     }
                     .buttonStyle(.borderedProminent)
+                    .hazeTinted(.button)
                 }
                 if provider != "github" {
                     Button(isSavingOAuthApp ? "Saving…" : "Save & Continue") {
@@ -470,6 +485,7 @@ struct ConnectorWizardView: View {
                         state.flowTask = Task { await saveOAuthAppAndContinue() }
                     }
                     .buttonStyle(.borderedProminent)
+                    .hazeTinted(.button)
                     .disabled(
                         isSavingOAuthApp
                         || state.oauthClientId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -495,6 +511,7 @@ struct ConnectorWizardView: View {
                     Task { await checkRegistrationAndProceed() }
                 }
                 .buttonStyle(.borderedProminent)
+                .hazeTinted(.button)
                 Button("Start Over") {
                     state.step = .notRegistered
                 }
@@ -531,6 +548,105 @@ struct ConnectorWizardView: View {
                     state.flowTask = Task { await startDeviceFlow() }
                 }
                 .buttonStyle(.borderedProminent)
+                .hazeTinted(.button)
+            }
+        }
+    }
+
+    // MARK: - GitHub sign-in (OAuth device flow)
+
+    private var githubSignInView: some View {
+        VStack(alignment: .leading, spacing: NativeAgentSpacing.lg) {
+            if let code = githubCode {
+                NativePanel(title: "Enter this code on GitHub", systemImage: "person.badge.key") {
+                    VStack(alignment: .leading, spacing: NativeAgentSpacing.md) {
+                        HStack(spacing: NativeAgentSpacing.md) {
+                            Text(code.userCode)
+                                .font(.system(size: 30, weight: .semibold, design: .monospaced))
+                                .textSelection(.enabled)
+                                .accessibilityLabel("Code \(code.userCode)")
+                            Spacer()
+                            Button(didCopyGitHubCode ? "Copied" : "Copy",
+                                   systemImage: didCopyGitHubCode ? "checkmark" : "doc.on.doc") {
+                                copyGitHubCode(code.userCode)
+                            }
+                            .buttonStyle(.bordered)
+                        }
+                        HStack(spacing: NativeAgentSpacing.sm) {
+                            ProgressView().controlSize(.small)
+                            Text("Waiting for you to approve on GitHub…")
+                                .font(NativeAgentFont.body)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                HStack {
+                    Button("Use a token instead") { cancelGitHubSignIn(); state.step = .manualToken }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Open GitHub") { NSWorkspace.shared.open(code.verificationURI) }
+                        .buttonStyle(.borderedProminent)
+                        .hazeTinted(.button)
+                }
+            } else {
+                NativePanel(title: "Sign in with your GitHub account", systemImage: "person.badge.key") {
+                    Text("GitHub opens in your browser and shows what I'm asking for: your repositories, pull requests, issues, organizations and notifications. Approve it and you're done. The sign-in is kept in your Mac's Keychain.")
+                        .font(NativeAgentFont.body)
+                }
+                HStack {
+                    // A sign-in may already be asking GitHub for a code; stop
+                    // it, or the code lands on the clipboard and the browser
+                    // opens after the person chose to paste a token.
+                    Button("Use a token instead") { cancelGitHubSignIn(); state.step = .manualToken }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Connect with GitHub") { startGitHubSignIn() }
+                        .buttonStyle(.borderedProminent)
+                        .hazeTinted(.button)
+                }
+            }
+        }
+    }
+
+    private func copyGitHubCode(_ code: String) {
+        NSPasteboard.general.clearContents()
+        didCopyGitHubCode = NSPasteboard.general.setString(code, forType: .string)
+    }
+
+    private func cancelGitHubSignIn() {
+        state.flowTask?.cancel()
+        state.flowTask = nil
+        githubCode = nil
+    }
+
+    private func startGitHubSignIn() {
+        state.flowTask?.cancel()
+        state.flowTask = Task {
+            let code: GitHubOAuthDeviceFlow.DeviceCode
+            do {
+                code = try await GitHubOAuthDeviceFlow.requestDeviceCode()
+            } catch {
+                guard !Task.isCancelled else { return }
+                state.errorMessage = error.localizedDescription
+                state.step = .error
+                return
+            }
+            guard !Task.isCancelled else { return }
+            githubCode = code
+            copyGitHubCode(code.userCode)
+            NSWorkspace.shared.open(code.verificationURI)
+            let outcome = await NativeOAuthFlow.completeGitHubDeviceFlow(code)
+            guard !Task.isCancelled else { return }
+            githubCode = nil
+            if outcome.result.ok {
+                githubLogin = outcome.login
+                state.step = .success
+                await appModel.refreshForSidebarItem(.connectors)
+            } else {
+                state.errorMessage = outcome.result.error ?? "GitHub sign-in stopped."
+                state.step = .error
             }
         }
     }
@@ -603,6 +719,7 @@ struct ConnectorWizardView: View {
                     state.flowTask = Task { await saveSlackToken() }
                 }
                 .buttonStyle(.borderedProminent)
+                .hazeTinted(.button)
                 .disabled(isSavingSlackToken || !slackAllowlistConfigured)
             }
             if let slackSettingsOpenOutcome {
@@ -639,6 +756,9 @@ struct ConnectorWizardView: View {
                 .foregroundStyle(.secondary)
             }
             HStack {
+                Button("Connect with GitHub instead") { state.step = .deviceFlow }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
                 Spacer()
                 Button("Open GitHub Tokens") {
                     if let url = URL(string: "https://github.com/settings/tokens") {
@@ -651,6 +771,7 @@ struct ConnectorWizardView: View {
                     state.flowTask = Task { await saveGitHubToken() }
                 }
                 .buttonStyle(.borderedProminent)
+                .hazeTinted(.button)
                 .disabled(
                     isSavingGitHubToken
                     || githubToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -685,6 +806,7 @@ struct ConnectorWizardView: View {
                     state.flowTask = Task { await saveNotionToken() }
                 }
                 .buttonStyle(.borderedProminent)
+                .hazeTinted(.button)
                 .disabled(
                     isSavingNotionToken
                     || notionToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -707,6 +829,10 @@ struct ConnectorWizardView: View {
                     .foregroundStyle(.green)
             }
             GradientText(text: "\(displayName) connected", colors: [.green, .teal], font: NativeAgentFont.title)
+            if let githubLogin {
+                Text("Signed in as @\(githubLogin)")
+                    .font(NativeAgentFont.body)
+            }
             Text("Try asking: \u{201C}List my \(provider == "github" ? "repos" : "recent items").\u{201D}")
                 .font(NativeAgentFont.body)
                 .foregroundStyle(.secondary)
@@ -738,6 +864,7 @@ struct ConnectorWizardView: View {
                         Task { await loadRegistrationStatus() }
                     }
                     .buttonStyle(.borderedProminent)
+                    .hazeTinted(.button)
                 }
                 Button("Dismiss") { onDismiss() }
                     .buttonStyle(.bordered)
@@ -751,6 +878,11 @@ struct ConnectorWizardView: View {
     private func loadRegistrationStatus() async {
         state.step = .loading
         switch ConnectorWizardSetupRoute.resolve(provider: provider) {
+        case .manualToken where provider.lowercased() == "github":
+            // Sign-in first; the token paste stays one tap away.
+            state.step = .deviceFlow
+            if startsSignIn && githubCode == nil { startGitHubSignIn() }
+            return
         case .manualToken:
             state.step = .manualToken
             return

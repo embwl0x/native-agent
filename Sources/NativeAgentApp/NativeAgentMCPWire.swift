@@ -97,7 +97,7 @@ enum NativeAgentMCPWire {
                     return failure(id, code: -32602, message: "request_id is required and must be a canonical UUID. It is this message's replay key: retry the same message under the same request_id, and use a new one only for new content.")
                 }
                 let message: [String: Any] = ["text": text, "sessionId": session, "request_id": request]
-                guard let data = try? JSONSerialization.data(withJSONObject: message) else {
+                guard let data = try? JSONSerialization.data(withJSONObject: message, options: .sortedKeys) else {
                     return failure(id, code: -32603, message: "Could not encode message.")
                 }
                 let agent = PeerFacingIdentity.agentName
@@ -134,7 +134,8 @@ enum NativeAgentMCPWire {
                 return .reply(requestID: request, sessionID: session, offset: offset, project: { receipt in
                     let allowed: Set<String> = ["status", "reply", "request_id", "session_id", "run_id", "offset", "next_offset", "has_more", "evidence", "coverage", "original_status", "original_outcome", "detail", "provider_failure", "work"]
                     return toolResult(id, fields: receipt.filter { allowed.contains($0.key) },
-                                      failed: receipt["status"] as? String != "ok"
+                                      // "pending" is a reply still being written, not an error.
+                                      failed: !["ok", "pending"].contains(receipt["status"] as? String ?? "")
                                         || ["failed", "canceled", "chat_failed", "no_reply"].contains(receipt["original_status"] as? String ?? ""))
                 })
             }

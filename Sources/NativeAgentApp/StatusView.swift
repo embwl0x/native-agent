@@ -107,7 +107,7 @@ struct StatusView: View {
                         if !watchdog.launchAgentStatus.isEmpty {
                             Text("Old startup helper: \(watchdog.launchAgentStatus) · \(watchdog.launchAgentDetail)")
                                 .font(.caption2)
-                                .foregroundStyle(.tertiary)
+                                .foregroundStyle(NativeAgentShell.secondary)
                         }
                     }
                 }

@@ -71,6 +71,12 @@ enum AgentWorkspaceWork {
                                        ("next_notes", "notes_offset", "Earlier notes"), ("next_links", "refs_offset", "More linked evidence")] {
             if let button = continuation(content[field], tool: "desk_read", input: pagingInput, changing: offset, label: label, title: text(record["title"]) ?? "Ongoing work") { actions.append(button) }
         }
+        if case .int(let matched)? = content["matched_count"], case .int(let offset)? = content["offset"],
+           Int(matched) > array(content["items"]).count {
+            let shown = array(content["items"]).count
+            content["showing"] = .string("\(offset + 1)–\(Int(offset) + shown) of \(matched)"
+                + (content["next_read"] != nil ? "; \"" + (selectedHandle == nil ? "More work" : "More parts") + "\" reads the next" : ""))
+        }
         content.removeValue(forKey: "items"); content.removeValue(forKey: "linked_evidence")
         return .init(title: text(record["title"]) ?? "Ongoing work", content: .object(content), items: items, actions: actions)
     }

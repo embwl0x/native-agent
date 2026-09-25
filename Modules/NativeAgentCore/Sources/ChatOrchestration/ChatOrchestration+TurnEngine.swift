@@ -1699,10 +1699,23 @@ public actor SwiftNativeTurnEngine {
             dataRoot: remPinsDataRoot,
             sessionID: sessionID
         )
+        if let voiceStep = FirstConversationPersonaExemption.pendingVoiceDirective(
+            dataRoot: remPinsDataRoot, sessionID: sessionID
+        ) {
+            withSessionDirective = Self.contextByAppendingRuntimeContext(
+                withSessionDirective, runtimeContext: voiceStep)
+        }
         if let arrivals = await AgentWorkspaceArrivals.pending(dataRoot: remPinsDataRoot, scope: sessionID),
            let text = try? arrivals.serialize(pretty: false) {
             withSessionDirective = Self.contextByAppendingRuntimeContext(withSessionDirective,
                 runtimeContext: "Workspace arrivals (navigation notices, not requests):\n" + text)
+        }
+        // Her screen's glance (Phase 2): what changed since she last looked
+        // and what needs her, one line, only when either. Dynamic segment,
+        // never the cached prefix; helpers' own sessions do not get hers.
+        if let dataRoot = remPinsDataRoot, let sessionID, !sessionID.hasPrefix("bot-"),
+           let glance = await HerScreen.glance(dataRoot: dataRoot, scope: sessionID, turn: clockNowOverride) {
+            withSessionDirective = Self.contextByAppendingRuntimeContext(withSessionDirective, runtimeContext: glance)
         }
         guard let runtimeContext = await renderRuntimeContext(
             surface: withSessionDirective.surface,
@@ -1845,11 +1858,18 @@ public actor SwiftNativeTurnEngine {
             .filter { $0["grokSetup"] as? String != "disconnected" }
             .compactMap { $0["name"] as? String }
             .sorted() ?? []
+        // The app's Simple | Advanced switch (SimpleViewMode.swift). Only the
+        // app's own chat sees the window; unset leaves the prompt unchanged.
+        let defaults = UserDefaults.standard
+        let viewMode = surfaceName != "chat" ? nil
+            : defaults.bool(forKey: "uiClassicShell") ? "advanced"
+            : defaults.string(forKey: "nativeagent.viewMode")
         return Self.renderRuntimeContext(
             surface: surfaceName,
             provider: providerName,
             model: model,
-            connectedAgents: connectedAgents
+            connectedAgents: connectedAgents,
+            viewMode: viewMode
         )
     }
 
@@ -2369,9 +2389,17 @@ public actor SwiftNativeTurnEngine {
         surface: String,
         provider: String,
         model: String,
-        connectedAgents: [String] = []
+        connectedAgents: [String] = [],
+        viewMode: String? = nil
     ) -> String {
-        let line = "Current runtime: surface=\(surface); provider=\(provider); model=\(model). If asked what model or provider you are using, answer from Current runtime; do not guess."
+        var line = "Current runtime: surface=\(surface); provider=\(provider); model=\(model). If asked what model or provider you are using, answer from Current runtime; do not guess."
+        switch viewMode {
+        case "simple":
+            line += " Person is in Simple view: there are no settings pages; for any setup (connector, provider, key, sign-in, permission) raise request_interaction."
+        case "advanced":
+            line += " For setup a person must do, raise request_interaction rather than sending them to a page."
+        default: break
+        }
         guard !connectedAgents.isEmpty else { return line }
         let more = connectedAgents.count > 12 ? " (+\(connectedAgents.count - 12) more)" : ""
         return line + "\nConnected agents: " + connectedAgents.prefix(12).joined(separator: ", ") + more + "."

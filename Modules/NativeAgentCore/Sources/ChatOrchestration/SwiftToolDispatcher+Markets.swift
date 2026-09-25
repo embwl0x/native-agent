@@ -49,9 +49,20 @@ extension SwiftToolDispatcher {
 
     func impl_market_quote(input: [String: JSONValue]) async throws -> JSONValue {
         let input = input.filter { $0.value != .string("") }
-        let symbols = marketSymbols(from: input)
+        var symbols = marketSymbols(from: input)
+        // A local watchlist by name quotes its symbols in the same call.
+        if let group = marketJSONString(input["watchlist"])?.trimmingCharacters(in: .whitespacesAndNewlines) {
+            let config = readMarketSecretsConfig()
+            let lists = localMarketWatchlistRows(from: config, includeSymbols: true, group: group)
+            guard case .object(let list)? = lists.first else {
+                let names = localMarketWatchlistRows(from: config, includeSymbols: false, group: nil)
+                    .compactMap { if case .object(let row) = $0 { return marketJSONString(row["id"]) } else { return nil } }
+                throw AutonomyGateError.toolDenied(reason: "No watchlist named '\(group)'." + (names.isEmpty ? "" : " Watchlists: " + names.joined(separator: ", ") + "."))
+            }
+            if case .array(let listed)? = list["symbols"] { symbols += listed.compactMap(marketJSONString) }
+        }
         guard !symbols.isEmpty else {
-            throw AutonomyGateError.toolDenied(reason: "market_quote requires symbol or symbols")
+            throw AutonomyGateError.toolDenied(reason: "Give symbol (e.g. AAPL or \"AAPL, MSFT\") or watchlist (a name from market_watchlists).")
         }
         let provider = marketJSONString(input["provider"])?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "tradingview"
         switch provider {
@@ -60,7 +71,7 @@ extension SwiftToolDispatcher {
         case "yahoo", "yfinance":
             return try await fetchYahooQuote(symbols: symbols)
         default:
-            throw AutonomyGateError.toolDenied(reason: "Unsupported market_quote provider '\(provider)'")
+            throw AutonomyGateError.toolDenied(reason: "provider is tradingview or yahoo, not '\(provider)'.")
         }
     }
 
@@ -219,6 +230,9 @@ extension SwiftToolDispatcher {
             "name", "description", "exchange", "type", "subtype", "close",
             "change", "change_abs", "volume", "Recommend.All", "RSI",
             "MACD.macd", "MACD.signal",
+            // When the price is from, and whether it is delayed (desk walk 4:
+            // a quote with no time reads as live).
+            "last_bar_update_time", "update_mode",
         ]
         let body: [String: Any] = [
             "symbols": [
@@ -228,16 +242,31 @@ extension SwiftToolDispatcher {
             "columns": columns,
         ]
         request.httpBody = try JSONSerialization.data(withJSONObject: body, options: [])
-        let json = try await marketJSONRequest(request)
-        return .object([
+        let json = sanitizeMarketPayload(try await marketJSONRequest(request))
+        // One named row per symbol, not a column list and bare arrays to zip.
+        var quotes: [JSONValue] = []
+        if case .object(let root) = json, case .array(let rows)? = root["data"] {
+            for case .object(let row) in rows {
+                var quote: [String: JSONValue] = ["symbol": row["s"] ?? .null]
+                if case .array(let values)? = row["d"] {
+                    for (column, value) in zip(columns, values) { quote[column] = value }
+                }
+                if let at = Self.marketEpoch(quote.removeValue(forKey: "last_bar_update_time")) { quote["as_of"] = .string(at) }
+                quotes.append(.object(quote))
+            }
+        }
+        let found = Set(quotes.compactMap { if case .object(let q) = $0 { return marketJSONString(q["symbol"]) } else { return nil } })
+        let missing = tickers.filter { !found.contains($0) }
+        var result: [String: JSONValue] = [
             "status": .string("ok"),
             "runtime": .string("swift-native"),
             "provider": .string("tradingview"),
             "requested_symbols": .array(symbols.map { .string(normalizeMarketSymbol($0)) }),
-            "symbols": .array(tickers.map { .string($0) }),
-            "columns": .array(columns.map { .string($0) }),
-            "payload": sanitizeMarketPayload(json),
-        ])
+            "quotes": .array(quotes),
+            "change_is": .string("percent; change_abs is the price change"),
+        ]
+        if !missing.isEmpty { result["not_found"] = .string(missing.joined(separator: ", ") + " — try the exchange prefix, e.g. NASDAQ:AAPL") }
+        return .object(result)
     }
 
     private func fetchYahooQuote(symbols: [String]) async throws -> JSONValue {
@@ -305,8 +334,21 @@ extension SwiftToolDispatcher {
             ] {
                 if let value = obj[key] { row[key] = value }
             }
+            if let at = Self.marketEpoch(obj["regularMarketTime"]) { row["as_of"] = .string(at) }
             return .object(row)
         }
+    }
+
+    /// A provider's epoch seconds as ISO 8601, or nil when it gave none.
+    static func marketEpoch(_ value: JSONValue?) -> String? {
+        let seconds: Double
+        switch value {
+        case .int(let n)?: seconds = Double(n)
+        case .double(let n)?: seconds = n
+        default: return nil
+        }
+        guard seconds > 946_684_800 else { return nil }
+        return ISO8601DateFormatter().string(from: Date(timeIntervalSince1970: seconds))
     }
 
     private func marketSymbols(from input: [String: JSONValue]) -> [String] {
@@ -320,6 +362,8 @@ extension SwiftToolDispatcher {
                     out.append(contentsOf: splitSymbolInput(symbol))
                 }
             }
+        } else if let joined = marketJSONString(input["symbols"]) {
+            out.append(contentsOf: splitSymbolInput(joined))
         }
         var seen: Set<String> = []
         return out.map(normalizeMarketSymbol).filter { symbol in

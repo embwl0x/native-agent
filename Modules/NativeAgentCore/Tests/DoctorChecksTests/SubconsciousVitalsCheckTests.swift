@@ -186,7 +186,7 @@ struct SubconsciousVitalsCheckTests {
                         felt: feltPool[index % feltPool.count],
                         inner: innerPool[index % innerPool.count],
                         sound: index % 10 == 0
-                            ? "a few of the same words keep echoing lately"
+                            ? "“, boss.” has closed a line in 5 of your last 20 replies — let the moment pick the word"
                             : "the phrasing has room in it"
                     )
                 )
@@ -222,7 +222,7 @@ struct SubconsciousVitalsCheckTests {
         let text = capsule(
             felt: ["curious", "warm"],
             inner: "Something specific and unrepeated",
-            sound: "a few of the same words keep echoing lately"
+            sound: "“, boss.” has closed a line in 5 of your last 20 replies — let the moment pick the word"
         )
         let row = try snapshotRow(
             turnId: "t", surface: "chat", at: anchor, capsuleText: text, truncate: true
@@ -281,7 +281,7 @@ struct SubconsciousVitalsCheckTests {
                     capsuleText: capsule(
                         felt: ["curious"],
                         inner: "the same line every time",
-                        sound: "a few of the same words keep echoing lately"
+                        sound: "“, boss.” has closed a line in 5 of your last 20 replies — let the moment pick the word"
                     )
                 )
             )
@@ -396,7 +396,7 @@ extension SubconsciousVitalsCheckTests {
                     capsuleText: capsule(
                         felt: ["curious"],
                         inner: "the same line every time",
-                        sound: "a few of the same words keep echoing lately"
+                        sound: "“, boss.” has closed a line in 5 of your last 20 replies — let the moment pick the word"
                     )
                 )
             )

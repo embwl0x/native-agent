@@ -363,6 +363,18 @@ extension AppModel {
     }
 
     @MainActor
+    func saveKillSwitchEnabled(_ enabled: Bool) async -> Bool {
+        do {
+            let savedPolicy = try await client.saveKillSwitchEnabled(enabled)
+            applySavedTrustPolicy(savedPolicy, status: enabled ? "Everything paused" : "Pause lifted")
+            return true
+        } catch {
+            recordTrustActionFailure("Pause everything save failed: \(error.localizedDescription)")
+            return false
+        }
+    }
+
+    @MainActor
     @discardableResult
     func saveAgentAccessMode(_ mode: String, developerMode: Bool? = nil) async -> Bool {
         do {

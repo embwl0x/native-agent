@@ -156,6 +156,9 @@ struct ChatMessageMetadata: Codable, Hashable {
     /// of leaving "I'll check… now I'll read… here's what I found" as one
     /// permanent answer. Absent on single-round turns and on every user row.
     var workingCommentaryChars: Int?
+    /// The engine's `mechanicalKind` stamp. Decode-only: `systemRow` marks a
+    /// persisted turn-failure notice, which is not a reply.
+    var mechanicalKind: String?
 
     // Custom CodingKeys to map snake_case daemon keys → camelCase Swift properties
     enum CodingKeys: String, CodingKey {
@@ -179,6 +182,7 @@ struct ChatMessageMetadata: Codable, Hashable {
         case attachments
         case origin
         case workingCommentaryChars
+        case mechanicalKind
     }
 
     /// Empty metadata. Declaring `init(from:)` in the body suppresses the
@@ -292,6 +296,7 @@ struct ChatMessageMetadata: Codable, Hashable {
         }
         workingCommentaryChars = try? c.decodeIfPresent(
             Int.self, forKey: .workingCommentaryChars)
+        mechanicalKind = try? c.decodeIfPresent(String.self, forKey: .mechanicalKind)
         // input may be a dict — decode to JSON string for display
         if let rawInput = try? c.decodeIfPresent([String: AnyDecodable].self, forKey: .inputJSON) {
             let dict = rawInput.mapValues { $0.value }

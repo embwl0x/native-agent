@@ -89,7 +89,7 @@ struct BotsShelfTests {
             + (botsEnabled ? [.bots] : [])
             + BotsShelfRailProposal.configuration(top) + Array(items.suffix(1))
         let expected = ["Chat", "Today", "Memories", "Desk", "Notifications"]
-            + (botsEnabled ? ["Bots"] : [])
+            + (botsEnabled ? ["Helpers"] : [])
             + ["Personality", "Providers", "Trust", "Connectors", "Capabilities", "Diagnostics", "Settings"]
         #expect(visual.map(\.shellRailTitle) == expected)
         #expect(visual.map(\.rawValue) == BotsShelfRailProposal.destinations(items, enabled: botsEnabled))

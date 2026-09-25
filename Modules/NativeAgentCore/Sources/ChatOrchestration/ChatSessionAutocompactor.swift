@@ -4,7 +4,11 @@ import PersistenceCore
 import ProviderRouting
 
 public struct ChatSessionAutocompactionConfig: Sendable, Equatable {
+    /// Settings › Context window › Custom size (N tokens). The key keeps its
+    /// old name so a size saved as the compaction threshold carries over.
     public static let defaultsKey = "nativeagent.compactionThresholdTokens"
+    /// Settings › Context window mode: "model" or "custom".
+    public static let contextWindowModeKey = "nativeagent.contextWindowMode"
     public static let distillEnabledKey = "nativeagent.compactionDistillEnabled"
     public static let agingEnabledKey = "nativeagent.compactionAgingEnabled"
     public static let defaultThresholdTokens = 200_000
@@ -17,8 +21,16 @@ public struct ChatSessionAutocompactionConfig: Sendable, Equatable {
     /// older turns away several times, so the synchronous check finds nothing.
     public static let defaultAgingFraction = 0.25
 
+    /// Model's default window: 60% of the model's own window. Custom size:
+    /// `thresholdTokens`, never past 60% of the model's window.
+    public enum ContextWindowMode: String, Sendable {
+        case modelDefault = "model"
+        case custom
+    }
+
     public var enabled: Bool
     public var thresholdTokens: Int
+    public var contextWindowMode: ContextWindowMode
     public var keepCount: Int
     /// When true (and a pre-compaction backup exists), the autocompactor's
     /// caller spawns a fire-and-forget LLM pass that swaps the mechanical
@@ -37,10 +49,12 @@ public struct ChatSessionAutocompactionConfig: Sendable, Equatable {
         keepCount: Int = Self.defaultKeepCount,
         distillEnabled: Bool = true,
         agingEnabled: Bool = true,
-        agingFraction: Double = Self.defaultAgingFraction
+        agingFraction: Double = Self.defaultAgingFraction,
+        contextWindowMode: ContextWindowMode = .custom
     ) {
         self.enabled = enabled
         self.thresholdTokens = max(1, thresholdTokens)
+        self.contextWindowMode = contextWindowMode
         self.keepCount = max(1, keepCount)
         self.distillEnabled = distillEnabled
         self.agingEnabled = agingEnabled
@@ -63,36 +77,54 @@ public struct ChatSessionAutocompactionConfig: Sendable, Equatable {
         let aging = defaults.object(forKey: agingEnabledKey) == nil
             ? true
             : defaults.bool(forKey: agingEnabledKey)
+        // Absent mode → Custom when a size is already saved (User's 300k carries
+        // over), otherwise the model's default window.
+        let mode = defaults.string(forKey: contextWindowModeKey)
+            .flatMap(ContextWindowMode.init(rawValue:))
+            ?? (stored > 0 ? .custom : .modelDefault)
         return ChatSessionAutocompactionConfig(
             enabled: true,
             thresholdTokens: stored > 0 ? stored : defaultThresholdTokens,
             keepCount: defaultKeepCount,
             distillEnabled: distill,
-            agingEnabled: aging
+            agingEnabled: aging,
+            contextWindowMode: mode
         )
     }
 
-    /// The configured threshold is an upper bound. Smaller-window models
-    /// compact sooner so a global 200k preference cannot exceed a 128k model's
-    /// usable request window. Forty percent leaves room for persona, Fluid
-    /// Context, cognition, tool schemas, the current turn, and model output.
+    /// HER context window, the one source of truth (User 2026-09-24). She
+    /// compacts here, and every prompt budget, the in-turn trim, aging, and
+    /// the composer meter size against it instead of the model's raw window:
+    /// 60% of the model's window, capped by the Custom size. The 40% left over
+    /// covers persona, tool schemas, Fluid Context, a tool round, and output.
+    /// nil only when the model's window is unknown.
+    public func effectiveWindowTokens(nativeWindowTokens: Int?) -> Int? {
+        guard let native = nativeWindowTokens, native > 0 else { return nil }
+        let safe = max(1, Int(Double(native) * Self.maximumContextWindowFraction))
+        return contextWindowMode == .custom ? min(thresholdTokens, safe) : safe
+    }
+
+    public func effectiveWindowTokens(
+        forModel model: String,
+        providerID: String? = nil,
+        dataRoot: URL? = nil
+    ) -> Int? {
+        effectiveWindowTokens(nativeWindowTokens: ProviderRouting.verifiedContextLength(
+            forModel: model,
+            providerID: providerID,
+            dataRoot: dataRoot
+        ))
+    }
+
+    /// Where she compacts: her effective window. An unknown model falls back
+    /// to the saved size, the only number there is.
     public func effectiveThresholdTokens(
         forModel model: String,
         providerID: String? = nil,
         dataRoot: URL? = nil
     ) -> Int {
-        guard let contextWindow = ProviderRouting.verifiedContextLength(
-            forModel: model,
-            providerID: providerID,
-            dataRoot: dataRoot
-        ) else {
-            return thresholdTokens
-        }
-        let modelPressureThreshold = max(
-            1,
-            Int(Double(contextWindow) * Self.maximumContextWindowFraction)
-        )
-        return min(thresholdTokens, modelPressureThreshold)
+        effectiveWindowTokens(forModel: model, providerID: providerID, dataRoot: dataRoot)
+            ?? thresholdTokens
     }
 
     /// The boundary at which a session's OLDER turns start aging into

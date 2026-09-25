@@ -235,7 +235,10 @@ struct DreamsView: View {
     @State private var diaryTotalEntries: Int?
     @State private var diaryUnreadableEntries = 0
 
-    private let diaryLimit = 60
+    /// One page of the diary; "Show older dreams" adds another page, so every
+    /// entry, archived ones included, is reachable from the list.
+    private static let diaryPage = 60
+    @State private var diaryLimit = DreamsView.diaryPage
 
     private var isLoadingDiary: Bool { diaryLoadGeneration.isLoading }
     private var isLoadingEntry: Bool { entryLoadGeneration.isLoading }
@@ -267,7 +270,7 @@ struct DreamsView: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
+        VStack(alignment: .leading, spacing: AliveMetrics.sectionSpacing) {
             controlBar
 
             if let banner = DreamErrorBannerPresentation.banner(for: appModel.dreamError) {
@@ -281,6 +284,7 @@ struct DreamsView: View {
 
             content
         }
+        .alivePageLine(headerLine, id: "dreams.line")
         // ui-taste-sweep 2026-06-07: was falling back to the bundle name
         // ("NativeAgent") because no title was set on the body root.
         .navigationTitle("Dreams")
@@ -299,10 +303,24 @@ struct DreamsView: View {
         }
     }
 
+    /// The header's one sentence in my own voice (alive glass, 2026-09-23).
+    /// Nil until the diary has been read; the tab row's page keeps its line.
+    private var headerLine: String? {
+        if diaryLoadFailed && entries.isEmpty { return "I couldn't read my dream diary just now." }
+        guard hasReadDiaryGate else { return nil }
+        let count = diaryTotalEntries ?? entries.count
+        let kept = count == 0
+            ? "I haven't written a dream yet"
+            : "I've written \(count) \(count == 1 ? "dream" : "dreams") in my diary"
+        return kept + (dreamCycleOn ? "." : "; my dream cycle is off.")
+    }
+
     // ── Controls ──────────────────────────────────────────────────────────────
     private var controlBar: some View {
         VStack(alignment: .leading, spacing: 12) {
-            AdvancedCard {
+            // Alive glass (2026-09-23): one group card, the runs on one row
+            // and the two cycle switches on the next.
+            AliveGroupCard {
                 HStack(spacing: 8) {
                     Button {
                         runDream()
@@ -336,7 +354,7 @@ struct DreamsView: View {
                 }
 
                 HStack(spacing: 24) {
-                    Toggle("Dream cycle enabled", isOn: Binding(
+                    Toggle("Dream cycle", isOn: Binding(
                         get: { dreamCycleOn },
                         set: { newValue in
                             guard !savingDream else { return }
@@ -357,10 +375,11 @@ struct DreamsView: View {
                         }
                     ))
                     .toggleStyle(.switch)
+                    .hazeTinted()
                     .controlSize(.small)
                     .disabled(savingDream)
 
-                    Toggle("REM cycle enabled", isOn: Binding(
+                    Toggle("REM cycle", isOn: Binding(
                         get: { remCycleOn },
                         set: { newValue in
                             guard !savingRem else { return }
@@ -376,6 +395,7 @@ struct DreamsView: View {
                         }
                     ))
                     .toggleStyle(.switch)
+                    .hazeTinted()
                     .controlSize(.small)
                     .disabled(savingRem)
 
@@ -393,11 +413,6 @@ struct DreamsView: View {
                 Text(remRunFeedback.message)
                     .font(ShellType.label)
                     .foregroundStyle(remRunFeedback.isSuccess ? NativeAgentShell.secondary : NativeAgentShell.trouble)
-            }
-            if let diaryTotalEntries, diaryTotalEntries > entries.count {
-                Text("Showing \(entries.count) of \(diaryTotalEntries) dreams. Narrowing is not available in this view yet.")
-                    .font(ShellType.label)
-                    .foregroundStyle(NativeAgentShell.secondary)
             }
             if let label = DreamDiaryListPresentation.unreadableLabel(diaryUnreadableEntries) {
                 Text(label)
@@ -434,6 +449,8 @@ struct DreamsView: View {
                 )
             }
         } else {
+            VStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
+            AliveEyebrow("My diary")
             HSplitView {
                 // Left: diary dates, newest first.
                 List(selection: Binding(
@@ -450,13 +467,34 @@ struct DreamsView: View {
                         }
                     }
                 )) {
+                    // Week titles are plain rows: a plain List pins section
+                    // headers, and over the clear background they stacked.
                     ForEach(DreamDiaryWeeks.weeks(entries)) { week in
-                        Section(week.title) {
-                            ForEach(week.entries, id: \.date) { entry in
-                                DreamDateRow(entry: entry)
-                                    .tag(entry.date)
-                            }
+                        Text(week.title)
+                            .font(ShellType.captionMedium)
+                            .foregroundStyle(NativeAgentShell.secondary)
+                            .padding(.top, 6)
+                            .selectionDisabled()
+                        ForEach(week.entries, id: \.date) { entry in
+                            DreamDateRow(entry: entry)
+                                .tag(entry.date)
                         }
+                    }
+                    if let diaryTotalEntries, diaryTotalEntries > entries.count {
+                        Button {
+                            diaryLimit += Self.diaryPage
+                            refreshTask?.cancel()
+                            refreshTask = Task { await loadDiary(selectLatest: false) }
+                        } label: {
+                            Text(isLoadingDiary
+                                 ? "Reading older dreams…"
+                                 : "Show older dreams (\(diaryTotalEntries - entries.count) more)")
+                                .font(ShellType.label)
+                                .foregroundStyle(NativeAgentShell.secondary)
+                        }
+                        .buttonStyle(.borderless)
+                        .disabled(isLoadingDiary)
+                        .padding(.vertical, 4)
                     }
                 }
                 .listStyle(.plain)
@@ -467,6 +505,9 @@ struct DreamsView: View {
                 detailPanel
                     .frame(minWidth: 340, maxWidth: .infinity, maxHeight: .infinity)
             }
+            .padding(.vertical, 8)
+            .aliveCard()
+            }
         }
     }
 
@@ -475,17 +516,25 @@ struct DreamsView: View {
         if case .loading = entryDetailPresentation {
             AdvancedWaitingLine("Reading this dream…")
         } else if case .entry = entryDetailPresentation, let entry = selectedEntry {
+            let reading = DreamReaderText.reading(entry.content)
             ScrollView {
                 VStack(alignment: .leading, spacing: 12) {
-                    HStack(spacing: 8) {
-                        Text(entry.date)
+                    // Lead with the dream's own title; the date is a caption.
+                    VStack(alignment: .leading, spacing: 2) {
+                        // The file's date is the day the dream is about; its
+                        // time is when I wrote it (the 03:30 run lands the next
+                        // morning), so the two are named apart.
+                        let night = "Night of " + DreamReaderText.friendlyDate(entry.date)
+                        Text(reading.title ?? night)
                             .font(ShellType.bodySemibold)
                             .foregroundStyle(NativeAgentShell.text)
-                        Spacer()
-                        if let modified = entry.modified_at {
-                            Text(shortTimestamp(modified))
+                        let written = entry.modified_at.map { "written " + shortTimestamp($0) }
+                        if let caption = reading.title != nil
+                            ? [night, written].compactMap { $0 }.joined(separator: " · ")
+                            : written.map({ "W" + $0.dropFirst() }) {
+                            Text(caption)
                                 .font(ShellType.caption)
-                                .foregroundStyle(NativeAgentShell.tertiary)
+                                .foregroundStyle(NativeAgentShell.secondary)
                         }
                     }
 
@@ -494,7 +543,7 @@ struct DreamsView: View {
                             .font(ShellType.label)
                             .foregroundStyle(NativeAgentShell.secondary)
                     } else {
-                        ForEach(Array(entry.content.components(separatedBy: "\n").enumerated()), id: \.offset) { _, line in
+                        ForEach(Array(reading.body.components(separatedBy: "\n").enumerated()), id: \.offset) { _, line in
                             dreamLine(line)
                         }
                     }
@@ -546,7 +595,7 @@ struct DreamsView: View {
             HStack(alignment: .top, spacing: 8) {
                 Text("•")
                     .font(ShellType.label)
-                    .foregroundStyle(NativeAgentShell.tertiary)
+                    .foregroundStyle(NativeAgentShell.secondary)
                 Text(LocalizedStringKey(String(trimmed.dropFirst(2))))
                     .font(ShellType.label)
                     .foregroundStyle(NativeAgentShell.text)
@@ -722,9 +771,9 @@ struct DreamsView: View {
         case .checking:
             return "Checking whether the dream cycle is available."
         case .enabled:
-            return "The nightly dream cycle hasn't written an entry yet. Run a dream pass to create the first one."
+            return "I haven't written an entry yet. Run a dream pass and I'll write the first one."
         case .disabled:
-            return "The dream cycle is currently disabled. Enable it above, or run a dream pass manually once enabled."
+            return "My dream cycle is off. Turn it on above and I dream each night, or when you run a pass."
         case .unavailable:
             return "The dream diary could not be read, so cycle availability is unavailable."
         }
@@ -732,6 +781,56 @@ struct DreamsView: View {
 
     private func shortTimestamp(_ iso: String) -> String {
         UserDisplayFormatters.shortTime(iso)
+    }
+}
+
+// ── Reader text ────────────────────────────────────────────────────────────────
+
+/// How a stored entry reads on screen. `DreamCycleRunner` writes
+/// `# Dream — <date>` then `**<title>**`; the date is already in the list and
+/// the caption, so that heading is dropped (only an exact match of the
+/// pattern) and the title leads the reader.
+enum DreamReaderText {
+    static func reading(_ content: String) -> (title: String?, body: String) {
+        var lines = content.components(separatedBy: "\n")[...]
+        func dropBlank() {
+            while let first = lines.first, first.trimmingCharacters(in: .whitespaces).isEmpty {
+                lines = lines.dropFirst()
+            }
+        }
+        dropBlank()
+        guard let heading = lines.first?.trimmingCharacters(in: .whitespaces),
+              heading.range(of: #"^# Dream — \d{4}-\d{2}-\d{2}$"#, options: .regularExpression) != nil
+        else { return (nil, content) }
+        lines = lines.dropFirst()
+        dropBlank()
+        var title: String?
+        if let line = lines.first?.trimmingCharacters(in: .whitespaces),
+           line.count > 4, line.hasPrefix("**"), line.hasSuffix("**") {
+            let inner = String(line.dropFirst(2).dropLast(2)).trimmingCharacters(in: .whitespaces)
+            if !inner.isEmpty, !inner.contains("**") {
+                title = inner
+                lines = lines.dropFirst()
+                dropBlank()
+            }
+        }
+        return (title, lines.joined(separator: "\n"))
+    }
+
+    /// `2026-09-22` → "Tue, Sep 22" (with the year only when it isn't this
+    /// one). Anything that isn't a plain date stays as written.
+    static func friendlyDate(_ key: String, now: Date = Date(),
+                             calendar: Calendar = DisplayTimeZone.calendar) -> String {
+        let parser = ISO8601DateFormatter()
+        parser.formatOptions = [.withFullDate]
+        parser.timeZone = calendar.timeZone
+        guard key.count == 10, let date = parser.date(from: key) else { return key }
+        var style = Date.FormatStyle.dateTime.weekday(.abbreviated).month(.abbreviated).day()
+        if calendar.component(.year, from: date) != calendar.component(.year, from: now) {
+            style = style.year()
+        }
+        style.timeZone = calendar.timeZone
+        return date.formatted(style)
     }
 }
 
@@ -785,7 +884,7 @@ private struct DreamDateRow: View {
     let entry: DreamEntry
 
     /// The first real line of the dream. A byte count tells a reader nothing
-    /// about which night this was; her own opening words do.
+    /// about which night this was; my own opening words do.
     private var excerpt: String {
         let lines = (entry.content ?? "").split(whereSeparator: \.isNewline)
         let first = lines.lazy
@@ -798,13 +897,13 @@ private struct DreamDateRow: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
-            Text(entry.date)
-                .font(ShellType.bodySemibold)
+            Text(DreamReaderText.friendlyDate(entry.date))
+                .font(.system(size: 14, weight: .medium))
                 .foregroundStyle(NativeAgentShell.text)
             if !excerpt.isEmpty {
                 Text(excerpt)
-                    .font(ShellType.caption)
-                    .foregroundStyle(NativeAgentShell.tertiary)
+                    .font(.system(size: 12))
+                    .foregroundStyle(NativeAgentShell.secondary)
                     .lineLimit(2)
             }
         }

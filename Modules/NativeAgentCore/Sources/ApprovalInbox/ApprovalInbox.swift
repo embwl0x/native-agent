@@ -445,6 +445,13 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
             .appendingPathComponent("requests.json")
     }
 
+    /// Pending requests, read-only and without the lock, for a glance that
+    /// must not wait; a file caught mid-write fails its check and throws.
+    public nonisolated func pendingUnlocked() throws -> [ApprovalRecord] {
+        let path = root.appendingPathComponent("workflows/approvals/requests.json")
+        return try Self.loadApprovalRowsChecked(at: path).compactMap(ApprovalRecord.init(json:)).filter { $0.status == "pending" }
+    }
+
     public func list(filter: ApprovalFilter) async throws -> [ApprovalRecord] {
         let items = try await persistence.withFileLock(approvalsPath) { [approvalsPath] in
             try Self.loadApprovalRowsChecked(at: approvalsPath)

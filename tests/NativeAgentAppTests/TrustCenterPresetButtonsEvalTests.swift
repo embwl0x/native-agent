@@ -48,7 +48,7 @@ struct TrustCenterPresetButtonsEvalTests {
                 approval = "Edits inside your workspaces run on their own; writes outside them wait for your approval."
             case .fullMac:
                 reach = "It can reach files anywhere on this Mac, inside and outside your workspaces. macOS still asks separately for access to protected folders."
-                approval = "Enabled routine actions, file changes included, run without asking on this Mac and trusted remote surfaces, including external messages. macOS permissions, account setup, explicit tool blocks, and external-agent safeguards still apply."
+                approval = "Under Full Mac I make changes without asking. macOS permissions and account setup still ask."
             case nil:
                 reach = "It can reach files in your workspace folders. Files outside them are off limits."
                 approval = "NativeAgent's own memory and notes update without asking; file changes ask you first."
@@ -59,9 +59,9 @@ struct TrustCenterPresetButtonsEvalTests {
             case .safe:
                 #expect([mac.value, mac.detail] == ["Off", "Mac control is off: app automation, terminal commands, and clicking are not available."])
             case .fullMac:
-                #expect([mac.value, mac.detail] == ["Runs without asking", "Runs without asking: Terminal commands, Mac-controlled files, App automation, Clicking and typing, System settings, Shortcuts, Notifications, Spotlight search.\nFile access limits and protected-action checks still apply."])
+                #expect([mac.value, mac.detail] == ["Runs without asking", "Runs without asking: Terminal commands, Mac-controlled files, app automation, clicking and typing, system settings, Shortcuts, notifications, Spotlight search.\nFile access limits and protected-action checks still apply."])
             default:
-                #expect([mac.value, mac.detail] == ["Some ask first", "Runs without asking: Shortcuts, Notifications, Spotlight search.\nAsks first: Mac-controlled files.\nNot available: Terminal commands, App automation, Clicking and typing, System settings.\nFile access limits, risk checks, and tool permissions still apply."])
+                #expect([mac.value, mac.detail] == ["Some ask first", "Runs without asking: Shortcuts, notifications, Spotlight search.\nAsks first: Mac-controlled files.\nNot available: Terminal commands, app automation, clicking and typing, system settings.\nFile access limits, risk checks, and tool permissions still apply."])
             }
             let backups = try #require(rows.first { $0.id == "backups" })
             let send = try #require(rows.first { $0.id == "external_send" })

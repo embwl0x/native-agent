@@ -71,9 +71,7 @@ enum QuietComposerVerbs {
            let status = try? await appModel.getSessionContext(
                sessionId: sessionID, model: appModel.chatModel
            ) {
-            let usage = ContextFillPresentation.usage(
-                usedTokens: status.used_tokens, budget: status.budget
-            )
+            let usage = ContextFillPresentation.usage(status)
             body["ring_fraction"] = .double(usage.fillFraction)
             body["ring_percent"] = .int(Int64(usage.percent.rounded()))
             body["context_used_tokens"] = .int(Int64(status.used_tokens))
@@ -344,6 +342,9 @@ enum QuietComposerVerbs {
                 "rail", "unknown_page",
                 "No page is called that. The pages are: " + QuietPages.ids.joined(separator: ", ")
             )
+        }
+        guard !SimpleViewMode.isShowing else {
+            return .refuse("rail", "no_pages_in_simple_view", SimpleViewMode.noPagesNote)
         }
         guard coordinator.deliverQuietly(.sidebar(page.item)) else {
             return .refuse(
