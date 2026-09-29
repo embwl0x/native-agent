@@ -50,6 +50,10 @@ actor TelegramAssistantDeliveryDriver {
     private var lane: Lane
     private var lastRichDraftAt = Date.distantPast
     private var latestAccumulatedText = ""
+    private var pendingRichText: String?
+    private var richDraftFlush: Task<Void, Never>?
+    private var richDraftSleeping = false
+    private var settling = false
 
     init(
         token: String,
@@ -77,7 +81,7 @@ actor TelegramAssistantDeliveryDriver {
     }
 
     func onDelta(_ accumulated: String) async {
-        guard lane != .terminal else { return }
+        guard lane != .terminal, !settling else { return }
         let safeAccumulated = TelegramRichMessageRenderer.sanitize(
             TelegramRichMessageRenderer.stripBoldMarkers(accumulated)
         )
@@ -91,30 +95,67 @@ actor TelegramAssistantDeliveryDriver {
             // are negative; keep the rich final lane without manufacturing a
             // predictable draft rejection and false health error.
             guard destination.chatId > 0 else { return }
-            let now = clock()
-            guard now.timeIntervalSince(lastRichDraftAt) >= richDraftInterval else {
-                return
-            }
-            guard let rich = TelegramRichMessageRenderer.render(safeAccumulated),
-                  let sendRichDraft else {
-                await fallBackToOrdinary(reason: "rich draft was not safely representable")
-                return
-            }
-            do {
-                try await sendRichDraft(token, destination, draftId, rich)
-                lastRichDraftAt = now
-            } catch {
-                // A rich draft is only a 30-second preview, never the durable
-                // assistant reply. Switching lanes cannot duplicate a reply.
-                await reportFailure(step: "rich draft", error: error)
-                await fallBackToOrdinary(reason: nil)
-            }
+            pendingRichText = safeAccumulated
+            scheduleRichDraftFlush()
         case .terminal:
             return
         }
     }
 
+    private func scheduleRichDraftFlush() {
+        guard richDraftFlush == nil else { return }
+        richDraftFlush = Task { [weak self] in
+            await self?.flushRichDrafts()
+        }
+    }
+
+    private func flushRichDrafts() async {
+        while pendingRichText != nil, lane == .rich, !settling {
+            let wait = richDraftInterval - clock().timeIntervalSince(lastRichDraftAt)
+            if wait > 0 {
+                richDraftSleeping = true
+                do {
+                    try await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000))
+                } catch {
+                    break
+                }
+                richDraftSleeping = false
+                continue
+            }
+            guard let text = pendingRichText else { break }
+            pendingRichText = nil
+            guard let rich = TelegramRichMessageRenderer.render(text),
+                  let sendRichDraft else {
+                await fallBackToOrdinary(reason: "rich draft was not safely representable")
+                break
+            }
+            // One task owns the wire and claims this window before the send.
+            lastRichDraftAt = clock()
+            do {
+                try await sendRichDraft(token, destination, draftId, rich)
+            } catch {
+                // Rich drafts are ephemeral, so ordinary delivery is safe.
+                await reportFailure(step: "rich draft", error: error)
+                await fallBackToOrdinary(reason: nil)
+                break
+            }
+        }
+        richDraftSleeping = false
+        richDraftFlush = nil
+    }
+
+    private func settleRichDrafts() async {
+        settling = true
+        pendingRichText = nil
+        while let task = richDraftFlush {
+            if richDraftSleeping { task.cancel() }
+            await task.value
+            if richDraftFlush == task { richDraftFlush = nil }
+        }
+    }
+
     func finalize(reply: String) async -> TelegramAssistantDeliveryOutcome {
+        await settleRichDrafts()
         guard lane != .terminal else {
             return .outcomeUnknown(reason: "assistant delivery was already terminal")
         }
@@ -154,6 +195,7 @@ actor TelegramAssistantDeliveryDriver {
     }
 
     func abortDelivering(notice: String) async -> Bool {
+        await settleRichDrafts()
         guard lane != .terminal else { return false }
         switch lane {
         case .ordinary:

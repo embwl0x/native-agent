@@ -3,6 +3,7 @@ import Foundation
 // Telegram has no token stream. The native streaming idiom is the growing
 // draft: send the first chunk as a real message early, then editMessageText
 // with the accumulated text on a throttle until the final edit completes it.
+// The model stream never waits on those Telegram round trips.
 actor TelegramDraftStreamer {
     /// What this streamer knows about the one draft message it owns.
     ///
@@ -27,17 +28,13 @@ actor TelegramDraftStreamer {
     private var state: DraftState = .none
     private var lastEditAt = Date.distantPast
     private var lastText = ""
-    /// 2026-09-28: the newest text a throttled delta could not show yet, and
-    /// the one timer that shows it. Without it a reply whose last words came
-    /// inside the throttle window sat half-written until the response closed
-    /// — up to half a minute when the provider kept the stream open.
+    /// The newest text to show and the one background task that sends it.
+    /// Deltas only replace this value; the model stream never waits on Telegram.
     private var pendingText: String?
     private var trailingFlush: Task<Void, Never>?
     private var trailingSleeping = false
-    /// One draft edit on the wire at a time, so an older text can never land
-    /// after a newer one.
-    private var pushing = false
-    private var pushFinished: [CheckedContinuation<Void, Never>] = []
+    /// Set once finalize or abort starts settling: no draft edit starts after.
+    private var settling = false
 
     init(
         token: String,
@@ -61,54 +58,43 @@ actor TelegramDraftStreamer {
         // would post one extra message per delta for a draft that may already
         // exist; finalize settles the turn with a single send instead.
         if case .outcomeUnknown = state { return }
-        let now = Date()
-        let wait = editIntervalSeconds - now.timeIntervalSince(lastEditAt)
-        guard !pushing else {
-            // The finishing edit picks this up.
-            pendingText = accumulated
-            return
-        }
-        guard wait <= 0 else {
-            pendingText = accumulated
-            scheduleTrailingFlush(after: wait)
-            return
-        }
-        pendingText = nil
-        pushing = true
-        // Claim the throttle window before the wire, and keep it on failure
-        // so errors back off too.
-        lastEditAt = now
-        await push(accumulated)
-        pushing = false
-        let waiters = pushFinished
-        pushFinished.removeAll()
-        waiters.forEach { $0.resume() }
-        if pendingText != nil, trailingFlush == nil {
-            scheduleTrailingFlush(after: editIntervalSeconds - Date().timeIntervalSince(lastEditAt))
-        }
+        guard !settling else { return }
+        pendingText = accumulated
+        scheduleTrailingFlush()
     }
 
-    private func scheduleTrailingFlush(after seconds: TimeInterval) {
+    private func scheduleTrailingFlush() {
         guard trailingFlush == nil else { return }
-        trailingSleeping = true
         trailingFlush = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: UInt64(max(0, seconds) * 1_000_000_000))
-            guard !Task.isCancelled else { return }
             await self?.flushPending()
         }
     }
 
     private func flushPending() async {
-        trailingSleeping = false
-        if let text = pendingText {
+        // This task alone sends drafts. While it sleeps or awaits Telegram,
+        // onDelta can only replace pendingText, so edits stay in wire order.
+        while pendingText != nil {
+            let wait = editIntervalSeconds - Date().timeIntervalSince(lastEditAt)
+            if wait > 0 {
+                trailingSleeping = true
+                do {
+                    try await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000))
+                } catch {
+                    break
+                }
+                trailingSleeping = false
+                continue
+            }
+            guard let text = pendingText else { break }
             pendingText = nil
-            await onDelta(text)
+            // Claim the throttle window before the wire, including on failure.
+            lastEditAt = Date()
+            await push(text)
+            if case .outcomeUnknown = state { pendingText = nil }
         }
+        trailingSleeping = false
         // Cleared only after the edit, so finalize can wait it out.
         trailingFlush = nil
-        if pendingText != nil, !pushing {
-            scheduleTrailingFlush(after: editIntervalSeconds - Date().timeIntervalSince(lastEditAt))
-        }
     }
 
     private func push(_ accumulated: String) async {
@@ -218,12 +204,9 @@ actor TelegramDraftStreamer {
     /// wire, so no partial draft lands after — or races the creating send
     /// of — the final text.
     private func settleTrailingFlush() async {
+        settling = true
         pendingText = nil
-        while pushing || trailingFlush != nil {
-            guard let task = trailingFlush else {
-                await withCheckedContinuation { pushFinished.append($0) }
-                continue
-            }
+        while let task = trailingFlush {
             // Cancel only a timer still asleep. Cancelling an edit already on
             // the wire could lose a creating send Telegram accepted, and the
             // final text would then arrive as a second message.

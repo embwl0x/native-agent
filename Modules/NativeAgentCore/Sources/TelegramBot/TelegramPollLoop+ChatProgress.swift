@@ -121,11 +121,10 @@ extension TelegramPollLoop {
             turnId: turnId,
             ordinary: ordinary,
             sendOrdinary: sendMessage,
-            // User 09-27: one real message that grows in place. The rich draft
-            // is a 30-second preview, so its final had to arrive as a second
-            // message and read as a rewrite. Restore these two to go back.
-            sendRichDraft: nil,
-            sendRichFinal: nil,
+            // Stream native draft previews like Hermes; ordinary grow-in-place
+            // delivery remains the fallback for unsupported or rejected drafts.
+            sendRichDraft: sendRichMessageDraft,
+            sendRichFinal: sendRichMessage,
             richDraftInterval: draftEditIntervalSeconds,
             recordFailure: { redactedError in
                 await recordError(
