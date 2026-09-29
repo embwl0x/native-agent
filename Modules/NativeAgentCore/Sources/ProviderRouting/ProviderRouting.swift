@@ -2015,7 +2015,7 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
         switch lowerModel {
         case let model where model.hasPrefix("kimi-") || model.hasPrefix("moonshot-"):
             supported = Set(MoonshotModelCatalog.supportedReasoningEfforts(for: model))
-        case FirstPartyModelCatalog.gpt6AstraModelID, "gpt-6-sol":
+        case FirstPartyModelCatalog.gpt6AstraModelID, "gpt-6.1-sol", "gpt-6-sol":
             supported = providerID?.lowercased() == "openai"
                 ? Set(FirstPartyModelCatalog.publicGPT6AstraEfforts)
                 : Set(FirstPartyModelCatalog.accountGPT6AstraEfforts)
