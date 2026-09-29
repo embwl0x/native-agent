@@ -15,7 +15,8 @@ Reverse-chronological. Each phase: 1–2 lines.
 - No end-of-reply freeze; the reply settles when it is done; `/` menu keeps typing; Command-F uses the system search field.
 
 ### Telegram
-- Replies grow in one message (edits every second); the transcribing note clears.
+- Replies stream in Telegram's native draft preview and land as one message; slow Telegram never blocks the reply; the transcribing note clears.
+- GPT-6.1 Sol on ChatGPT/Codex sign-in.
 
 ### Agents
 - Replies come back on their own (including sends made while talking with another agent); approval-held conversations and restart-cut agents heal themselves; desktop-app agents time out at three minutes; bridge notes hidden from chat; Full Mac covers card-resumed turns and agent-to-agent messages (coding agents still ask).
