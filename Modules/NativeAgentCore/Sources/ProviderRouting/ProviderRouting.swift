@@ -851,7 +851,7 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
 
         let skipNames: Set<String> = [
             "registry.json", "models.json", "active.json", "surfaces.json",
-            "pending-surface-configuration.json",
+            "pending-surface-configuration.json", "cli_session_adoption.json",
             "openrouter-models-cache.json", "moonshot-models-cache.json",
         ]
         if let files = try? FileManager.default.contentsOfDirectory(

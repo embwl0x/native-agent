@@ -550,7 +550,10 @@ create_archive() {
     ARCHIVE_PATH="$OUTPUT_DIR/NativeAgentMobile-${MARKETING_VERSION}-${BUILD_NUMBER}.xcarchive"
   rm -rf "$ARCHIVE_PATH"
   printf '[ARCHIVE] %s\n' "$ARCHIVE_PATH"
-  xcodebuild archive \
+  # Opt-in only: lets Xcode register App IDs/profiles for new targets on the team.
+  local provisioning=()
+  [[ "${NATIVEAGENT_IOS_ALLOW_PROVISIONING:-0}" == "1" ]] && provisioning=(-allowProvisioningUpdates)
+  xcodebuild archive "${provisioning[@]}" \
     -onlyUsePackageVersionsFromResolvedFile -skipPackageUpdates \
     -project "$PROJECT" \
     -scheme "$SCHEME" \
@@ -586,7 +589,9 @@ export_archive() {
     return
   fi
   printf '[EXPORT] %s\n' "$EXPORT_PATH"
-  xcodebuild -exportArchive \
+  local provisioning=()
+  [[ "${NATIVEAGENT_IOS_ALLOW_PROVISIONING:-0}" == "1" ]] && provisioning=(-allowProvisioningUpdates)
+  xcodebuild -exportArchive "${provisioning[@]}" \
     -archivePath "$ARCHIVE_PATH" \
     -exportPath "$EXPORT_PATH" \
     -exportOptionsPlist "$options" || {

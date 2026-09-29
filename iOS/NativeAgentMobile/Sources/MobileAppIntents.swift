@@ -26,7 +26,7 @@ struct MobileAgentQuery: EntityStringQuery {
 
 struct MobileAskIntent: AppIntent {
     static let title: LocalizedStringResource = "Ask Your Agent"
-    static let description = IntentDescription("Send a message to your agent on the Mac and return her reply.")
+    static let description = IntentDescription("Send a message to your agent on your computer and return the reply.")
     static let authenticationPolicy: IntentAuthenticationPolicy = .requiresAuthentication
     @available(iOS 27, *)
     static var allowedExecutionTargets: IntentExecutionTargets { .main }
@@ -106,7 +106,7 @@ struct MobileApprovalQuery: EntityQuery {
 
 struct MobileApproveIntent: AppIntent {
     static let title: LocalizedStringResource = "Approve a Pending Request"
-    static let description = IntentDescription("Choose a pending request from the Mac and approve it after confirmation.")
+    static let description = IntentDescription("Choose a pending request from your computer and approve it after confirmation.")
     static let authenticationPolicy: IntentAuthenticationPolicy = .requiresAuthentication
     @available(iOS 27, *)
     static var allowedExecutionTargets: IntentExecutionTargets { .main }
@@ -127,7 +127,7 @@ struct MobileApproveIntent: AppIntent {
 
 struct MobileStatusIntent: AppIntent {
     static let title: LocalizedStringResource = "Your Agent's Status"
-    static let description = IntentDescription("Read your agent's one-line status from the last synced Mac snapshot.")
+    static let description = IntentDescription("Read your agent's one-line status from the last synced snapshot.")
     static let authenticationPolicy: IntentAuthenticationPolicy = .requiresAuthentication
     @available(iOS 27, *)
     static var allowedExecutionTargets: IntentExecutionTargets { .main }
