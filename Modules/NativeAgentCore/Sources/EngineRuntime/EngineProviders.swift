@@ -376,6 +376,9 @@ extension ProvidersFacade {
             // interrupted commit, the provider catalog must not synthesize a
             // fake "Pending Surface Configuration" provider row from it.
             "pending-surface-configuration.json",
+            // The CLI sign-in consent record, not a provider (fake "Cli
+            // Session Adoption" row on fresh installs; same list in ProviderRouting).
+            "cli_session_adoption.json",
             "openrouter-models-cache.json",
             "moonshot-models-cache.json",
         ]

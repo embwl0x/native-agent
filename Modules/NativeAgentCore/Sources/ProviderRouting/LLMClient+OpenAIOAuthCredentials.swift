@@ -82,9 +82,19 @@ extension OpenAIOAuthDirectAdapter {
         defaultRoot: URL = PersistenceCore.defaultDataRoot()
     ) -> URL {
         if !allowSharedFallbacks, let dataRoot {
-            return dataRoot.standardizedFileURL
+            let owned = dataRoot.standardizedFileURL
                 .appendingPathComponent("codex_home", isDirectory: true)
                 .appendingPathComponent("auth.json")
+            // A CLI session this root consented to adopt is this root's own
+            // sign-in, not a shared fallback; without it a fresh install on
+            // "Use it" chatted fine but every helper failed "Connect your model".
+            let shared = userCodexHome.appendingPathComponent("auth.json")
+            if !hasUsableTokens(at: owned),
+               cliAdoptionConsent(dataRoot: dataRoot) == .allowed,
+               hasUsableTokens(at: shared) {
+                return shared
+            }
+            return owned
         }
         if let codexHome = environment["CODEX_HOME"], !codexHome.isEmpty {
             return URL(fileURLWithPath: (codexHome as NSString).expandingTildeInPath)
