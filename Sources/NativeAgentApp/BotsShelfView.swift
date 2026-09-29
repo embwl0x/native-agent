@@ -1,7 +1,11 @@
+import ChatOrchestration
+import AppToolRuntime
+import NativeAgentCore
 import SwiftUI
 import StandingBots
 import ApprovalInbox
 import PersistenceCore
+import Transcripts
 import NativeAgentShared
 import AppKit
 
@@ -32,12 +36,11 @@ struct BotsShelfView: View {
     /// One shelf read in flight, one pending refresh behind it.
     @State private var reloadInFlight = false
     @State private var reloadPending = false
-    /// Alive glass (2026-09-23) is the Advanced shell's list; the classic
-    /// shell and every bot's detail keep the cards they had.
-    @AppStorage(NativeAgentShellPreference.classicShellKey) private var classicShell = false
+    /// Alive glass (2026-09-23) is the list's; every bot's detail keeps the
+    /// cards it had.
     private var root: URL { appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot() }
     private var selected: BotsShelfRecord? { records.first { $0.id == selectedID } }
-    private var aliveList: Bool { !classicShell && selected == nil }
+    private var aliveList: Bool { selected == nil }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -156,21 +159,23 @@ struct BotsShelfView: View {
     /// The Advanced shell's list: every helper a row in ONE group card, rows
     /// split by hairlines, the status as a pill on the right.
     private var groupList: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: AliveMetrics.sectionSpacing) {
-                if !records.isEmpty {
-                    AliveGroupCard {
-                        ForEach(records) { record in
-                            Button { selectedID = record.id; notice = nil } label: {
-                                BotRow(record: record, state: state(record))
-                            }.buttonStyle(.plain)
-                        }
+        // The Mac's own grouped list, System Settings style (User 09-27: all
+        // controls native).
+        Form {
+            if !records.isEmpty {
+                Section {
+                    ForEach(records) { record in
+                        Button { selectedID = record.id; notice = nil } label: {
+                            BotRow(record: record, state: state(record))
+                                .contentShape(Rectangle())
+                        }.buttonStyle(.plain)
                     }
                 }
-                listFooter
             }
-            .padding(.bottom, 20)
+            Section { listFooter }
         }
+        .formStyle(.grouped)
+        .scrollContentBackground(.hidden)
     }
 
     /// The header's one sentence, in numerals: how many helpers, and when the
@@ -296,7 +301,7 @@ struct BotsShelfView: View {
                     messagesLoading = true
                     messagesError = nil
                     do {
-                        let loaded = try await appModel.client.getChatMessages(sessionId: record.definition.sessionID)
+                        let loaded = try await appModel.engine.transcripts.loadMessages(sessionId: record.definition.sessionID, cached: true)
                         guard !Task.isCancelled else { return }
                         messages = loaded
                     } catch {
@@ -317,10 +322,6 @@ struct BotsShelfView: View {
         do { try action(); reload() } catch { notice = error.localizedDescription }
     }
     private func reload() {
-        #if DEBUG
-        // The offscreen renderer injects its records and live states directly.
-        if ProcessInfo.processInfo.environment["BOTS_SHELF_SNAPSHOT_DIR"] != nil { return }
-        #endif
         // A settling run writes several watched files in a burst, and each
         // event used to launch its own unstructured reload of the whole shelf.
         // One read in flight, one pending refresh behind it: the last event of
@@ -410,7 +411,7 @@ struct BotsShelfView: View {
             let session = try await Self.chatSession(for: record.definition, root: root)
             await appModel.selectChatSession(session)
             if appModel.activeChatSessionId == session.id {
-                if !appModel.chatSessions.contains(where: { $0.id == session.id }) { appModel.chatSessions.append(session) }
+                if !appModel.engine.transcripts.sessions.contains(where: { $0.id == session.id }) { appModel.engine.transcripts.sessions.append(session) }
                 onContinue(destination)
             }
         } catch { notice = error.localizedDescription }
@@ -430,13 +431,13 @@ struct BotsShelfView: View {
     /// session index and lock, preserving an existing row if a turn won the race.
     static func chatSession(for bot: BotDefinition, root: URL) async throws -> ChatSession {
         let path = root.appendingPathComponent("chat/sessions.json")
-        let bytes = try await SwiftNativePersistenceCore().withFileLock(path) {
+        let row = try await SwiftNativePersistenceCore().withFileLock(path) {
             var rows = try ChatSessionIndexFile.loadObjectRowsForMutation(at: path)
             if let existing = rows.first(where: { row in
                 guard case .string(let id)? = row["id"] else { return false }
                 return id == bot.sessionID
             }) {
-                return try ChatSessionIndexFile.serializedData(for: [existing])
+                return existing
             }
             rows.append([
                 "id": .string(bot.sessionID), "title": .string(bot.name), "source": .string("bot"),
@@ -445,9 +446,9 @@ struct BotsShelfView: View {
             ])
             try FileManager.default.createDirectory(at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
             try SwiftNativePersistenceCore.writeDataAtomicDurable(ChatSessionIndexFile.serializedData(for: rows), to: path)
-            return try ChatSessionIndexFile.serializedData(for: [rows[rows.count - 1]])
+            return rows[rows.count - 1]
         }
-        return try JSONDecoder.nativeAgent.decode([ChatSession].self, from: bytes)[0]
+        return try ChatSession(row: row)
     }
 }
 

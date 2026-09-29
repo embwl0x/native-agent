@@ -1,3 +1,4 @@
+import ChatOrchestration
 import Foundation
 
 /// One completed wizard must enter Chat before it asks the durable welcome

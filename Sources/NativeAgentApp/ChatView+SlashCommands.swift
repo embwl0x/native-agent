@@ -105,15 +105,16 @@ extension ChatView {
         // actually consume the command. Clearing here wiped what the person
         // typed before the arguments were even checked, so `/think bogus`
         // answered "choose a supported level" with an empty box to retype in.
-        let showDeveloperSurfaces = NativeAgentShellPreference.developerSurfacesShown(
-            UserDefaults.standard.bool(forKey: "showDeveloperSurfaces")
-        )
         let builtIn = ChatSlashCommandRegistry.descriptor(named: cmd)
-        if builtIn?.developerOnly == true, !showDeveloperSurfaces {
-            showToast("Unknown command /\(cmd). Type /help for the list.")
-            return
-        }
         switch builtIn?.route {
+        case .new:
+            // Same as Telegram's /new: this conversation keeps its history and
+            // a fresh one opens, in Simple and Advanced alike.
+            text = ""
+            appModel.commitChatDraft("", sessionId: appModel.activeChatSessionId)
+            draftAdoptedText = ""
+            Task { await appModel.newChatSession() }
+            return
         case .clear:
             clearConfirmation.request()
         case .compact:
@@ -137,7 +138,7 @@ extension ChatView {
             }
         case .think:
             let effort = arg.lowercased()
-            let valid = reasoningOptions(from: appModel.modelCatalog, model: appModel.chatModel)
+            let valid = reasoningOptions(from: appModel.engine.providers.catalog, model: appModel.chatModel)
                 .map(\.id)
             guard valid.contains(effort) else {
                 showToast("Choose a supported level: \(valid.joined(separator: ", "))")
@@ -199,7 +200,7 @@ extension ChatView {
             }
         case .help:
             let helpMsg = ChatMessage(role: "system", content:
-                ChatSlashCommandRegistry.helpText(showDeveloperSurfaces: showDeveloperSurfaces)
+                ChatSlashCommandRegistry.helpText()
             )
             appModel.chatMessages.append(helpMsg)
         // One tool catalog owner: /tools opens the Tools page in the shared tab.
@@ -322,9 +323,9 @@ extension ChatView {
     // helpers name the session the command was typed into.
     @MainActor
     func appendDispatchMessage(_ message: ChatMessage, to sessionId: String) {
-        var messages = appModel.chatMessages(for: sessionId)
+        var messages = appModel.engine.transcripts.messages(for: sessionId)
         messages.append(message)
-        appModel.setChatMessages(messages, for: sessionId)
+        appModel.engine.transcripts.setMessages(messages, for: sessionId)
     }
 
     @MainActor
@@ -333,10 +334,10 @@ extension ChatView {
         with message: ChatMessage,
         in sessionId: String
     ) {
-        var messages = appModel.chatMessages(for: sessionId)
+        var messages = appModel.engine.transcripts.messages(for: sessionId)
         messages.removeAll { $0.id == placeholderId }
         messages.append(message)
-        appModel.setChatMessages(messages, for: sessionId)
+        appModel.engine.transcripts.setMessages(messages, for: sessionId)
     }
 
     // Sendable-safe dispatch that accepts the ToolInputForm's already validated,

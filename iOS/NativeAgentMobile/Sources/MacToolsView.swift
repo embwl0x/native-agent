@@ -4,6 +4,7 @@ import SwiftUI
 // MARK: - MacToolsView
 
 struct MacToolsView: View {
+    @EnvironmentObject private var pairingStore: PairingStore
     @State private var macPolicy: TrustMacControlPolicy?
     @State private var hasLoadedPolicy = false
     @State private var manualShortcutName = ""
@@ -12,6 +13,8 @@ struct MacToolsView: View {
     @State private var isSendingNotif = false
     @State private var notifResult: MacNotificationSendPresentation.Feedback?
     @State private var volume: Double = MacVolumeControlPresentation.defaultTargetFraction
+    /// No level shows until one is picked: the Mac never says its volume.
+    @State private var volumePicked = false
     @State private var isSettingVolume = false
     @State private var spotlightQuery = ""
     @State private var spotlightOutcome: MacToolsSpotlightPresentation.Outcome?
@@ -32,11 +35,27 @@ struct MacToolsView: View {
         MacVolumeControlPresentation.targetPercent(for: volume)
     }
 
+    private var paired: Bool { pairingStore.isPaired }
+
+    private func allowed(_ privilege: MacToolsPrivilege) -> Bool {
+        paired && MacToolsPrivilegePresentation.isAllowed(privilege, policy: macPolicy)
+    }
+
+    /// Unpaired, the page's one reason says why; no per-card Trust hint.
+    private func footer(_ privilege: MacToolsPrivilege, _ text: String?) -> String? {
+        !paired ? nil : allowed(privilege) ? text : lockedText(privilege)
+    }
+
     var body: some View {
-        Group {
-            if !hasLoadedPolicy {
-                ProgressView("Checking Mac Control...")
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+        AlivePage(title: "Mac Tools", line: "Things I can do on your Mac from here.") {
+            if !paired {
+                AliveUnpairedReason()
+                enabledContent
+            } else if !hasLoadedPolicy {
+                ProgressView("Checking Mac Control…")
+                    .foregroundStyle(AlivePalette.secondary)
+                    .frame(maxWidth: .infinity)
+                    .padding(.top, 40)
             } else if !iosOk {
                 disabledEmptyState
             } else {
@@ -44,295 +63,199 @@ struct MacToolsView: View {
             }
         }
         .task { await refresh() }
-        .mobileReadingScreen()
-        .navigationTitle("Mac Tools")
         .macSyncErrorBanner()
-        .navigationBarTitleDisplayMode(.inline)
-        .safeAreaInset(edge: .top, spacing: 0) {
-                MacStatusChip().frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 16)
-            }
         .refreshable { await refresh() }
     }
 
     // MARK: - Disabled empty state
-    // PATCH-2026-05-07: polish-MacToolsView gradient icon + Material card for disabled state
 
     private var disabledEmptyState: some View {
-        VStack(spacing: 20) {
-            MobileReadingEmptyState(
-                title: "Mac Tools Unavailable",
-                systemImage: "macbook.and.iphone",
-                kind: .unavailable,
-                description: MacToolsPolicyGatePresentation.disabledDescription(for: macPolicy)
-            )
-        }
-        .padding()
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        AliveCalmState(
+            title: "Mac Tools are off",
+            line: MacToolsPolicyGatePresentation.disabledDescription(for: macPolicy),
+            actionTitle: "Check again",
+            action: { Task { await refresh() } }
+        )
     }
 
     // MARK: - Enabled content
 
+    @ViewBuilder
     private var enabledContent: some View {
-        List {
-            // ── Status header ──────────────────────────────────────────
-            Section {
-                MobileReadingSurface {
-                    MobileAdaptiveRow(spacing: 12) {
-                        Circle()
-                            .fill(Color.green)
-                            .frame(width: 8, height: 8)
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text("Mac Tools Active")
-                                .font(.headline)
-                            Text("Mac Control enabled · iOS remote allowed")
-                                .font(.callout)
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                }
-                .listRowBackground(Color.clear)
-                .listRowSeparator(.hidden)
-            } header: {
-                Label("Mac Tools", systemImage: "macbook.and.iphone")
-                    .font(.headline)
+        if let status = actionStatus {
+            AliveFootnote(status, systemImage: "arrow.turn.down.right")
+        }
+
+        // ── Shortcuts ──────────────────────────────────────────────
+        AliveSection(
+            "Run a shortcut",
+            footer: footer(.shortcuts, "Use the name exactly as it appears in Shortcuts on the Mac.")
+        ) {
+            HStack(spacing: 12) {
+                field("Shortcut name", text: $manualShortcutName)
+                    .submitLabel(.go)
+                    .onSubmit { submitShortcut() }
+                Button("Run") { submitShortcut() }
+                    .alivePrimaryButton()
+                    .disabled(manualShortcutName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                              || !allowed(.shortcuts))
             }
+            .aliveRow()
+            .aliveUnavailable(!allowed(.shortcuts))
+        }
 
-            Section {
-                if remoteActions.isEmpty {
-                    Text("Remote Mac actions will appear here with live status, approval handoff, retry, and completion receipts.")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                } else {
-                    ForEach(remoteActions.prefix(8)) { action in
-                        RemoteActionCardView(action: action) {
-                            Task { await retry(action) }
-                        }
-                        .listRowBackground(Color.clear)
-                        .listRowSeparator(.hidden)
-                    }
-                }
-            } header: {
-                Label("Remote Actions", systemImage: "arrow.triangle.2.circlepath")
-                    .font(.headline)
-            } footer: {
-                Text("Remote action receipts remain available while this app session is open.")
-                    .font(.callout)
-            }
-
-            // ── Shortcuts ──────────────────────────────────────────────
-            Section {
-                if !MacToolsPrivilegePresentation.isAllowed(.shortcuts, policy: macPolicy) {
-                    lockedPolicyRow(MacToolsPrivilegePresentation.disabledDescription(for: .shortcuts))
-                } else {
-                    VStack(alignment: .leading, spacing: 12) {
-                        MobileAdaptiveRow(spacing: 8) {
-                            Image(systemName: "square.stack.3d.up")
-                                .foregroundStyle(.secondary)
-                            TextField("Shortcut name, exactly as on the Mac", text: $manualShortcutName)
-                                .textFieldStyle(.roundedBorder)
-                                .autocorrectionDisabled()
-                                .submitLabel(.go)
-                                .onSubmit {
-                                    let name = manualShortcutName.trimmingCharacters(in: .whitespacesAndNewlines)
-                                    guard !name.isEmpty else { return }
-                                    Task { await runShortcut(name) }
-                                }
-                            Button {
-                                let name = manualShortcutName.trimmingCharacters(in: .whitespacesAndNewlines)
-                                guard !name.isEmpty else { return }
-                                Task { await runShortcut(name) }
-                            } label: {
-                                Label("Run", systemImage: "play.fill")
-                            }
-                            .buttonStyle(.borderedProminent)
-                    .foregroundStyle(NativeAgentMobileTheme.Colors.onAccent)
-                            .disabled(manualShortcutName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                        }
-                        Text("Runs the named Shortcut on your Mac. Find the exact name in the Shortcuts app.")
-                            .font(.callout)
-                            .foregroundStyle(.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                    .padding(.vertical, 4)
-                }
-            } header: {
-                Label("Shortcuts", systemImage: "square.stack.3d.up")
-                    .font(.headline)
-            }
-
-            // ── Quick Actions ──────────────────────────────────────────
-            Section {
-                // Send notification
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("Send Notification")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.secondary)
-                    TextField("Title", text: $notifTitle)
-                        .textFieldStyle(.roundedBorder)
-                    TextField("Message", text: $notifMessage)
-                        .textFieldStyle(.roundedBorder)
-                    if !MacToolsPrivilegePresentation.isAllowed(.notifications, policy: macPolicy) {
-                        lockedPolicyRow(MacToolsPrivilegePresentation.disabledDescription(for: .notifications))
-                    }
-                    MobileAdaptiveRow {
-                        Button {
-                            Task { await sendNotification() }
-                        } label: {
-                            if isSendingNotif {
-                                ProgressView()
-                            } else {
-                                Label("Send", systemImage: "bell")
-                            }
-                        }
-                        .buttonStyle(.borderedProminent)
-                    .foregroundStyle(NativeAgentMobileTheme.Colors.onAccent)
-                        .disabled(
-                            notifMessage.isEmpty || isSendingNotif
-                                || !MacToolsPrivilegePresentation.isAllowed(.notifications, policy: macPolicy)
-                        )
-                        if let r = notifResult {
-                            Label(r.text, systemImage: r.systemImage)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                                .accessibilityLabel("Notification status: \(r.text)")
-                        }
-                    }
-                }
-                .padding(.vertical, 4)
-
-                // Lock screen
+        // ── Notification ───────────────────────────────────────────
+        AliveSection(
+            "Send a notification",
+            footer: footer(.notifications, notifResult?.text)
+        ) {
+            field("Title", text: $notifTitle).aliveRow()
+                .aliveUnavailable(!allowed(.notifications))
+            AliveDivider()
+            HStack(spacing: 12) {
+                field("Message", text: $notifMessage)
                 Button {
-                    Task { await quickAction("lock_screen") }
+                    Task { await sendNotification() }
                 } label: {
-                    Label("Lock Screen", systemImage: "lock.display")
+                    if isSendingNotif { ProgressView().controlSize(.small) } else { Text("Send") }
                 }
-                .disabled(!MacToolsPrivilegePresentation.isAllowed(.systemControl, policy: macPolicy))
+                .aliveSecondaryButton()
+                .disabled(notifMessage.isEmpty || isSendingNotif || !allowed(.notifications))
+                .accessibilityLabel(notifResult.map { "Send. Notification status: \($0.text)" } ?? "Send")
+            }
+            .aliveRow()
+            .aliveUnavailable(!allowed(.notifications))
+        }
 
-                // Sleep display
-                Button {
-                    Task { await quickAction("sleep_display") }
-                } label: {
-                    Label("Sleep Display", systemImage: "display")
+        // ── The Mac itself ─────────────────────────────────────────
+        AliveSection(
+            "The Mac",
+            footer: footer(.systemControl, MacVolumeControlPresentation.currentVolumeDisclosure)
+        ) {
+            actionRow("Lock screen") { Task { await quickAction("lock_screen") } }
+            AliveDivider()
+            actionRow("Sleep display") { Task { await quickAction("sleep_display") } }
+            AliveDivider()
+            VStack(alignment: .leading, spacing: 10) {
+                HStack {
+                    Text("Volume").font(.body).foregroundStyle(AlivePalette.text)
+                    Spacer()
+                    Text(volumePicked ? "\(volumeTargetPercent)%" : "\u{2014}")
+                        .font(.body.monospacedDigit())
+                        .foregroundStyle(AlivePalette.secondary)
+                        .accessibilityLabel(volumePicked ? "Target \(volumeTargetPercent)%" : "No level picked")
                 }
-                .disabled(!MacToolsPrivilegePresentation.isAllowed(.systemControl, policy: macPolicy))
-
-                // A2: reason for the Lock Screen / Sleep Display pair — both gate
-                // on systemControlAllowed and were previously opacity-only.
-                if !MacToolsPrivilegePresentation.isAllowed(.systemControl, policy: macPolicy) {
-                    lockedPolicyRow(MacToolsPrivilegePresentation.disabledDescription(for: .systemControl))
-                }
-
-                // Volume slider
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Choose a volume target")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.secondary)
-                    MobileAdaptiveRow {
-                        Image(systemName: "speaker.fill").foregroundStyle(.secondary)
-                        Slider(value: $volume, in: 0...1, step: 0.05)
-                        Image(systemName: "speaker.wave.3.fill").foregroundStyle(.secondary)
-                    }
-                    Text("Target: \(volumeTargetPercent)%")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    Text(MacVolumeControlPresentation.currentVolumeDisclosure)
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
+                HStack(spacing: 12) {
+                    Slider(value: $volume, in: 0...1, step: 0.05)
+                        .onChange(of: volume) { volumePicked = true }
+                        .hazeTinted()
+                        .accessibilityLabel("Volume target")
                     Button {
                         Task { await setVolume() }
                     } label: {
-                        if isSettingVolume {
-                            ProgressView()
-                        } else {
-                            Text("Set target \(volumeTargetPercent)%")
-                        }
+                        if isSettingVolume { ProgressView().controlSize(.small) } else { Text("Set") }
                     }
-                    .buttonStyle(.bordered)
-                .tint(.secondary)
-                    .disabled(
-                        isSettingVolume
-                            || !MacToolsPrivilegePresentation.isAllowed(.systemControl, policy: macPolicy)
-                    )
-                    if !MacToolsPrivilegePresentation.isAllowed(.systemControl, policy: macPolicy) {
-                        lockedPolicyRow(MacToolsPrivilegePresentation.disabledDescription(for: .systemControl))
-                    }
+                    .aliveSecondaryButton()
+                    .disabled(!volumePicked)
+                    .accessibilityLabel("Set target \(volumeTargetPercent)%")
                 }
-                .padding(.vertical, 4)
-
-                // Spotlight search
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Spotlight Search")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.secondary)
-                    MobileAdaptiveRow {
-                        TextField("Search…", text: $spotlightQuery)
-                            .textFieldStyle(.roundedBorder)
-                            .submitLabel(.search)
-                            .onSubmit { Task { await runSpotlight() } }
-                        Button {
-                            Task { await runSpotlight() }
-                        } label: {
-                            if isSearching { ProgressView() } else { Image(systemName: "magnifyingglass") }
-                        }
-                        .buttonStyle(.bordered)
-                .tint(.secondary)
-                        .disabled(
-                            spotlightQuery.isEmpty || isSearching
-                                || !MacToolsPrivilegePresentation.isAllowed(.spotlight, policy: macPolicy)
-                        )
-                    }
-                    if !MacToolsPrivilegePresentation.isAllowed(.spotlight, policy: macPolicy) {
-                        lockedPolicyRow(MacToolsPrivilegePresentation.disabledDescription(for: .spotlight))
-                    }
-                    if let spotlightOutcome {
-                        spotlightResultPresentation(spotlightOutcome)
-                    }
-                }
-                .padding(.vertical, 4)
-
-                if let status = actionStatus {
-                    Text(status)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-
-            } header: {
-                Label("Quick Actions", systemImage: "bolt")
-                    .font(.headline)
             }
-
+            .aliveRow()
+            .disabled(isSettingVolume)
+            .aliveUnavailable(!allowed(.systemControl))
         }
-        .listStyle(.insetGrouped)
+
+        // ── Spotlight ──────────────────────────────────────────────
+        AliveSection("Search the Mac", footer: footer(.spotlight, nil)) {
+            HStack(spacing: 12) {
+                field("Spotlight", text: $spotlightQuery)
+                    .submitLabel(.search)
+                    .onSubmit { Task { await runSpotlight() } }
+                Button {
+                    Task { await runSpotlight() }
+                } label: {
+                    if isSearching { ProgressView().controlSize(.small) } else { Image(systemName: "magnifyingglass") }
+                }
+                .aliveSecondaryButton()
+                .disabled(spotlightQuery.isEmpty || isSearching)
+                .accessibilityLabel("Search")
+            }
+            .aliveRow()
+            .aliveUnavailable(!allowed(.spotlight))
+            if let spotlightOutcome {
+                AliveDivider()
+                spotlightResultPresentation(spotlightOutcome)
+                    .aliveRow()
+            }
+        }
+
+        // ── Receipts ───────────────────────────────────────────────
+        if !remoteActions.isEmpty {
+            AliveSection("Recent on the Mac", footer: "Kept while this app stays open.") {
+                ForEach(Array(remoteActions.prefix(8).enumerated()), id: \.element.id) { index, action in
+                    if index > 0 { AliveDivider() }
+                    RemoteActionCardView(action: action) {
+                        Task { await retry(action) }
+                    }
+                }
+            }
+        }
+    }
+
+    /// An input inside a card: no border of its own, the card is the field.
+    private func field(_ prompt: String, text: Binding<String>) -> some View {
+        TextField(prompt, text: text, prompt: Text(prompt).foregroundStyle(AlivePalette.secondary))
+            .font(.body)
+            .foregroundStyle(AlivePalette.text)
+            .autocorrectionDisabled()
+            .frame(minHeight: 36)
+    }
+
+    /// A tappable row that does one thing on the Mac.
+    private func actionRow(_ title: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(title)
+                .font(.body)
+                .foregroundStyle(AlivePalette.text)
+                .aliveRow()
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .aliveUnavailable(!allowed(.systemControl))
+    }
+
+    private func submitShortcut() {
+        let name = manualShortcutName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { return }
+        Task { await runShortcut(name) }
     }
 
     @ViewBuilder
     private func spotlightResultPresentation(_ outcome: MacToolsSpotlightPresentation.Outcome) -> some View {
         switch outcome {
-        case .emptyResponse:
-            Label(outcome.statusText, systemImage: "exclamationmark.triangle")
-                .font(.callout)
-                .foregroundStyle(.secondary)
-        case .noResults:
-            Label(outcome.statusText, systemImage: "magnifyingglass")
-                .font(.callout)
-                .foregroundStyle(.secondary)
+        case .emptyResponse, .noResults:
+            Text(outcome.statusText)
+                .font(.subheadline)
+                .foregroundStyle(AlivePalette.secondary)
         case .results:
-            VStack(alignment: .leading, spacing: 5) {
+            VStack(alignment: .leading, spacing: 6) {
                 ForEach(outcome.visibleRows(showingAll: showsAllSpotlightResults), id: \.self) { result in
                     Text(result)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .font(.subheadline)
+                        .foregroundStyle(AlivePalette.text)
                         .lineLimit(showsAllSpotlightResults ? nil : 1)
+                        .truncationMode(.middle)
                         .textSelection(.enabled)
                 }
                 if let truncationText = outcome.truncationText(showingAll: showsAllSpotlightResults) {
                     Text(truncationText)
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
+                        .font(.footnote)
+                        .foregroundStyle(AlivePalette.secondary)
                     Button(showsAllSpotlightResults ? "Show fewer Spotlight results" : "Show all Spotlight results") {
                         showsAllSpotlightResults.toggle()
                     }
-                    .font(.callout)
+                    .font(.footnote.weight(.medium))
+                    .foregroundStyle(AlivePalette.text)
                 }
             }
         }
@@ -342,11 +265,8 @@ struct MacToolsView: View {
     // actionable Trust-tab hint so a disabled control isn't just dimmed — it
     // says why it's off and where to turn it on. Matches the app's existing
     // "Mac app's Trust tab" copy (see disabledEmptyState).
-    private func lockedPolicyRow(_ text: String) -> some View {
-        Label("\(text) Enable in the Mac app's Trust tab.", systemImage: "lock.fill")
-            .font(.callout)
-            .foregroundStyle(.secondary)
-            .fixedSize(horizontal: false, vertical: true)
+    private func lockedText(_ privilege: MacToolsPrivilege) -> String {
+        "\(MacToolsPrivilegePresentation.disabledDescription(for: privilege)) Enable in the Mac app's Trust tab."
     }
 
     @discardableResult
@@ -388,6 +308,12 @@ struct MacToolsView: View {
     // every Mac action below goes through iCloudSyncEngine.
 
     private func loadPolicy() async {
+        #if DEBUG
+        if MobileDesignSamples.screen != nil {
+            loadDesignSample()
+            return
+        }
+        #endif
         let snapshotLoaded = await iCloudSyncEngine.shared.refreshTrustSnapshot()
         macPolicy = MacToolsPolicyGatePresentation.policyForGate(
             snapshotLoaded: snapshotLoaded,
@@ -396,10 +322,23 @@ struct MacToolsView: View {
         hasLoadedPolicy = true
     }
 
+    #if DEBUG
+    /// `-designScreen mac-tools`: an open policy and two receipts, never sent anywhere.
+    private func loadDesignSample() {
+        macPolicy = TrustMacControlPolicy(enabled: true, systemControlAllowed: true, remoteFromIosAllowed: true)
+        hasLoadedPolicy = true
+        guard remoteActionLedger.actions.isEmpty else { return }
+        let volume = remoteActionLedger.start(.volume(40), title: "Set volume", subtitle: "40%")
+        remoteActionLedger.update(volume, state: .failed, detail: "The Mac didn’t answer in time.")
+        let shortcut = remoteActionLedger.start(.shortcut("Morning focus"), title: "Run shortcut", subtitle: "Morning focus")
+        remoteActionLedger.update(shortcut, state: .ranOnMac, detail: "Ran on Mac through iCloud")
+    }
+    #endif
+
     private func sendNotification(titleOverride: String? = nil, messageOverride: String? = nil, retrying cardID: UUID? = nil) async {
         isSendingNotif = true
         notifResult = nil
-        let title = titleOverride ?? (notifTitle.isEmpty ? "NativeAgent" : notifTitle)
+        let title = titleOverride ?? (notifTitle.isEmpty ? iCloudSyncEngine.shared.agentDisplayName : notifTitle)
         let message = messageOverride ?? notifMessage
         let actionID = cardID ?? startRemoteAction(.notify(title: title, message: message), title: "Send notification", subtitle: title)
         updateRemoteAction(
@@ -432,8 +371,8 @@ struct MacToolsView: View {
             }
             return
         }
-        actionStatus = "Running \(action)…"
-        let actionID = cardID ?? startRemoteAction(.system(action), title: action.replacingOccurrences(of: "_", with: " ").capitalized, subtitle: "System action")
+        actionStatus = "Running \(action.replacingOccurrences(of: "_", with: " "))…"
+        let actionID = cardID ?? startRemoteAction(.system(action), title: AliveWords.humanized(action), subtitle: "System action")
         updateRemoteAction(
             actionID,
             state: .running,
@@ -687,64 +626,55 @@ final class RemoteActionLedger: ObservableObject {
     }
 }
 
+
+/// One receipt as a row: what ran, its state and age in secondary text, and
+/// the next step only when there is one.
 private struct RemoteActionCardView: View {
     let action: RemoteActionCard
     let onRetry: () -> Void
 
     var body: some View {
-        MobileReadingSurface {
-            VStack(alignment: .leading, spacing: 8) {
-                MobileAdaptiveRow(alignment: .top, spacing: 12) {
-                    Image(systemName: action.state.icon)
-                        .foregroundStyle(.secondary)
-                        .frame(width: 20)
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(action.title)
-                            .font(.headline)
-                        Text(action.subtitle)
-                            .font(.callout)
-                            .foregroundStyle(.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                    Spacer()
-                    Text(action.state.rawValue)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 4)
-                        .background(NativeAgentMobileTheme.Colors.quietFill, in: Capsule())
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .center, spacing: 12) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(action.title)
+                        .font(.body)
+                        .foregroundStyle(AlivePalette.text)
+                    (Text("\(action.subtitle) · \(action.state.rawValue) · ")
+                        + Text(action.updatedAt, format: .relative(presentation: .named)))
+                        .font(.subheadline)
+                        .foregroundStyle(AlivePalette.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
-                Text(action.detail)
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-                MobileAdaptiveRow {
-                    Text(action.updatedAt, style: .relative)
-                        .font(.caption)
-                        .foregroundStyle(.tertiary)
-                    Spacer()
-                    if action.state == .waitingApproval,
-                       RemoteActionCardRecoveryPresentation.control(for: action.state) == .reviewApproval {
-                        Text("Approval status is local to this session; review it in Activity.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                        Button("Review Approval", systemImage: "checkmark.shield") {
-                            NotificationCenter.default.post(
-                                name: .nativeagentOpenActivity,
-                                object: nil,
-                                userInfo: ["screen": "approvals"]
-                            )
-                        }
-                        .buttonStyle(.borderedProminent)
-                    .foregroundStyle(NativeAgentMobileTheme.Colors.onAccent)
-                    } else if action.state == .failed,
-                              RemoteActionCardRecoveryPresentation.control(for: action.state) == .retry {
-                        Button("Retry", systemImage: "arrow.clockwise", action: onRetry)
-                            .buttonStyle(.bordered)
-                .tint(.secondary)
-                    }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                if action.state == .failed,
+                   RemoteActionCardRecoveryPresentation.control(for: action.state) == .retry {
+                    Button("Retry", systemImage: "arrow.clockwise", action: onRetry)
+                        .labelStyle(.titleOnly)
+                        .aliveSecondaryButton()
                 }
             }
+            Text(action.detail)
+                .font(.footnote)
+                .foregroundStyle(AlivePalette.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            if action.state == .waitingApproval,
+               RemoteActionCardRecoveryPresentation.control(for: action.state) == .reviewApproval {
+                Text("Approval status is local to this session; review it in Activity.")
+                    .font(.footnote)
+                    .foregroundStyle(AlivePalette.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Button("Review Approval", systemImage: "checkmark.shield") {
+                    NotificationCenter.default.post(
+                        name: .nativeagentOpenActivity,
+                        object: nil,
+                        userInfo: ["screen": "approvals"]
+                    )
+                }
+                .labelStyle(.titleOnly)
+                .alivePrimaryButton()
+            }
         }
+        .aliveRow()
     }
 }

@@ -7,6 +7,7 @@
 //          `responses/<msg_id>.json`. iOS polls KVS key `inbox_response_<msg_id>` for the reply.
 
 import CryptoKit
+import AppIntents
 import Foundation
 import SwiftUI
 import NativeAgentShared
@@ -50,6 +51,47 @@ struct SurfaceModelPref: Equatable, Sendable, Codable {
 
 // MARK: - iCloudSyncEngine
 
+/// The last agent name this phone heard, kept only for the pairing that
+/// delivered it. The key is a fingerprint of the pairing secret (a different
+/// Mac or Apple Account pairs with a different secret), never the secret.
+/// Unpaired, or paired to someone else, the name is dropped, not shown.
+enum AgentNameCache {
+    private static let nameKey = "nativeagent.lastAgentName"
+    private static let pairingKey = "nativeagent.lastAgentName.pairing"
+
+    static func fingerprint(_ secret: Data?) -> String? {
+        guard let secret, !secret.isEmpty else { return nil }
+        return SHA256.hash(data: secret).prefix(8).map { String(format: "%02x", $0) }.joined()
+    }
+
+    static func remember(_ name: String, pairing secret: Data?, defaults: UserDefaults = .standard) {
+        guard let fingerprint = fingerprint(secret) else { return }
+        defaults.set(name, forKey: nameKey)
+        defaults.set(fingerprint, forKey: pairingKey)
+        CommunicationNotification.remember(name: name, pairing: fingerprint)
+    }
+
+    /// The remembered name when it belongs to this pairing. A different
+    /// pairing clears it. No secret in hand (unpaired, or the Keychain still
+    /// locked at launch) shows nothing and keeps it; `forget` runs when the
+    /// pairing is known to be gone.
+    static func name(pairing secret: Data?, defaults: UserDefaults = .standard) -> String? {
+        guard let name = defaults.string(forKey: nameKey), let fingerprint = fingerprint(secret) else { return nil }
+        guard defaults.string(forKey: pairingKey) == fingerprint else {
+            forget(defaults: defaults)
+            return nil
+        }
+        CommunicationNotification.remember(name: name, pairing: fingerprint)
+        return name
+    }
+
+    static func forget(defaults: UserDefaults = .standard) {
+        defaults.removeObject(forKey: nameKey)
+        defaults.removeObject(forKey: pairingKey)
+        CommunicationNotification.forget()
+    }
+}
+
 @MainActor
 final class iCloudSyncEngine: ObservableObject {
     static let shared = iCloudSyncEngine()
@@ -58,6 +100,9 @@ final class iCloudSyncEngine: ObservableObject {
 
     @Published var workshopTasks: [WorkshopTaskRecord] = []
     @Published var deskItems: [MobileDeskItem] = []
+    @Published var schedulerSnapshot: MobileSchedulerSnapshot?
+    var schedulerJobReceiptTimes: [String: Double] = [:]
+    @Published var schedulerError: String?
     /// What the Mac's Desk bounds dropped, as the Mac reported it. nil means no
     /// report was delivered (an older Mac), never "nothing was dropped".
     @Published var deskBounds: MobileDeskProjectionReport?
@@ -78,13 +123,22 @@ final class iCloudSyncEngine: ObservableObject {
     // R25 (2026-07-02): personality.json now carries the real native
     // NativeClient.getPersonality() profile (shared PersonalityProfile type,
     // typed encode) — the daemon-era raw-bytes note and the `{}` stub are gone.
-    @Published var personality: PersonalityProfile?
+    @Published var personality: PersonalityProfile? {
+        didSet {
+            // Remember the configured name, so the chat header still says it
+            // offline and after a relaunch, before any snapshot arrives.
+            let name = NativeAgentIdentity.displayName(personality?.name, fallback: "")
+            if !name.isEmpty {
+                AgentNameCache.remember(name, pairing: pairingStore?.iCloudPairingSecret)
+                if oldValue?.name != personality?.name { NativeAgentMobileShortcuts.updateAppShortcutParameters() }
+            }
+        }
+    }
     @Published var sessions: [ChatSession] = []
+    @Published var helpersSnapshot: MobileHelpersSnapshot?
     @Published var pinnedChatSessions: [ChatSession] = []
-    /// The conversation anchor the Mac published beside `sessions.json` — the
-    /// session the human is currently active in on a direct remote surface.
-    /// Read-only on the phone: it is merged into the tab strip and defaulted to,
-    /// never written into anyone's pins and never synced back.
+    /// The Mac window's current chat, published beside `sessions.json`.
+    /// Main follows it; explicitly opened history keeps its own destination.
     @Published var chatAnchor: ConversationAnchorPin?
     /// 2026-09-06: one published transcript for a session — the rows the Mac
     /// published and the version it published them at, in ONE value. Two
@@ -108,6 +162,7 @@ final class iCloudSyncEngine: ObservableObject {
     @Published var connectors: [ConnectorRecord] = []
     // PATCH-2026-05-07: leftover-1 providers snapshot — loaded from providers.json written by MacSyncEngine
     @Published var providers: [ProviderInfo] = []
+    @Published var providerSignIns: [String: [String: String]] = [:]
     @Published var surfaceModels: [String: SurfaceModelPref] = [:]
     @Published var approvals: [ApprovalRequest] = []
     @Published var inboxItems: [InboxItemRecord] = []
@@ -134,12 +189,13 @@ final class iCloudSyncEngine: ObservableObject {
             return stored
         }
         // One-time migration: the single global clock this replaced was a real
-        // delivery, so seed every group with it rather than showing every
-        // screen as never-delivered after the upgrade.
+        // delivery for the original groups. Scheduler needs its own delivery
+        // evidence because older Macs never published that projection.
         guard let legacy = UserDefaults.standard
             .object(forKey: legacyDeliveryDefaultsKey) as? Date else { return [:] }
         return Dictionary(
-            uniqueKeysWithValues: NAMobileSnapshotGroup.allCases.map { ($0.rawValue, legacy) }
+            uniqueKeysWithValues: NAMobileSnapshotGroup.allCases.filter { $0 != .scheduler }
+                .map { ($0.rawValue, legacy) }
         )
     }
 
@@ -183,6 +239,10 @@ final class iCloudSyncEngine: ObservableObject {
     /// timestamp looks.
     @Published var staleSnapshotGroups: [String: String] = [:]
     @Published var syncError: String?
+    /// Set by `sendActionWithSignatureRetry` on every nil return: the send
+    /// error when the action never left the phone, nil when it was sent but
+    /// unanswered. Read synchronously by `requireSuccessfulActionResponse`.
+    var lastActionSendFailure: String?
     var inboxSnapshotLoaded = false
     /// Per-queue arrival, for the same reason the inbox flag exists: a
     /// provider-catalog update alone sets `lastSyncAt`, so a shared timestamp
@@ -191,8 +251,11 @@ final class iCloudSyncEngine: ObservableObject {
     var approvalsSnapshotLoaded = false
     var memoryProposalsSnapshotLoaded = false
 
+    /// The configured name from the Mac; else the last one this phone heard;
+    /// the product name only before any name has ever been known.
     var agentDisplayName: String {
-        NativeAgentIdentity.displayName(personality?.name)
+        let lastKnown = AgentNameCache.name(pairing: pairingStore?.iCloudPairingSecret)
+        return NativeAgentIdentity.displayName(personality?.name, fallback: NativeAgentIdentity.displayName(lastKnown))
     }
 
     // MARK: - Private
@@ -264,6 +327,9 @@ enum SyncError: LocalizedError {
     /// transport failure.
     case approvalRequired(String)
     case unsupported(String)
+    /// The action never reached the Mac: a definite failure, unlike the
+    /// unconfirmed outcome `.timeout` stands for.
+    case sendFailed(String)
 
     var errorDescription: String? {
         switch self {
@@ -274,6 +340,7 @@ enum SyncError: LocalizedError {
         case .busy(let msg):    return msg
         case .approvalRequired(let msg): return msg
         case .unsupported(let msg): return msg
+        case .sendFailed(let msg): return msg
         }
     }
 }

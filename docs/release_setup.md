@@ -16,6 +16,16 @@ the one-time setup and per-release workflow.
 
 ## 1. One-time setup
 
+Install XcodeGen (`brew install xcodegen`): the ignored Mac and iOS `.xcodeproj` bundles are generated from root `project.yml` and `iOS/NativeAgentMobile/project.yml`; `build_and_run.sh` (including `install_app.sh`) and `ios_release.sh` regenerate before building, and manual Xcode builds require `xcodegen --spec <project.yml>` first.
+
+Root `Package.resolved` is the only reviewed package lockfile. Both specs copy it
+into the generated project's `project.xcworkspace/xcshareddata/swiftpm/` directory.
+iOS currently depends only on the local `NativeAgentShared` package, with no
+external dependencies or separate pins. Command-line builds use
+`-onlyUsePackageVersionsFromResolvedFile -skipPackageUpdates`: incompatible pins
+fail the build instead of updating versions. Change root pins only as an explicit
+dependency update.
+
 ### Bundled model (default)
 
 `release.sh` defaults to `NATIVEAGENT_EMBEDDING_DISTRIBUTION=bundled` and copies the local `embedding.json`, `embedding.mlpackage`, and `vocab.txt` from `NATIVEAGENT_EMBEDDING_MODEL_DIR` (default `extras/embedding`) into the app inside the DMG, without fetching weights.
@@ -92,10 +102,6 @@ the app-side downloader in a development install, set
 `NATIVEAGENT_EMBEDDING_DISTRIBUTION=separate-download` and
 `NATIVEAGENT_EMBEDDING_DOWNLOAD_MANIFEST` to the release descriptor before
 installation. Existing installed models are preserved; bundled mode removes any staged download descriptor.
-
-`tests/scripts/github_release_updater_test.sh` uses temporary model fixtures,
-two real fixture DMGs, an ephemeral Sparkle key, BinaryDelta apply/compare,
-and stubbed Git/GitHub calls. It never publishes a real release.
 
 ### Apple Developer account and certificate
 
@@ -461,9 +467,6 @@ text. `<string>true</string>` used to satisfy `NativeAgentUpdateFeedPublished`
 while Swift's `info[…] as? Bool` read nil — a verified artifact with a dead
 updater. Booleans must be real `<true/>`/`<false/>` and `SUFeedURL` a real
 `<string>`.
-
-All of this is covered by `tests/scripts/sparkle_publish_ordering_test.sh`, which
-runs the real publish path offline against a stub release host.
 
 ### appcast.xml format
 

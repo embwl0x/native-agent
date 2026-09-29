@@ -1,44 +1,19 @@
+import EngineRuntime
+import NativeAgentCore
 import Foundation
 import Observation
 import NativeAgentShared
 import PersistenceCore
 
-struct KernelGuardrail: Identifiable, Codable, Hashable {
-    var id: String
-    var title: String
-    var status: String
-}
+typealias KernelGuardrail = EngineRuntime.KernelGuardrail
 
-struct ApprovalClass: Identifiable, Codable, Hashable {
-    var id: String
-    var title: String
-    var requiresApproval: Bool
-}
+typealias ApprovalClass = EngineRuntime.ApprovalClass
 
-struct AutonomyKernelSummary: Codable, Hashable {
-    var status: String
-    var mode: String?
-    var enabled: Bool?
-    var processEnabled: Bool?
-    var trustEnabled: Bool?
-    var disabledReason: String?
-    var guardrails: [KernelGuardrail]
-    var approvalClasses: [ApprovalClass]
-    var runningImprovements: Int?
-    var createdAt: String?
-}
+typealias AutonomyKernelSummary = EngineRuntime.AutonomyKernelSummary
 
-struct PersonalOSSpace: Identifiable, Codable, Hashable {
-    var id: String
-    var name: String
-    var count: Int
-    var kind: String?
-}
+typealias PersonalOSSpace = EngineRuntime.PersonalOSSpace
 
-struct PersonalOSSummary: Codable, Hashable {
-    var spaces: [PersonalOSSpace]
-    var createdAt: String?
-}
+typealias PersonalOSSummary = EngineRuntime.PersonalOSSummary
 
 struct CapabilityCatalogItem: Identifiable, Codable, Hashable {
     var id: String
@@ -63,63 +38,6 @@ struct CapabilityPackInstall: Identifiable, Codable, Hashable {
     var rolledBackAt: String?
 }
 
-struct CapabilityCatalogSource: Identifiable, Codable, Hashable {
-    var id: String
-    var name: String
-    var kind: String?
-    var url: String?
-    var status: String?
-    var trustedRootId: String?
-    var lastCheckedAt: String?
-    var createdAt: String?
-    var updatedAt: String?
-}
-
-struct CapabilityTrustRoot: Identifiable, Codable, Hashable {
-    var id: String
-    var name: String
-    var kind: String?
-    var fingerprint: String?
-    var status: String?
-    var createdAt: String?
-    var updatedAt: String?
-}
-
-struct CapabilityTrustRecord: Identifiable, Codable, Hashable {
-    var id: String
-    var name: String?
-    var kind: String?
-    var status: String?
-    var riskClass: String?
-    var trustScore: Double?
-    var trustTier: String?
-    var reasons: [String]?
-}
-
-struct CapabilityTrustSummary: Codable, Hashable {
-    var trusted: Int
-    var review: Int
-    var untrusted: Int
-}
-
-struct CapabilityTrustNetwork: Codable, Hashable {
-    var status: String
-    var roots: [CapabilityTrustRoot]
-    var sources: [CapabilityCatalogSource]
-    var records: [CapabilityTrustRecord]
-    var summary: CapabilityTrustSummary?
-    var createdAt: String?
-}
-
-struct CapabilityTrustEvaluation: Codable, Hashable {
-    var id: String
-    var name: String?
-    var trustScore: Double
-    var trustTier: String
-    var reasons: [String]
-    var createdAt: String?
-}
-
 struct CapabilityUpdateRecord: Identifiable, Codable, Hashable {
     var id: String
     var packId: String?
@@ -136,17 +54,7 @@ struct CapabilityUpdateCheck: Codable, Hashable {
     var createdAt: String?
 }
 
-struct PersonalityGrowthSummary: Codable, Hashable {
-    var engineVersion: String
-    var activeKind: String?
-    var fingerprint: String?
-    /// 2026-09-13: what changed this week and why, one line per lesson or
-    /// view. Replaced `growthEntries`, which counted lines in GROWTH.md.
-    var growthWeek: [String]
-    var feedbackMemories: Int
-    var nextActions: [String]
-    var createdAt: String?
-}
+typealias PersonalityGrowthSummary = EngineRuntime.PersonalityGrowthSummary
 
 struct NativePowerSurface: Identifiable, Codable, Hashable {
     var id: String
@@ -166,65 +74,12 @@ struct NativeActionRegistry: Codable, Hashable {
     var createdAt: String?
 }
 
-struct NativeActionRecord: Identifiable, Codable, Hashable {
-    var id: String
-    var name: String
-    var kind: String?
-    var risk: String?
-    var requiresApproval: Bool?
-    var dryRunAvailable: Bool?
-}
+typealias NativeActionRecord = NativeAgentCore.NativeActionRecord
 
-struct NativeActionReceipt: Identifiable, Codable, Hashable {
-    var id: String
-    var actionId: String
-    var name: String?
-    var kind: String?
-    var status: String
-    var dryRun: Bool?
-    var approvalId: String?
-    var createdAt: String?
-    var url: String?
-    var textPath: String?
-    var textPreview: String?
-    var textChars: Int64?
-    var linksPath: String?
-    var pngPath: String?
-    var linkCount: Int64?
-    var linksPreview: [BrowserLink]?
-}
+typealias NativeActionReceipt = EngineRuntime.NativeActionReceipt
 
+typealias NotificationRuntimeStatus = EngineRuntime.NotificationRuntimeStatus
 
-struct NotificationRuntimeStatus: Codable, Hashable {
-    var status: String
-    var authorization: String?
-    var pendingApprovals: Int?
-    var receiptCount: Int?
-    var latestReceipt: NativeActionReceipt?
-    var createdAt: String?
-}
+typealias BrowserRuntimeStatus = EngineRuntime.BrowserRuntimeStatus
 
-struct BrowserRuntimeStatus: Codable, Hashable {
-    var status: String
-    var profilePath: String?
-    var sourcePath: String?
-    var screenshotPath: String?
-    var approvedDomains: [String]?
-    var domainPolicy: String?
-    var activeRuns: [BrowserRun]?
-    var receiptCount: Int?
-    var latestReceipt: BrowserRun?
-    var createdAt: String?
-}
-
-struct BrowserRun: Identifiable, Codable, Hashable {
-    var id: String
-    var url: String?
-    var domain: String?
-    var status: String
-    var dryRun: Bool?
-    var visible: Bool?
-    var opened: Bool?
-    var approvalId: String?
-    var createdAt: String?
-}
+typealias BrowserRun = EngineRuntime.BrowserRun

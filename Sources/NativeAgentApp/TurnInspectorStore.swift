@@ -1,6 +1,7 @@
 import Foundation
 import Observation
 import PersistenceCore
+import TurnTrace
 
 /// The inspector must distinguish a quiet live feed from one that lost events
 /// under its own backpressure. Keep the visible wording in the same boundary
@@ -89,6 +90,7 @@ final class TurnInspectorStore {
     /// Availability-preserving form of `liveDropCount`. Views must render this
     /// rather than treating the compatibility integer's zero as a receipt.
     private(set) var liveDropCountState: TurnInspectorLiveDropState = .measured(0)
+    private(set) var liveSinkActive = false
     /// Replay diagnostics.
     private(set) var replayDate: Date = Date()
     private(set) var replaySkipped: Int = 0
@@ -172,6 +174,7 @@ final class TurnInspectorStore {
     /// still tears the sink down rather than leaking it.
     func start() {
         guard consumeTask == nil else { return }
+        TurnInspectorDoctor.active = self
         liveGeneration += 1
         // Fresh subscription, fresh diagnostics (gpt-5.5 W3 review: a reopened
         // Inspector showed the PRIOR generation's drop count until the first
@@ -191,7 +194,9 @@ final class TurnInspectorStore {
             // the defer unsubscribes the just-created sink.
             if Task.isCancelled { return }
             let stale = await MainActor.run { [weak self] in
-                self?.liveGeneration != generation
+                guard let self, self.liveGeneration == generation else { return true }
+                self.liveSinkActive = true
+                return false
             }
             if stale { return }
             if let beforeLiveConsumption {
@@ -224,6 +229,7 @@ final class TurnInspectorStore {
             if !Task.isCancelled {
                 await MainActor.run { [weak self] in
                     guard let self, self.liveGeneration == generation else { return }
+                    self.liveSinkActive = false
                     self.applyLiveDropRead(.unavailable)
                 }
             }
@@ -235,6 +241,8 @@ final class TurnInspectorStore {
     /// The bus sink is removed by the task's `defer`, not here — that's the one
     /// place that always owns a valid sub.id. Safe to call repeatedly.
     func stop() {
+        if TurnInspectorDoctor.active === self { TurnInspectorDoctor.active = nil }
+        liveSinkActive = false
         liveGeneration += 1
         consumeTask?.cancel()
         consumeTask = nil

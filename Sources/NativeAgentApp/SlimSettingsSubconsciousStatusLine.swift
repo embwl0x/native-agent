@@ -1,4 +1,5 @@
 import Foundation
+import Cognition
 
 /// The Settings row is a receipt for the effective runtime configuration, not
 /// a restatement of the toggle's requested value. In particular, the

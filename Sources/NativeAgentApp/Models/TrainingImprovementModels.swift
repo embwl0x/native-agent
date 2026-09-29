@@ -2,6 +2,8 @@ import Foundation
 import Observation
 import NativeAgentShared
 import PersistenceCore
+import TriggerScheduler
+import SelfImprovement
 
 struct TrainingArtifact: Identifiable, Codable, Hashable {
     var id: String
@@ -14,155 +16,11 @@ struct TrainingArtifact: Identifiable, Codable, Hashable {
     var summary: String?
 }
 
-struct ResearchResult: Identifiable, Codable, Hashable {
-    var id: String { url }
-    var title: String
-    var url: String
-    var snippet: String
-    var source: String?
-}
-
-struct ImprovementRun: Identifiable, Codable, Hashable {
-    var id: String
-    var objective: String
-    var status: String
-    var phase: String
-    var createdAt: String
-    var summary: String?
-    var completedAt: String?
-    var model: String?
-    var worktree: String?
-    var exitReason: String?
-    var promotedCommitSha: String?
-    var revertCommitSha: String?
-}
-
-struct ImprovementRevertResult: Codable, Hashable {
-    var ok: Bool
-    var revertCommitSha: String?
-    var originalCommitSha: String?
-    var warning: String?
-    var error: String?
-}
-
-struct SchedulerJob: Identifiable, Codable, Hashable {
-    var id: String
-    var name: String
-    var kind: String
-    var intervalSeconds: Int?
-    var enabled: Bool
-    var nextRunAt: String?
-    var lastRunAt: String?
-}
-
-struct ImprovementFailureEntry: Codable, Hashable, Identifiable {
-    var id: String { runId ?? UUID().uuidString }
-    var runId: String?
-    var createdAt: String?
-    var status: String?
-    var failureClass: String?
-    var summary: String?
-    enum CodingKeys: String, CodingKey {
-        case runId = "id"
-        case createdAt
-        case status
-        case failureClass
-        case summary
+extension SelfImprovement.ImprovementSummary {
+    var trustEnabled: Bool? {
+        guard case .object(let row) = rawResponse, case .bool(let enabled)? = row["trustEnabled"] else { return nil }
+        return enabled
     }
-}
-
-struct ImprovementSummary: Codable, Hashable {
-    var enabled: Bool
-    var processEnabled: Bool?
-    var trustEnabled: Bool?
-    var disabledReason: String?
-    var status: String
-    var runningCount: Int
-    var succeededCount: Int
-    var failedCount: Int
-    var interruptedCount: Int
-    var totalCount: Int
-    var stagedCount: Int
-    var stagedRuns: [ImprovementRun]?
-    var latestRun: ImprovementRun?
-    var latestFailure: ImprovementRun?
-    var failureBreakdown: [String: Int]?
-    var recentFailures: [ImprovementFailureEntry]?
-    var nextImproveJob: SchedulerJob?
-    var recurringImproveJobs: [SchedulerJob]
-    var personalityGrowthEntries: Int
-    var latestPersonalityGrowthEntries: [String]?
-    var smokeJobCount: Int
-    var oldInterruptedCount: Int
-    var repairableReceiptFailureCount: Int
-    var learningReceiptCount: Int?
-    var latestLearningReceipts: [HarnessLearningReceipt]?
-    var learningProposalCount: Int?
-    var latestLearningProposals: [HarnessLearningProposal]?
-    var learningProposalCounts: [String: Int]?
-    var harnessBenchmark: HarnessBenchmarkSummary?
-    var learningStandard: HarnessLearningStandard?
-    var dataRoot: String
-    var createdAt: String
-}
-
-struct HarnessLearningStandard: Codable, Hashable {
-    var activeHints: Int?
-    var provenHints: Int?
-    var watchHints: Int?
-    var probationHints: Int?
-    var archivedHints: Int?
-    var archiveBelowConfidence: Double?
-    var promoteAfterSuccesses: Int?
-    var promoteAfterUses: Int?
-}
-
-struct HarnessLearningReceipt: Identifiable, Codable, Hashable {
-    var id: String
-    var kind: String
-    var title: String
-    var summary: String
-    var why: String?
-    var changes: [String]?
-    var runId: String?
-    var source: String?
-    var impact: String?
-    var createdAt: String
-}
-
-struct HarnessLearningProposal: Identifiable, Codable, Hashable {
-    var id: String
-    var type: String?
-    var status: String?
-    var problem: String?
-    var proposedChange: String?
-    var expectedBenefit: String?
-    var evidenceRuns: [String]?
-    var riskTier: String?
-    var approvalRequired: Bool?
-    var approvalReasons: [String]?
-    var promotionMode: String?
-    var implementationStatus: String?
-    var implementedAt: String?
-    var implementationEvidenceGrade: String?
-    var implementationUseCount: Int?
-    var implementationSuccessCount: Int?
-    var implementationConfidence: Double?
-    var permanentAt: String?
-    var requiredEvalGate: String?
-    var seenCount: Int?
-    var createdAt: String?
-    var updatedAt: String?
-}
-
-struct HarnessBenchmarkSummary: Codable, Hashable {
-    var status: String?
-    var latest: HarnessBenchmarkRun?
-    var runCount: Int?
-    var weeklyJob: SchedulerJob?
-    var manualRunEndpoint: String?
-    var chatPathImpact: String?
-    var createdAt: String?
 }
 
 struct HarnessBenchmarkRun: Identifiable, Codable, Hashable {
@@ -184,15 +42,6 @@ struct HarnessBenchmarkCheck: Identifiable, Codable, Hashable {
     var detail: String?
 }
 
-struct ImprovementPromoteResult: Codable, Hashable {
-    var ok: Bool
-    var commitSha: String?
-    var filesChanged: Int?
-    var error: String?
-    var warning: String?
-    var swiftChanged: Bool?
-}
-
 // PATCH-2026-05-08: no-terminal-moments — result types for rebuild/push/stash-recover
 struct SystemRebuildResult: Codable, Hashable {
     var ok: Bool
@@ -212,4 +61,75 @@ struct GitStashRecoverResult: Codable, Hashable {
     var stashRef: String?
     var output: String?
     var error: String?
+}
+
+extension SelfImprovement.ImprovementSummary {
+    /// The persisted UI summary is a flat record; the core summary keeps its
+    /// long-tail fields in rawResponse instead of duplicating them in app state.
+    init(persistedRow value: JSONValue) throws {
+        guard case .object(let row) = value,
+              let enabled = improvementBool(row["enabled"]),
+              let status = improvementString(row["status"]) else {
+            throw CocoaError(.coderReadCorrupt)
+        }
+        func count(_ key: String) throws -> Int {
+            guard case .int(let value)? = row[key], let result = Int(exactly: value) else {
+                throw CocoaError(.coderReadCorrupt)
+            }
+            return result
+        }
+        func run(_ key: String) throws -> SelfImprovement.ImprovementRun? {
+            guard let value = row[key], value != .null else { return nil }
+            return try SelfImprovement.ImprovementRun(persistedRow: value)
+        }
+        let staged: [SelfImprovement.ImprovementRun]?
+        if case .array(let values)? = row["stagedRuns"] {
+            staged = try values.map { try SelfImprovement.ImprovementRun(persistedRow: $0) }
+        } else {
+            staged = nil
+        }
+        self.init(
+            enabled: enabled, status: status,
+            disabledReason: improvementString(row["disabledReason"]),
+            runningCount: try count("runningCount"), succeededCount: try count("succeededCount"),
+            failedCount: try count("failedCount"), interruptedCount: try count("interruptedCount"),
+            stagedCount: try count("stagedCount"), totalCount: try count("totalCount"),
+            latestRun: try run("latestRun"), latestFailure: try run("latestFailure"),
+            stagedRuns: staged, rawResponse: value
+        )
+    }
+}
+
+private extension SelfImprovement.ImprovementRun {
+    init(persistedRow value: JSONValue) throws {
+        guard case .object(let row) = value,
+              let id = improvementString(row["id"]),
+              let status = improvementString(row["status"]),
+              let phase = improvementString(row["phase"]),
+              let createdAt = improvementString(row["createdAt"]),
+              let objective = improvementString(row["objective"]) else {
+            throw CocoaError(.coderReadCorrupt)
+        }
+        let known: Set<String> = ["id", "status", "phase", "createdAt", "completedAt", "objective", "summary", "model", "worktree", "exitReason", "promotedCommitSha", "revertCommitSha"]
+        let extras = row.filter { !known.contains($0.key) }
+        self.init(
+            id: id, status: status, phase: phase, createdAt: createdAt,
+            completedAt: improvementString(row["completedAt"]), objective: objective,
+            summary: improvementString(row["summary"]), model: improvementString(row["model"]),
+            worktree: improvementString(row["worktree"]), exitReason: improvementString(row["exitReason"]),
+            promotedCommitSha: improvementString(row["promotedCommitSha"]),
+            revertCommitSha: improvementString(row["revertCommitSha"]),
+            extras: extras.isEmpty ? nil : .object(extras)
+        )
+    }
+}
+
+private func improvementString(_ value: JSONValue?) -> String? {
+    guard case .string(let string)? = value else { return nil }
+    return string
+}
+
+private func improvementBool(_ value: JSONValue?) -> Bool? {
+    guard case .bool(let bool)? = value else { return nil }
+    return bool
 }

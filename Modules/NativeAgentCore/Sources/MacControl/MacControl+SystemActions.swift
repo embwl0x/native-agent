@@ -436,7 +436,16 @@ extension SwiftNativeMacControl {
         } else {
             chosen = windows.first
         }
-        guard let chosen else { return finish("app_has_no_window") }
+        guard let chosen else {
+            // Putting back an app that had no window (no window asked for):
+            // activate that exact pid; `finish` verifies it is frontmost.
+            guard identity == nil, exact == nil else { return finish("app_has_no_window") }
+            _ = app.activate()
+            for _ in 0..<20 where accessibilitySource.frontmostApp()?.processIdentifier != pid {
+                try? await Task.sleep(nanoseconds: 50_000_000)
+            }
+            return finish("focused", ["window_matched": .bool(false)])
+        }
         let outcome = accessibilityActSource.raise(chosen)
         guard outcome == .performed else {
             var extra: [String: JSONValue] = ["raise": .string(outcome.rawValue)]
@@ -460,7 +469,8 @@ extension SwiftNativeMacControl {
               !raw.isEmpty,
               let url = URL(string: raw),
               let scheme = url.scheme?.lowercased(),
-              (scheme == "file" || (["http", "https"].contains(scheme) && url.host != nil)) else {
+              (scheme == "file" || scheme == "x-apple.systempreferences"
+                || (["http", "https"].contains(scheme) && url.host != nil)) else {
             throw MacControlError.missingField("url")
         }
         let started = now()

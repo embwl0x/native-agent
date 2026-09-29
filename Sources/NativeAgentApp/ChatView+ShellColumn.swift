@@ -113,23 +113,10 @@ extension ChatView {
             .padding(.horizontal, 8)
             .padding(.bottom, 12)
 
-            HStack(spacing: 8) {
-                Image(systemName: "magnifyingglass")
-                    .font(ShellType.labelSemibold)
-                    .foregroundStyle(NativeAgentShell.secondary)
-                TextField("Search", text: $sessionSearch)
-                    .textFieldStyle(.plain)
-                    .font(ShellType.label)
-                    .accessibilityLabel("Search conversations")
-                    .accessibilityIdentifier("chat.conversations.search")
-            }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 8)
-            .background(
-                NativeAgentShell.quietFill,
-                in: RoundedRectangle(cornerRadius: 8, style: .continuous)
-            )
-            .padding(.bottom, 8)
+            NativeSearchField(text: $sessionSearch, prompt: "Search",
+                              identifier: "chat.conversations.search",
+                              accessibilityLabel: "Search conversations")
+                .padding(.bottom, 8)
 
             // M12: a list that could not refresh says so rather than passing
             // off an old snapshot as live. Both notices survive the reshape.
@@ -140,76 +127,56 @@ extension ChatView {
                 )
             }
 
-            ScrollView {
-                // User, 2026-09-04: plain VStack, same reason as the transcript
-                // (LazyVStack prefetch loop). The list is dozens of rows.
-                VStack(spacing: NativeAgentShellLayout.listRowGap) {
-                    let sections = shellConversationSections
-                    if sections.rows.isEmpty && sections.working.isEmpty {
-                        Text(
-                            ChatSessionListEmptyStatePresentation.message(
-                                totalSessionCount: appModel.chatSessions.count,
-                                searchQuery: sessionSearch
-                            )
+            // User 09-27: all controls Mac native — the system sidebar list:
+            // its own selection, arrow keys and collapsible sections.
+            let sections = shellConversationSections
+            List(selection: Binding<String?>(
+                get: { appModel.activeChatSessionId },
+                set: { id in
+                    guard let id, id != appModel.activeChatSessionId, renamingSessionId == nil,
+                          let session = (sections.rows + sections.briefs + sections.working)
+                            .first(where: { $0.id == id }) else { return }
+                    renameTitle = session.title
+                    Task { await appModel.selectChatSession(session) }
+                }
+            )) {
+                if sections.rows.isEmpty && sections.working.isEmpty {
+                    Text(
+                        ChatSessionListEmptyStatePresentation.message(
+                            totalSessionCount: appModel.engine.transcripts.sessions.count,
+                            searchQuery: sessionSearch
                         )
-                        .font(ShellType.label)
-                        .foregroundStyle(NativeAgentShell.secondary)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 8)
-                    }
-                    ForEach(sections.rows) { session in
-                        shellSessionRow(session)
-                    }
-                    if !sections.briefs.isEmpty {
-                        ShellWorkingGroupRow(
-                            title: ChatShellCopy.briefsRowTitle,
-                            count: sections.briefs.count,
-                            isExpanded: shellBriefsExpanded,
-                            onToggle: {
-                                withAnimation(NativeAgentMotion.respecting(
-                                    NativeAgentMotion.spring, reduceMotion: reduceMotion
-                                )) { shellBriefsExpanded.toggle() }
-                            }
-                        )
-                        .padding(.top, 10)
-                        if shellBriefsExpanded {
-                            ForEach(Array(sections.briefs.enumerated()), id: \.element.id) { index, session in
-                                shellSessionRow(session)
-                                    .padding(.leading, 10)
-                                    .transition(NativeAgentMotion.reveal(reduceMotion: reduceMotion))
-                                    .animation(
-                                        NativeAgentMotion.respecting(NativeAgentMotion.spring, reduceMotion: reduceMotion),
-                                        value: shellBriefsExpanded
-                                    )
-                            }
+                    )
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.secondary)
+                    .selectionDisabled()
+                }
+                ForEach(sections.rows) { session in
+                    shellSessionRow(session).tag(session.id)
+                }
+                if !sections.briefs.isEmpty {
+                    Section(isExpanded: $shellBriefsExpanded) {
+                        ForEach(sections.briefs) { session in
+                            shellSessionRow(session).tag(session.id)
                         }
+                    } header: {
+                        Text("\(ChatShellCopy.briefsRowTitle)  \(sections.briefs.count)")
+                            .foregroundStyle(NativeAgentShell.secondary)
                     }
-                    if !sections.working.isEmpty {
-                        ShellWorkingGroupRow(
-                            count: sections.working.count,
-                            isExpanded: shellWorkingExpanded,
-                            onToggle: {
-                                withAnimation(NativeAgentMotion.respecting(
-                                    NativeAgentMotion.spring, reduceMotion: reduceMotion
-                                )) { shellWorkingExpanded.toggle() }
-                            }
-                        )
-                        .padding(.top, 10)
-                        if shellWorkingExpanded {
-                            ForEach(Array(sections.working.enumerated()), id: \.element.id) { index, session in
-                                shellSessionRow(session)
-                                    .padding(.leading, 10)
-                                    .transition(NativeAgentMotion.reveal(reduceMotion: reduceMotion))
-                                    .animation(
-                                        NativeAgentMotion.respecting(NativeAgentMotion.spring, reduceMotion: reduceMotion),
-                                        value: shellWorkingExpanded
-                                    )
-                            }
+                }
+                if !sections.working.isEmpty {
+                    Section(isExpanded: $shellWorkingExpanded) {
+                        ForEach(sections.working) { session in
+                            shellSessionRow(session).tag(session.id)
                         }
+                    } header: {
+                        Text("\(ChatShellCopy.workingRowTitle)  \(sections.working.count)")
+                            .foregroundStyle(NativeAgentShell.secondary)
                     }
                 }
             }
+            .listStyle(.sidebar)
+            .scrollContentBackground(.hidden)
             .opacity(appModel.chatSidebarSessionListOpacity)
         }
         .padding(.horizontal, NativeAgentShellLayout.conversationsInset)
@@ -283,6 +250,13 @@ extension ChatView {
                 )
             }
         }
+        .overlay(alignment: .leading) {
+            if MacChatUnreadSessions.shared.ids.contains(session.id) {
+                Circle().fill(Color.accentColor).frame(width: 6, height: 6)
+                    .offset(x: -7)
+                    .accessibilityLabel("Unread messages")
+            }
+        }
         .overlay {
             if !renaming {
                 SessionDragSource(sessionId: session.id, sessionTitle: session.title)
@@ -311,7 +285,7 @@ extension ChatView {
     /// True while an approval is waiting on a decision. This is the ONE thing
     /// that spends the teal.
     var shellHasPendingApproval: Bool {
-        appModel.approvals.contains {
+        appModel.engine.approvals.records.contains {
             $0.status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "pending"
         }
     }
@@ -324,7 +298,7 @@ extension ChatView {
 
     var shellStatus: ChatShellStatus {
         .make(
-            policy: appModel.trustPolicy,
+            policy: appModel.engine.trust.policy,
             hasPendingApproval: shellHasPendingApproval,
             hasTrouble: shellHasTrouble
         )

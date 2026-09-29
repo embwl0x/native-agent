@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import TurnTrace
 
 /// Anthropic OAuth wire layout and cache placement. Transport and token
 /// ownership remain in the adapter; these helpers preserve model-visible bytes.
@@ -22,35 +23,6 @@ extension AnthropicOAuthDirectAdapter {
     // a new turn; native-tool turns reserve a separate last-tool breakpoint.
     // makeMessagesRequestBody and makeSystemBlocks enforce the four-marker
     // budget for each layout, including the v2 prefix's shared identity prefix.
-    //
-    // NATIVE_AGENT_GROWN_PROMPT_COMPAT=1 (or true/yes/on) restores dynamic-end
-    // caching and disables conversation breakpoints. The task-local override
-    // selects the same mode for a task tree. Both layouts preserve model-visible
-    // content: only cache metadata changes.
-    //
-    // ChatOrchestration also gates IntraTurnToolResultClearing on this switch.
-    // Clearing rewrites cached prefix bytes, so it runs only in compatibility
-    // mode; the default layout retains those bytes for prefix reuse.
-    public enum GrownPromptCompat {
-        static let envVar = "NATIVE_AGENT_GROWN_PROMPT_COMPAT"
-
-        /// Pure, injectable parser for the env flag.
-        static func isForced(env: [String: String]) -> Bool {
-            guard let raw = env[envVar]?
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-                .lowercased(),
-                !raw.isEmpty else { return false }
-            return ["1", "true", "yes", "on"].contains(raw)
-        }
-
-        static let forcedFromEnv = isForced(env: ProcessInfo.processInfo.environment)
-
-        /// Test hook: binds over the env flag for a task tree. Production
-        /// never binds it (nil → env flag decides).
-        @TaskLocal public static var compatOverride: Bool?
-
-        public static var effective: Bool { compatOverride ?? forcedFromEnv }
-    }
 
     // MARK: - Within-turn reuse
     //
@@ -61,18 +33,6 @@ extension AnthropicOAuthDirectAdapter {
     // Unbound callers retain the single-shot request layout.
     public enum MessagesCacheHint {
         @TaskLocal public static var withinTurnReuse: Bool = false
-    }
-
-    /// U1 item 9: TRUE when the auth file at `path` carries a usable access
-    /// token (expiry ignored — the adapter refreshes inline on use). The
-    /// text-compat loop preflights this before choosing the append-only
-    /// messages transport: without OAuth credentials the messages path would
-    /// fall through to the api-key adapter's NON-streaming streamMessages
-    /// default (single-delta flatten) and kill live deltas, while the legacy
-    /// prompt transport keeps real SSE through the api-key adapter's
-    /// stream(). Fail-closed → caller keeps the legacy wire shape.
-    public static func hasUsableOAuthCredentials(at path: URL) -> Bool {
-        loadAccessTokenAndExpiry(from: path) != nil
     }
 
     // MARK: - cache_control body helpers (U1 step 3 + 2b/3b, 2026-06-10)
@@ -166,17 +126,6 @@ extension AnthropicOAuthDirectAdapter {
         return messages[..<userIndex].lastIndex { $0.role == .assistant }
     }
 
-    /// Completed prior turns visible in this request, counted as assistant
-    /// messages — which on v2 includes every assistant message the history
-    /// projection REPLAYED, so a resumed session is credited with the turns
-    /// it actually carries rather than restarting from zero. Gates the
-    /// speculative 1h write: a one-shot (0 or 1 prior turns) would pay the
-    /// 2x extended-TTL write premium with no expected reader (1h needs three
-    /// reads to break even, against two for 5m).
-    static func priorTurnCount(_ messages: [LLMMessage]) -> Int {
-        messages.reduce(0) { $0 + ($1.role == .assistant ? 1 : 0) }
-    }
-
     /// ONE extended-TTL decision for the WHOLE request.
     ///
     /// ORDERING RULE (Anthropic): entries with the longer TTL must appear
@@ -193,7 +142,9 @@ extension AnthropicOAuthDirectAdapter {
         usesPrefixShape: Bool,
         messages: [LLMMessage]
     ) -> String? {
-        guard usesPrefixShape, priorTurnCount(messages) >= 2 else { return nil }
+        // User 2026-09-29: the stable prefix lives an hour from the first turn,
+        // so a reply after a pause still reads it from cache.
+        guard usesPrefixShape else { return nil }
         return "1h"
     }
 
@@ -423,7 +374,7 @@ extension AnthropicOAuthDirectAdapter {
     /// Unbound (every non-chat caller: dream, REM, executions, tests) →
     /// `.v1Legacy`, i.e. byte-identical to the pre-v2 wire.
     ///
-    /// v2 additionally needs the compat lever off AND segments that
+    /// v2 additionally needs segments that
     /// make it representable: a non-empty stable segment that reassembles
     /// byte-for-byte into the combined `system` string. Same safety guard as
     /// v1 — a stale or caller-mutated binding falls back to the legacy arm
@@ -435,7 +386,6 @@ extension AnthropicOAuthDirectAdapter {
         segments: SystemPromptSegments?
     ) -> Bool {
         guard ConversationPrefixShape.override == .v2Prefix,
-              !GrownPromptCompat.effective,
               let sys = system,
               !sys.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               let seg = segments,
@@ -465,15 +415,14 @@ extension AnthropicOAuthDirectAdapter {
     // MARK: - Shared messages-request body builder (U1 items 8 + 9)
     //
     // ONE encoder behind completeMessages AND the streaming runStreamMessages
-    // so the wire shape (block encoding, breakpoint layout, lever behavior)
+    // so the wire shape (block encoding, breakpoint layout)
     // cannot drift between the non-streaming and SSE transports. The bodies
     // are test-pinned deep-equal modulo the `stream` key
     // (LLMCallTelemetryTests + AnthropicStreamMessagesSSETests).
     //
-    // Reads three task-locals at call time (all inherited through the
+    // Reads two task-locals at call time (all inherited through the
     // adapter's inner Task per the LLMCallContext propagation contract):
     //   - LLMCallContext.systemSegments (via makeSystemBlocks' default arg)
-    //   - GrownPromptCompat.compatOverride (rollback lever)
     //   - MessagesCacheHint.withinTurnReuse (item 9 — see enum doc above)
     static func makeMessagesRequestBody(
         messages: [LLMMessage],
@@ -483,14 +432,13 @@ extension AnthropicOAuthDirectAdapter {
         stream: Bool
     ) -> [String: Any] {
         // Conversation-cache INVARIANT: caching ships iff the call is a v2
-        // prefix turn OR withinTurnReuse-hinted (the text-compat loop's
-        // explicit "I re-send this conversation as a prefix next iteration"
-        // signal — see MessagesCacheHint), and trailing-eligible, and not
-        // compat. The grown-prompt compat lever restores the old layout.
+        // prefix turn OR withinTurnReuse-hinted (the tool loop's explicit "I
+        // re-send this conversation as a prefix next round" signal — see
+        // MessagesCacheHint), and trailing-eligible.
         // V2: EVERY turn is a prefix-reuse turn — the transcript is re-sent
         // as a cached prefix across turns, not only inside one tool loop — so
         // the conversation breakpoints are unconditional (still subject to
-        // trailing-eligibility and the compat lever). The v2 system-block
+        // trailing-eligibility). The v2 system-block
         // shape only engages when the segments actually reassemble; when it
         // does not, the identity block keeps its own breakpoint and there is
         // no free slot, so no previous-turn boundary is marked.
@@ -513,7 +461,6 @@ extension AnthropicOAuthDirectAdapter {
         let useConversationCache =
             (usesPrefixShape || MessagesCacheHint.withinTurnReuse)
             && trailingEligible
-            && !Self.GrownPromptCompat.effective
         let longTTL = Self.requestLongTTL(
             usesPrefixShape: usesPrefixShape, messages: messages
         )

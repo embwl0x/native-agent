@@ -1,6 +1,9 @@
+import Privacy
 import Foundation
+import ApprovalInbox
 import ChatOrchestration
 import NativeAgentShared
+import PersistenceCore
 
 /// Desk 658.12 — the approval a turn is waiting on, projected into the card.
 ///
@@ -101,11 +104,11 @@ enum MacChatTurnApprovalProjection {
     static func approval(
         sessionId: String,
         turnStartedAt: Date,
-        approvals: [ApprovalRequest]
+        approvals: [ApprovalRecord]
     ) -> MacChatTurnCardApproval? {
         guard !sessionId.isEmpty else { return nil }
 
-        let candidates: [(row: ApprovalRequest, requestedAt: Date)] = approvals.compactMap { row in
+        let candidates: [(row: ApprovalRecord, requestedAt: Date)] = approvals.compactMap { row in
             guard row.chatOriginSessionId == sessionId,
                   let requestedAt = parseTimestamp(row.lastRequestedAt ?? row.createdAt),
                   requestedAt >= turnStartedAt else { return nil }
@@ -165,7 +168,7 @@ enum MacChatTurnApprovalProjection {
     /// The inbox stores a caller-written preview when there is one and the
     /// serialized payload otherwise (`ApprovalInbox.stageApproval`), so this
     /// reads an object when it can and falls back to the raw string.
-    static func inputSummary(_ row: ApprovalRequest) -> String? {
+    static func inputSummary(_ row: ApprovalRecord) -> String? {
         guard let raw = nonEmpty(row.payloadPreview) else { return nil }
         guard let data = raw.data(using: .utf8),
               let object = try? JSONSerialization.jsonObject(with: data),
@@ -264,7 +267,7 @@ enum MacChatTurnApprovalProjection {
     /// Reads a row's outcome. The default arm is `.unresolved` on purpose: a
     /// status this projection does not understand must never be rendered as a
     /// decision that was never made.
-    static func outcome(for row: ApprovalRequest) -> MacChatTurnCardApproval.Outcome {
+    static func outcome(for row: ApprovalRecord) -> MacChatTurnCardApproval.Outcome {
         let status = row.status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let decision = row.decision?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
 
@@ -292,7 +295,7 @@ enum MacChatTurnApprovalProjection {
         }
     }
 
-    private static func displayAction(_ row: ApprovalRequest) -> String {
+    private static func displayAction(_ row: ApprovalRecord) -> String {
         nonEmpty(row.action) ?? nonEmpty(row.title) ?? "this action"
     }
 

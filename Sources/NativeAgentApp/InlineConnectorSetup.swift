@@ -1,7 +1,11 @@
+import Connectors
+import ProviderRouting
 import ChatOrchestration
 import Foundation
 import PersistenceCore
+import TurnTrace
 import TelegramBot
+import SlackBot
 
 /// The token-paste half of a connector's setup, for the inline card.
 ///
@@ -86,7 +90,7 @@ enum InlineConnectorSetup {
             outcome = result.ok ? Outcome(note: "token checked with Notion")
                 : Outcome(error: result.error ?? "Notion rejected the token.")
         case "github":
-            let result = await NativeOAuthFlow.saveGitHubToken(token, dataRoot: dataRoot)
+            let result = await NativeOAuthFlow.saveGitHubToken(token, dataRoot: dataRoot, credentialStore: AppGitHubOAuthCredentials())
             outcome = result.ok ? Outcome(note: "token checked with GitHub")
                 : Outcome(error: result.error ?? "GitHub rejected the token.")
         case "slack":

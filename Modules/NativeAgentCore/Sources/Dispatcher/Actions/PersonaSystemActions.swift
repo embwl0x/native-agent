@@ -21,7 +21,7 @@ import PersistenceCore
 // `makeDispatcher` factory passes `localActions: nil`; this registry is only
 // consulted when a SwiftNativeDispatcher is explicitly constructed with
 // `localActions: .fileSystemDefault`. Flipping callers through SwiftNative is a
-// separate, leash-gated wave (CUTOVER_PLAN §6.97 disposition).
+// separate, leash-gated wave.
 //
 // AUDIT NOTE (HONESTY GATE): the brief asked for "+5". A full audit of the
 // remaining unported `_exec_*` builtin handlers found that the 5th would-be
@@ -66,9 +66,8 @@ enum PersonaSystemActions {
             in: name, range: NSRange(location: 0, length: ns.length)) != nil
     }
 
-    /// Resolve the persona root the same way `_resolve_na_persona_root` does:
-    /// explicit context personaRoot wins; otherwise fall through to
-    /// PersistenceCore.defaultPersonaRoot (env / stamped bundle / <data>/memory).
+    /// An explicit context personaRoot, otherwise
+    /// PersistenceCore.defaultPersonaRoot for the context's data root.
     static func personaRootURL(_ ctx: ConnectorActionContext) -> URL {
         if let pr = ctx.personaRoot, !pr.isEmpty {
             return URL(fileURLWithPath: pr)

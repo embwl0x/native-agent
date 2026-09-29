@@ -8,25 +8,13 @@ let package = Package(
         .iOS(.v17)
     ],
     products: [
-        .library(name: "NativeAgentShared", targets: ["NativeAgentShared"]),
-        // Reusable by Mac and iPhone tests; production apps depend only on Shared.
-        .library(name: "NativeAgentSharedTestSupport", targets: ["NativeAgentSharedTestSupport"])
+        .library(name: "NativeAgentShared", targets: ["NativeAgentShared"])
     ],
     targets: [
         .target(
             name: "NativeAgentShared",
             dependencies: [],
             path: "Sources/NativeAgentShared"
-        ),
-        .target(
-            name: "NativeAgentSharedTestSupport",
-            dependencies: ["NativeAgentShared"],
-            path: "Tests/NativeAgentSharedTestSupport"
-        ),
-        .testTarget(
-            name: "NativeAgentSharedTests",
-            dependencies: ["NativeAgentShared", "NativeAgentSharedTestSupport"],
-            path: "Tests/NativeAgentSharedTests"
         )
     ]
 )

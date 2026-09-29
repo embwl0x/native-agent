@@ -1,6 +1,8 @@
+import FeedPolicy
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import TrustCenter
 #if canImport(CoreGraphics)
 import CoreGraphics
 #endif

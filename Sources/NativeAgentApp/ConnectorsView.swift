@@ -482,37 +482,6 @@ struct ConnectorsView: View {
         }
     }
 
-    #if DEBUG
-    /// Headless fixtures of the production controls; no AppModel or window.
-    @MainActor
-    static func renderSharedFolderSnapshots(to directory: URL) throws {
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        for scheme in [ColorScheme.light, .dark] {
-            for (name, state) in [("untouched", SharedFolderSearchState.notSearched),
-                                  ("searching", .searching), ("empty", .completed([])),
-                                  ("failed", .failed)] {
-                var view = ConnectorsView()
-                view._workspaceName = State(initialValue: "Project notes")
-                view._workspacePath = State(initialValue: "/Users/example/Documents/Project notes")
-                view._workspaceQuery = State(initialValue: "meeting")
-                view._workspaceSearchState = State(initialValue: state)
-                let content = VStack(alignment: .leading, spacing: 24) {
-                    view.shareFolderSection
-                    view.searchFolderSection
-                }
-                .padding(24)
-                .frame(width: 680)
-                .background(scheme == .dark ? Color.black : Color.white)
-                .environment(\.colorScheme, scheme)
-                // The shared helper rasterizes AppKit-backed fields in an
-                // unattached host before ImageRenderer; no window is created.
-                try BotsShelfSnapshots.write(content,
-                    name: "\(name)-\(scheme == .dark ? "dark" : "light")",
-                    size: CGSize(width: 680, height: 440), scheme: scheme, directory: directory)
-            }
-        }
-    }
-    #endif
 
     /// One account: what it is called, how it stands, what it is for, and the
     /// one or two things you can do to it.

@@ -20,13 +20,16 @@ import TrustCenter
 /// `filename`, `content`, `size`, and (on list responses) `modified_at`.
 /// Anything else that appears on the wire rides in `extras` so this struct
 /// does not have to change when a compatibility field appears.
-public struct DreamEntry: Sendable, Codable, Equatable {
+public struct DreamEntry: Sendable, Codable, Equatable, Identifiable {
     public var date: String
     public var filename: String?
     public var content: String?
     public var size: Int?
     public var modifiedAt: String?
     public var extras: JSONValue?
+
+    /// One entry per night.
+    public var id: String { date }
 
     public init(
         date: String,

@@ -16,8 +16,7 @@ public enum MoonshotModelCatalog {
         endpoint: endpoint,
         readCache: { readCache(dataRoot: $0) },
         cacheUpdatedAt: { cacheUpdatedAt(dataRoot: $0) },
-        fetchLive: { try await fetchLiveModels(dataRoot: $0, session: $1) },
-        fallback: { fallbackModels() }
+        fetchLive: { try await fetchLiveModels(dataRoot: $0, session: $1) }
     )
 
     public static func models(
@@ -26,6 +25,15 @@ public enum MoonshotModelCatalog {
         refresh: Bool = false
     ) async -> [ProviderModelDescriptor] {
         await ttlCache.models(dataRoot: dataRoot, session: session, refresh: refresh)
+    }
+
+    /// The same read, saying whether it reached Moonshot and, if not, why.
+    public static func modelsWithFreshness(
+        dataRoot: URL = PersistenceCore.defaultDataRoot(),
+        session: URLSession = .shared,
+        refresh: Bool = false
+    ) async -> ModelCatalogRead {
+        await ttlCache.modelsWithFreshness(dataRoot: dataRoot, session: session, refresh: refresh)
     }
 
     /// True when the cache is missing its `updated_at` stamp or that stamp is
@@ -64,6 +72,8 @@ public enum MoonshotModelCatalog {
     /// recognize those from the same disk cache `models()` maintains — without
     /// going async or touching the network. Memoized on the cache file's
     /// mtime so the per-provider-call cost is a stat(), not a JSON parse.
+    /// Only the provider's own fetched rows count here; the shipped rows are
+    /// `FirstPartyModelCatalog.moonshotModels`, which routing checks first.
     private static let knownIDsLock = NSLock()
     nonisolated(unsafe) private static var knownIDsMemo: (path: String, mtime: Date?, ids: Set<String>)?
 
@@ -80,21 +90,9 @@ public enum MoonshotModelCatalog {
         if let memo = knownIDsMemo, memo.path == path.path, memo.mtime == mtime {
             return memo.ids.contains(needle)
         }
-        var ids = Set(fallbackModels().map { $0.id.lowercased() })
-        for model in readCache(dataRoot: dataRoot) ?? [] {
-            ids.insert(model.id.lowercased())
-        }
+        let ids = Set((readCache(dataRoot: dataRoot) ?? []).map { $0.id.lowercased() })
         knownIDsMemo = (path.path, mtime, ids)
         return ids.contains(needle)
-    }
-
-    public static func fallbackModels() -> [ProviderModelDescriptor] {
-        [
-            .init(id: "kimi-k3", name: "Kimi K3", contextLength: 1_048_576, supportsVision: true, supportsTools: true, supportsJSONMode: true),
-            .init(id: "kimi-k2.7-code-highspeed", name: "Kimi K2.7 Code Highspeed", contextLength: 262_144, supportsVision: true, supportsTools: true, supportsJSONMode: true),
-            .init(id: "kimi-k2.7-code", name: "Kimi K2.7 Code", contextLength: 262_144, supportsVision: true, supportsTools: true, supportsJSONMode: true),
-            .init(id: "kimi-k2.6", name: "Kimi K2.6", contextLength: 262_144, supportsVision: true, supportsTools: true, supportsJSONMode: true),
-        ]
     }
 
     static func parseModelsResponse(_ data: Data) throws -> [ProviderModelDescriptor] {
@@ -106,7 +104,7 @@ public enum MoonshotModelCatalog {
             let id = rawID.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !id.isEmpty else { continue }
             let context = positiveInt(row["context_length"])
-                ?? fallbackModels().first(where: { $0.id == id })?.contextLength
+                ?? FirstPartyModelCatalog.moonshotModels.first(where: { $0.id == id })?.contextLength
                 ?? 128_000
             byID[id] = ProviderModelDescriptor(
                 id: id,
@@ -141,10 +139,8 @@ public enum MoonshotModelCatalog {
 
     private static func fetchLiveModels(dataRoot: URL, session: URLSession) async throws -> [ProviderModelDescriptor] {
         guard let key = LLMCredentialResolver.resolveAPIKey(
-            envVar: "MOONSHOT_API_KEY",
             providerConfigFile: "moonshot.json",
-            dataRoot: dataRoot,
-            includeEnvironment: dataRoot.standardizedFileURL == PersistenceCore.defaultDataRoot().standardizedFileURL
+            dataRoot: dataRoot
         ), !key.isEmpty else {
             throw LLMError.notConfigured(provider: "moonshot")
         }

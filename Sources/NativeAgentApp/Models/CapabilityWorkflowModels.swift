@@ -2,6 +2,7 @@ import Foundation
 import Observation
 import NativeAgentShared
 import PersistenceCore
+import TrustCenter
 
 struct PrivacyCategory: Identifiable, Codable, Hashable {
     var id: String
@@ -22,36 +23,6 @@ struct SupportDiagnostics: Codable, Hashable {
     var version: String
     var doctorStatus: String?
     var generatedAt: String
-}
-
-struct CapabilityCounts: Codable, Hashable {
-    var total: Int
-    var active: Int
-    var review: Int
-    var autoloaded: Int
-    var byKind: [String: Int]?
-}
-
-struct CapabilitySummaryResponse: Codable, Hashable {
-    var records: [CapabilityRecord]
-    var summary: CapabilityCounts
-    var createdAt: String?
-}
-
-struct CapabilityRecord: Identifiable, Codable, Hashable {
-    var id: String
-    var sourceId: String?
-    var name: String?
-    var kind: String
-    var status: String?
-    var description: String?
-    var triggers: [String]?
-    var permissions: [String]?
-    var riskClass: String?
-    var autoload: Bool?
-    var useCount: Int?
-    var lastUsedAt: String?
-    var updatedAt: String?
 }
 
 struct IntentRoutePlan: Identifiable, Codable, Hashable {

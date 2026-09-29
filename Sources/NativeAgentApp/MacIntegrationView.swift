@@ -6,6 +6,7 @@
 import SwiftUI
 import MacIntegration
 import AVFoundation
+import DeviceSync
 
 /// Presentation-level truth for the System Permissions card. These helpers
 /// deliberately accept only the statuses the real probes can verify; cached,
@@ -540,7 +541,7 @@ struct MacIntegrationView: View {
                             write: current.write
                         )
                         // Publish to the phone only after persistence succeeds.
-                        MacIntegrationICloudBridge.shared.push(
+                        NativeAgentEngine.liveDeviceSync.macIntegrationPermissions.push(
                             id: id,
                             read: current.read,
                             write: current.write

@@ -3,6 +3,11 @@ import NativeAgentCore
 import PersistenceCore
 
 extension CognitiveSubstrate {
+    public func backupPersistentStateForDoctor() async throws -> URL {
+        guard let store else { throw CognitivePersistenceError.storeUnavailable }
+        return try await store.backupForDoctor()
+    }
+
     public func restorePersistentState() async throws {
         guard configuration.enabled else { return }
         guard configuration.persistenceEnabled else {

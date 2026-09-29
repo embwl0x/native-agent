@@ -58,7 +58,7 @@ private func isWordCont(_ c: Unicode.Scalar) -> Bool {
 // Python's `capability_records()` ALSO includes skill, tool, manifest-skill,
 // workflow, and MCP-server records. Those record sources are Python-only
 // today; the Swift router-plan path is FLIPPABLE FOR THE NARROWED INPUT SET
-// only. See SystemOps RESIDUAL CAVEATS block + CUTOVER_PLAN.md §6.14.
+// only. See SystemOps RESIDUAL CAVEATS block.
 
 /// In-memory capability record used for scoring. Subset of the Python dict
 /// shape — only the fields `score_context_capability` reads + those the
@@ -267,7 +267,7 @@ func selectContextCapabilities(
 ///
 /// Python additionally includes skill, tool, manifest-skill, workflow, and
 /// MCP-server records — those record sources are Python-only and are NOT
-/// re-implemented here. See CUTOVER_PLAN.md §6.14.
+/// re-implemented here.
 func swiftNativeCapabilityRecords(nowISO: String) -> [CapabilityScoringRecord] {
     var records: [CapabilityScoringRecord] = []
     records.reserveCapacity(featureSurfaceRecordsCount + connectorActionDescriptorsCount)

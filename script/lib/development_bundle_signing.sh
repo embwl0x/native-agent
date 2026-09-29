@@ -58,12 +58,103 @@ _nativeagent_sign_nested_plain() {
   fi
 }
 
+# Widget provisioning is optional; the app's existing signing contract is not.
+_nativeagent_gate_widget() {
+  local bundle="$1" root="$2" profile="$3" widget_profile group profile_plist provisioned=0
+  widget_profile="${NATIVEAGENT_WIDGET_PROVISIONING_PROFILE:-$root/local/NativeAgentWidget.provisionprofile}"
+  group="$(/usr/libexec/PlistBuddy -c 'Print :NativeAgentMacAppGroupID' "$bundle/Contents/Info.plist")" || return 1
+  profile_plist="$bundle/../widget-gate.$$.plist"
+  if [[ -f "$widget_profile" && -f "$profile" ]]; then
+    if ! decode_provisioning_profile "$profile" "$profile_plist"; then
+      rm -f "$profile_plist"
+      return 1
+    fi
+    if provisioning_profile_array_contains "$profile_plist" 'Entitlements:com.apple.security.application-groups' "$group"; then
+      provisioned=1
+    fi
+    rm -f "$profile_plist"
+  fi
+  if [[ "$provisioned" == "0" ]]; then
+    rm -rf "$bundle/Contents/PlugIns/NativeAgentWidget.appex" || return 1
+    echo 'widget not embedded: register io.github.embwl0x.nativeagent.mac.widget + group.io.github.embwl0x.nativeagent.mac in the developer portal' >&2
+  elif [[ ! -d "$bundle/Contents/PlugIns/NativeAgentWidget.appex" ]]; then
+    echo '[sign] Missing embedded NativeAgentWidget.appex in provisioned build' >&2
+    return 1
+  fi
+}
+
+# Only an embedded widget (or the extension itself) needs the shared group.
+_nativeagent_set_widget_group() {
+  local bundle="$1" entitlements="$2" profile_plist="${3:-}" group groups
+  /usr/libexec/PlistBuddy -c 'Delete :com.apple.security.application-groups' "$entitlements" >/dev/null 2>&1 || true
+  if [[ "$bundle" != *.appex && ! -d "$bundle/Contents/PlugIns/NativeAgentWidget.appex" ]]; then
+    return 0
+  fi
+  group="$(/usr/libexec/PlistBuddy -c 'Print :NativeAgentMacAppGroupID' "$bundle/Contents/Info.plist")" || return 1
+  [[ -n "$group" && "$group" != *'$('* ]] || return 1
+  if [[ -n "$profile_plist" ]]; then
+    groups="$(provisioning_profile_value "$profile_plist" 'Entitlements:com.apple.security.application-groups')"
+    if ! printf '%s\n' "$groups" | awk -v group="$group" '$1 == group { found=1 } END { exit !found }'; then
+      echo "[sign] Profile does not grant App Group $group. Enable it for the Mac app and widget and refresh both profiles." >&2
+      return 1
+    fi
+  fi
+  /usr/libexec/PlistBuddy -c 'Add :com.apple.security.application-groups array' \
+    -c "Add :com.apple.security.application-groups:0 string $group" "$entitlements"
+}
+
+_nativeagent_sign_widget() {
+  local bundle="$1" identity="$2" root="$3" widget profile entitlements widget_id
+  widget="$bundle/Contents/PlugIns/NativeAgentWidget.appex"
+  [[ -d "$widget" ]] || return 0
+  entitlements="$bundle/../widget-sign.$$.entitlements"
+  cp "$root/Config/NativeAgentWidget.entitlements" "$entitlements" || return 1
+  if ! _nativeagent_set_widget_group "$widget" "$entitlements"; then
+    rm -f "$entitlements"
+    return 1
+  fi
+  if [[ "$identity" == "-" ]]; then
+    codesign --force --sign - --options runtime --entitlements "$entitlements" "$widget"
+  else
+    profile="${NATIVEAGENT_WIDGET_PROVISIONING_PROFILE:-$root/local/NativeAgentWidget.provisionprofile}"
+    if [[ ! -f "$profile" ]]; then
+      echo "[sign] Missing widget profile: $profile. Register the widget ID and shared App Group first." >&2
+      rm -f "$entitlements"
+      return 1
+    fi
+    widget_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$widget/Contents/Info.plist")"
+    _nativeagent_sign_with_development_identity "$widget" "$identity" "$profile" "$entitlements" "$widget_id" '[sign widget]'
+  fi
+  local result=$?
+  rm -f "$entitlements"
+  return "$result"
+}
+
 _nativeagent_strip_unprovisioned_entitlements() {
   local source_entitlements="$1" output="$2"
   # The current personal development profile does not grant this future-facing
   # capability. Signing it anyway causes AMFI to reject the bundle at launch.
   /usr/bin/perl -0pe 's/\s*<key>com\.apple\.developer\.background-tasks<\/key>\s*<array>.*?<\/array>//s' \
     "$source_entitlements" > "$output"
+}
+
+# Push (CloudKit phone→Mac notifications) needs aps-environment in the signed
+# payload; codesign does not copy it from the embedded profile. Sign whatever
+# environment the profile grants, and nothing when it grants none.
+_nativeagent_add_profile_push_environment() {
+  local profile_plist="$1" entitlements="$2" aps_environment
+
+  aps_environment="$(
+    provisioning_profile_value "$profile_plist" \
+      "Entitlements:com.apple.developer.aps-environment"
+  )"
+  [[ -z "$aps_environment" ]] && return 0
+  /usr/libexec/PlistBuddy \
+    -c "Delete :com.apple.developer.aps-environment" \
+    "$entitlements" >/dev/null 2>&1 || true
+  /usr/libexec/PlistBuddy \
+    -c "Add :com.apple.developer.aps-environment string $aps_environment" \
+    "$entitlements"
 }
 
 _nativeagent_assert_profile_allows_current_mac() {
@@ -121,7 +212,9 @@ _nativeagent_sign_with_development_identity() {
   if ! _nativeagent_strip_unprovisioned_entitlements "$source_entitlements" "$entitlement_template" \
     || ! decode_provisioning_profile "$profile" "$profile_plist" \
     || ! verify_profile_identity_contract "$profile_plist" "$bundle_id" \
-    || ! prepare_profile_signing_entitlements "$entitlement_template" "$profile_plist" "$entitlement_sign"; then
+    || ! _nativeagent_set_widget_group "$bundle" "$entitlement_template" "$profile_plist" \
+    || ! prepare_profile_signing_entitlements "$entitlement_template" "$profile_plist" "$entitlement_sign" \
+    || ! _nativeagent_add_profile_push_environment "$profile_plist" "$entitlement_sign"; then
     rm -f "$entitlement_template" "$entitlement_sign" "$profile_plist"
     echo "$log_prefix FATAL: provisioning profile identity does not match the bundle." >&2
     return 10
@@ -149,7 +242,16 @@ _nativeagent_sign_adhoc_bundle() {
   local bundle="$1" adhoc_entitlements="$2"
   _nativeagent_sign_nested_plain "$bundle" "-" || return 1
   if [[ -f "$adhoc_entitlements" ]]; then
-    codesign --force --sign - --entitlements "$adhoc_entitlements" "$bundle"
+    local expanded="$bundle/../app-sign.$$.entitlements"
+    cp "$adhoc_entitlements" "$expanded" || return 1
+    if ! _nativeagent_set_widget_group "$bundle" "$expanded"; then
+      rm -f "$expanded"
+      return 1
+    fi
+    codesign --force --sign - --entitlements "$expanded" "$bundle"
+    local result=$?
+    rm -f "$expanded"
+    return "$result"
   else
     codesign --force --sign - "$bundle"
   fi
@@ -174,15 +276,18 @@ nativeagent_sign_development_bundle() {
   source_entitlements="${NATIVEAGENT_ENTITLEMENTS:-$root/local/NativeAgent.entitlements}"
   adhoc_entitlements="$root/NativeAgent.adhoc.entitlements"
   sign_identity="$(nativeagent_resolve_development_signing_identity "$log_prefix")" || return 1
+  _nativeagent_gate_widget "$bundle" "$root" "$profile" || return 1
 
   if [[ "${NATIVE_AGENT_ADHOC:-0}" == "1" ]]; then
     echo "$log_prefix NATIVE_AGENT_ADHOC=1 — using ad-hoc signature (iCloud disabled)"
+    _nativeagent_sign_widget "$bundle" "-" "$root" || return 1
     _nativeagent_sign_adhoc_bundle "$bundle" "$adhoc_entitlements" || return 1
   elif [[ -f "$profile" && -f "$source_entitlements" ]] \
     && [[ -n "$sign_identity" ]] \
     && security find-identity -v -p codesigning 2>/dev/null | grep -Fq -- "$sign_identity"; then
     echo "$log_prefix Apple Development cert + provisioning profile + iCloud entitlements"
     _nativeagent_assert_profile_allows_current_mac "$profile" "$bundle_id" "$root" "$log_prefix" || return 1
+    _nativeagent_sign_widget "$bundle" "$sign_identity" "$root" || return 1
     if _nativeagent_sign_with_development_identity \
       "$bundle" "$sign_identity" "$profile" "$source_entitlements" "$bundle_id" "$log_prefix"; then
       :
@@ -195,6 +300,7 @@ nativeagent_sign_development_bundle() {
       if [[ "${NATIVE_AGENT_ADHOC_FALLBACK:-0}" == "1" ]]; then
         echo "$log_prefix NATIVE_AGENT_ADHOC_FALLBACK=1 — falling back to ad-hoc" >&2
         echo "$log_prefix iCloud entitlements will NOT be honored and macOS may kill the app." >&2
+        _nativeagent_sign_widget "$bundle" "-" "$root" || return 1
         _nativeagent_sign_adhoc_bundle "$bundle" "$adhoc_entitlements" || return 1
       else
         echo "$log_prefix cert+profile are present, so this is NOT a missing-identity case —" >&2
@@ -206,6 +312,7 @@ nativeagent_sign_development_bundle() {
     fi
   else
     echo "$log_prefix no local provisioning profile / cert — ad-hoc (iCloud disabled)"
+    _nativeagent_sign_widget "$bundle" "-" "$root" || return 1
     _nativeagent_sign_adhoc_bundle "$bundle" "$adhoc_entitlements" || return 1
   fi
 

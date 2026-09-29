@@ -247,19 +247,21 @@ pkill -f "$APP_DEST/Contents/Resources/native_agentd.py" 2>/dev/null || true
 # clean-stop receipt. Sending pkill immediately after AppleScript used to race
 # that drain and made an ordinary developer reinstall look like an unclean
 # restart. Give the app one bounded grace window; retain the force-stop only as
-# recovery for a wedged/ignored quit request.
+# recovery for a wedged/ignored quit request. 30s, not 15: a quit mid-turn
+# first waits up to 20s for the turn to finish (applicationShouldTerminate),
+# then the 3s drain.
 APP_PROCESS_PATTERN="$(printf '%s' "$APP_DEST/Contents/MacOS/NativeAgentApp" | sed 's/[][\.^$*+?(){}|]/\\&/g')([[:space:]].*)?"
 osascript - "$APP_DEST" <<'APPLESCRIPT' 2>/dev/null || true
 on run argv
   tell application (item 1 of argv) to quit
 end run
 APPLESCRIPT
-quit_deadline=$((SECONDS + 15))
+quit_deadline=$((SECONDS + 30))
 while pgrep -fx "$APP_PROCESS_PATTERN" >/dev/null 2>&1 && (( SECONDS < quit_deadline )); do
   sleep 0.1
 done
 if pgrep -fx "$APP_PROCESS_PATTERN" >/dev/null 2>&1; then
-  echo "[install_app.sh] graceful quit exceeded 15s; forcing NativeAgentApp stop"
+  echo "[install_app.sh] graceful quit exceeded 30s; forcing NativeAgentApp stop"
   # Path-scoped: a bare `pkill -x` killed every NativeAgent on the Mac,
   # including the public test install and scratch walks (2026-09-15).
   pkill -fx "$APP_PROCESS_PATTERN" 2>/dev/null || true
@@ -396,12 +398,15 @@ if [[ "$INSTALL_LAUNCH_OK" == "1" ]] \
   # full model turns in her main session answering "Received: installer
   # reports build ...". She reads the running build from buildIdentity when
   # she needs it. Set NA_INSTALL_RECEIPT=1 to post one.
-  if [ -r "$HOME/.config/claude-bridge/token" ] && [ -n "${NA_INSTALL_RECEIPT:-}" ] && command -v jq >/dev/null 2>&1; then
+  # The address and token come from the bridge's descriptor (each install
+  # has its own port); an unreadable one is said, not guessed around.
+  if [ -n "${NA_INSTALL_RECEIPT:-}" ] && command -v jq >/dev/null 2>&1 \
+      && source "$ROOT/script/lib/nativeagent_bridge.sh" && nativeagent_bridge_resolve; then
     _na_sha=$(git -C "$(cd "$(dirname "$0")/.." && pwd)" rev-parse --short=8 HEAD 2>/dev/null || echo unknown)
     # Synchronous on purpose: a backgrounded curl did not survive the
     # script's exit, so the receipt never arrived.
-    curl -sS --max-time 30 -X POST "http://127.0.0.1:8771/claude/message" \
-      -H "Authorization: Bearer $(cat "$HOME/.config/claude-bridge/token")" -H "Content-Type: application/json" \
+    curl -sS --max-time 30 -X POST "$BASE_URL/claude/message" \
+      -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
       -d "$(jq -n --arg t "[install_app.sh] Install receipt, posted by the install script itself, not by a person: build $_na_sha is running as pid $APP_PID." --arg s install_app.sh '{text:$t,sender:$s}')" \
       >/dev/null 2>&1 || true
   fi

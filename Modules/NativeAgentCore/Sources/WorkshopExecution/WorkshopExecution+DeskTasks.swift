@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import Desk
 
 /// Result of shadow-submitting a user-directed task through the Workshop. The
 /// Desk handle is the durable user-facing identity; `executionId` is only the

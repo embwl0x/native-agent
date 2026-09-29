@@ -40,22 +40,11 @@ import WorkflowOrchestration
 import Skills
 import Connectors
 import Browser
+import Cognition
 
 // FIX: per-element wrapper used by NativeClient.getList for lossy array decode.
 // Captures the decode result of a single array element so a malformed element
 // is dropped (and logged) instead of throwing the whole array.
-struct LossyElement<T: Decodable>: Decodable {
-    let result: Result<T, Error>
-
-    init(from decoder: Decoder) throws {
-        let container = try decoder.singleValueContainer()
-        do {
-            result = .success(try container.decode(T.self))
-        } catch {
-            result = .failure(error)
-        }
-    }
-}
 
 extension NativeClient {
     func _swiftDispatch(
@@ -237,149 +226,27 @@ extension NativeClient {
         )
     }
 
-    /// The one canonical approvals location shared by the reader and mounted
-    /// Desk invalidation. Keeping this at the client boundary preserves an
-    /// isolated/recovered client's explicit root instead of silently watching
-    /// the process-global inbox.
-    func approvalRequestsPath() async -> URL {
-        let inbox = approvalInbox()
-        return await inbox.approvalsPath
-    }
-
-    func swiftListApprovals() async throws -> [ApprovalRequest] {
-        let inbox = approvalInbox()
-        let items = try await inbox.list(filter: .all)
-        return items.map { rec in
-            ApprovalRequest(
-                id: rec.id,
-                title: rec.title,
-                action: rec.action,
-                risk: rec.risk,
-                reason: rec.reason,
-                status: rec.status,
-                createdAt: rec.createdAt,
-                resolvedAt: rec.resolvedAt,
-                decision: rec.decision,
-                payloadPreview: rec.payloadPreview,
-                localOnly: rec.localOnly,
-                remoteResolvable: rec.remoteResolvable,
-                chatOriginSessionId: NativeClient.chatApprovalOriginSessionId(rec.payload),
-                lastRequestedAt: rec.lastRequestedAt
-            )
-        }
-    }
-
-    private func approvalInbox() -> SwiftNativeApprovalInbox {
-        SwiftNativeApprovalInbox(
-            root: dataRootOverride ?? SwiftNativeApprovalInbox.defaultDataRoot()
-        )
-    }
-
-    /// The canonical inbox already records which conversation asked for a chat
-    /// tool approval (`NativeAgentChatApprovalFiler` writes
-    /// `payload.origin.sessionId`). This mapping stops dropping it on the way
-    /// to the app so surfaces can key on it; it reads the record and invents
-    /// nothing. Only `chat_tool_approval` records carry a chat origin — every
-    /// other kind stays nil rather than borrowing a lookalike field.
-    nonisolated static func chatApprovalOriginSessionId(_ payload: JSONValue) -> String? {
-        guard case .object(let fields) = payload,
-              case .string(let kind)? = fields["kind"],
-              // ACP questions belong to a live protocol request, not a tool
-              // replay. They share chat presentation only, never execution.
-              kind == "chat_tool_approval" || kind == "agent_acp_live_approval",
-              case .object(let origin)? = fields["origin"],
-              case .string(let sessionId)? = origin["sessionId"] else { return nil }
-        let trimmed = sessionId.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
-    }
-
     func swiftListMCPConsents() async throws -> [MCPConsentRecord] {
         let disp = mcpDispatcherForClientRoot()
         let items = try await disp.listConsents()
         return items.map(NativeClient._mapMCPConsent)
     }
 
-    /// Project the core consent into the app record; permissions and extras have
-    /// no app-side slot and are intentionally omitted.
-    static func _mapMCPConsent(_ c: MCPConsent) -> MCPConsentRecord {
-        MCPConsentRecord(
-            id: c.id,
-            serverId: c.serverId,
-            toolName: c.toolName,
-            scope: c.scope,
-            risk: c.risk,
-            status: c.status,
-            argumentSummary: c.argumentSummary,
-            grantedAt: c.grantedAt,
-            revokedAt: c.revokedAt,
-            updatedAt: c.updatedAt
-        )
+    static func _mapMCPConsent(_ value: MCPConsent) -> MCPConsentRecord {
+        MCPUIActions.mapConsent(value)
     }
 
-    /// Persist the current per-tool risk; a stale displayed risk requires review.
-    func swiftGrantMCPConsent(
-
-        serverId: String,
-        toolName: String,
-        risk: String?
-    ) async throws -> MCPConsentRecord {
-        let disp = mcpDispatcherForClientRoot()
-        let servers = try await disp.listServers()
-        guard let server = servers.first(where: { $0.id == serverId }) else {
-            throw NSError(domain: "NativeAgentMCP", code: 404, userInfo: [
-                NSLocalizedDescriptionKey: "MCP server not found: \(serverId)",
-            ])
-        }
-        let resolvedRisk = MCPToolBridge.effectiveRiskClass(
-            serverId: serverId,
-            toolName: toolName,
-            serverRiskClass: server.riskClass,
+    func swiftGrantMCPConsent(serverId: String, toolName: String, risk: String?) async throws -> MCPConsentRecord {
+        try await MCPUIActions.grantConsent(
+            serverId: serverId, toolName: toolName, risk: risk,
+            dispatcher: mcpDispatcherForClientRoot(),
             dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()
         )
-        if let risk, !risk.isEmpty, risk != resolvedRisk {
-            throw NSError(domain: "NativeAgentMCP", code: 409, userInfo: [
-                NSLocalizedDescriptionKey: "MCP tool risk changed to \(resolvedRisk). Review the current risk and grant again.",
-            ])
-        }
-        let grant = MCPConsentGrant(
-            serverId: serverId,
-            toolName: toolName,
-            scope: "server_tool",
-            risk: resolvedRisk
-        )
-        let rec = try await disp.grantConsent(grant)
-        return NativeClient._mapMCPConsent(rec)
     }
 
-    /// Core revocation returns no record, so reread the ledger for the app result.
-    /// A concurrent regrant or prune must not change what this call reports:
-    /// synthesize a revoked record unless the reread still shows revocation.
-    func swiftRevokeMCPConsent(
-
-        serverId: String,
-        toolName: String
-    ) async throws -> MCPConsentRecord {
-        let disp = mcpDispatcherForClientRoot()
-        try await disp.revokeConsent(serverId: serverId, toolName: toolName)
-        let key = "\(serverId):\(toolName)"
-        let consents = try await disp.listConsents()
-        if let revoked = consents.first(where: { $0.id == key && $0.status == "revoked" }) {
-            return NativeClient._mapMCPConsent(revoked)
-        }
-        // Revoke succeeded but the re-read row is gone (concurrent prune) or has
-        // been re-granted out from under us. Return a minimal revoked record so
-        // the return reflects THIS call's revoke — never a granted row.
-        return MCPConsentRecord(
-            id: key,
-            serverId: serverId,
-            toolName: toolName,
-            scope: "server_tool",
-            risk: nil,
-            status: "revoked",
-            argumentSummary: nil,
-            grantedAt: nil,
-            revokedAt: nil,
-            updatedAt: nil
+    func swiftRevokeMCPConsent(serverId: String, toolName: String) async throws -> MCPConsentRecord {
+        try await MCPUIActions.revokeConsent(
+            serverId: serverId, toolName: toolName, dispatcher: mcpDispatcherForClientRoot()
         )
     }
 
@@ -406,7 +273,7 @@ extension NativeClient {
     // produced — so a flag-ON caller sees the same 403 as the HTTP path, not a
     // silently-allowed read. /v1/evals/runs is NOT gated (the retired daemon
     // serves it unconditionally), so swiftGetEvals has no gate, preserving daemon
-    // parity. See CUTOVER_PLAN.md 6.76.
+    // parity.
     // Each helper constructs the actor directly (the read methods live on the
     // concrete SwiftNativeSelfImprovement, not the protocol).
 
@@ -441,7 +308,7 @@ extension NativeClient {
         guard await actor.trainingAllowed() else {
             throw NativeClient._trustForbidden(detail: "autonomous_training not enabled in trust policy")
         }
-        let raw = await actor.listTrainingRunsLocal()
+        let raw = try await actor.listTrainingRunsLocal()
         let data = try raw.serializedData(pretty: false)
         return try JSONDecoder.nativeAgent.decode([TrainingRunSummary].self, from: data)
     }
@@ -451,7 +318,7 @@ extension NativeClient {
         guard await actor.trainingAllowed() else {
             throw NativeClient._trustForbidden(detail: "autonomous_training not enabled in trust policy")
         }
-        let raw = await actor.listTrainingProposalsLocal()
+        let raw = try await actor.listTrainingProposalsLocal()
         let data = try raw.serializedData(pretty: false)
         return try JSONDecoder.nativeAgent.decode([TrainingProposalSummary].self, from: data)
     }
@@ -461,7 +328,7 @@ extension NativeClient {
         guard await actor.promotionAllowed() else {
             throw NativeClient._trustForbidden(detail: "promotionPolicy.enabled not set in trust policy")
         }
-        let raw = await actor.listPromotionCandidatesLocal()
+        let raw = try await actor.listPromotionCandidatesLocal()
         let data = try raw.serializedData(pretty: false)
         return try JSONDecoder.nativeAgent.decode([PromotionCandidateSummary].self, from: data)
     }
@@ -471,39 +338,19 @@ extension NativeClient {
         guard await actor.promotionAllowed() else {
             throw NativeClient._trustForbidden(detail: "promotionPolicy.enabled not set in trust policy")
         }
-        let raw = await actor.listPromotionPendingLocal()
+        let raw = try await actor.listPromotionPendingLocal()
         let data = try raw.serializedData(pretty: false)
         return try JSONDecoder.nativeAgent.decode([PromotionCandidateSummary].self, from: data)
     }
 
     func swiftGetEvals() async throws -> [EvalRun] {
-        let raw = await NativeClient._trainingPromotionActor(dataRoot: dataRootOverride).listEvalsLocal()
+        let raw = try await NativeClient._trainingPromotionActor(dataRoot: dataRootOverride).listEvalsLocal()
         let data = try raw.serializedData(pretty: false)
         return try JSONDecoder.nativeAgent.decode([EvalRun].self, from: data)
     }
 
-    // wave 33 W09: GET /v1/improvements/gauntlet native read — wires the wave-32
-    // W09 dormant module impl into the seam (closes §6.76 W09 retirement-path
-    // step 1). improvement_gauntlet_status is an
-    // unconditional pure file read (improvements/gauntlet/runs.json) + a static
-    // promotion-class table — NO trust gate. The module's status field is
-    // optional (Python `.get("status")` can return a stored null); the app's
-    // ImprovementGauntletStatus.status is non-optional String, so we normalize a
-    // null/absent status to "ready" at the seam (the daemon's own fallback for
-    // the empty-runs case) before decoding into the app struct.
     func swiftImprovementGauntlet() async throws -> ImprovementGauntletStatus {
-        let actor = NativeClient._trainingPromotionActor(dataRoot: dataRootOverride)
-        let status = await actor.improvementGauntletStatusLocal()
-        let data = try JSONEncoder().encode(status)
-        // Normalize status: null/absent -> "ready" for the app's non-optional field.
-        guard var obj = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return try JSONDecoder.nativeAgent.decode(ImprovementGauntletStatus.self, from: data)
-        }
-        if obj["status"] == nil || obj["status"] is NSNull {
-            obj["status"] = "ready"
-        }
-        let normalized = try JSONSerialization.data(withJSONObject: obj)
-        return try JSONDecoder.nativeAgent.decode(ImprovementGauntletStatus.self, from: normalized)
+        try await RuntimeReadProjection.swiftImprovementGauntlet(dataRoot: dataRootOverride)
     }
 
     // MARK: - Training-proposal mutation routes (gate: .selfImprovement)
@@ -512,19 +359,16 @@ extension NativeClient {
     // a flag-ON Swift write is under the SAME _training_allowed() leash the HTTP
     // path enforces.
 
-    /// Serialize a JSONValue object into the `[String: Any]` shape
-    /// `postDictionary` returns, so the Swift and HTTP approve/reject paths hand
-    /// the caller (AppModel) byte-identical dictionaries.
+    /// Keep the legacy dictionary result at the action boundary without a JSON round-trip.
     static func _jsonValueToDictionary(_ value: JSONValue) throws -> [String: Any] {
-        let data = try value.serializedData(pretty: false)
-        guard let dict = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        guard case .object(let row) = value else {
             throw NSError(
                 domain: "NativeAgent",
                 code: -1,
                 userInfo: [NSLocalizedDescriptionKey: "swift training-proposal result was not an object"]
             )
         }
-        return dict
+        return MCPInputSchemaForm.toFoundationDict(row)
     }
 
     /// Returns the approve result dict. With `route_through_promotion` enabled,
@@ -548,40 +392,6 @@ extension NativeClient {
         return try NativeClient._jsonValueToDictionary(raw)
     }
 
-    // MARK: - ToolRegistry helpers
-
-    /// Maps a Core ToolRegistry.ToolRecord into the app's ToolRecord. The app
-    /// struct surfaces fields Core deliberately CARVES OUT (autoRun,
-    /// validationStatus, quarantinePath, description, triggers, etc) and
-    /// round-trips them through `extras`. We round-trip via JSON: take Core's
-    /// `toJSON()` (typed fields + extras merged), serialize, then decode into
-    /// the app's `ToolRecord`. JSONDecoder.nativeAgent's keyDecodingStrategy
-    /// is default (NOT snake_case) so both Core's camelCase and the daemon's
-    /// camelCase land the same way the HTTP path already does.
-    static func _mapCoreToolRecord(_ rec: ToolRegistry.ToolRecord) throws -> ToolRecord {
-        let json = rec.toJSON()
-        let data = try json.serializedData(pretty: false)
-        return try JSONDecoder.nativeAgent.decode(ToolRecord.self, from: data)
-    }
-
-    func swiftListTools() async throws -> [ToolRecord] {
-        let root = dataRootOverride ?? PersistenceCore.defaultDataRoot()
-        let registryPath = root.appendingPathComponent("tools/registry.json")
-        let fm = FileManager.default
-        if fm.fileExists(atPath: registryPath.path) {
-            let data = try Data(contentsOf: registryPath)
-            let parsed = try JSONValue.parse(data)
-            guard case .array = parsed else {
-                throw ToolRegistryError.registryUnreadable(
-                    reason: "tools registry must be a JSON array"
-                )
-            }
-        }
-        let reg = SwiftNativeToolRegistry(root: root)
-        let coreRecords = try await reg.listTools(filter: .all)
-        return try coreRecords.map { try NativeClient._mapCoreToolRecord($0) }
-    }
-
     // MARK: - ToolExecution / ToolRegistry mutation routes
     // (gates: .toolRegistry — promote/quarantine share the same flag because
     // both write the same registry.json and either path may end up modifying
@@ -589,31 +399,27 @@ extension NativeClient {
     // half-flips where promote routes via Swift but the next quarantine on
     // the same registry returns to HTTP and loses Swift's mutations.)
 
-    /// Promote a proposal via SwiftNativeToolExecution and adapt the resulting
-    /// ProposalRecord (rich proposal-side fields) into the app's `ToolRecord`
-    /// (tool-registry-side fields). ProposalRecord.toJSON() emits typed slots
-    /// (id/name/status/createdAt) PLUS every extras key the promote engine
-    /// merges in (activePath/manifestSignature/signedAt/codeFingerprint/
-    /// phase/promotedAt/validationStatus/risk-ack fields), so ToolRecord's
-    /// JSONDecoder.nativeAgent decode picks them up exactly like the HTTP
-    /// path does. The app-side ToolRecord requires `description: String` and
-    /// `triggers: [String]` non-optionally — the promote engine merges the
-    /// full manifest (which the daemon's create_tool_proposal always populates
-    /// with description/triggers) so those land in extras and survive decode.
+    /// Promote a proposal via SwiftNativeToolExecution. The returned
+    /// ProposalRecord's JSON carries the registry record's typed slots
+    /// (id/name/status/createdAt) plus every extras key the promote engine
+    /// merges in, so it reads as the promoted `ToolRecord`.
     func swiftPromoteTool(id: String, allowRisky: Bool) async throws -> ToolRecord {
         let exec = SwiftNativeToolExecution(
             root: dataRootOverride ?? PersistenceCore.defaultDataRoot()
         )
-        let proposal = try await exec.promote(id: id, allowRisky: allowRisky)
-        let data = try proposal.toJSON().serializedData(pretty: false)
-        return try JSONDecoder.nativeAgent.decode(ToolRecord.self, from: data)
+        let proposal = try await exec.promote(id: id, allowRisky: allowRisky).toJSON()
+        if let field = ToolRecord.stringFieldProblem(in: proposal) {
+            throw ToolRegistryError.registryUnreadable(reason: "promoted tool \(id) has no valid \(field)")
+        }
+        guard let record = ToolRecord(json: proposal) else {
+            throw ToolRegistryError.registryUnreadable(reason: "promoted tool \(id) has no registry record")
+        }
+        try ToolsFacade.checkAuthored(record)
+        return record
     }
 
-    /// Quarantine a tool via SwiftNativeToolRegistry. Returns a ToolRecord
-    /// adapted from Core via the existing `_mapCoreToolRecord` (which mirrors
-    /// the same JSON round-trip the HTTP path uses).
+    /// Quarantine a tool via SwiftNativeToolRegistry.
     func swiftQuarantineTool(
-
         id: String,
         reason: String
     ) async throws -> ToolRecord {
@@ -622,8 +428,9 @@ extension NativeClient {
         // integration tests exercise this exact route without touching live
         // tool authority.
         let reg = SwiftNativeToolRegistry(root: dataRootOverride ?? PersistenceCore.defaultDataRoot())
-        let coreRec = try await reg.quarantine(id: id, reason: reason)
-        return try NativeClient._mapCoreToolRecord(coreRec)
+        let record = try await reg.quarantine(id: id, reason: reason)
+        try ToolsFacade.checkAuthored(record)
+        return record
     }
 
     // MARK: - MCPDispatcher listServers (gate: .mcpDispatcher)
@@ -639,28 +446,6 @@ extension NativeClient {
         return try servers.map { server in
             let data = try server.toJSON().serializedData(pretty: false)
             return try JSONDecoder.nativeAgent.decode(MCPServerRecord.self, from: data)
-        }
-    }
-
-    /// Live MCP session statuses — backed by SwiftNativeMCPDispatcher's
-    /// `listSessions()` (subprocess pool + idle/warm/failed status per spec).
-    func swiftListMCPSessions() async throws -> [MCPSessionStatus] {
-        let disp = mcpDispatcherForClientRoot()
-        let rows = try await disp.listSessions()
-        return rows.map { row in
-            MCPSessionStatus(
-                id: row.id,
-                serverId: row.serverId,
-                serverName: row.serverName,
-                transport: row.transport,
-                status: row.status,
-                healthStatus: row.healthStatus,
-                toolCount: row.toolCount,
-                resourceCount: row.resourceCount,
-                lastWarmedAt: row.lastWarmedAt,
-                lastError: row.lastError,
-                updatedAt: nil
-            )
         }
     }
 
@@ -737,64 +522,20 @@ extension NativeClient {
     /// Hits the configured SearXNG /search endpoint, writes a receipt JSON
     /// to `data/research/<id>.json`, returns the same per-result
     /// {title, url, snippet, source} shape the daemon returns.
-    func swiftResearchSearch(query: String) async throws -> [ResearchResult] {
+    func swiftResearchSearch(query: String) async throws -> [ResearchSearchResult] {
         let client = makeResearchClient(
             dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()
         )
-        let response = try await client.search(query: query)
-        return response.results.map { row in
-            ResearchResult(
-                title: row.title,
-                url: row.url,
-                snippet: row.snippet,
-                source: row.source
-            )
-        }
-    }
-
-    /// Map a Research module `ResearchSearchResult` into the app's
-    /// `ResearchResult` model.
-    private func mapResearchResult(_ row: Research.ResearchSearchResult) -> ResearchResult {
-        ResearchResult(title: row.title, url: row.url, snippet: row.snippet, source: row.source)
-    }
-
-    /// Map a Research module `ResearchLabRun` into the app's `ResearchLabRun`
-    /// model (Models.swift) — same field set 1:1.
-    private func mapLabRun(_ run: Research.ResearchLabRun) -> ResearchLabRun {
-        ResearchLabRun(
-            id: run.id,
-            objective: run.objective,
-            status: run.status,
-            query: run.query,
-            sources: run.sources.map { mapResearchResult($0) },
-            brief: run.brief,
-            connector: run.connector,
-            error: run.error,
-            createdAt: run.createdAt
-        )
-    }
-
-    /// Research lab runs — in-process Swift mirror of
-    /// `Daemon.research_lab_runs()`. Reads data/research/lab/runs.json,
-    /// decodes the stored run rows into the app model. (Gate: .research.)
-    func swiftResearchLabRuns() async throws -> [ResearchLabRun] {
-        let client = makeResearchClient()
-        let rows = try await client.researchLabRuns()
-        // The stored rows are raw JSON; decode each into the app model via the
-        // shared JSONValue -> Codable bridge to honor missing-field defaults.
-        return rows.compactMap { row -> ResearchLabRun? in
-            guard let data = try? row.serializedData(pretty: false) else { return nil }
-            return try? JSONDecoder().decode(ResearchLabRun.self, from: data)
-        }
+        return try await client.search(query: query).results
     }
 
     /// Research lab run — in-process Swift mirror of
     /// `Daemon.run_research_lab(body)`. Passes maxResults=5 to match the
     /// daemon caller's body. (Gate: .research.)
     func swiftRunResearchLab(objective: String) async throws -> ResearchLabRun {
-        let client = makeResearchClient()
-        let run = try await client.runResearchLab(objective: objective, maxResults: 5)
-        return mapLabRun(run)
+        try await makeResearchClient(
+            dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        ).runResearchLab(objective: objective, maxResults: 5)
     }
 
     // MARK: - PersonaEngine routes (gate: .personaEngine)
@@ -818,35 +559,9 @@ extension NativeClient {
     /// via SwiftNativeMemoryV2.listMemory(kind:nil) filtered by the
     /// `persona-feedback` tag (mirrors daemon's persona-feedback memory query).
     func swiftPersonalityGrowth() async throws -> PersonalityGrowthSummary {
-        let compiler = PersonaCompiler()
-        let feedbackProvider: @Sendable () async throws -> Int = {
-            let mem = SwiftNativeMemoryV2.shared
-            let records = try await mem.listMemory(kind: nil)
-            return records.reduce(0) { acc, rec in
-                let tags = rec.tags ?? []
-                return acc + (tags.contains("persona-feedback") ? 1 : 0)
-            }
+        try await RuntimeReadProjection.swiftPersonalityGrowth {
+            await NativeAgentEngine.liveCognition.substrate.growthWeekLines()
         }
-        // 2026-09-13: the week's actual changes, from the substrate that owns
-        // the records. PersonaEngine must not depend on CognitiveSubstrate, so
-        // the rows are injected here exactly as the feedback count is.
-        let growthWeekProvider: @Sendable () async throws -> [String] = {
-            await NativeCognitionRuntime.shared.substrate.growthWeekLines()
-        }
-        let summary = try await compiler.growthSummary(
-            feedbackMemoryProvider: feedbackProvider,
-            growthWeekProvider: growthWeekProvider,
-            now: Date.init
-        )
-        return PersonalityGrowthSummary(
-            engineVersion: summary.engineVersion,
-            activeKind: summary.activeKind,
-            fingerprint: summary.fingerprint,
-            growthWeek: summary.growthWeek,
-            feedbackMemories: summary.feedbackMemories,
-            nextActions: summary.nextActions,
-            createdAt: summary.createdAt.isEmpty ? nil : summary.createdAt
-        )
     }
 
     // MARK: - CompiledPersonality route (gate: .personaEngine)
@@ -876,20 +591,6 @@ extension NativeClient {
             fingerprint: wire.fingerprint,
             compiled: wire.compiled
         )
-    }
-
-    // MARK: - TrustCenter route (gate: .trustCenter)
-
-    /// Decode the app-side `TrustPolicy` from `SwiftNativeTrustCenter.loadTrustPolicyJSON()`.
-    /// The adapter encodes the in-Swift policy dict to the same compact wire
-    /// shape the daemon's `/v1/trust` returns, so the app decoder sees the
-    /// identical byte stream it does on the HTTP path. The fully-qualified
-    /// `NativeAgentApp` lookup is implicit — module-local `TrustPolicy` wins
-    /// over the imported `TrustCenter.TrustPolicy` for unqualified use.
-    func swiftTrustPolicy() async throws -> TrustPolicy {
-        let root = dataRootOverride ?? PersistenceCore.defaultDataRoot()
-        let data = try await SwiftNativeTrustCenter(dataRoot: root).loadTrustPolicyJSON()
-        return try JSONDecoder.nativeAgent.decode(TrustPolicy.self, from: data)
     }
 
     // MARK: - PersonalityDocs route (gate: .personaEngine)

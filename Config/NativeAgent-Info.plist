@@ -1,0 +1,107 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>BGTaskSchedulerPermittedIdentifiers</key>
+	<array>
+		<string>$(NATIVEAGENT_BACKGROUND_TASK_PREFIX).dream_cycle</string>
+		<string>$(NATIVEAGENT_BACKGROUND_TASK_PREFIX).rem_cycle</string>
+		<string>$(NATIVEAGENT_BACKGROUND_TASK_PREFIX).memory_consolidation</string>
+		<string>$(NATIVEAGENT_BACKGROUND_TASK_PREFIX).self_improvement_sweep</string>
+	</array>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>$(DEVELOPMENT_LANGUAGE)</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<key>CFBundleIconName</key>
+	<string>AppIcon</string>
+	<key>CFBundleIdentifier</key>
+	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>NativeAgent</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.0.0-dev</string>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>$(NATIVEAGENT_MAC_BUNDLE_ID).oauth</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>nativeagent</string>
+			</array>
+		</dict>
+	</array>
+	<key>CFBundleVersion</key>
+	<string>0.0.0-dev</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>26.0</string>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>NativeAgent uses Apple Events to coordinate with system applications.</string>
+	<key>NSCalendarsFullAccessUsageDescription</key>
+	<string>NativeAgent uses full calendar access to read upcoming events for assistant briefings and user-approved watch jobs.</string>
+	<key>NSCalendarsUsageDescription</key>
+	<string>NativeAgent uses calendar access for assistant briefings and user-approved watch jobs.</string>
+	<key>NSCalendarsWriteOnlyAccessUsageDescription</key>
+	<string>NativeAgent uses write-only calendar access to create events only when the user enables Calendar write access.</string>
+	<key>NSContactsUsageDescription</key>
+	<string>NativeAgent uses Contacts so the assistant can look up people you ask about and (with the Contacts write toggle on) create or update contacts on your behalf.</string>
+	<key>NSDesktopFolderUsageDescription</key>
+	<string>NativeAgent may read files from your Desktop when you request it.</string>
+	<key>NSDocumentsFolderUsageDescription</key>
+	<string>NativeAgent may read files from your Documents folder when you request it.</string>
+	<key>NSDownloadsFolderUsageDescription</key>
+	<string>NativeAgent may read files from your Downloads folder when you request it.</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>NativeAgent uses the local network to connect the Mac app and trusted companion devices.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>NativeAgent uses your microphone for voice input.</string>
+	<key>NSPrincipalClass</key>
+	<string>NSApplication</string>
+	<key>NSRemindersFullAccessUsageDescription</key>
+	<string>NativeAgent uses reminders access to read due reminders for assistant briefings and user-approved watch jobs.</string>
+	<key>NSRemindersUsageDescription</key>
+	<string>NativeAgent uses reminders access for assistant briefings and user-approved watch jobs.</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>NativeAgent uses speech recognition to transcribe your voice.</string>
+	<key>NativeAgentBackgroundTaskIDPrefix</key>
+	<string>$(NATIVEAGENT_BACKGROUND_TASK_PREFIX)</string>
+	<key>NativeAgentDeviceSync</key>
+	<string>$(NATIVEAGENT_DEVICE_SYNC)</string>
+	<key>NativeAgentICloudContainerID</key>
+	<string>$(NATIVEAGENT_ICLOUD_CONTAINER_ID)</string>
+	<key>NativeAgentMacAppGroupID</key>
+	<string>$(NATIVEAGENT_MAC_APP_GROUP_ID)</string>
+	<key>NativeAgentMacBundleID</key>
+	<string>$(NATIVEAGENT_MAC_BUNDLE_ID)</string>
+	<key>NativeAgentMobileSourceKey</key>
+	<string>$(NATIVEAGENT_MOBILE_SOURCE_KEY)</string>
+	<key>NativeAgentReleasePageURL</key>
+	<string>$(NATIVEAGENT_RELEASE_PAGE_URL)</string>
+	<key>NativeAgentSourceDirty</key>
+	<false/>
+	<key>NativeAgentSourceRevision</key>
+	<string>unknown</string>
+	<key>UTExportedTypeDeclarations</key>
+	<array>
+		<dict>
+			<key>UTTypeConformsTo</key>
+			<array>
+				<string>public.data</string>
+			</array>
+			<key>UTTypeDescription</key>
+			<string>NativeAgent Chat Session</string>
+			<key>UTTypeIdentifier</key>
+			<string>com.nativeagent.chat-session</string>
+		</dict>
+	</array>
+</dict>
+</plist>

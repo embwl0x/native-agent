@@ -1,3 +1,4 @@
+import AppToolRuntime
 import SwiftUI
 
 // "Alive glass" (User, 2026-09-23): while she is working on a turn and has not
@@ -8,12 +9,11 @@ import SwiftUI
 //
 // Performance: everything here is a leaf. The signal is read in `ThinkingGlow`
 // itself, never in ChatView or the composer, so a lifecycle tick invalidates
-// this view and nothing else. The motion is a TimelineView driving a Canvas
-// that sits in a background/overlay: an overlay is sized by its host and never
-// proposes a size back, so a frame here re-draws one layer and re-lays-out
-// nothing — not the composer, not the transcript. The fade animates one
-// @State that only this leaf reads, so its transaction never reaches anything
-// else.
+// this view and nothing else. The motion is Core Animation in a layer that
+// sits in a background/overlay: the render server runs it, so a frame costs
+// the app nothing, and an overlay is sized by its host and never proposes a
+// size back, so it re-lays-out nothing. The fade animates one @State that
+// only this leaf reads, so its transaction never reaches anything else.
 
 extension AppModel {
     /// She is working on the open conversation's turn and no reply text has
@@ -21,7 +21,7 @@ extension AppModel {
     /// reads as thinking again until its new text arrives.
     var isThinkingBeforeReply: Bool {
         guard isBusy || isChatStreaming else { return false }
-        guard let lifecycle = chatTurnLifecycle(for: activeChatSessionId) else { return true }
+        guard let lifecycle = engine.turns.lifecycle(for: activeChatSessionId) else { return true }
         return !lifecycle.presentation.isTerminal && lifecycle.presentation.streamedTextLength == 0
     }
 }
@@ -81,91 +81,208 @@ private struct ThinkingGlowLayer: View {
 
     @ViewBuilder private var effect: some View {
         let haze = HazeColor(stored: hazeRaw)
-        let shape = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
         if reduceMotion {
             // No travel: a still rim, a step brighter than the moving arc's
             // average, says she is thinking. No shimmer.
             if kind == .rim {
-                shape.strokeBorder(haze.edgeLight.opacity(0.42), lineWidth: 1.5)
+                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                    .strokeBorder(haze.edgeLight.opacity(0.42), lineWidth: 1.5)
             }
         } else {
-            // The rim's canvas reaches past the host by `rimBleed` so its glow
+            // The rim's layer reaches past the host by `rimBleed` so its glow
             // is not clipped at the glass edge.
-            let bleed = kind == .rim ? Self.rimBleed : 0
-            TimelineView(.animation(paused: !running)) { timeline in
-                let t = timeline.date.timeIntervalSinceReferenceDate
-                Canvas(rendersAsynchronously: true) { context, size in
-                    switch kind {
-                    case .rim: drawRim(in: &context, size: size, t: t, light: haze.edgeLight)
-                    case .shimmer: drawShimmer(in: &context, size: size, t: t, light: haze.edgeLight)
-                    }
-                }
-            }
-            .padding(-bleed)
+            ThinkingLightLayer(kind: kind, cornerRadius: cornerRadius, haze: haze)
+                .padding(kind == .rim ? -Self.rimBleed : 0)
         }
     }
 
     static let rimBleed: CGFloat = 12
+}
 
-    /// A 2pt stroke of the rounded rectangle, lit by one ~70° comet of a conic
-    /// gradient that turns once every `rimPeriod`: full brightness at the
-    /// head, fading back along the tail, over the same arc blurred 6pt at half
-    /// opacity. It reads as the agent working, not as a reflection.
-    private func drawRim(in context: inout GraphicsContext, size: CGSize, t: Double, light: Color) {
-        let line: CGFloat = 2
-        let inset = Self.rimBleed + line / 2
-        let rect = CGRect(origin: .zero, size: size).insetBy(dx: inset, dy: inset)
-        let path = RoundedRectangle(cornerRadius: max(0, cornerRadius - line / 2), style: .continuous)
-            .path(in: rect)
-        // Wider than the composer's 70°: on a 30pt avatar a short arc read as
-            // a speck (User 09-23 wanted the outline itself to shine).
-            let arc = 130.0 / 360.0, lead = 4.0 / 360.0
-        let gradient = Gradient(stops: [
-            .init(color: light.opacity(0), location: 0),
-            .init(color: light.opacity(0), location: 0.5 - arc),
-            .init(color: light.opacity(0.35), location: 0.5 - arc * 0.4),
-            .init(color: light.opacity(1), location: 0.5),
-            .init(color: light.opacity(0), location: 0.5 + lead),
-            .init(color: light.opacity(0), location: 1),
-        ])
-        let turn = (t / Self.rimPeriod).truncatingRemainder(dividingBy: 1)
-        let shading = GraphicsContext.Shading.conicGradient(
-            gradient,
-            center: CGPoint(x: size.width / 2, y: size.height / 2),
-            angle: .degrees(turn * 360)
-        )
-        context.drawLayer { glow in
-            glow.addFilter(.blur(radius: 6))
-            glow.opacity = 0.5
-            glow.stroke(path, with: shading, lineWidth: line * 2)
-        }
-        context.stroke(path, with: shading, lineWidth: line)
-    }
+/// The moving light, on Core Animation: animations the render server runs, so
+/// a thinking turn costs the main thread nothing per frame (a TimelineView
+/// redrew every glow's Canvas each display frame). Both run on the wall
+/// clock, so every glow on screen is in step.
+private struct ThinkingLightLayer: NSViewRepresentable {
+    let kind: ThinkingGlow.Kind
+    let cornerRadius: CGFloat
+    let haze: HazeColor
 
-    /// Two soft radial pools of the haze's light shade sliding past each other
-    /// along the shape's long axis, trading brightness as they go.
-    private func drawShimmer(in context: inout GraphicsContext, size: CGSize, t: Double, light: Color) {
-        context.clip(to: RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-            .path(in: CGRect(origin: .zero, size: size)))
-        let theta = t * .pi / Self.shimmerSlide
-        let s = sin(theta), c = cos(theta)
-        let wide = size.width >= size.height
-        let radius = max(min(size.width, size.height) * 1.3, 60)
-        func pool(along: Double, across: Double, alpha: Double) {
-            let center = wide
-                ? CGPoint(x: size.width * along, y: size.height * across)
-                : CGPoint(x: size.width * across, y: size.height * along)
-            let rect = CGRect(x: center.x - radius, y: center.y - radius, width: radius * 2, height: radius * 2)
-            context.fill(
-                Path(ellipseIn: rect),
-                with: .radialGradient(
-                    Gradient(colors: [light.opacity(alpha), light.opacity(0)]),
-                    center: center, startRadius: 0, endRadius: radius
-                )
-            )
+    func makeNSView(context: Context) -> LightView { LightView(kind: kind) }
+    func updateNSView(_ view: LightView, context: Context) { view.apply(haze: haze, cornerRadius: cornerRadius) }
+
+    final class LightView: NSView {
+        private let kind: ThinkingGlow.Kind
+        private var applied: (HazeColor, CGFloat)?
+        private let content = CALayer()
+        // Rim: a 2pt stroke of the rounded rectangle, lit by one 130° comet
+        // of a conic gradient that turns once every `rimPeriod` — full
+        // brightness at the head, fading back along the tail — over the same
+        // arc 4pt wide, blurred 6pt at half opacity. The blur is `glow`'s
+        // shadow, not a CIFilter, which would pull the layer tree back into
+        // the app to render: `glow` sits out of view past the clip and casts
+        // its shadow back in.
+        private let glow = CALayer()
+        private let glowRing = CALayer()
+        private let glowMask = CAShapeLayer()
+        private let glowComet = CAGradientLayer()
+        private let ring = CALayer()
+        private let ringMask = CAShapeLayer()
+        private let comet = CAGradientLayer()
+        // Shimmer: two soft radial pools of the haze's light shade sliding
+        // past each other along the shape's long axis, trading brightness.
+        private let clip = CAShapeLayer()
+        private let pools = [CAGradientLayer(), CAGradientLayer()]
+
+        init(kind: ThinkingGlow.Kind) {
+            self.kind = kind
+            super.init(frame: .zero)
+            wantsLayer = true
+            content.masksToBounds = true
+            layer?.addSublayer(content)
+            switch kind {
+            case .rim:
+                glow.shadowOpacity = 0.5
+                glow.shadowRadius = 6
+                for (holder, mask, gradient) in [(glowRing, glowMask, glowComet), (ring, ringMask, comet)] {
+                    mask.fillColor = nil
+                    mask.strokeColor = NSColor.black.cgColor
+                    holder.mask = mask
+                    // CA's conic runs anticlockwise from its end point, SwiftUI's
+                    // clockwise: the stops are reversed to draw the same comet.
+                    gradient.type = .conic
+                    gradient.startPoint = CGPoint(x: 0.5, y: 0.5)
+                    gradient.endPoint = CGPoint(x: 1, y: 0.5)
+                    gradient.locations = Self.cometStops.reversed().map { NSNumber(value: 1 - $0.location) }
+                    holder.addSublayer(gradient)
+                }
+                glowMask.lineWidth = 4
+                ringMask.lineWidth = 2
+                glow.addSublayer(glowRing)
+                content.addSublayer(glow)
+                content.addSublayer(ring)
+            case .shimmer:
+                content.mask = clip
+                for pool in pools {
+                    pool.type = .radial
+                    pool.startPoint = CGPoint(x: 0.5, y: 0.5)
+                    pool.endPoint = CGPoint(x: 1, y: 1)
+                    content.addSublayer(pool)
+                }
+            }
         }
-        pool(along: 0.5 + 0.55 * s, across: 0.3, alpha: 0.30 * (0.55 + 0.45 * c))
-        pool(along: 0.5 - 0.55 * s, across: 0.75, alpha: 0.30 * (0.55 - 0.45 * c))
+        required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+        override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+        private static let arc = 130.0 / 360.0, lead = 4.0 / 360.0
+        /// The comet's gradient as SwiftUI draws it: location clockwise from
+        /// the start angle, and the light's opacity there.
+        private static let cometStops: [(location: Double, alpha: Double)] = [
+            (0, 0), (0.5 - arc, 0), (0.5 - arc * 0.4, 0.35), (0.5, 1), (0.5 + lead, 0), (1, 0),
+        ]
+
+        func apply(haze: HazeColor, cornerRadius: CGFloat) {
+            if let applied, applied.0 == haze, applied.1 == cornerRadius { return }
+            applied = (haze, cornerRadius)
+            let light = NSColor(haze.edgeLight)
+            CATransaction.begin(); CATransaction.setDisableActions(true)
+            switch kind {
+            case .rim:
+                let colors = Self.cometStops.reversed().map { light.withAlphaComponent($0.alpha).cgColor }
+                glowComet.colors = colors
+                comet.colors = colors
+                glow.shadowColor = light.cgColor
+            case .shimmer:
+                for pool in pools { pool.colors = [light.cgColor, light.withAlphaComponent(0).cgColor] }
+            }
+            CATransaction.commit()
+            needsLayout = true
+        }
+
+        override func setFrameSize(_ newSize: NSSize) { super.setFrameSize(newSize); needsLayout = true }
+        override func viewDidMoveToWindow() { super.viewDidMoveToWindow(); needsLayout = true }
+        override func viewDidChangeBackingProperties() { super.viewDidChangeBackingProperties(); needsLayout = true }
+
+        /// Sizes the layers and (re)starts the motion at the wall clock's phase.
+        override func layout() {
+            super.layout()
+            guard let applied, bounds.width > 0, bounds.height > 0 else { return }
+            CATransaction.begin(); CATransaction.setDisableActions(true)
+            let scale = window?.backingScaleFactor ?? 2
+            for layer in [content, glow, glowRing, glowMask, glowComet, ring, ringMask, comet, clip] + pools {
+                layer.contentsScale = scale
+            }
+            content.frame = bounds
+            switch kind {
+            case .rim: layoutRim(cornerRadius: applied.1)
+            case .shimmer: layoutShimmer(cornerRadius: applied.1)
+            }
+            CATransaction.commit()
+        }
+
+        private func layoutRim(cornerRadius: CGFloat) {
+            let line: CGFloat = 2
+            let inset = ThinkingGlowLayer.rimBleed + line / 2
+            let path = RoundedRectangle(cornerRadius: max(0, cornerRadius - line / 2), style: .continuous)
+                .path(in: bounds.insetBy(dx: inset, dy: inset)).cgPath
+            let away = bounds.width + 64
+            glow.frame = bounds.offsetBy(dx: -away, dy: 0)
+            glow.shadowOffset = CGSize(width: away, height: 0)
+            // A square the ring never leaves while the comet turns.
+            let side = hypot(bounds.width, bounds.height)
+            for (holder, mask, gradient) in [(glowRing, glowMask, glowComet), (ring, ringMask, comet)] {
+                holder.frame = bounds
+                mask.frame = bounds
+                mask.path = path
+                gradient.bounds = CGRect(x: 0, y: 0, width: side, height: side)
+                gradient.position = CGPoint(x: bounds.midX, y: bounds.midY)
+                // Clockwise, as SwiftUI's angle turns: negative about z here.
+                let spin = CABasicAnimation(keyPath: "transform.rotation.z")
+                spin.fromValue = 0
+                spin.toValue = -2 * Double.pi
+                spin.duration = ThinkingGlowLayer.rimPeriod
+                spin.repeatCount = .infinity
+                spin.timeOffset = Self.phase(ThinkingGlowLayer.rimPeriod)
+                gradient.add(spin, forKey: "turn")
+            }
+        }
+
+        private func layoutShimmer(cornerRadius: CGFloat) {
+            let size = bounds.size
+            clip.frame = bounds
+            clip.path = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous).path(in: bounds).cgPath
+            let wide = size.width >= size.height
+            let radius = max(min(size.width, size.height) * 1.3, 60)
+            // One there-and-back: theta runs 0…2π over twice `shimmerSlide`.
+            let period = ThinkingGlowLayer.shimmerSlide * 2
+            let thetas = (0...96).map { Double($0) / 96 * 2 * .pi }
+            for (pool, (across, sign)) in zip(pools, [(0.3, 1.0), (0.75, -1.0)]) {
+                pool.bounds = CGRect(x: 0, y: 0, width: radius * 2, height: radius * 2)
+                // SwiftUI's y runs down, this layer's up.
+                func center(_ theta: Double) -> NSValue {
+                    let along = 0.5 + sign * 0.55 * sin(theta)
+                    return NSValue(point: wide
+                        ? CGPoint(x: size.width * along, y: size.height * (1 - across))
+                        : CGPoint(x: size.width * across, y: size.height * (1 - along)))
+                }
+                let move = CAKeyframeAnimation(keyPath: "position")
+                move.values = thetas.map(center)
+                let fade = CAKeyframeAnimation(keyPath: "opacity")
+                fade.values = thetas.map { 0.30 * (0.55 + sign * 0.45 * cos($0)) }
+                let slide = CAAnimationGroup()
+                slide.animations = [move, fade]
+                slide.duration = period
+                slide.repeatCount = .infinity
+                slide.timeOffset = Self.phase(period)
+                pool.add(slide, forKey: "slide")
+            }
+        }
+
+        /// Where the wall clock is in a loop of `period`: the phase the
+        /// TimelineView drew, shared by every glow.
+        private static func phase(_ period: Double) -> Double {
+            Date().timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: period)
+        }
     }
 }
 

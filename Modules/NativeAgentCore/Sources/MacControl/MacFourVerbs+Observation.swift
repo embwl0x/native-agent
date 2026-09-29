@@ -108,21 +108,34 @@ extension MacFourVerbs {
                 detail: Self.operationDetail(result).merging(["observed_after": .bool(false)]) { current, _ in current }
             )
         case .seen(let after):
+            // In a batch, the text the step before typed is that step's change,
+            // not this one's: a return that only "changed" that text did nothing.
+            // Too short a text ("a") would match unrelated words: ignored then.
+            let typedRaw = Self.typedJustBefore.flatMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).count >= 3 ? $0 : nil }
+            let typedBefore = typedRaw.map(Self.normalize)
+            let withoutTyped: (String) -> String = { render in
+                typedRaw.map { render.replacingOccurrences(of: $0, with: "") } ?? render
+            }
             // A scoped post-action render is intentionally shaped differently
             // from the full pre-action screen. That difference is presentation,
             // not effect evidence; visible values and handler evidence remain
             // independently comparable.
             let structuralChanged = afterPart == nil
-                ? before.map { $0.effectRender != after.effectRender }
+                ? before.map { withoutTyped($0.effectRender) != withoutTyped(after.effectRender) }
                 : nil
+            let textValueVerified = Self.bool(Self.object(result.output)["text_value_verified"])
             let handlerEvidence = Self.bool(Self.object(result.output)["verified"]) == true
             let changed = structuralChanged.map { $0 || handlerEvidence }
-            let visibleValueChanged: Bool = {
+            let differingValues: Set<String> = {
                 guard let before,
                       let beforeValues = Self.visionValueTexts(before.detail),
-                      let afterValues = Self.visionValueTexts(after.detail) else { return false }
-                return beforeValues != afterValues
+                      let afterValues = Self.visionValueTexts(after.detail) else { return [] }
+                return beforeValues.symmetricDifference(afterValues)
             }()
+            let onlyTypedChanged = typedBefore.map { typed in
+                !differingValues.isEmpty && differingValues.map(Self.normalize).allSatisfy { $0.contains(typed) || ($0.count >= 3 && typed.contains($0)) }
+            } ?? false
+            let visibleValueChanged = !differingValues.isEmpty && !onlyTypedChanged
             let pointerOnTarget: Bool? = {
                 guard let pointerTarget, let before,
                       before.bundleIdentifier == after.bundleIdentifier,
@@ -137,6 +150,9 @@ extension MacFourVerbs {
             else if pointerOnTarget == false { observation = " The system pointer is outside the target's freshly observed bounds." }
             else if visibleValueChanged { observation = " A value the fresh screen says changed after it." }
             else if structuralChanged == true { observation = " The fresh screen changed after it." }
+            else if onlyTypedChanged, !handlerEvidence {
+                observation = " Nothing visibly happened after it: the only change on the fresh screen is the text typed just before."
+            }
             else if handlerEvidence && allowGenericScreenChangeVerification {
                 observation = " The fresh fused view changed after it, although the structural words stayed the same."
             }
@@ -154,7 +170,13 @@ extension MacFourVerbs {
             // evidence that the visible computer reacted, so settle THAT claim
             // (not the caller's larger goal). An unchanged screen remains
             // explicitly unverified.
-            if pointerTarget != nil {
+            if let textValueVerified {
+                detail["verification"] = .string(textValueVerified
+                    ? MotorVerificationState.satisfied.rawValue : MotorVerificationState.unverified.rawValue)
+                detail["text_value_verified"] = .bool(textValueVerified)
+                detail.removeValue(forKey: "verification_evidence")
+                if textValueVerified { detail["verification_evidence"] = .string("focused_text_value_match") }
+            } else if pointerTarget != nil {
                 detail["pointer_on_target"] = pointerOnTarget.map(JSONValue.bool) ?? .null
                 detail["verification"] = .string(pointerOnTarget == true
                     ? MotorVerificationState.satisfied.rawValue : MotorVerificationState.unverified.rawValue)
@@ -241,6 +263,12 @@ extension MacFourVerbs {
         var frontmostApp: (name: String, pid: Int32, window: JSONValue?)? = nil
         /// Her-screen Phase 5 — the window's kind, the app map's key.
         var windowKind: String? = nil
+        /// Where keyboard focus is in this read (same paths as targets' sourceAXPath).
+        var focusPath: [Int]? = nil
+        /// Handles of the editable fields in this read ("text" alone also covers labels).
+        var editableHandles: Set<String> = []
+        /// Keyboard focus may be (or is) a password field. Unknown counts as secure.
+        var focusSecure: Bool = true
     }
 
     /// A resolvable thing on the screen. `label` is the DISPLAY text — what the
@@ -269,6 +297,9 @@ extension MacFourVerbs {
         let regionOnly: Bool
         let physicalOnly: Bool
         let motionUncertain: Bool
+        /// An editable field's placeholder: a name it answers to after every
+        /// exact label on the screen (Maps' "Apple Maps" field reads "Search Maps").
+        var placeholder: String? = nil
 
         // A semantic look handle remains the preferred semantic route even
         // after fusion enriches it with a physical frame/mark. Only a target
@@ -316,15 +347,17 @@ extension MacFourVerbs {
 
     // Module-internal so paired perception fixtures can inspect the same
     // private target/render compilation used by screen and act.
-    func sight(part: String?, app: String? = nil) async -> Sighted {
-        await sight(part: part, app: app, wakeAttemptsRemaining: 2)
+    /// `seek`: a name the caller is about to act on. When the ordinary walk
+    /// stops short of it, the look searches deeper and frames it (`seekScoped`).
+    func sight(part: String?, app: String? = nil, seek: String? = nil) async -> Sighted {
+        await sight(part: part, app: app, seek: seek, wakeAttemptsRemaining: 2)
     }
 
     /// A screen saver is an obstruction to perception, not a destination Agent
     /// should reason about. Clear it with the already-gated wake organ and then
     /// start the read again. Two attempts cover the observed macOS teardown
     /// delay without creating an unbounded input loop.
-    private func sight(part: String?, app: String?, wakeAttemptsRemaining: Int) async -> Sighted {
+    private func sight(part: String?, app: String?, seek: String? = nil, wakeAttemptsRemaining: Int) async -> Sighted {
         let result: MacControlResult
         do {
             // fable51 item 32a — when `app` is named, the look is ANCHORED to
@@ -334,6 +367,7 @@ extension MacFourVerbs {
             // truth about what it is describing.
             var body: [String: JSONValue] = ["grade": .string("look"), "app_map": .bool(true)]
             if let app { body["app"] = .string(app) }
+            if let seek = seek ?? part, !seek.isEmpty { body["seek"] = .string(seek) }
             result = try await host.dispatch(action: "look", body: body)
         } catch {
             return .blind(MacFourVerbsReply(
@@ -353,7 +387,7 @@ extension MacFourVerbs {
             if wakeAttemptsRemaining > 0,
                let wake = try? await host.dispatch(action: "wake", body: ["settle_ms": .int(700)]),
                wake.ok || Self.object(Self.object(wake.output)["wake"])["still_obstructed"] == .bool(true) {
-                return await sight(part: part, app: app, wakeAttemptsRemaining: wakeAttemptsRemaining - 1)
+                return await sight(part: part, app: app, seek: seek, wakeAttemptsRemaining: wakeAttemptsRemaining - 1)
             }
             MacScreenLock.wakeFailed = true
         }
@@ -369,7 +403,7 @@ extension MacFourVerbs {
                 detail: [
                     "error": .string(result.error ?? "look_failed"),
                     "message": .string(why),
-                ]
+                ].merging(output["frontmost_app"].map { ["frontmost_app": $0] } ?? [:]) { current, _ in current }
             ))
         }
 
@@ -398,7 +432,7 @@ extension MacFourVerbs {
             let wakeOutput = Self.object(wake.output)
             let wakeReceipt = Self.object(wakeOutput["wake"] ?? .null)
             if wake.ok || wakeReceipt["still_obstructed"] == .bool(true) {
-                return await sight(part: part, app: app, wakeAttemptsRemaining: wakeAttemptsRemaining - 1)
+                return await sight(part: part, app: app, seek: seek, wakeAttemptsRemaining: wakeAttemptsRemaining - 1)
             }
             return .blind(MacFourVerbsReply(
                 ok: false,
@@ -444,6 +478,7 @@ extension MacFourVerbs {
                 mark: nil,
                 sourceAXPath: row.path
             ))
+            targets[targets.count - 1].placeholder = row.placeholder
         }
         let controlOrdinals = MacScreenRender.controlRoleOrdinals(for: controls)
         for control in controls {
@@ -462,6 +497,7 @@ extension MacFourVerbs {
                 mark: nil,
                 sourceAXPath: control.path
             ))
+            targets[targets.count - 1].placeholder = control.placeholder
         }
 
         // Structural regions are addresses too. They are not click targets—
@@ -531,7 +567,7 @@ extension MacFourVerbs {
                         || existing.sourceAXPath == candidate.sourceAXPath
                     let mergedViewId = existing.viewId ?? (sameAXElement ? candidate.viewId : nil)
                     let mergedMark = existing.mark ?? (sameAXElement ? candidate.mark : nil)
-                    let enriched = ActTarget(
+                    var enriched = ActTarget(
                         handle: existing.handle,
                         label: mergedLabel,
                         aliases: (existing.aliases + candidate.aliases).reduce(into: []) {
@@ -551,6 +587,7 @@ extension MacFourVerbs {
                         motionUncertain: candidate.motionUncertain,
                         sourceAXPath: existing.sourceAXPath ?? candidate.sourceAXPath
                     )
+                    enriched.placeholder = existing.placeholder
                     if duplicateIndex < targets.count {
                         targets[duplicateIndex] = enriched
                     } else {
@@ -646,6 +683,7 @@ extension MacFourVerbs {
                         motionUncertain: existing.motionUncertain,
                         sourceAXPath: existing.sourceAXPath
                     )
+                    targets[index].placeholder = existing.placeholder
                     full = Self.adding(
                         controls: [MacScreenRender.Control(
                             label: MacScreenText(label, redacted: .string(label)),
@@ -674,6 +712,7 @@ extension MacFourVerbs {
                         motionUncertain: existing.motionUncertain,
                         sourceAXPath: existing.sourceAXPath
                     )
+                    targets[index].placeholder = existing.placeholder
                 }
             } else {
                 targets.append(ActTarget(
@@ -720,9 +759,20 @@ extension MacFourVerbs {
             live: targets,
             rendered: zoom == nil ? Self.renderedPaths(full, options: options) : nil
         )
-        let renderedText = rendering.text + (knownLine.map { $0 + "\n" } ?? "") + "\n" + pointerLine
+        // A walk its caps cut must not read as the whole window: say so, and
+        // how to reach the rest (a named act searches past the cut).
+        let cutLine: String? = percept.truncated
+            && percept.truncationReasons.contains(where: { $0 == "depth_cap" || $0 == "node_cap" })
+            ? "CUT     the read stopped at its size limit; at least \(percept.skippedAtLeast) more elements "
+                + "weren't read. Name a control and I'll search past the cut."
+            : nil
+        let renderedText = rendering.text + (knownLine.map { $0 + "\n" } ?? "")
+            + (cutLine.map { $0 + "\n" } ?? "") + "\n" + pointerLine
         if let name = percept.app?.name {
-            sightRecorder?.record(app: name, kind: windowKind, readouts: percept.readouts.compactMap(\.displayText))
+            // A scroll bar's thumb is a raw position (Freeform · 0.3936617029400535 on
+            // home, walk 6), not something the window says: home never shows it.
+            sightRecorder?.record(app: name, kind: windowKind,
+                                  readouts: percept.readouts.filter { $0.role != "AXValueIndicator" }.compactMap(\.displayText))
         }
         return .seen(Sighting(
             render: renderedText,
@@ -740,6 +790,7 @@ extension MacFourVerbs {
             zoomNote: zoom?.note,
             controls: .object([
                 "frame_id": .string(frameId),
+                "craft_document": output["craft_document"] ?? .null,
                 "app": output["app"] ?? .null,
                 "front": output["front"] ?? .bool(false),
                 "affordances": output["affordances"] ?? .array([]),
@@ -758,7 +809,31 @@ extension MacFourVerbs {
                       let pid = Self.int(front["pid"]).flatMap(Int32.init(exactly:)), pid > 0 else { return nil }
                 return (name, pid, front["window"])
             }(),
-            windowKind: windowKind
+            windowKind: windowKind,
+            focusPath: percept.focus?.path,
+            editableHandles: {
+                // Password fields never count, whatever their role says.
+                let fieldRoles: Set<String> = ["AXTextField", "AXTextArea", "AXComboBox", "AXSearchField"]
+                let secure = Set(percept.affordances.filter {
+                    $0.role == "AXSecureTextField" || $0.subrole == "AXSecureTextField"
+                }.map(\.handle))
+                var editable = Set(percept.affordances.filter {
+                    fieldRoles.contains($0.role) || $0.subrole == "AXSearchField"
+                }.map(\.handle)).subtracting(secure)
+                if let focus = percept.focus, let handle = focus.handle,
+                   fieldRoles.contains(focus.role), !secure.contains(handle) { editable.insert(handle) }
+                return editable
+            }(),
+            focusSecure: {
+                guard let focus = percept.focus else { return true }
+                let read = percept.affordances.first { $0.path == focus.path }
+                // A text field whose subrole this read never saw may be a password field.
+                if read == nil, ["AXTextField", "AXComboBox"].contains(focus.role) { return true }
+                return MacScreenViewBuilder.isSecretField(role: focus.role, subrole: nil, label: focus.label)
+                    || read.map {
+                        $0.secret || MacScreenViewBuilder.isSecretField(role: $0.role, subrole: $0.subrole, label: $0.label)
+                    } == true
+            }()
         ))
     }
 

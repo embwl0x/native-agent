@@ -10,6 +10,7 @@ struct MemoryView: View {
     @StateObject private var store = MemoryStore()
     @ObservedObject private var sync = iCloudSyncEngine.shared
     @EnvironmentObject private var bridgeClient: MacBridgeClient
+    @EnvironmentObject private var pairingStore: PairingStore
     @State private var showsConnection = false
     @State private var hasNoCloudAccount = false
     @Environment(\.scenePhase) private var scenePhase
@@ -43,7 +44,11 @@ struct MemoryView: View {
     }
 
     init(initialSegment: MemorySegment = .memories, embedInNavigationStack: Bool = true) {
-        _segment = State(initialValue: initialSegment)
+        var segment = initialSegment
+        #if DEBUG
+        if ProcessInfo.processInfo.arguments.contains("-memorySampleProposals") { segment = .proposals }
+        #endif
+        _segment = State(initialValue: segment)
         self.embedInNavigationStack = embedInNavigationStack
     }
 
@@ -67,12 +72,19 @@ struct MemoryView: View {
                 ProposalsListView(store: store, header: AnyView(memoryHeader))
             }
         }
-        .navigationTitle("Memories")
-        .navigationBarTitleDisplayMode(.inline)
-        .toolbarBackground(NativeAgentMobileTheme.Colors.canvas, for: .navigationBar)
-        .toolbarBackground(.visible, for: .navigationBar)
-        .background { MobileRoomBackground() }
-        .tint(NativeAgentMobileTheme.Colors.accentText)
+        // At the tab root the bar has nothing to hold; pushed, it keeps Back.
+        .alivePageChrome(title: "Memories", root: embedInNavigationStack)
+        // The search floats over the list, above the tab bar, like the
+        // composer. Outside the chrome, so the list's bottom fade runs under it.
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            // Nothing to search until something has arrived.
+            if segment == .memories && (!store.memories.isEmpty || MemorySamples.isOn || !searchQuery.isEmpty) {
+                AliveSearchField(prompt: "Search memories", text: $searchQuery)
+                    .padding(.horizontal, AliveMetrics.pageInset)
+                    .padding(.top, 6)
+                    .padding(.bottom, 8)
+            }
+        }
         .sheet(isPresented: $showsConnection) {
             PairingView(onSkip: { showsConnection = false }, onPaired: { showsConnection = false })
         }
@@ -87,42 +99,32 @@ struct MemoryView: View {
         }
     }
 
-    private var memoryHeader: some View {
-        VStack(spacing: 8) {
-            if segment == .memories {
-                HStack {
-                    Image(systemName: "magnifyingglass").accessibilityHidden(true)
-                    TextField("Search memories", text: $searchQuery)
-                        .font(.body)
-                        .submitLabel(.search)
-                }
-                .padding(12)
-                .background(NativeAgentMobileTheme.Colors.softFill, in: RoundedRectangle(cornerRadius: 12))
-            }
-            memorySyncStatus
-            HStack(spacing: 4) {
-                ForEach(MemorySegment.allCases, id: \.self) { seg in
-                    Button { segment = seg } label: {
-                        Text(seg.rawValue)
-                            .font(.body.weight(.semibold))
-                            .fixedSize(horizontal: false, vertical: true)
-                            .frame(maxWidth: .infinity, minHeight: 44)
-                            .padding(.vertical, 4)
-                            .background(segment == seg ? NativeAgentMobileTheme.Colors.softFill : .clear,
-                                        in: RoundedRectangle(cornerRadius: 10))
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityAddTraits(segment == seg ? .isSelected : [])
-                }
-            }
+    private var headerLine: String {
+        let sample = MemorySamples.isOn
+        switch segment {
+        case .memories:
+            return MemoryWords.memoriesLine(sample ? MemorySamples.memories.count : store.memories.count)
+        case .proposals:
+            let count = sample && store.memoryProposals.isEmpty ? MemorySamples.proposals.count : store.memoryProposals.count
+            return MemoryWords.proposalsLine(count)
+        }
+    }
 
+    private var memoryHeader: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            AlivePageHeader(title: "Memories", line: headerLine,
+                            style: embedInNavigationStack ? .root : .pushed)
+                .padding(.horizontal, 4)
+            memorySyncStatus
+            AliveSegmentedPicker(selection: $segment, options: MemorySegment.allCases) { $0.rawValue }
+                .padding(.top, 6)
             if let error = MemoryErrorLinePresentation.visibleMessage(store.error) {
                 MemoryErrorLine(message: error) {
                     store.dismissError()
                 }
             }
-
         }
+        .padding(.top, embedInNavigationStack ? AliveMetrics.rootTop : 4)
     }
 
     private var sampleSyncState: String? {
@@ -140,7 +142,7 @@ struct MemoryView: View {
         // are independent facts, presented together with one recovery.
         TimelineView(.periodic(from: .now, by: 15)) { context in
             let sample = sampleSyncState
-            let state = StatusConnectionPresentation.syncState(
+            let state = MacSnapshotPageFreshness.state(
                 // This segment's own delivery clock, not the cache-read clock.
                 lastSyncedAt: sample == "stale"
                     ? context.date.addingTimeInterval(-7200)
@@ -149,37 +151,126 @@ struct MemoryView: View {
                         : sync.transportDeliveryAt(screenGroup: Self.snapshotGroup(for: segment)),
                 now: context.date)
             let reason = MacSnapshotGroupStaleness.reason(in: sync.staleSnapshotGroups, group: Self.snapshotGroup(for: segment))
-            let noAccount = sample == "noAccount" || (sample == nil && hasNoCloudAccount)
-            let unavailable = noAccount || (sample == nil && bridgeClient.bridgeStatus != .online)
             let sharedError = MemoryErrorLinePresentation.visibleMessage(sync.syncError)
-            VStack(alignment: .leading, spacing: 4) {
-                Text(sharedError != nil ? "Memories could not update" : reason == nil ? StatusConnectionPresentation.cardValue(for: state) : "Memories out of date")
-                    .font(.caption.weight(.semibold))
-                if sharedError == nil && (unavailable || reason != nil || StatusConnectionPresentation.needsAttention(state)) {
-                    Text(noAccount ? "No iCloud account; memories cannot update."
-                         : reason.map { "Saved memories may be out of date. \($0)" }
-                         ?? (unavailable ? "Connection unavailable; memories cannot update."
-                             : StatusConnectionPresentation.detail(for: state) ?? ""))
-                        .font(.callout)
-                        .fixedSize(horizontal: false, vertical: true)
+            // The Mac's status is said once, in the chat header and More ›
+            // Connection. Here: unpaired, only the one way on; paired, only
+            // this page's own age when it is stale or never arrived.
+            let unpaired = sample == nil && !pairingStore.usesICloudTransport
+            // A paired phone that lost its Apple Account: no snapshot can
+            // arrive, so the age alone would not say why or how to fix it.
+            let noAccount = sample == "noAccount" || (sample == nil && hasNoCloudAccount)
+            let attention = sharedError != nil || reason != nil || StatusConnectionPresentation.needsAttention(state)
+            if unpaired {
+                AliveNoteAction(title: "Pair with Mac", hint: "Connects this iPhone to your Mac") {
+                    showsConnection = true
                 }
-                if sharedError != nil || unavailable || reason != nil || StatusConnectionPresentation.needsAttention(state) {
-                    Button(noAccount ? "Open Settings" : unavailable ? "Review connection" : "Refresh memories") {
-                        if noAccount {
-                            UIApplication.shared.open(URL(string: UIApplication.openSettingsURLString)!)
-                        } else if unavailable { showsConnection = true }
-                        else { Task { await store.refresh() } }
-                    }
-                    .accessibilityHint(noAccount ? "Sign in to Apple Account in Settings, then return to refresh memories." : "")
-                    .foregroundStyle(NativeAgentMobileTheme.Colors.accentText)
-                    .frame(minHeight: 44)
+                .padding(.horizontal, 4)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            } else if noAccount {
+                AliveStatusNote(
+                    systemImage: "icloud.slash",
+                    text: AliveConnection.noICloud + ". Sign in to iCloud in Settings and my memories will arrive here.",
+                    actionTitle: "Open Settings",
+                    actionHint: "Sign in to Apple Account in Settings, then return to refresh memories."
+                ) {
+                    UIApplication.shared.open(URL(string: UIApplication.openSettingsURLString)!)
                 }
+            } else if attention {
+                // The page note every page wears: what is true, and one way on.
+                let title = sharedError != nil ? "My memories couldn\u{2019}t update"
+                    : reason != nil ? "My memories may be out of date"
+                    : MacSnapshotPageFreshness.line(for: state)
+                let detail: String? = sharedError != nil ? nil
+                    : reason.map { "Saved memories may be out of date. \($0)" }
+                AliveStatusNote(
+                    systemImage: "arrow.clockwise.icloud",
+                    text: [title, detail].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: ". "),
+                    actionTitle: "Refresh memories"
+                ) {
+                    Task { await store.refresh() }
+                }
+            } else {
+                AliveFootnote(MacSnapshotPageFreshness.line(for: state))
             }
-            .foregroundStyle(NativeAgentMobileTheme.Colors.metadataText)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.horizontal, 16)
         }
         .macSyncErrorBanner()
+    }
+}
+
+/// Plain words for the page: counts spelled out, kinds named for people.
+private enum MemoryWords {
+    static func memoriesLine(_ n: Int) -> String {
+        switch n {
+        case 0: return "What I keep from our conversations."
+        case 1: return "I remember one thing."
+        default: return "I remember \(AliveWords.spelled(n, capitalized: false)) things."
+        }
+    }
+
+    static func proposalsLine(_ n: Int) -> String {
+        switch n {
+        case 0: return "What I\u{2019}d like to remember, for you to decide."
+        case 1: return "One thing I\u{2019}d like to remember."
+        default:
+            return AliveWords.spelled(n) + " things I\u{2019}d like to remember."
+        }
+    }
+
+    static func kind(_ layer: String?) -> String? {
+        guard let raw = layer?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else { return nil }
+        switch raw.lowercased() {
+        case "semantic": return "Fact"
+        case "episodic": return "Moment"
+        case "procedural": return "Habit"
+        case "working": return "For now"
+        default: return raw.prefix(1).uppercased() + raw.dropFirst()
+        }
+    }
+
+    static func meta(kind: String?, pinned: Bool, importance: Double?, extra: [String]) -> String {
+        var parts: [String] = []
+        if let kind { parts.append(kind) }
+        if pinned { parts.append("pinned") }
+        if let importance, importance >= 0.8 { parts.append("important") }
+        return (parts + extra).joined(separator: " \u{00B7} ")
+    }
+
+    static func evidence(_ proposal: MemoryProposalRecord) -> String {
+        let times = proposal.recurrenceCount <= 1 ? "once" : proposal.recurrenceCount == 2 ? "twice" : "\(AliveWords.spelled(proposal.recurrenceCount, capitalized: false)) times"
+        let sessions = proposal.supportingSessionIds.count
+        guard sessions > 1 else { return "noticed \(times)" }
+        return "noticed \(times) across \(AliveWords.spelled(sessions, capitalized: false)) conversations"
+    }
+}
+
+/// View-only fixtures for `-memorySample`; never inserted into the store or
+/// sent to the Mac.
+private enum MemorySamples {
+    static var isOn: Bool {
+        #if DEBUG
+        ProcessInfo.processInfo.arguments.contains("-memorySample")
+        #else
+        false
+        #endif
+    }
+
+    static let memories: [MemoryRecord] = decode("""
+    [
+      {"id":"sample-1","layer":"semantic","text":"Keep mornings open for focused work and save errands for the afternoon.","importance":0.8,"confidence":1,"tags":["routine","focus"],"createdAt":"2026-09-07"},
+      {"id":"sample-2","layer":"episodic","text":"A walk by the water was a good way to end a busy week.","importance":0.6,"confidence":1,"tags":["weekend","outdoors"],"createdAt":"2026-09-07"},
+      {"id":"sample-3","layer":"semantic","text":"When planning a project, start with a short outline and one useful next step.","importance":0.7,"confidence":1,"tags":["planning"],"createdAt":"2026-09-07"}
+    ]
+    """)
+
+    static let proposals: [MemoryProposalRecord] = decode("""
+    [
+      {"id":"sample-p1","text":"Prefers a short summary first, with the details after.","layer":"semantic","importance":0.85,"supporting_session_ids":["a","b"],"recurrence_count":3},
+      {"id":"sample-p2","text":"Likes to finish the week with a walk outside.","layer":"episodic","importance":0.5,"supporting_session_ids":[],"recurrence_count":1}
+    ]
+    """)
+
+    private static func decode<T: Decodable>(_ json: String) -> [T] {
+        (try? JSONDecoder().decode([T].self, from: Data(json.utf8))) ?? []
     }
 }
 
@@ -427,25 +518,10 @@ struct MemoryListView: View {
     var header: AnyView = AnyView(EmptyView())
     @State private var pendingDeleteMemory: MemoryRecord?
 
-    private var isSample: Bool {
-        #if DEBUG
-        ProcessInfo.processInfo.arguments.contains("-memorySample")
-        #else
-        false
-        #endif
-    }
+    private var isSample: Bool { MemorySamples.isOn }
 
     private var sourceMemories: [MemoryRecord] {
-        guard isSample else { return store.memories }
-        // View-only fixtures; never inserted into the store or sent to the Mac.
-        let json = """
-        [
-          {"id":"sample-1","layer":"semantic","text":"Keep mornings open for focused work and save errands for the afternoon.","importance":0.8,"confidence":1,"tags":["routine","focus"],"createdAt":"2026-09-07"},
-          {"id":"sample-2","layer":"episodic","text":"A walk by the water was a good way to end a busy week.","importance":0.6,"confidence":1,"tags":["weekend","outdoors"],"createdAt":"2026-09-07"},
-          {"id":"sample-3","layer":"semantic","text":"When planning a project, start with a short outline and one useful next step.","importance":0.7,"confidence":1,"tags":["planning"],"createdAt":"2026-09-07"}
-        ]
-        """
-        return (try? JSONDecoder().decode([MemoryRecord].self, from: Data(json.utf8))) ?? []
+        isSample ? MemorySamples.memories : store.memories
     }
 
     private var visibleMemories: [MemoryRecord] {
@@ -464,8 +540,7 @@ struct MemoryListView: View {
     var body: some View {
         ScrollViewReader { proxy in
         List {
-            header.listRowBackground(Color.clear).listRowSeparator(.hidden)
-            if isSample { Text("Sample memories").font(.caption).foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary).listRowBackground(Color.clear) }
+            header.aliveListRow(top: 0, bottom: 10)
             if let emptyState = MemorySearchPresentation.emptyState(
                 visibleCount: visibleMemories.count,
                 syncedCount: sourceMemories.count,
@@ -473,82 +548,32 @@ struct MemoryListView: View {
             ) {
                 switch emptyState {
                 case .noSyncedMemories:
-                    AppEmptyState(
-                        title: "No memories",
-                        systemImage: "brain.head.profile",
-                        kind: .unavailable,
-                        description: "Memories will appear here after iCloud sync."
+                    AliveCalmState(
+                        title: "Nothing here yet.",
+                        line: "What I learn with you on the Mac arrives here once iCloud syncs."
                     )
-                    .listRowBackground(Color.clear)
-                    .listRowSeparator(.hidden)
+                    .aliveListRow()
                 case .noMatches(let query):
-                    AppEmptyState(
-                        title: "No matches",
-                        systemImage: "magnifyingglass",
-                        kind: .empty,
-                        description: "No synced memory matches \u{201c}\(query)\u{201d}."
+                    AliveCalmState(
+                        title: "Nothing matches \u{201c}\(query)\u{201d}.",
+                        line: "I only search the memories already on this iPhone."
                     )
-                    .listRowBackground(Color.clear)
-                    .listRowSeparator(.hidden)
+                    .aliveListRow()
                 }
             } else {
-                // PATCH-2026-05-07: polish-MemoryView importance-tinted layer badge, richer tag pills
                 ForEach(visibleMemories) { memory in
-                    let importance = memory.importance
-                    let importanceTint = NativeAgentMobileTheme.Colors.metadataText
                     let isDeleting = store.deletingMemoryIDs.contains(memory.id)
-                    VStack(alignment: .leading, spacing: 8) {
-                        ViewThatFits(in: .horizontal) {
-                        HStack(spacing: 12) {
-                            Text(memory.layer.capitalized)
-                                .font(.caption.weight(.medium))
-                                .foregroundStyle(importanceTint)
-                            Spacer()
-                            if memory.pinned == true {
-                                Image(systemName: "pin").font(.caption).foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
-                            }
-                            if isDeleting {
-                                ProgressView()
-                                    .controlSize(.small)
-                            }
-                            Text(String(format: "Importance %.0f%%", importance * 100))
-                                .font(AppFont.mono)
-                                .foregroundStyle(importanceTint)
+                    MemoryCard(memory: memory, isDeleting: isDeleting)
+                        .id(memory.id)
+                        .aliveListRow(top: 5, bottom: 5)
+                        .swipeActions(edge: .trailing) {
+                            Button(
+                                role: ButtonRole.destructive,
+                                action: { pendingDeleteMemory = memory },
+                                label: { Label("Delete", systemImage: "trash") }
+                            )
+                            .disabled(isDeleting || isSample)
                         }
-                        .fixedSize(horizontal: true, vertical: false)
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text(memory.layer.capitalized)
-                            Text(String(format: "Importance %.0f%%", importance * 100))
-                            if memory.pinned == true { Label("Pinned", systemImage: "pin") }
-                            if isDeleting { ProgressView().controlSize(.small) }
-                        }
-                        .font(.caption)
-                        .foregroundStyle(importanceTint)
-                        }
-                        Text(memory.text)
-                            .font(.body)
-                            .fixedSize(horizontal: false, vertical: true)
-                        if let tags = memory.tags, !tags.isEmpty {
-                            ScrollView(.horizontal, showsIndicators: false) {
-                                HStack(spacing: 4) {
-                                    ForEach(tags, id: \.self) { tag in
-                                        MemoryTagPill(tag: tag)
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    .padding(.vertical, 8)
-                    .id(memory.id)
-                    .listRowBackground(NativeAgentMobileTheme.Colors.contentSurface)
-                    .swipeActions(edge: .trailing) {
-                        Button(
-                            role: ButtonRole.destructive,
-                            action: { pendingDeleteMemory = memory },
-                            label: { Label("Delete", systemImage: "trash") }
-                        )
-                        .disabled(isDeleting || isSample)
-                    }
                 }
             }
         }
@@ -556,6 +581,7 @@ struct MemoryListView: View {
         .contentMargins(.top, 0, for: .scrollContent)
         .contentMargins(.bottom, 24, for: .scrollContent)
         .scrollContentBackground(.hidden)
+        .scrollDismissesKeyboard(.immediately)
         .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { _ in
             #if DEBUG
             if isSample, let i = ProcessInfo.processInfo.arguments.firstIndex(of: "-memorySampleRow"),
@@ -599,17 +625,38 @@ struct MemoryListView: View {
     }
 }
 
-private struct MemoryTagPill: View {
-    let tag: String
+/// One memory, as I would say it: the words first and large, what kind of
+/// thing it is and its tags as quiet small words under it.
+private struct MemoryCard: View {
+    let memory: MemoryRecord
+    let isDeleting: Bool
 
     var body: some View {
-        Text(tag)
-            .font(.caption)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
-            .background(NativeAgentMobileTheme.Colors.quietFill)
-            .foregroundStyle(NativeAgentMobileTheme.Colors.metadataText)
-            .clipShape(Capsule())
+        VStack(alignment: .leading, spacing: 10) {
+            Text(memory.text)
+                .font(.system(.title3, design: .serif))
+                .foregroundStyle(AlivePalette.text)
+                .lineSpacing(3)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text(MemoryWords.meta(kind: MemoryWords.kind(memory.layer),
+                                      pinned: memory.pinned == true,
+                                      importance: memory.importance,
+                                      extra: memory.tags ?? []))
+                    .font(.footnote)
+                    .foregroundStyle(AlivePalette.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 0)
+                if isDeleting {
+                    ProgressView().controlSize(.small)
+                }
+            }
+        }
+        .padding(.horizontal, 18)
+        .padding(.vertical, 16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .aliveCard()
+        .accessibilityElement(children: .combine)
     }
 }
 
@@ -625,37 +672,42 @@ struct ProposalsListView: View {
     @ObservedObject var store: MemoryStore
     var header: AnyView = AnyView(EmptyView())
 
+    private var isSample: Bool { MemorySamples.isOn && store.memoryProposals.isEmpty }
+
+    private var proposals: [MemoryProposalRecord] {
+        isSample ? MemorySamples.proposals : store.memoryProposals
+    }
+
     var body: some View {
         List {
-            header.listRowBackground(Color.clear).listRowSeparator(.hidden)
-            if !store.memoryProposals.isEmpty {
-                Section("Memory Proposals (\(store.memoryProposals.count))") {
-                    ForEach(store.memoryProposals) { proposal in
-                        MemoryProposalRow(
-                            proposal: proposal,
-                            isDeciding: store.decidingMemoryProposalIDs.contains(proposal.id),
-                            onApprove: { store.approveMemoryProposal(proposal) },
-                            onDeny: { store.rejectMemoryProposal(proposal) }
-                        )
-                    }
+            header.aliveListRow(top: 0, bottom: 10)
+            if proposals.isEmpty {
+                AliveCalmState(
+                    title: "Nothing to decide.",
+                    line: "When something seems worth keeping, I\u{2019}ll ask you here first."
+                )
+                .aliveListRow()
+            } else {
+                ForEach(proposals) { proposal in
+                    MemoryProposalRow(
+                        proposal: proposal,
+                        isDeciding: store.decidingMemoryProposalIDs.contains(proposal.id),
+                        // Sample rows are pictures only; they never reach the Mac.
+                        onApprove: { if !isSample { store.approveMemoryProposal(proposal) } },
+                        onDeny: { if !isSample { store.rejectMemoryProposal(proposal) } }
+                    )
+                    .aliveListRow(top: 5, bottom: 5)
                 }
             }
-
-            if store.memoryProposals.isEmpty {
-                AppEmptyState(
-                    title: "No memory proposals",
-                    systemImage: "lightbulb",
-                    kind: .empty,
-                    description: "Pending memory proposals will appear here."
-                )
-                .listRowBackground(Color.clear)
-                .listRowSeparator(.hidden)
-            }
         }
-        .listStyle(.insetGrouped)
+        .listStyle(.plain)
+        .contentMargins(.top, 0, for: .scrollContent)
+        .contentMargins(.bottom, 24, for: .scrollContent)
+        .scrollContentBackground(.hidden)
     }
 }
 
+/// Something I would like to remember, and your two answers.
 struct MemoryProposalRow: View {
     let proposal: MemoryProposalRecord
     let isDeciding: Bool
@@ -663,51 +715,51 @@ struct MemoryProposalRow: View {
     let onDeny: () -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text(proposal.displayText ?? proposal.text)
-                .font(AppFont.body)
-                .lineLimit(3)
-
-            Text(proposal.evidenceSummary)
-                .font(AppFont.label)
-                .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
-
-            HStack(spacing: 8) {
-                if let layer = proposal.layer {
-                    Text(layer)
-                        .font(AppFont.label)
-                        .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
-                }
-                Spacer(minLength: 8)
-                if let imp = proposal.importance {
-                    Text(String(format: "importance %.0f%%", imp * 100))
-                        .font(AppFont.tag)
-                        .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
-                }
+        VStack(alignment: .leading, spacing: 14) {
+            VStack(alignment: .leading, spacing: 8) {
+                Text(proposal.displayText ?? proposal.text)
+                    .font(.system(.title3, design: .serif))
+                    .foregroundStyle(AlivePalette.text)
+                    .lineSpacing(3)
+                    .lineLimit(4)
+                    .fixedSize(horizontal: false, vertical: true)
+                Text(MemoryWords.meta(kind: MemoryWords.kind(proposal.layer),
+                                      pinned: false,
+                                      importance: proposal.importance,
+                                      extra: [MemoryWords.evidence(proposal)]))
+                    .font(.footnote)
+                    .foregroundStyle(AlivePalette.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
+            .accessibilityElement(children: .combine)
 
-            HStack(spacing: 10) {
-                if isDeciding {
-                    ProgressView()
-                        .controlSize(.small)
+            MobileAdaptiveRow(spacing: 10) {
+                Button(action: onDeny) {
+                    Text("Discard").frame(maxWidth: .infinity)
                 }
-                Spacer(minLength: 8)
-                Button(role: .destructive, action: onDeny) {
-                    Label("Deny", systemImage: "xmark")
-                }
-                .buttonStyle(.bordered)
-                .disabled(isDeciding)
+                .aliveSecondaryButton()
+                .accessibilityLabel("Discard this memory")
 
                 Button(action: onApprove) {
-                    Label("Approve", systemImage: "checkmark")
+                    Group {
+                        if isDeciding {
+                            ProgressView().tint(.white)
+                        } else {
+                            Text("Keep")
+                        }
+                    }
+                    .frame(maxWidth: .infinity)
                 }
-                .buttonStyle(.borderedProminent)
-                .tint(.green)
-                .disabled(isDeciding)
+                .alivePrimaryButton()
+                .accessibilityLabel("Keep this memory")
             }
-            .font(AppFont.label)
+            .font(.body.weight(.semibold))
+            .controlSize(.large)
+            .disabled(isDeciding)
         }
-        .padding(.vertical, 4)
+        .padding(18)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .aliveCard()
     }
 }
 

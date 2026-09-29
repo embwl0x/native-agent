@@ -286,7 +286,7 @@ struct ToolPillView: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .focusable()
+            .buttonFocusable()
             .shellKeyboardTarget(.receipt)
             .onKeyPress(.return) { toggleDetails(); return .handled }
             .onKeyPress(.space) { toggleDetails(); return .handled }

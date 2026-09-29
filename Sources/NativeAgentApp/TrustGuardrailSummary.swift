@@ -17,6 +17,7 @@
 // every row's actual switch lives in a panel further down the same page.
 
 import SwiftUI
+import TrustCenter
 
 /// How alarming a summary row should look. Purely presentational.
 enum TrustGuardrailTone: String, Hashable, Sendable {
@@ -358,7 +359,7 @@ enum TrustGuardrailSummary {
 
 // MARK: - Panel
 
-/// The live summary panel. Reads the same `appModel.trustPolicy` the rest of
+/// The live summary panel. Reads the same `appModel.engine.trust.policy` the rest of
 /// the page already loaded — no extra fetch, no extra state.
 struct TrustGuardrailSummaryPanel: View {
     @Environment(AppModel.self) private var appModel
@@ -366,7 +367,7 @@ struct TrustGuardrailSummaryPanel: View {
     let accessMode: String
 
     private var rows: [TrustGuardrailRow] {
-        TrustGuardrailSummary.rows(policy: appModel.trustPolicy, accessMode: accessMode)
+        TrustGuardrailSummary.rows(policy: appModel.engine.trust.policy, accessMode: accessMode)
     }
 
     var body: some View {
@@ -442,7 +443,7 @@ private struct TrustGuardrailRowView: View {
                 .fixedSize(horizontal: false, vertical: true)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .textSelection(.enabled)
+        // macOS 27: selectable text + a custom accessibility label loops SwiftUI AX and crashes the app.
         .accessibilityElement(children: .combine)
         .accessibilityLabel("\(row.title): \(row.value). \(row.detail)")
     }

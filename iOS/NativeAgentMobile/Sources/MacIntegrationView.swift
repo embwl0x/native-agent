@@ -29,17 +29,17 @@ struct MacIntegrationRow: Identifiable {
 
 enum MacIntegrationCatalog {
     static let rows: [MacIntegrationRow] = [
-        .init(id: "calendar",       displayName: "Calendar",            description: "Read upcoming events + create/modify events",                       icon: "calendar",                              supportsRead: true,  supportsWrite: true,  defaultRead: true,  defaultWrite: false),
-        .init(id: "reminders",      displayName: "Reminders",           description: "Read due reminders + create/check off",                              icon: "checklist",                             supportsRead: true,  supportsWrite: true,  defaultRead: true,  defaultWrite: false),
-        .init(id: "contacts",       displayName: "Contacts",            description: "Look up contacts + create/edit (write OFF by default)",              icon: "person.crop.circle",                    supportsRead: true,  supportsWrite: true,  defaultRead: true,  defaultWrite: false),
-        .init(id: "mail",           displayName: "Mail",                description: "Read inbox + manage messages (write OFF by default)",                icon: "envelope",                              supportsRead: true,  supportsWrite: true,  defaultRead: true,  defaultWrite: false),
-        .init(id: "messages",       displayName: "Messages",            description: "Read recent threads + send iMessage (write OFF by default)",         icon: "message",                               supportsRead: true,  supportsWrite: true,  defaultRead: true,  defaultWrite: false),
-        .init(id: "notes",          displayName: "Notes",               description: "Search + create/update Apple Notes (write OFF by default)",          icon: "note.text",                             supportsRead: true,  supportsWrite: true,  defaultRead: true,  defaultWrite: false),
-        .init(id: "music",          displayName: "Music",               description: "Search library + control playback (write OFF by default)",           icon: "music.note",                            supportsRead: true,  supportsWrite: true,  defaultRead: true,  defaultWrite: false),
-        .init(id: "notify_mac",     displayName: "Mac Notifications",   description: "Send Mac notifications",                                             icon: "bell",                                  supportsRead: false, supportsWrite: true,  defaultRead: false, defaultWrite: true),
-        .init(id: "notify_mobile",  displayName: "iPhone Notifications", description: "Send notifications to paired iPhone",                              icon: "iphone.radiowaves.left.and.right",      supportsRead: false, supportsWrite: true,  defaultRead: false, defaultWrite: true),
-        .init(id: "spotlight",      displayName: "Spotlight Search",    description: "Search via Spotlight",                                               icon: "magnifyingglass",                       supportsRead: true,  supportsWrite: false, defaultRead: true,  defaultWrite: false),
-        .init(id: "scheduler",      displayName: "Scheduler",           description: "Schedule future-firing jobs",                                        icon: "clock",                                 supportsRead: false, supportsWrite: true,  defaultRead: false, defaultWrite: true),
+        .init(id: "calendar",       displayName: "Calendar",             description: "See upcoming events; add and change them.",       icon: "calendar",                         supportsRead: true,  supportsWrite: true,  defaultRead: true,  defaultWrite: false),
+        .init(id: "reminders",      displayName: "Reminders",            description: "See what’s due; add reminders and check them off.", icon: "checklist",                        supportsRead: true,  supportsWrite: true,  defaultRead: true,  defaultWrite: false),
+        .init(id: "contacts",       displayName: "Contacts",             description: "Look people up; add and edit cards.",             icon: "person.crop.circle",               supportsRead: true,  supportsWrite: true,  defaultRead: true,  defaultWrite: false),
+        .init(id: "mail",           displayName: "Mail",                 description: "Read your inbox; file and manage messages.",      icon: "envelope",                         supportsRead: true,  supportsWrite: true,  defaultRead: true,  defaultWrite: false),
+        .init(id: "messages",       displayName: "Messages",             description: "Read recent threads; send iMessages.",            icon: "message",                          supportsRead: true,  supportsWrite: true,  defaultRead: true,  defaultWrite: false),
+        .init(id: "notes",          displayName: "Notes",                description: "Search your notes; write and update them.",       icon: "note.text",                        supportsRead: true,  supportsWrite: true,  defaultRead: true,  defaultWrite: false),
+        .init(id: "music",          displayName: "Music",                description: "Search your library; play and pause.",            icon: "music.note",                       supportsRead: true,  supportsWrite: true,  defaultRead: true,  defaultWrite: false),
+        .init(id: "notify_mac",     displayName: "Mac notifications",    description: "Post a notification on the Mac.",                 icon: "bell",                             supportsRead: false, supportsWrite: true,  defaultRead: false, defaultWrite: true),
+        .init(id: "notify_mobile",  displayName: "iPhone notifications", description: "Post a notification on this iPhone.",             icon: "iphone.radiowaves.left.and.right", supportsRead: false, supportsWrite: true,  defaultRead: false, defaultWrite: true),
+        .init(id: "spotlight",      displayName: "Spotlight",            description: "Search the Mac with Spotlight.",                  icon: "magnifyingglass",                  supportsRead: true,  supportsWrite: false, defaultRead: true,  defaultWrite: false),
+        .init(id: "scheduler",      displayName: "Scheduler",            description: "Set things to happen later.",                     icon: "clock",                            supportsRead: false, supportsWrite: true,  defaultRead: false, defaultWrite: true),
     ]
 }
 
@@ -48,11 +48,9 @@ enum MacIntegrationProjectionPresentation {
     static let awaitingMacTitle = "Not yet received from the Mac"
     static let awaitingMacDetail = """
         This iPhone has not received the permission matrix from your Mac yet, \
-        so nothing below is confirmed policy. The rows show NativeAgent's \
-        built-in defaults as a placeholder only; open the Mac app (and check \
-        pairing) to publish the real settings.
+        so no switches show here: nothing below is confirmed policy. Open the \
+        Mac app to publish the real settings.
         """
-    static let placeholderRowNote = "Placeholder default \u{00b7} not confirmed by the Mac"
 }
 
 // MARK: - MacIntegrationView
@@ -60,75 +58,55 @@ enum MacIntegrationProjectionPresentation {
 struct MacIntegrationView: View {
     @StateObject private var sync = MacIntegrationPermissionsSync.shared
     @ObservedObject private var identity = iCloudSyncEngine.shared
+    @EnvironmentObject private var pairingStore: PairingStore
+
+    /// Design screenshots show the matrix as the Mac would publish it.
+    private var isDesignSample: Bool { MobileDesignSamples.screen != nil }
 
     var body: some View {
-        List {
-            Section {
-                Text("These toggles control what \(identity.agentDisplayName) can do on your Mac when you ask. Each change is signed, applied by the Mac, and read back before it is accepted.")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            } header: {
-                Label("Mac Integration", systemImage: "macbook.and.iphone")
-                    .font(.headline)
+        let paired = pairingStore.isPaired
+        // Only values the Mac published; a design screenshot stands in for
+        // them on a paired phone. Never a built-in default dressed as policy.
+        let showsValues = sync.hasMacProjection || (isDesignSample && paired)
+        AlivePage(title: "Mac Integration", line: "What I may read or change on your Mac.") {
+            if !paired {
+                AliveUnpairedReason()
             }
-
             if let projectionError = sync.projectionError {
-                Section {
+                AliveSection("Permission sync unavailable") {
                     Text(projectionError)
-                        .font(.callout)
-                        .foregroundStyle(.red)
+                        .font(.subheadline)
+                        .foregroundStyle(NativeAgentMobileTheme.Colors.trouble)
                         .fixedSize(horizontal: false, vertical: true)
-                } header: {
-                    Label("Mac Permission Sync Unavailable", systemImage: "exclamationmark.triangle")
-                        .font(.headline)
+                        .aliveRow()
                 }
             }
 
             // Sweep 2026-09-01 item 36. Before this, a phone that had never
             // received a projection rendered the eleven hardcoded defaults as
             // a live, editable, authoritative matrix with no error anywhere.
-            if case .awaitingMac = sync.projectionState {
-                Section {
-                    Text(MacIntegrationProjectionPresentation.awaitingMacDetail)
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                } header: {
-                    Label(
-                        MacIntegrationProjectionPresentation.awaitingMacTitle,
-                        systemImage: "icloud.slash"
-                    )
-                    .font(.headline)
-                }
+            if case .awaitingMac = sync.projectionState, !isDesignSample, paired {
+                AliveCalmState(
+                    title: MacIntegrationProjectionPresentation.awaitingMacTitle,
+                    line: MacIntegrationProjectionPresentation.awaitingMacDetail
+                )
             }
 
-            ForEach(MacIntegrationCatalog.rows) { row in
-                Section {
+            AliveSection(
+                "Apps",
+                footer: "Your Mac owns these. Each change is signed, applied there, and read back before it counts."
+            ) {
+                ForEach(Array(MacIntegrationCatalog.rows.enumerated()), id: \.element.id) { index, row in
+                    if index > 0 { AliveDivider() }
                     MacIntegrationRowView(
                         row: row,
                         sync: sync,
-                        isPlaceholder: !sync.hasMacProjection
+                        showsValues: showsValues,
+                        locked: !paired || !showsValues
                     )
                 }
             }
-
-            Section {
-                Text("The Mac owns these settings and publishes the current result through iCloud. The Mac runtime checks them before reading from or writing to any surface above.")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            } header: {
-                Label("About", systemImage: "info.circle")
-                    .font(.headline)
-            }
         }
-        .mobileReadingScreen()
-        .navigationTitle("Mac Integration")
-        .navigationBarTitleDisplayMode(.inline)
-        .safeAreaInset(edge: .top, spacing: 0) {
-                MacStatusChip().frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 16)
-            }
         .macSyncErrorBanner()
         .refreshable {
             await refreshMacIntegrationProjection()
@@ -149,17 +127,17 @@ struct MacIntegrationView: View {
 private struct MacIntegrationRowView: View {
     let row: MacIntegrationRow
     @ObservedObject var sync: MacIntegrationPermissionsSync
-    /// True while the Mac has published nothing readable. The toggles then
-    /// show the built-in default, labelled as such, and cannot be moved —
-    /// editing a value the Mac never sent would write policy against a matrix
-    /// nobody has seen.
-    var isPlaceholder: Bool = false
+    /// False while the Mac has published nothing readable: no switch then,
+    /// because a switch would show a value nobody sent.
+    var showsValues = true
+    /// Unpaired or unpublished: switches are off and dimmed. Editing a value
+    /// the Mac never sent would write policy against a matrix nobody has seen.
+    var locked = false
     @State private var isSaving = false
     @State private var saveError: String?
 
     // Mirror the supported axes via Binding<Bool> so the Toggle drives the
-    // KVS write through the sync store. Toggles for unsupported axes render
-    // disabled with their default-false state.
+    // KVS write through the sync store. Only supported axes get a switch.
     private var readBinding: Binding<Bool> {
         Binding(
             get: { sync.get(id: row.id, mode: "read") },
@@ -179,66 +157,61 @@ private struct MacIntegrationRowView: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            MobileAdaptiveRow(spacing: 12) {
-                Image(systemName: row.icon)
-                    .font(.title3)
-                    .foregroundStyle(.secondary)
-                    .frame(width: 28)
-                VStack(alignment: .leading, spacing: 4) {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .center, spacing: 12) {
+                VStack(alignment: .leading, spacing: 3) {
                     Text(row.displayName)
-                        .font(.callout)
-                        .fontWeight(.semibold)
+                        .font(.body)
+                        .foregroundStyle(AlivePalette.text)
                     Text(row.description)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .font(.subheadline)
+                        .foregroundStyle(AlivePalette.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
-                Spacer(minLength: 0)
-            }
-
-            Divider()
-                .padding(.vertical, 2)
-
-            MobileAdaptiveRow(spacing: 16) {
-                Toggle(isOn: readBinding) {
-                    Label("Read", systemImage: "eye")
-                        .font(.callout)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                // A single-axis app is one switch beside its name.
+                if showsValues && row.supportsRead != row.supportsWrite {
+                    Toggle(row.displayName, isOn: row.supportsRead ? readBinding : writeBinding)
+                        .labelsHidden()
+                        .hazeTinted()
+                        .disabled(isSaving)
+                        .aliveUnavailable(locked)
                 }
-                .toggleStyle(.switch)
-                .tint(NativeAgentMobileTheme.Colors.accentText)
-                .disabled(!row.supportsRead || isSaving || isPlaceholder)
-                .opacity(row.supportsRead ? 1.0 : 0.4)
-
-                Toggle(isOn: writeBinding) {
-                    Label("Write", systemImage: "pencil")
-                        .font(.callout)
-                }
-                .toggleStyle(.switch)
-                .tint(NativeAgentMobileTheme.Colors.accentText)
-                .disabled(!row.supportsWrite || isSaving || isPlaceholder)
-                .opacity(row.supportsWrite ? 1.0 : 0.4)
             }
-            if isPlaceholder {
-                Label(
-                    MacIntegrationProjectionPresentation.placeholderRowNote,
-                    systemImage: "questionmark.circle"
-                )
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            // Both axes: two labelled switches under the name.
+            if showsValues && row.supportsRead && row.supportsWrite {
+                HStack(spacing: 28) {
+                    axisToggle("Read", isOn: readBinding).fixedSize()
+                    axisToggle("Change", isOn: writeBinding).fixedSize()
+                    Spacer(minLength: 0)
+                }
             }
             if let saveError {
                 Text(saveError)
-                    .font(.caption)
-                    .foregroundStyle(.red)
+                    .font(.footnote)
+                    .foregroundStyle(NativeAgentMobileTheme.Colors.trouble)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
-        .padding(.vertical, 4)
+        .aliveRow()
+    }
+
+    private func axisToggle(_ title: String, isOn: Binding<Bool>) -> some View {
+        Toggle(isOn: isOn) {
+            Text(title)
+                .font(.subheadline)
+                .foregroundStyle(AlivePalette.text)
+        }
+        .toggleStyle(.switch)
+        .hazeTinted()
+        .disabled(isSaving)
+        .aliveUnavailable(locked)
+        .accessibilityLabel("\(row.displayName): \(title)")
     }
 
     private func update(read: Bool, write: Bool) {
         // Never write a "change" measured against a matrix the Mac never sent.
-        guard !isSaving, !isPlaceholder else { return }
+        guard !isSaving, !locked else { return }
         let previousRead = sync.get(id: row.id, mode: "read")
         let previousWrite = sync.get(id: row.id, mode: "write")
         sync.applyProjection(

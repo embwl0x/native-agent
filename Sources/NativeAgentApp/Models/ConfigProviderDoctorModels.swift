@@ -1,285 +1,23 @@
+import ProviderRouting
+import DoctorChecks
 import Foundation
 import Observation
 import NativeAgentShared
 import PersistenceCore
+import MemoryV2
+import TrustCenter
+import TelegramBot
 
-struct AppConfig: Codable, Hashable {
+struct AppConfig: Equatable {
     var searxngBaseURL: String?
     var searxngDetected: Bool?
-    var telegram: TelegramConfig?
+    var telegram: TelegramConfigurationSummary?
     var codexAuth: CodexAuthStatus?
     var modelRouting: ModelRoutingConfig?
     var autoDoctor: AutoDoctorConfig?
 }
 
-struct AutoDoctorConfig: Codable, Hashable {
-    var enabled: Bool?
-    var runOnStartup: Bool?
-    var intervalSeconds: Int?
-    var usesModelCalls: Bool?
-    var checkLLM: Bool?
-}
-
-struct TelegramConfig: Codable, Hashable {
-    var tokenConfigured: Bool?
-    var allowedChatIds: [String]?
-    var allowedUserIds: [String]?
-    var requireMention: Bool?
-    var enabled: Bool?
-    var model: String?
-    var reasoningEffort: String?
-}
-
-struct TelegramStatus: Codable, Hashable {
-    var enabled: Bool
-    var tokenConfigured: Bool
-    var allowedChatIds: [String]
-    var allowedUserIds: [String]
-    var requireMention: Bool
-    var model: String?
-    var reasoningEffort: String?
-    var pollerEnabled: Bool
-    var lastSeenUpdateId: Int?
-    var lastSeenAt: String?
-    var lastReplyAt: String?
-    var lastError: String?
-    /// Consecutive long-poll transport failures. A successful poll resets this
-    /// to zero in the canonical Telegram state file.
-    var pollBackoffFailures: Int?
-    var lastPollAt: String?
-    var lastDiagnosticsClearedAt: String?
-    var voiceTranscription: TelegramVoiceTranscriptionStatus?
-    var receipts: [TelegramReceipt]
-    var blocked: [TelegramBlockedEvent]
-    var errors: [TelegramErrorEvent]
-    /// Existing diagnostic bytes that cannot be decoded are unavailable, not an
-    /// empty feed. The settings page renders these separately from empty state.
-    var receiptsIssue: String? = nil
-    var blockedIssue: String? = nil
-    var errorsIssue: String? = nil
-}
-
-extension TelegramStatus {
-    var normalizedLastError: String? {
-        guard let value = lastError?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !value.isEmpty else { return nil }
-        return value
-    }
-
-    /// Telegram long polling is a retrying transport. One or two consecutive
-    /// interruptions while the canonical poller is still running are
-    /// observations, not an outage. The third consecutive failure becomes
-    /// actionable so a genuinely unreachable bot still surfaces promptly.
-    var isTransientPollInterruption: Bool {
-        guard pollerEnabled,
-              let error = normalizedLastError,
-              error.lowercased().hasPrefix("poll:") else { return false }
-        return (pollBackoffFailures ?? 0) < 3
-    }
-
-    var actionableError: String? {
-        isTransientPollInterruption ? nil : normalizedLastError
-    }
-
-    var isOperational: Bool {
-        enabled && tokenConfigured && pollerEnabled && actionableError == nil
-    }
-}
-
-struct TelegramVoiceTranscriptionStatus: Codable, Hashable {
-    var enabled: Bool
-    var backend: String
-    var model: String
-    var maxBytes: Int
-}
-
-struct TelegramReceipt: Identifiable, Codable, Hashable {
-    var eventId: String?
-    var at: String
-    var kind: String?
-    var chatId: String?
-    var userId: String?
-    var updateId: Int?
-    var messageId: Int?
-    var textPreview: String?
-    var replyPreview: String?
-    var model: String?
-    var reasoningEffort: String?
-
-    var id: String { eventId ?? "\(at)-\(chatId ?? "")-\(messageId ?? 0)" }
-
-    enum CodingKeys: String, CodingKey {
-        case eventId = "id"
-        case at
-        case kind
-        case chatId
-        case userId
-        case updateId
-        case messageId
-        case textPreview
-        case replyPreview
-        case model
-        case reasoningEffort
-    }
-}
-
-struct ReasoningEffortOption: Identifiable, Codable, Hashable {
-    var id: String
-    var label: String
-    var description: String?
-}
-
-struct ModelCatalogItem: Identifiable, Codable, Hashable {
-    var id: String
-    var displayName: String
-    var description: String?
-    var defaultReasoningEffort: String?
-    var supportedReasoningEfforts: [String]?
-    var supportsFast: Bool?
-    var priority: Int?
-}
-
-struct ModelSurfacePreference: Codable, Hashable {
-    var surface: String?
-    var model: String
-    var reasoningEffort: String
-    var serviceTier: String? = nil
-    var source: String?
-    var modelKnown: Bool?
-}
-
-struct ModelRoutingCurrent: Codable, Hashable {
-    var chat: ModelSurfacePreference
-    var telegram: ModelSurfacePreference
-    // FIX: the other 6 routing surfaces silently dropped on decode because they
-    // were never declared. Optional so they don't break existing chat/telegram.
-    var ios: ModelSurfacePreference?
-    var executions: ModelSurfacePreference?
-    var autonomy: ModelSurfacePreference?
-    var swarms: ModelSurfacePreference?
-    var dream: ModelSurfacePreference?
-    var training: ModelSurfacePreference?
-
-    enum CodingKeys: String, CodingKey {
-        case chat, telegram, ios, autonomy, swarms, dream, training
-        case executions = "workshop"
-        // P2-3: the routing-config surface key was `missions` through 0.3.7.
-        // The runtime emits `workshop` now, but a cached/older routing payload
-        // (or an iOS build a version behind) can still carry the old key, so
-        // `executions` decodes new-then-old and encodes only the new one.
-        case legacyExecutions = "missions"
-    }
-
-    // Restated because the custom `init(from:)` below suppresses synthesis.
-    init(
-        chat: ModelSurfacePreference,
-        telegram: ModelSurfacePreference,
-        ios: ModelSurfacePreference? = nil,
-        executions: ModelSurfacePreference? = nil,
-        autonomy: ModelSurfacePreference? = nil,
-        swarms: ModelSurfacePreference? = nil,
-        dream: ModelSurfacePreference? = nil,
-        training: ModelSurfacePreference? = nil
-    ) {
-        self.chat = chat
-        self.telegram = telegram
-        self.ios = ios
-        self.executions = executions
-        self.autonomy = autonomy
-        self.swarms = swarms
-        self.dream = dream
-        self.training = training
-    }
-
-    init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        chat = try c.decode(ModelSurfacePreference.self, forKey: .chat)
-        telegram = try c.decode(ModelSurfacePreference.self, forKey: .telegram)
-        ios = try c.decodeIfPresent(ModelSurfacePreference.self, forKey: .ios)
-        executions = try c.decodeIfPresent(ModelSurfacePreference.self, forKey: .executions)
-            ?? c.decodeIfPresent(ModelSurfacePreference.self, forKey: .legacyExecutions)
-        autonomy = try c.decodeIfPresent(ModelSurfacePreference.self, forKey: .autonomy)
-        swarms = try c.decodeIfPresent(ModelSurfacePreference.self, forKey: .swarms)
-        dream = try c.decodeIfPresent(ModelSurfacePreference.self, forKey: .dream)
-        training = try c.decodeIfPresent(ModelSurfacePreference.self, forKey: .training)
-    }
-
-    func encode(to encoder: Encoder) throws {
-        var c = encoder.container(keyedBy: CodingKeys.self)
-        try c.encode(chat, forKey: .chat)
-        try c.encode(telegram, forKey: .telegram)
-        try c.encodeIfPresent(ios, forKey: .ios)
-        try c.encodeIfPresent(executions, forKey: .executions)
-        try c.encodeIfPresent(autonomy, forKey: .autonomy)
-        try c.encodeIfPresent(swarms, forKey: .swarms)
-        try c.encodeIfPresent(dream, forKey: .dream)
-        try c.encodeIfPresent(training, forKey: .training)
-    }
-}
-
-struct ModelRoutingConfig: Codable, Hashable {
-    var status: String?
-    var defaultModel: String?
-    var fallbackModels: [String]?
-    var reasoningEfforts: [ReasoningEffortOption]?
-    var current: ModelRoutingCurrent
-}
-
-struct ModelCatalogResponse: Codable, Hashable {
-    var status: String
-    var source: String?
-    var defaultModel: String
-    var fallbackModels: [String]
-    var models: [ModelCatalogItem]
-    var reasoningEfforts: [ReasoningEffortOption]
-    var current: ModelRoutingCurrent
-    var updatedAt: String?
-    /// User, 2026-09-06: where the discovered provider rows in this response
-    /// actually came from — `live`, `cached`, `stale`, `built_in`,
-    /// `built_in_stale`. A failed refresh used to be indistinguishable from a
-    /// successful one, so the Providers UI reported "Model catalog refreshed"
-    /// for a refresh that never reached the network. Additive and optional:
-    /// a persisted `models.json` written before this decodes exactly as before.
-    var catalogFreshness: String?
-}
-
-struct TelegramBlockedEvent: Identifiable, Codable, Hashable {
-    var eventId: String?
-    var at: String
-    var reason: String?
-    var chatId: String?
-    var userId: String?
-    var updateId: Int?
-    var textPreview: String?
-
-    var id: String { eventId ?? "\(at)-\(chatId ?? "")-\(userId ?? "")-\(reason ?? "")" }
-
-    enum CodingKeys: String, CodingKey {
-        case eventId = "id"
-        case at
-        case reason
-        case chatId
-        case userId
-        case updateId
-        case textPreview
-    }
-}
-
-struct TelegramErrorEvent: Identifiable, Codable, Hashable {
-    var eventId: String?
-    var at: String
-    var context: String?
-    var error: String
-
-    var id: String { eventId ?? "\(at)-\(context ?? "")-\(error)" }
-
-    enum CodingKeys: String, CodingKey {
-        case eventId = "id"
-        case at
-        case context
-        case error
-    }
-}
+typealias AutoDoctorConfig = DoctorChecks.AutoDoctorConfig
 
 struct TelegramTestResponse: Codable, Hashable {
     var ok: Bool
@@ -293,6 +31,89 @@ struct TelegramTestResponse: Codable, Hashable {
     var tokenConfigured: Bool?
     var pollerRegistered: Bool?
     var pollerTicking: Bool?
+
+    init(result: TelegramTestResult) throws {
+        let row = try TelegramReplyFields(result.rawResponse)
+        ok = try row.required("ok") { if case .bool(let b) = $0 { return b }; return nil }
+        chatId = try row.required("chatId", TelegramReplyFields.string)
+        messageId = try row.optional("messageId", TelegramReplyFields.integer)
+        tokenConfigured = try row.optional("tokenConfigured", TelegramReplyFields.boolean)
+        pollerRegistered = try row.optional("pollerRegistered", TelegramReplyFields.boolean)
+        pollerTicking = try row.optional("pollerTicking", TelegramReplyFields.boolean)
+        if let raw = try row.optional("receipt", { $0 }) {
+            let receiptRow = try TelegramReplyFields(raw)
+            receipt = TelegramReceipt(
+                eventId: try receiptRow.optional("id", TelegramReplyFields.string),
+                at: try receiptRow.required("at", TelegramReplyFields.string),
+                kind: try receiptRow.optional("kind", TelegramReplyFields.string),
+                chatId: try receiptRow.optional("chatId", TelegramReplyFields.string),
+                userId: try receiptRow.optional("userId", TelegramReplyFields.string),
+                updateId: try receiptRow.optional("updateId", TelegramReplyFields.integer),
+                messageId: try receiptRow.optional("messageId", TelegramReplyFields.integer),
+                textPreview: try receiptRow.optional("textPreview", TelegramReplyFields.string),
+                replyPreview: try receiptRow.optional("replyPreview", TelegramReplyFields.string),
+                model: try receiptRow.optional("model", TelegramReplyFields.string),
+                reasoningEffort: try receiptRow.optional("reasoningEffort", TelegramReplyFields.string)
+            )
+        }
+    }
+}
+
+private struct TelegramReplyFields {
+    let fields: [String: JSONValue]
+
+    init(_ value: JSONValue) throws {
+        guard case .object(let fields) = value else {
+            throw DecodingError.typeMismatch([String: JSONValue].self,
+                .init(codingPath: [], debugDescription: "A Telegram reply is a JSON object."))
+        }
+        self.fields = fields
+    }
+
+    func optional<T>(_ key: String, _ read: (JSONValue) -> T?) throws -> T? {
+        guard let raw = fields[key], raw != .null else { return nil }
+        guard let value = read(raw) else {
+            throw DecodingError.typeMismatch(T.self,
+                .init(codingPath: [Key(stringValue: key)], debugDescription: "Invalid Telegram reply field: \(key)"))
+        }
+        return value
+    }
+
+    func required<T>(_ key: String, _ read: (JSONValue) -> T?) throws -> T {
+        let codingKey = Key(stringValue: key)
+        guard fields[key] != nil else {
+            throw DecodingError.keyNotFound(codingKey,
+                .init(codingPath: [], debugDescription: "Missing Telegram reply field: \(key)"))
+        }
+        guard let value = try optional(key, read) else {
+            throw DecodingError.valueNotFound(T.self,
+                .init(codingPath: [codingKey], debugDescription: "Null Telegram reply field: \(key)"))
+        }
+        return value
+    }
+
+    static func string(_ value: JSONValue) -> String? {
+        if case .string(let s) = value { return s }; return nil
+    }
+
+    static func boolean(_ value: JSONValue) -> Bool? {
+        if case .bool(let b) = value { return b }; return nil
+    }
+
+    static func integer(_ value: JSONValue) -> Int? {
+        switch value {
+        case .int(let i): return Int(exactly: i)
+        case .double(let d): return Int(exactly: d)
+        default: return nil
+        }
+    }
+
+    private struct Key: CodingKey {
+        let stringValue: String
+        var intValue: Int? { nil }
+        init(stringValue: String) { self.stringValue = stringValue }
+        init?(intValue: Int) { return nil }
+    }
 }
 
 struct DetectSearXNGResponse: Codable, Hashable {
@@ -300,43 +121,6 @@ struct DetectSearXNGResponse: Codable, Hashable {
     var baseURL: String?
     var source: String?
     var error: String?
-}
-
-struct CodexAuthStatus: Codable, Hashable {
-    var active: String
-    var appOwnedLoggedIn: Bool
-    var sharedLoggedIn: Bool
-    var codexHome: String
-    var detail: String
-}
-
-struct CodexDeviceLogin: Codable, Hashable {
-    var running: Bool?
-    var pid: Int?
-    var url: String?
-    var code: String?
-    var expiresInMinutes: Int?
-    var openedBrowser: Bool?
-    var codexHome: String?
-    var loginCommand: String?
-    var detail: String?
-    var exitCode: Int?
-    var startedAt: String?
-    var finishedAt: String?
-}
-
-struct DoctorReport: Codable, Hashable {
-    var status: String
-    var repaired: Bool
-    var checks: [DoctorCheck]
-}
-
-struct DoctorCheck: Identifiable, Codable, Hashable {
-    var id: String
-    var title: String
-    var status: String
-    var detail: String
-    var repair: String?
 }
 
 // PATCH-2026-05-06: skill-ui Models — skill manifest + registry types for lifecycle UI
@@ -425,63 +209,8 @@ struct SkillInfo: Identifiable {
     }
 }
 
-// PATCH-2026-05-07: self-improvement-ui Beyond B.1/B.3 — training + promotion models
-
-struct TrustPromotionPolicy: Codable, Hashable {
-    var enabled: Bool = false
-    var auto_promote_tier_a: Bool = false
-    var run_smoke_in_harness: Bool = true
-}
-
-// PATCH-2026-05-07: living-memory Trust gates for living memory system
-struct TrustMemoryPolicy: Codable, Hashable {
-    var consolidation_enabled: Bool = false
-    var cross_session_recall: Bool = true
-    var auto_promote_consolidated: Bool = false
-    var knowledge_graph_enabled: Bool = true
-    var adaptive_promotion: Bool = false
-    var hygiene_enabled: Bool = true
-    var hygiene_interval_hours: Double = 6
-    var archive_noisy_reflections: Bool = true
-    var reject_low_value_proposals: Bool = true
-
-    init(
-        consolidation_enabled: Bool = false,
-        cross_session_recall: Bool = true,
-        auto_promote_consolidated: Bool = false,
-        knowledge_graph_enabled: Bool = true,
-        adaptive_promotion: Bool = false,
-        hygiene_enabled: Bool = true,
-        hygiene_interval_hours: Double = 6,
-        archive_noisy_reflections: Bool = true,
-        reject_low_value_proposals: Bool = true
-    ) {
-        self.consolidation_enabled = consolidation_enabled
-        self.cross_session_recall = cross_session_recall
-        self.auto_promote_consolidated = auto_promote_consolidated
-        self.knowledge_graph_enabled = knowledge_graph_enabled
-        self.adaptive_promotion = adaptive_promotion
-        self.hygiene_enabled = hygiene_enabled
-        self.hygiene_interval_hours = hygiene_interval_hours
-        self.archive_noisy_reflections = archive_noisy_reflections
-        self.reject_low_value_proposals = reject_low_value_proposals
-    }
-
-    init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        consolidation_enabled = try c.decodeIfPresent(Bool.self, forKey: .consolidation_enabled) ?? false
-        cross_session_recall = try c.decodeIfPresent(Bool.self, forKey: .cross_session_recall) ?? true
-        auto_promote_consolidated = try c.decodeIfPresent(Bool.self, forKey: .auto_promote_consolidated) ?? false
-        knowledge_graph_enabled = try c.decodeIfPresent(Bool.self, forKey: .knowledge_graph_enabled) ?? true
-        adaptive_promotion = try c.decodeIfPresent(Bool.self, forKey: .adaptive_promotion) ?? false
-        hygiene_enabled = try c.decodeIfPresent(Bool.self, forKey: .hygiene_enabled) ?? true
-        hygiene_interval_hours = try c.decodeIfPresent(Double.self, forKey: .hygiene_interval_hours) ?? 6
-        archive_noisy_reflections = try c.decodeIfPresent(Bool.self, forKey: .archive_noisy_reflections) ?? true
-        reject_low_value_proposals = try c.decodeIfPresent(Bool.self, forKey: .reject_low_value_proposals) ?? true
-    }
-}
-
-// PATCH-2026-05-07: living-memory MemoryProposal model for pending-review UI
+// The phone's memory_proposals.json row (MacSyncEngine snapshots). The Mac
+// views read MemoryV2's ProposalRecord through engine.memory.
 struct MemoryProposalRecord: Codable, Identifiable, Hashable {
     var proposal_id: String
     var fact_text: String
@@ -496,14 +225,19 @@ struct MemoryProposalRecord: Codable, Identifiable, Hashable {
     var rejection_reason: String?
     var id: String { proposal_id }
 
-    var evidenceSummary: String {
-        let sessions = supporting_session_ids.count
-        if sessions == 0 {
-            return recurrence_count == 1
-                ? "Observed once; session evidence unavailable"
-                : "Observed \(recurrence_count)x; session evidence unavailable"
-        }
-        return "Observed \(recurrence_count)x in \(sessions) session\(sessions == 1 ? "" : "s")"
+    init(_ proposal: ProposalRecord) {
+        let evidence = proposal.evidence
+        proposal_id = proposal.id
+        fact_text = proposal.content
+        display_text = nil
+        supporting_session_ids = evidence.sessionIDs
+        recurrence_count = evidence.recurrenceCount
+        first_seen = proposal.createdAt
+        last_seen = proposal.createdAt
+        status = proposal.status
+        staged_at = proposal.createdAt
+        resolved_at = nil
+        rejection_reason = proposal.rejectionReason
     }
 }
 
@@ -630,38 +364,14 @@ typealias ProviderAuthStatus = NativeAgentShared.ProviderAuthStatus
 
 typealias ProviderModelInfo = NativeAgentShared.ProviderModelInfo
 
-struct ProviderInfo: Codable, Hashable, Identifiable {
-    var id: String { provider_id }
-    var provider_id: String
-    var display_name: String
-    var auth_modes: [String]
-    var auth_status: ProviderAuthStatus
-    var models: [ProviderModelInfo]
-    var auth_mode: String?
-    var default_model: String?
-}
-
 typealias ProviderTestResult = NativeAgentShared.ProviderTestResult
 
 // PATCH-2026-05-08: wave3-health-card Feature A models
-struct HealthCardSubsystem: Codable, Hashable, Identifiable {
-    var id: String
-    var label: String
-    var status: String  // "ok" | "warn" | "error"
-    var detail: String
-    var fixAction: String?
-}
-
-struct HealthCard: Codable, Hashable {
-    var overall: String  // "ok" | "warn" | "error"
-    var subsystems: [HealthCardSubsystem]
-    var createdAt: String?  // Fix 9: optional — older daemon responses may omit this
-}
-
 // Swift-native embeddings backend status payload. The field names preserve
 // the former daemon wire shape so existing UI/state decoding stays stable.
 // The active runtime is one of: CoreML MiniLM, explicit mock (config or env
 // opt-in), or fail-closed (CoreML resources missing / load failed).
+
 struct EmbeddingsStatus: Codable, Hashable {
     var libraryAvailable: Bool
     var modelLoadable: Bool?

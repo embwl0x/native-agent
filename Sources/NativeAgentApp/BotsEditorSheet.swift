@@ -35,23 +35,12 @@ struct BotsEditorSheet: View {
     @State private var condition = ""
     @State private var providers: [ProviderThenModelPicker.Provider] = []
     @State private var error: String?
-    private var loadsProviders = true
 
     init(definition: BotDefinition?, save: @escaping (BotDefinition) throws -> Void) {
         self.definition = definition
         self.save = save
     }
 
-    #if DEBUG
-    init(snapshotProviders: [ProviderThenModelPicker.Provider], provider: String = "", model: String = "") {
-        self.definition = nil
-        self.save = { _ in }
-        self.loadsProviders = false
-        _providers = State(initialValue: snapshotProviders)
-        _provider = State(initialValue: provider)
-        _model = State(initialValue: model)
-    }
-    #endif
     private var selectedModel: ProviderThenModelPicker.Model? {
         providers.first { $0.id == provider }?.models.first { $0.id == model }
     }
@@ -78,7 +67,6 @@ struct BotsEditorSheet: View {
         }
         .padding(24).frame(width: 570)
         .task {
-            guard loadsProviders else { return }
             populate()
             switch await ProviderSettingsRefreshAction.perform(appModel: appModel, refreshCatalog: false) {
             case .loaded(let snapshot):

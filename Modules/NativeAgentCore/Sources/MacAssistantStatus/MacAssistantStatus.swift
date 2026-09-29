@@ -20,7 +20,7 @@ import TrustCenter
 
 // MARK: - Result types
 
-public struct MacAssistantAccessItem: Sendable, Equatable {
+public struct MacAssistantAccessItem: Sendable, Equatable, Identifiable {
     public let id: String
     public let title: String
     public let status: String
@@ -75,7 +75,7 @@ public struct MacAssistantAccessItem: Sendable, Equatable {
     }
 }
 
-public struct MacAssistantWatchTemplate: Sendable, Equatable {
+public struct MacAssistantWatchTemplate: Sendable, Equatable, Identifiable {
     public let id: String
     public let title: String
     public let status: String
@@ -126,26 +126,28 @@ public struct MacAssistantWatchTemplate: Sendable, Equatable {
 public struct MacAssistantStatusResult: Sendable, Equatable {
     public let status: String
     public let summary: String
-    public let access: [JSONValue]
-    public let watchTemplates: [JSONValue]
+    public let access: [MacAssistantAccessItem]
+    public let watchTemplates: [MacAssistantWatchTemplate]
     public let blockedAccessCount: Int
     public let templateAttentionCount: Int
     public let schedulerActions: [String]
     public let createsJobs: Bool
     public let lazyContract: JSONValue
     public let createdAt: String
+    private let lightweight: Bool
 
     public init(
         status: String,
         summary: String,
-        access: [JSONValue],
-        watchTemplates: [JSONValue],
+        access: [MacAssistantAccessItem],
+        watchTemplates: [MacAssistantWatchTemplate],
         blockedAccessCount: Int,
         templateAttentionCount: Int,
         schedulerActions: [String],
         createsJobs: Bool,
         lazyContract: JSONValue,
-        createdAt: String
+        createdAt: String,
+        lightweight: Bool = false
     ) {
         self.status = status
         self.summary = summary
@@ -157,14 +159,24 @@ public struct MacAssistantStatusResult: Sendable, Equatable {
         self.createsJobs = createsJobs
         self.lazyContract = lazyContract
         self.createdAt = createdAt
+        self.lightweight = lightweight
     }
 
     public func toJSON() -> JSONValue {
-        .object([
+        let accessJSON = access.map { $0.toJSON() }
+        let templatesJSON = watchTemplates.map { $0.toJSON() }
+        func project(_ rows: [JSONValue], keys: [String]) -> [JSONValue] {
+            guard lightweight else { return rows }
+            return rows.map { row in
+                guard case .object(let object) = row else { return row }
+                return .object(object.filter { keys.contains($0.key) && Self.isTruthy($0.value) })
+            }
+        }
+        return .object([
             "status": .string(status),
             "summary": .string(summary),
-            "access": .array(access),
-            "watchTemplates": .array(watchTemplates),
+            "access": .array(project(accessJSON, keys: ["id", "title", "status", "setupRoute", "nextStep"])),
+            "watchTemplates": .array(project(templatesJSON, keys: ["id", "title", "status", "summary", "scheduleLabel", "sources", "requiredAccess", "actionIds"])),
             "blockedAccessCount": .int(Int64(blockedAccessCount)),
             "templateAttentionCount": .int(Int64(templateAttentionCount)),
             "schedulerActions": .array(schedulerActions.map { .string($0) }),
@@ -609,40 +621,6 @@ public actor SwiftNativeMacAssistantStatusClient: MacAssistantStatusClient {
         let blocked = access.filter { !okStates.contains($0.status) }.count
         let templateAttention = templates.filter { $0.status != "ready" }.count
 
-        let accessJSON: [JSONValue]
-        let templatesJSON: [JSONValue]
-        if lightweight {
-            // Allow-list keys for lightweight; emit only when present + truthy
-            // (matching Python's `... and value` filter — drops "" / [] / null).
-            let accessKeys: [String] = ["id", "title", "status", "setupRoute", "nextStep"]
-            accessJSON = access.prefix(5).map { item in
-                let full = item.toJSON()
-                guard case .object(let dict) = full else { return full }
-                var out: [String: JSONValue] = [:]
-                for k in accessKeys {
-                    if let v = dict[k], MacAssistantStatusResult.isTruthy(v) {
-                        out[k] = v
-                    }
-                }
-                return .object(out)
-            }
-            let tplKeys: [String] = ["id", "title", "status", "summary", "scheduleLabel", "sources", "requiredAccess", "actionIds"]
-            templatesJSON = templates.prefix(3).map { tpl in
-                let full = tpl.toJSON()
-                guard case .object(let dict) = full else { return full }
-                var out: [String: JSONValue] = [:]
-                for k in tplKeys {
-                    if let v = dict[k], MacAssistantStatusResult.isTruthy(v) {
-                        out[k] = v
-                    }
-                }
-                return .object(out)
-            }
-        } else {
-            accessJSON = access.map { $0.toJSON() }
-            templatesJSON = templates.map { $0.toJSON() }
-        }
-
         let lazyContract: JSONValue = .object([
             "chatInjection": .string("none"),
             "watchBodiesLoaded": .bool(false),
@@ -654,14 +632,15 @@ public actor SwiftNativeMacAssistantStatusClient: MacAssistantStatusClient {
         return MacAssistantStatusResult(
             status: blocked == 0 ? "ready" : "attention",
             summary: "Mac assistant watch setup is manifest-only here; no watcher jobs are created until scheduler.schedule_job is called.",
-            access: accessJSON,
-            watchTemplates: templatesJSON,
+            access: lightweight ? Array(access.prefix(5)) : access,
+            watchTemplates: lightweight ? Array(templates.prefix(3)) : templates,
             blockedAccessCount: blocked,
             templateAttentionCount: templateAttention,
             schedulerActions: ["scheduler.schedule_job", "scheduler.create_job", "scheduler.list_jobs", "scheduler.cancel_job"],
             createsJobs: false,
             lazyContract: lazyContract,
-            createdAt: createdAt
+            createdAt: createdAt,
+            lightweight: lightweight
         )
     }
 }

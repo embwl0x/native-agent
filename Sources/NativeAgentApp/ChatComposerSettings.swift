@@ -1,3 +1,5 @@
+import ChatOrchestration
+import AppToolRuntime
 import SwiftUI
 import NativeAgentShared
 
@@ -77,6 +79,9 @@ enum ComposerPane: Hashable {
 enum ComposerShellMetrics {
     static let providerColumn: CGFloat = 260 + NativeAgentSpacing.md * 2
     static let modelsColumn: CGFloat = 240
+    static let vendorColumn: CGFloat = 190
+    /// Space between the model menu's panels.
+    static let columnGap: CGFloat = 6
     static let think: CGFloat = 262 + NativeAgentSpacing.md * 2
     static let trust: CGFloat = 404 + NativeAgentSpacing.md * 2
     static let context: CGFloat = 320 + NativeAgentSpacing.md * 2
@@ -153,9 +158,16 @@ private struct ComposerCardRectReporter: NSViewRepresentable {
             publish()
         }
 
+        private var lastReported: CGRect?
+
         func publish() {
             guard window != nil else { return }
             let windowRect = convert(bounds, to: nil)
+            // Report a move, never a redraw: writing an unchanged rect still
+            // notifies observers, which redrew the card, which reported again
+            // — an open card redrew itself every frame (User 09-27 hover jitter).
+            guard windowRect != lastReported else { return }
+            lastReported = windowRect
             DispatchQueue.main.async { [report] in report(windowRect) }
         }
     }
@@ -173,6 +185,7 @@ private struct ComposerCardOutsideClick: NSViewRepresentable {
     var cardRect: CGRect
     var flyoutRect: CGRect
     var providerColumnRect: CGRect
+    var vendorColumnRect: CGRect = .zero
     var onOutside: () -> Void
 
     func makeNSView(context: Context) -> MonitorView { MonitorView() }
@@ -181,6 +194,7 @@ private struct ComposerCardOutsideClick: NSViewRepresentable {
         view.cardRect = cardRect
         view.flyoutRect = flyoutRect
         view.providerColumnRect = providerColumnRect
+        view.vendorColumnRect = vendorColumnRect
         view.onOutside = onOutside
     }
 
@@ -191,6 +205,7 @@ private struct ComposerCardOutsideClick: NSViewRepresentable {
         var cardRect: CGRect = .zero
         var flyoutRect: CGRect = .zero
         var providerColumnRect: CGRect = .zero
+        var vendorColumnRect: CGRect = .zero
         var onOutside: (() -> Void)?
         private var monitor: Any?
 
@@ -220,7 +235,10 @@ private struct ComposerCardOutsideClick: NSViewRepresentable {
                 // outside dismisses exactly like a click outside, and passes
                 // through, so the transcript moves on the same wheel.
                 if event.type == .scrollWheel {
-                    if flyoutRect.contains(point) || providerColumnRect.contains(point) {
+                    // Every scrolling column keeps its wheel (the company column
+                    // was missing, so OpenRouter's list could not scroll, 09-27).
+                    if flyoutRect.contains(point) || providerColumnRect.contains(point)
+                        || vendorColumnRect.contains(point) {
                         return event
                     }
                     if cardRect.contains(point) { return nil }
@@ -270,11 +288,23 @@ final class ComposerShellState {
     var cardWindowRect: CGRect = .zero
     /// Which row of the models pane the keyboard is on.
     var flyoutIndex: Int?
+    /// The company open inside a provider whose models come grouped by company
+    /// (OpenRouter). Hovering a company shows only its models.
+    var flyoutVendor: String?
+    var vendorContentHeight: CGFloat = 0
+    /// Where each provider/company row sits in the model pane, so a submenu
+    /// opens level with the row it came from. Not observed: a row reporting
+    /// its place must never redraw the pane (that loop was the old jitter).
+    @ObservationIgnored var rowTop: [String: CGFloat] = [:]
+    /// Each column's visible height, read from inside the column so no value
+    /// depends on the pane's total height (that dependency looped, 09-27).
+    @ObservationIgnored var columnHeight: [String: CGFloat] = [:]
     /// Window rects of the two scrollable regions inside the shell. A scroll
     /// over either one belongs to it; nothing reaches the transcript while the
     /// shell is open.
     var modelsWindowRect: CGRect = .zero
     var providerColumnWindowRect: CGRect = .zero
+    var vendorColumnWindowRect: CGRect = .zero
     /// The provider list's own height, measured the same way and for the same
     /// reason as the models list below.
     var providerContentHeight: CGFloat = 0
@@ -311,6 +341,15 @@ final class ComposerShellState {
     var flyoutProvider: String? {
         if case .models(let provider) = activePane { return provider }
         return nil
+    }
+
+    /// The list a keyboard pick walks: a company's models when the provider
+    /// opens by company (and three columns fit), nothing until one is open,
+    /// the provider's own list otherwise.
+    func shownModels(_ group: ChatComposerModelGroup) -> ChatComposerModelGroup? {
+        let threeColumns = bothColumnsWidth + ComposerShellMetrics.vendorColumn + 1
+        guard let vendors = group.vendorGroups, roomWidth >= threeColumns else { return group }
+        return vendors.first { $0.id == flyoutVendor }
     }
 
     func dismiss() {
@@ -502,7 +541,13 @@ extension ChatComposerRoutingReading {
     /// Every provider a person can pick from today, each carrying its own
     /// models. Providers are section headers in the card, never a control.
     var providerGroups: [ChatComposerModelGroup] {
-        appModel.providersList
+        // One pass over the catalog, not one search per model: this runs on
+        // every hover and OpenRouter alone is hundreds of rows (User 09-27).
+        var catalogById: [String: ModelCatalogItem] = [:]
+        for model in appModel.engine.providers.catalog?.models ?? [] where catalogById[model.id] == nil {
+            catalogById[model.id] = model
+        }
+        return appModel.engine.providers.connections
             .filter {
                 $0.provider_id == "codex"
                     || $0.auth_status.state == "ready"
@@ -517,7 +562,7 @@ extension ChatComposerRoutingReading {
             }
             .compactMap { provider in
                 let models = provider.models.map { item in
-                    let catalogModel = appModel.modelCatalog?.models.first { $0.id == item.id }
+                    let catalogModel = catalogById[item.id]
                     // Provider-scoped capabilities stay authoritative: the
                     // global catalog holds duplicate ids for transports with
                     // different contracts.
@@ -545,8 +590,8 @@ extension ChatComposerRoutingReading {
 
 
     /// Which row of a provider's flyout is the live one.
-    func flyoutSelectedIndex(for group: ChatComposerModelGroup) -> Int {
-        guard group.id == appModel.chatProvider,
+    func flyoutSelectedIndex(for group: ChatComposerModelGroup, provider: String? = nil) -> Int {
+        guard (provider ?? group.id) == appModel.chatProvider,
               let index = group.models.firstIndex(where: { $0.id == appModel.chatModel })
         else { return 0 }
         return index
@@ -570,7 +615,7 @@ extension ChatComposerRoutingReading {
     var efforts: [ReasoningEffortOption] {
         let supported = selectedModel?.supportedReasoningEfforts ?? chatComposerFallbackEfforts
         let catalogOptions = Dictionary(
-            uniqueKeysWithValues: (appModel.modelCatalog?.reasoningEfforts ?? []).map { ($0.id, $0) }
+            uniqueKeysWithValues: (appModel.engine.providers.catalog?.reasoningEfforts ?? []).map { ($0.id, $0) }
         )
         return supported.map { effort in
             catalogOptions[effort] ?? ReasoningEffortOption(
@@ -622,14 +667,14 @@ extension ChatComposerRoutingReading {
     }
 
     var trustWord: String {
-        guard let policy = appModel.trustPolicy else { return "Trust unavailable" }
+        guard let policy = appModel.engine.trust.policy else { return "Trust unavailable" }
         let access = AppModel.agentAccessMode(from: policy, fallback: appModel.chatFileAccess)
         return TrustCenterPolicyStatusPresentation.preset(policy: policy, accessMode: access)?.title
             ?? "Custom Trust"
     }
 
     var activeTrustPreset: TrustPolicyPreset? {
-        guard let policy = appModel.trustPolicy else { return nil }
+        guard let policy = appModel.engine.trust.policy else { return nil }
         let access = AppModel.agentAccessMode(from: policy, fallback: appModel.chatFileAccess)
         return TrustCenterPolicyStatusPresentation.preset(policy: policy, accessMode: access)
     }
@@ -711,6 +756,7 @@ struct ChatComposerSettings: View, ChatComposerRoutingReading {
 
     /// Bumped by the draft when Tab should move into the words.
     var focusWordToken: Int
+    @State private var showsContextPopover = false
 
     /// Sol, 2026-09-15: a bot conversation sends on its OWN model, effort and
     /// Fast, so the words must read the bot's contract — showing (and editing)
@@ -761,15 +807,7 @@ struct ChatComposerSettings: View, ChatComposerRoutingReading {
 
             separator
 
-            word(
-                .model,
-                text: modelWord,
-                help: isBotConversation
-                    ? "This conversation uses its bot's own model. Edit it in Bots."
-                    : "\(appModel.chatProvider) · \(appModel.chatModel). Choose the model for Chat.",
-                accessibility: isBotConversation ? "Bot model. Edit in Bots" : "Model: \(modelWord)",
-                identifier: "chat.composer.model"
-            )
+            modelMenuWord
             // At most 220, but no wider than the name: a greedy frame held
             // the ring out in the middle of the bar.
             .frame(maxWidth: 220, alignment: .trailing)
@@ -777,27 +815,64 @@ struct ChatComposerSettings: View, ChatComposerRoutingReading {
 
             separator
 
-            word(
-                .effort,
-                text: effortWord,
-                help: isBotConversation
-                    ? "This conversation uses its bot's own thinking level. Edit it in Bots."
-                    : "How much thinking \(appModel.agentDisplayName) spends on a turn.",
-                accessibility: isBotConversation
-                    ? "Bot thinking: \(effortWord). Edit in Bots"
-                    : "Thinking: \(effortWord)",
-                identifier: "chat.composer.effort"
-            )
+            if isBotConversation {
+                word(
+                    .effort,
+                    text: effortWord,
+                    help: "This conversation uses its bot's own thinking level. Edit it in Bots.",
+                    accessibility: "Bot thinking: \(effortWord). Edit in Bots",
+                    identifier: "chat.composer.effort"
+                )
+            } else {
+                // Native menu, like the model picker (User 09-27).
+                Menu {
+                    ForEach(Array(efforts.enumerated()), id: \.element.id) { index, effort in
+                        Button { setEffort(index: index) } label: {
+                            if index == effortIndex {
+                                Label(effort.label, systemImage: "checkmark")
+                            } else {
+                                Text(effort.label)
+                            }
+                        }
+                    }
+                } label: {
+                    menuWordLabel(effortWord, minWidth: widestEffortWordWidth)
+                }
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .fixedSize()
+                .help("How much thinking \(appModel.agentDisplayName) spends on a turn.")
+                .accessibilityIdentifier("chat.composer.effort")
+            }
 
             separator
 
-            word(
-                .trust,
-                text: trustWord,
-                help: "Your saved permissions, used throughout the app.",
-                accessibility: "Trust: \(trustWord)",
-                identifier: "chat.composer.trust"
-            )
+            Menu {
+                if appModel.engine.trust.policy == nil {
+                    Text("Reading the saved posture…")
+                } else {
+                    ForEach(TrustPolicyPreset.allCases, id: \.quietID) { preset in
+                        Button { cardState?.applyTrust(preset, appModel: appModel) } label: {
+                            if activeTrustPreset == preset {
+                                Label(preset.title, systemImage: "checkmark")
+                            } else {
+                                Text(preset.title)
+                            }
+                            // Trust's own words for what the posture permits.
+                            Text(preset.summary)
+                        }
+                    }
+                }
+                Divider()
+                Section("Saved default throughout the app") {}
+            } label: {
+                menuWordLabel(trustWord)
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .help("Your saved permissions, used throughout the app.")
+            .accessibilityIdentifier("chat.composer.trust")
         }
         .frame(maxWidth: .infinity, alignment: .trailing)
         .font(ShellType.label)
@@ -809,7 +884,8 @@ struct ChatComposerSettings: View, ChatComposerRoutingReading {
                     active: chatPageIsVisible && state.activePane.isOpen,
                     cardRect: state.cardWindowRect,
                     flyoutRect: state.activePane.word == .model ? state.modelsWindowRect : .zero,
-                    providerColumnRect: state.activePane.word == .model ? state.providerColumnWindowRect : state.cardWindowRect
+                    providerColumnRect: state.activePane.word == .model ? state.providerColumnWindowRect : state.cardWindowRect,
+                    vendorColumnRect: state.activePane.word == .model ? state.vendorColumnWindowRect : .zero
                 ) {
                     state.dismiss()
                 }
@@ -866,7 +942,11 @@ struct ChatComposerSettings: View, ChatComposerRoutingReading {
     /// settings words, so the receipt is reachable exactly like they are — and
     /// it opens the one shell, not a card of its own.
     private var contextRing: some View {
-        Button { toggle(.context) } label: {
+        Button {
+            // A native popover (User 09-27): the readout is not a picker, but it
+            // gets the system bubble, its arrow and room past the window edge.
+            if cardState != nil { showsContextPopover.toggle() } else { toggle(.context) }
+        } label: {
             ComposerContextRing(sessionId: appModel.activeChatSessionId,
                                 model: isBotConversation ? botContract?.model : nil)
                 .padding(.horizontal, 5)
@@ -880,7 +960,7 @@ struct ChatComposerSettings: View, ChatComposerRoutingReading {
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .focusable()
+        .buttonFocusable()
         .focused($focusedWord, equals: .context)
         // Same rule as the words: hover steers an open shell, never opens one.
         .onHover { inside in
@@ -889,6 +969,14 @@ struct ChatComposerSettings: View, ChatComposerRoutingReading {
             open(.context)
         }
         .accessibilityIdentifier("chat.composer.context")
+        .popover(isPresented: $showsContextPopover, arrowEdge: .top) {
+            if let state = cardState {
+                ComposerContextReceiptCard(sessionId: appModel.activeChatSessionId, shell: state,
+                                           model: isBotConversation ? botContract?.model : nil)
+                    .padding(NativeAgentSpacing.md)
+                    .frame(width: ComposerShellMetrics.context)
+            }
+        }
         .accessibilityHint(isActive(.context)
             ? "Closes the context receipt"
             : "Opens the context receipt for the last turn")
@@ -900,7 +988,7 @@ struct ChatComposerSettings: View, ChatComposerRoutingReading {
             cardState?.dismiss()
             return .handled
         }
-        .onKeyPress(keys: [.tab]) { press in tab(.context, press) }
+        .onKeyPress(keys: [.tab, .backTab]) { press in tab(.context, press) }
     }
 
     /// Tab off a word. With a pane open it walks INTO the pane's first control
@@ -914,7 +1002,7 @@ struct ChatComposerSettings: View, ChatComposerRoutingReading {
         if !backwards, let state = cardState,
            state.activePane.word == card, state.activePane != .context,
            !(card == .effort && efforts.count <= 1),
-           !(card == .trust && (appModel.trustPolicy == nil || state.savingTrust)) {
+           !(card == .trust && (appModel.engine.trust.policy == nil || state.savingTrust)) {
             state.focusShellToken &+= 1
             return .handled
         }
@@ -925,6 +1013,92 @@ struct ChatComposerSettings: View, ChatComposerRoutingReading {
         cardState?.dismiss()
         focusedWord = ring[next]
         return .handled
+    }
+
+    /// The model picker is a native macOS menu (User 09-27): submenus are their
+    /// own layers anchored to their rows, the safe triangle, scrolling long
+    /// lists and edge flipping all come from AppKit, and on macOS 27 it wears
+    /// Liquid Glass. OpenRouter cascades provider → company → model.
+    @ViewBuilder
+    private var modelMenuWord: some View {
+        if isBotConversation {
+            word(
+                .model,
+                text: modelWord,
+                help: "This conversation uses its bot's own model. Edit it in Bots.",
+                accessibility: "Bot model. Edit in Bots",
+                identifier: "chat.composer.model"
+            )
+        } else {
+            Menu {
+                ForEach(providerGroups) { group in
+                    Menu {
+                        if let vendors = group.vendorGroups {
+                            ForEach(vendors) { vendor in
+                                Menu(vendor.provider) { modelMenuItems(vendor.models, provider: group.id) }
+                            }
+                        } else {
+                            modelMenuItems(group.models, provider: group.id)
+                        }
+                    } label: {
+                        if group.id == appModel.chatProvider {
+                            Label(group.provider, systemImage: "checkmark")
+                        } else {
+                            Text(group.provider)
+                        }
+                    }
+                }
+                Divider()
+                if selectedModelSupportsFast {
+                    Toggle("Fast", isOn: Binding(
+                        get: { appModel.chatFastMode },
+                        set: { newValue in
+                            guard !appModel.isSavingChatBrain || appModel.chatBrainSaveTask != nil else { return }
+                            appModel.chatFastMode = newValue
+                            Task { @MainActor in await appModel.saveChatBrainDefaults() }
+                        }
+                    ))
+                }
+                Button("More models…") {
+                    NotificationCenter.default.post(name: .openCommandRouteRequest, object: "providers")
+                }
+                Section("Saved default for Chat") {}
+            } label: {
+                menuWordLabel(modelWord)
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .help("\(appModel.chatProvider) · \(appModel.chatModel). Choose the model for Chat.")
+            .accessibilityIdentifier("chat.composer.model")
+        }
+    }
+
+    /// A composer word that opens a native menu.
+    private func menuWordLabel(_ text: String, minWidth: CGFloat? = nil) -> some View {
+        Text(text)
+            .font(ShellType.labelMedium)
+            .lineLimit(1)
+            .truncationMode(.middle)
+            .foregroundStyle(NativeAgentShell.secondary)
+            .frame(minWidth: minWidth)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 4)
+    }
+
+    @ViewBuilder
+    private func modelMenuItems(_ models: [ModelCatalogItem], provider: String) -> some View {
+        ForEach(models) { model in
+            Button {
+                _ = select(model: model, provider: provider)
+            } label: {
+                if model.id == appModel.chatModel && provider == appModel.chatProvider {
+                    Label(model.displayName, systemImage: "checkmark")
+                } else {
+                    Text(model.displayName)
+                }
+            }
+        }
     }
 
     private func word(
@@ -955,10 +1129,10 @@ struct ChatComposerSettings: View, ChatComposerRoutingReading {
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        // A plain Button is not in the key view loop on its own, so Tab walked
-        // straight past the three words to the rail. Focusable puts them back
-        // in the ring and lets the shell's order focus them programmatically.
-        .focusable()
+        // A plain Button is not in the key view loop without Keyboard
+        // navigation, so Tab walked straight past the three words to the rail.
+        // See `buttonFocusable`.
+        .buttonFocusable()
         .focused($focusedWord, equals: card)
         // Hover only STEERS an already-open shell — it never opens one, and
         // leaving a word never closes it, so the pointer can cross from the
@@ -991,15 +1165,16 @@ struct ChatComposerSettings: View, ChatComposerRoutingReading {
         .onKeyPress(characters: .decimalDigits, phases: .down) { press in
             number(card, press.characters)
         }
-        .onKeyPress(keys: [.tab]) { press in tab(card, press) }
+        .onKeyPress(keys: [.tab, .backTab]) { press in tab(card, press) }
     }
 
     /// Return inside the model pane takes the highlighted models row.
     private func takeHighlightedModel(_ card: ChatComposerCard) -> Bool {
         guard card == .model, let state = cardState,
               let providerID = state.flyoutProvider else { return false }
-        guard let group = providerGroups.first(where: { $0.id == providerID }) else { return false }
-        let index = state.flyoutIndex ?? flyoutSelectedIndex(for: group)
+        guard let full = providerGroups.first(where: { $0.id == providerID }),
+              let group = state.shownModels(full) else { return false }
+        let index = state.flyoutIndex ?? flyoutSelectedIndex(for: group, provider: providerID)
         guard group.models.indices.contains(index) else { return false }
         select(model: group.models[index], provider: providerID)
         state.dismiss()
@@ -1057,9 +1232,10 @@ struct ChatComposerSettings: View, ChatComposerRoutingReading {
             // Agent (a): the arrows land in the live options, so up/down walk
             // the models rather than the column of provider names.
             guard let providerID = state.flyoutProvider,
-                  let group = providerGroups.first(where: { $0.id == providerID }),
+                  let full = providerGroups.first(where: { $0.id == providerID }),
+                  let group = state.shownModels(full),
                   !group.models.isEmpty else { return .ignored }
-            let current = state.flyoutIndex ?? flyoutSelectedIndex(for: group)
+            let current = state.flyoutIndex ?? flyoutSelectedIndex(for: group, provider: providerID)
             state.flyoutIndex = min(max(current + (forward ? 1 : -1), 0), group.models.count - 1)
             return .handled
         }
@@ -1185,6 +1361,7 @@ struct ChatComposerCardLayer: View, ChatComposerRoutingReading {
                 state.flyoutIndex = nil
                 state.modelsWindowRect = .zero
                 state.providerColumnWindowRect = .zero
+                state.vendorColumnWindowRect = .zero
                 state.modelsContentHeight = 0
                 state.providerContentHeight = 0
             }
@@ -1225,6 +1402,8 @@ struct ChatComposerCardLayer: View, ChatComposerRoutingReading {
         /// The tallest any pane's content may be here.
         let contentCap: CGFloat
         let origin: UnitPoint
+        /// Columns open leftward because the room ends to the right.
+        var opensLeft = false
     }
 
     /// The pane widths follow the system's text size. A ramp that grows inside
@@ -1248,10 +1427,17 @@ struct ChatComposerCardLayer: View, ChatComposerRoutingReading {
         let room = proxy.size.width
         let fitsBoth = ComposerShellMetrics.fitsBoth(room: room, bothColumns: bothColumnsWidth)
 
+        let vendorMode: Bool = {
+            guard fitsBoth, room >= threeColumnsWidth, case .models(let provider) = pane else { return false }
+            return providerGroups.first { $0.id == provider }?.vendorGroups != nil
+        }()
         let natural: CGFloat = switch pane {
         case .none: 0
         case .model: providerColumnWidth
-        case .models: fitsBoth ? bothColumnsWidth : modelsColumnWidth
+        case .models where vendorMode:
+            providerColumnWidth + ComposerShellMetrics.columnGap + vendorColumnWidth
+                + (state.flyoutVendor != nil ? ComposerShellMetrics.columnGap + modelsColumnWidth : 0)
+        case .models: fitsBoth ? bothColumnsWidth + ComposerShellMetrics.columnGap : modelsColumnWidth
         case .think: thinkWidth
         case .trust: trustWidth
         case .context: contextWidth
@@ -1262,12 +1448,33 @@ struct ChatComposerCardLayer: View, ChatComposerRoutingReading {
         let rect = proxy[anchor]
         // Centred over the word, clamped to the room. The words are
         // right-aligned, so a word's centre holds still while its text changes.
-        let x = min(max(0, rect.midX - width / 2), max(0, room - width))
+        // The provider column never moves: columns open to its right (User
+        // 09-27: re-centring on every width change made the card hop).
+        let providerX = min(max(0, rect.midX - providerColumnWidth / 2), max(0, room - providerColumnWidth))
+        var opensLeft = false
+        let x: CGFloat
+        switch pane {
+        case .models where fitsBoth:
+            // Direction from the WIDEST this cascade can get, so a company's
+            // models opening never flips the columns under the pointer.
+            let widest = vendorMode ? threeColumnsWidth : bothColumnsWidth
+            if providerX + widest <= room {
+                x = providerX
+            } else if providerX + providerColumnWidth - width >= 0 {
+                // Mirror: the provider column keeps its place at the right end.
+                x = providerX + providerColumnWidth - width
+                opensLeft = true
+            } else {
+                x = max(0, room - width)
+            }
+        default:
+            x = min(max(0, rect.midX - width / 2), max(0, room - width))
+        }
         // The bottom edge is the row, not the pane: the shell grows upward.
         let bottom = max(0, rect.minY - cardGap)
         let cap = min(ComposerShellMetrics.modelsMaxHeight, max(120, bottom - NativeAgentSpacing.sm * 2))
         let origin = UnitPoint(x: min(1, max(0, (rect.midX - x) / max(1, width))), y: 1)
-        return ShellLayout(pane: pane, x: x, width: width, bottom: bottom, fitsBoth: fitsBoth, contentCap: cap, origin: origin)
+        return ShellLayout(pane: pane, x: x, width: width, bottom: bottom, fitsBoth: fitsBoth, contentCap: cap, origin: origin, opensLeft: opensLeft)
     }
 
     func shellOverlay(_ anchors: [ChatComposerCard: Anchor<CGRect>]) -> some View {
@@ -1293,30 +1500,9 @@ struct ChatComposerCardLayer: View, ChatComposerRoutingReading {
                                     state.shellHeight = $0
                                 }
                         }
-                        .background {
-                            // On the glass the room fill is the coat UNDER the
-                            // material, and the material's blur is what stops
-                            // the transcript. An offscreen capture has nothing
-                            // to blur, so the same coat let the transcript read
-                            // straight through the receipt rows. A capture
-                            // substitutes the settled appearance: the opaque
-                            // slate every card already wears.
-                            shape.fill(quietOffscreenRead
-                                       ? TodayPalette.cardFill
-                                       : reduceTransparency
-                                       ? Color(nsColor: .controlBackgroundColor)
-                                       : NativeAgentShell.room.opacity(0.82))
-                        }
-                        .overlay {
-                            if reduceTransparency || quietOffscreenRead {
-                                shape.strokeBorder(quietOffscreenRead
-                                                   ? TodayPalette.cardStroke
-                                                   : NativeAgentShell.hairline,
-                                                   lineWidth: 1)
-                            }
-                        }
-                        .glassEffect(reduceTransparency || quietOffscreenRead ? .identity : .regular, in: shape)
-                        .clipShape(shape)
+                        .modifier(ShellSurface(active: placement.pane.word != .model, shape: shape,
+                                              quietOffscreenRead: quietOffscreenRead,
+                                              reduceTransparency: reduceTransparency))
                         .background {
                             ComposerCardRectReporter(rect: Binding(
                                 get: { state.cardWindowRect },
@@ -1431,6 +1617,22 @@ struct ChatComposerCardLayer: View, ChatComposerRoutingReading {
     /// the models REPLACE the provider column inside the same shell and a
     /// "Back to providers" control leads out — never a flyout that switches
     /// sides.
+    private enum PaneColumn {
+        case providers(width: CGFloat)
+        case vendors([ChatComposerModelGroup])
+        case models(ChatComposerModelGroup, provider: String, width: CGFloat, showsBack: Bool, parentRow: String)
+
+        /// Stable identity: a column that stays open keeps its scroll position
+        /// when a neighbour opens (index ids rebuilt it and reset the scroll).
+        var id: String {
+            switch self {
+            case .providers: "providers"
+            case .vendors: "vendors"
+            case .models: "models"
+            }
+        }
+    }
+
     @ViewBuilder
     private func modelPane(_ placement: ShellLayout) -> some View {
         let group = state.flyoutProvider.flatMap { provider in
@@ -1438,26 +1640,162 @@ struct ChatComposerCardLayer: View, ChatComposerRoutingReading {
         }
         // No provider chosen yet (or one that is gone): the column is the pane.
         let showsProviders = placement.pane == .model || placement.fitsBoth || group == nil
-        HStack(alignment: .top, spacing: 0) {
+        let columns: [PaneColumn] = {
+            var list: [PaneColumn] = []
             if showsProviders {
-                providerColumn
-                    .frame(width: placement.fitsBoth && group != nil
-                           ? providerColumnWidth
-                           : placement.width)
+                list.append(.providers(width: placement.fitsBoth && group != nil ? providerColumnWidth : placement.width))
             }
-            if let group, showsProviders ? placement.fitsBoth : true {
-                if showsProviders {
-                    // One shell, two columns: a hairline, not a second edge,
-                    // a second shadow or a gap.
-                    Rectangle()
-                        .fill(NativeAgentShell.hairline)
-                        .frame(width: 1)
-                        .frame(maxHeight: .infinity)
+            guard let group, showsProviders ? placement.fitsBoth : true else { return list }
+            if showsProviders, let vendors = vendorModeGroups(group, placement: placement) {
+                // OpenRouter: companies first, then the hovered company's models.
+                list.append(.vendors(vendors))
+                if let vendor = vendors.first(where: { $0.id == state.flyoutVendor }) {
+                    list.append(.models(vendor, provider: group.id, width: modelsColumnWidth, showsBack: false,
+                                        parentRow: "vendor:" + vendor.id))
                 }
-                modelsColumn(group, placement: placement, showsBack: !showsProviders)
-                    .frame(width: showsProviders ? modelsColumnWidth : placement.width)
+            } else {
+                list.append(.models(group, provider: group.id,
+                                    width: showsProviders ? modelsColumnWidth : placement.width,
+                                    showsBack: !showsProviders, parentRow: "provider:" + group.id))
+            }
+            // No room to the right: open leftward so the provider column holds
+            // still (User 09-27: a pop-out must never move what is already open).
+            return placement.opensLeft ? list.reversed() : list
+        }()
+        // Bottom-aligned: the shell grows upward from a fixed bottom edge, so a
+        // top-aligned column rode up whenever a taller neighbour opened, the
+        // row under the pointer slid away, and hover switched providers again
+        // — the bounce (User 09-27).
+        // Each column is its own glass panel, as tall as its list up to the
+        // cap and scrolling past it (User 09-27: no shared box). Everything is
+        // measured from the fixed bottom edge, so a panel opening or resizing
+        // never moves another one.
+        let cap = placement.contentCap
+        HStack(alignment: .bottom, spacing: ComposerShellMetrics.columnGap) {
+            ForEach(columns, id: \.id) { column in
+                switch column {
+                case .providers(let width):
+                    providerColumn
+                        .frame(width: width)
+                        .modifier(ColumnSpace(name: "providers", state: state))
+                        .modifier(ColumnPanel())
+                case .vendors(let vendors):
+                    vendorColumn(vendors, maxHeight: cap)
+                        .frame(width: vendorColumnWidth)
+                        .modifier(ColumnSpace(name: "vendors", state: state))
+                        .modifier(ColumnPanel())
+                        .padding(.bottom, vendorLift(cap: cap))
+                case .models(let models, let provider, let width, let showsBack, let parentRow):
+                    modelsColumn(models, provider: provider, placement: placement, showsBack: showsBack,
+                                 maxHeight: cap)
+                        .frame(width: width)
+                        .modifier(ColumnPanel())
+                        .padding(.bottom, modelsLift(parentRow: parentRow, cap: cap))
+                }
             }
         }
+    }
+
+    /// How far a submenu sits above the pane's bottom so its top is level with
+    /// the row it opened from, dropping only as far as it must. Every input is
+    /// measured inside the parent column, never from the pane's total height.
+    private func lift(rowFromBottom: CGFloat?, contentHeight: CGFloat, cap: CGFloat) -> CGFloat {
+        guard let rowFromBottom else { return 0 }
+        return max(0, rowFromBottom - min(max(contentHeight, 44), cap))
+    }
+
+    /// The provider row's top, measured from the pane's bottom edge (the
+    /// providers column sits on that edge).
+    private func providerRowFromBottom() -> CGFloat? {
+        guard let provider = state.flyoutProvider,
+              let top = state.rowTop["providers:provider:" + provider],
+              let height = state.columnHeight["providers"] else { return nil }
+        return height - top
+    }
+
+    private func vendorLift(cap: CGFloat) -> CGFloat {
+        lift(rowFromBottom: providerRowFromBottom(), contentHeight: state.vendorContentHeight, cap: cap)
+    }
+
+    private func modelsLift(parentRow: String, cap: CGFloat) -> CGFloat {
+        if parentRow.hasPrefix("vendor:") {
+            guard let top = state.rowTop["vendors:" + parentRow],
+                  let height = state.columnHeight["vendors"] else { return 0 }
+            let vendorsBase = vendorLift(cap: cap)
+            return lift(rowFromBottom: vendorsBase + height - top,
+                        contentHeight: state.modelsContentHeight, cap: cap)
+        }
+        return lift(rowFromBottom: providerRowFromBottom(), contentHeight: state.modelsContentHeight, cap: cap)
+    }
+
+
+    private func vendorModeGroups(_ group: ChatComposerModelGroup, placement: ShellLayout) -> [ChatComposerModelGroup]? {
+        guard placement.fitsBoth, state.roomWidth >= threeColumnsWidth else { return nil }
+        return group.vendorGroups
+    }
+
+    private var threeColumnsWidth: CGFloat { providerColumnWidth + vendorColumnWidth + modelsColumnWidth + ComposerShellMetrics.columnGap * 2 }
+    /// Company names are short; the column is narrower than the providers'.
+    private var vendorColumnWidth: CGFloat { ComposerShellMetrics.vendorColumn }
+
+    private func vendorColumn(_ vendors: [ChatComposerModelGroup], maxHeight: CGFloat) -> some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 2) {
+                ForEach(vendors) { vendor in vendorRow(vendor) }
+            }
+            .padding(NativeAgentSpacing.sm)
+            .onGeometryChange(for: CGFloat.self) { $0.size.height } action: {
+                state.vendorContentHeight = $0
+            }
+        }
+        .frame(height: min(max(state.vendorContentHeight, 44), maxHeight))
+        .background {
+            ComposerCardRectReporter(rect: Binding(
+                get: { state.vendorColumnWindowRect },
+                set: { state.vendorColumnWindowRect = $0 }
+            ))
+        }
+    }
+
+    private func vendorRow(_ vendor: ChatComposerModelGroup) -> some View {
+        let isOpen = state.flyoutVendor == vendor.id
+        return Button {
+            state.flyoutVendor = vendor.id
+            state.flyoutIndex = nil
+        } label: {
+            HStack(spacing: 6) {
+                Text(vendor.provider)
+                    .font(ShellType.labelMedium)
+                    .foregroundStyle(NativeAgentShell.text)
+                    .lineLimit(1)
+                Spacer(minLength: 4)
+                Text("\(vendor.models.count)")
+                    .font(ShellType.caption)
+                    .foregroundStyle(NativeAgentShell.tertiary)
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(NativeAgentShell.tertiary)
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 5)
+            .background {
+                if isOpen {
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .fill(NativeAgentShell.quietFill)
+                }
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        // Hover steers, like the providers: no timers, nothing closes on exit.
+        .onHover { inside in
+            guard inside, state.flyoutVendor != vendor.id else { return }
+            state.flyoutVendor = vendor.id
+            state.flyoutIndex = nil
+        }
+        .modifier(RowTopReporter(key: "vendors:vendor:" + vendor.id, state: state, space: "vendors"))
+        .accessibilityLabel(vendor.provider)
+        .accessibilityHint("Shows this company's models")
     }
 
     private var providerColumn: some View {
@@ -1581,6 +1919,7 @@ struct ChatComposerCardLayer: View, ChatComposerRoutingReading {
             guard inside, state.flyoutProvider != group.id else { return }
             showModels(of: group.id)
         }
+        .modifier(RowTopReporter(key: "providers:provider:" + group.id, state: state, space: "providers"))
         .accessibilityIdentifier("chat.composer.model.provider.\(group.id)")
         .accessibilityLabel(isCurrent
             ? "\(group.provider), in use, \(selectedModel?.displayName ?? "")"
@@ -1591,8 +1930,9 @@ struct ChatComposerCardLayer: View, ChatComposerRoutingReading {
     private func showModels(of provider: String) {
         state.activePane = .models(provider)
         state.flyoutIndex = nil
-        // A short list must not inherit the previous one's height.
-        state.modelsContentHeight = 0
+        state.flyoutVendor = nil
+        // Keep the last height until the new list measures itself: resetting
+        // to zero snapped the card small and back on every hover (the jump).
     }
 
     /// The models of the open provider, inside the same shell. It scrolls
@@ -1601,16 +1941,19 @@ struct ChatComposerCardLayer: View, ChatComposerRoutingReading {
     @ViewBuilder
     private func modelsColumn(
         _ group: ChatComposerModelGroup,
+        provider: String? = nil,
         placement: ShellLayout,
-        showsBack: Bool
+        showsBack: Bool,
+        maxHeight: CGFloat? = nil
     ) -> some View {
+        let providerID = provider ?? group.id
         // Only as tall as the list. `maxHeight` alone does nothing for a
         // ScrollView, which is greedy — the height has to be the measured
         // content, clamped (User, 2026-09-15).
-        let height = min(max(state.modelsContentHeight, 44), placement.contentCap)
+        let height = min(max(state.modelsContentHeight, 44), maxHeight ?? placement.contentCap)
         // The providers arrive after the pane opens, so the highlight follows
         // the SELECTION until a key moves it.
-        let highlight = state.flyoutIndex ?? flyoutSelectedIndex(for: group)
+        let highlight = state.flyoutIndex ?? flyoutSelectedIndex(for: group, provider: providerID)
         VStack(alignment: .leading, spacing: 0) {
             if showsBack {
                 // Narrow window: the models took the providers' place, so the
@@ -1637,7 +1980,7 @@ struct ChatComposerCardLayer: View, ChatComposerRoutingReading {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 2) {
                         ForEach(Array(group.models.enumerated()), id: \.element.id) { index, model in
-                            modelRow(model, provider: group.id, shortcut: index < 9 ? index + 1 : 0,
+                            modelRow(model, provider: providerID, shortcut: index < 9 ? index + 1 : 0,
                                      highlighted: highlight == index)
                                 .id(index)
                         }
@@ -1713,61 +2056,25 @@ struct ChatComposerCardLayer: View, ChatComposerRoutingReading {
     // MARK: - Effort card
 
     private var effortCard: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                // Agent's note 2: the ends name the thing being traded, and
-                // the thing being traded is thinking.
-                Text("Less thinking")
-                Spacer(minLength: 8)
-                Text("More thinking")
-            }
-            .font(ShellType.label)
-            .foregroundStyle(NativeAgentShell.secondary)
-
-            if efforts.count > 1 {
-                // The slider snaps to the levels this model actually supports:
-                // a step of one over the supported list, never a free ramp.
-                Slider(
-                    value: Binding(
-                        get: { Double(effortIndex) },
-                        set: { setEffort(index: Int($0.rounded())) }
-                    ),
-                    in: 0...Double(efforts.count - 1),
-                    step: 1
-                )
-                .controlSize(.small)
-                .tint(NativeAgentShell.secondary)
-                .labelsHidden()
-                .paneControl(first: true, $shellFocused)
-                .accessibilityIdentifier("chat.composer.effort.slider")
-                .accessibilityLabel("Thinking level")
-                .accessibilityValue(effortWord)
-            }
-
-            Text(effortWord)
-                .font(ShellType.bodyMedium)
-                .foregroundStyle(NativeAgentShell.text)
-
-            // Always drawn, so the card keeps one height while the slider
-            // moves; a line that came and went made the card grow, shrink
-            // and hop (User, 2026-09-15).
-            if let model = selectedModel,
-               let defaultLabel = efforts.first(where: { $0.id == model.defaultReasoningEffort })?.label {
-                Text("Default for \(model.displayName): \(defaultLabel)")
-                    .font(ShellType.label)
-                    .foregroundStyle(NativeAgentShell.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-
-            scopeLine("Saved default for Chat")
-        }
+        ThinkingPane(
+            levels: efforts.map(\.label),
+            // The track snaps to the levels this model actually supports: a
+            // step of one over the supported list, never a free ramp.
+            index: Binding(get: { effortIndex }, set: { setEffort(index: $0) }),
+            word: effortWord,
+            modelDefault: selectedModel.flatMap { model in
+                efforts.first { $0.id == model.defaultReasoningEffort }.map { (model.displayName, $0.label) }
+            },
+            scope: "Saved default for Chat",
+            focus: $shellFocused
+        )
     }
 
     // MARK: - Trust card
 
     @ViewBuilder
     private var trustCard: some View {
-        if appModel.trustPolicy == nil {
+        if appModel.engine.trust.policy == nil {
             // 2026-09-17: before the policy loads there is nothing to compare
             // a preset against, so all four rows were drawn and disabled with
             // no word for why. One line says what is happening instead.
@@ -1876,17 +2183,123 @@ private extension View {
     @ViewBuilder
     func paneControl(first: Bool = false, _ focus: FocusState<Bool>.Binding) -> some View {
         if first {
-            focusable().focused(focus)
+            buttonFocusable().focused(focus)
         } else {
-            focusable()
+            buttonFocusable()
         }
     }
 }
 
 /// One provider's models, as the card groups them. The provider is a header
 /// built from the routing snapshot, never a branch in the code.
+/// The shell's own coat and glass, for every pane but the model menu (whose
+/// columns wear their own).
+private struct ShellSurface<S: InsettableShape>: ViewModifier {
+    let active: Bool
+    let shape: S
+    let quietOffscreenRead: Bool
+    let reduceTransparency: Bool
+
+    func body(content: Content) -> some View {
+        if active {
+            content
+                .background {
+                    // On the glass the room fill is the coat UNDER the
+                    // material, and the material's blur is what stops the
+                    // transcript. An offscreen capture has nothing to blur, so
+                    // it substitutes the settled opaque slate every card wears.
+                    shape.fill(quietOffscreenRead
+                               ? TodayPalette.cardFill
+                               : reduceTransparency
+                               ? Color(nsColor: .controlBackgroundColor)
+                               : NativeAgentShell.room.opacity(0.82))
+                }
+                .overlay {
+                    if reduceTransparency || quietOffscreenRead {
+                        shape.strokeBorder(quietOffscreenRead ? TodayPalette.cardStroke : NativeAgentShell.hairline,
+                                           lineWidth: 1)
+                    }
+                }
+                .glassEffect(reduceTransparency || quietOffscreenRead ? .identity : .regular, in: shape)
+                .clipShape(shape)
+        } else {
+            content
+        }
+    }
+}
+
+/// One model-menu column's own panel: the shell's coat and glass, sized to
+/// the column.
+private struct ColumnPanel: ViewModifier {
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+
+    func body(content: Content) -> some View {
+        let shape = RoundedRectangle(cornerRadius: 14, style: .continuous)
+        content
+            .background {
+                shape.fill(reduceTransparency ? Color(nsColor: .controlBackgroundColor) : NativeAgentShell.room.opacity(0.82))
+            }
+            .overlay {
+                shape.strokeBorder(NativeAgentShell.hairline, lineWidth: 1).allowsHitTesting(false)
+            }
+            .glassEffect(reduceTransparency ? .identity : .regular, in: shape)
+            .clipShape(shape)
+    }
+}
+
+/// Names a model-menu column's coordinate space and records its visible
+/// height, both unobserved, so its rows can be placed from the pane's bottom.
+private struct ColumnSpace: ViewModifier {
+    let name: String
+    let state: ComposerShellState
+
+    func body(content: Content) -> some View {
+        content
+            .coordinateSpace(.named(name))
+            .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { state.columnHeight[name] = $0 }
+    }
+}
+
+/// Writes a row's top edge (in the model pane) into the shell state without
+/// observation, so reporting can never redraw the pane.
+private struct RowTopReporter: ViewModifier {
+    let key: String
+    let state: ComposerShellState
+    let space: String
+
+    func body(content: Content) -> some View {
+        content.onGeometryChange(for: CGFloat.self) {
+            $0.frame(in: .named(space)).minY
+        } action: { top in
+            state.rowTop[key] = top
+        }
+    }
+}
+
 struct ChatComposerModelGroup: Identifiable {
     let id: String
     let provider: String
     let models: [ModelCatalogItem]
+
+    /// A provider whose models are "company/model" and too many for one list
+    /// opens to its companies first (OpenRouter: ~460 models, 63 companies).
+    var vendorGroups: [ChatComposerModelGroup]? {
+        guard models.count > 40, models.allSatisfy({ $0.id.contains("/") }) else { return nil }
+        let byVendor = Dictionary(grouping: models) { String($0.id.prefix { $0 != "/" }) }
+        return byVendor.keys
+            .map { ChatComposerModelGroup(id: $0, provider: Self.vendorName($0), models: byVendor[$0] ?? []) }
+            .sorted { $0.provider.localizedCaseInsensitiveCompare($1.provider) == .orderedAscending }
+    }
+
+    private static let knownVendorNames = [
+        "openai": "OpenAI", "anthropic": "Anthropic", "google": "Google", "x-ai": "xAI",
+        "meta-llama": "Meta", "mistralai": "Mistral", "qwen": "Qwen", "deepseek": "DeepSeek",
+        "z-ai": "Z.ai", "nvidia": "NVIDIA", "moonshotai": "Moonshot", "microsoft": "Microsoft",
+        "amazon": "Amazon", "cohere": "Cohere", "perplexity": "Perplexity", "minimax": "MiniMax",
+    ]
+
+    static func vendorName(_ id: String) -> String {
+        if let known = knownVendorNames[id] { return known }
+        return id.split(separator: "-").map { $0.prefix(1).uppercased() + $0.dropFirst() }.joined(separator: " ")
+    }
 }

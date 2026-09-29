@@ -1,83 +1,6 @@
 import SwiftUI
 import AppKit
 
-enum NativeAgentFont {
-    static let title = Font.system(.title2, weight: .semibold)
-    static let display = Font.system(.largeTitle, design: .rounded, weight: .bold)
-    static let section = Font.system(.headline, weight: .semibold)
-    static let body = Font.system(.body)
-    static let label = Font.system(.caption, weight: .semibold)
-    static let tag  = Font.system(.caption2, weight: .medium)
-    static let mono = Font.system(.caption, design: .monospaced)
-}
-
-enum NativeAgentSpacing {
-    static let xs: CGFloat = 4
-    static let sm: CGFloat = 8
-    static let md: CGFloat = 12
-    static let lg: CGFloat = 16
-    static let xl: CGFloat = 24
-}
-
-enum NativeAgentRadius {
-    static let compact: CGFloat = 4
-    static let control: CGFloat = 6
-    static let panel: CGFloat = 8
-    static let card: CGFloat = 8
-}
-
-enum NativeAgentLayout {
-    static let cardPadding: CGFloat = NativeAgentSpacing.lg
-    static let maxReadableChatWidth: CGFloat = 760
-}
-
-enum NativeAgentTheme {
-    static let ok = Color.green
-    static let warn = Color.orange
-    static let fail = Color.red
-    static let info = Color.blue
-
-    static func statusColor(_ status: String?) -> Color {
-        switch status?.lowercased() {
-        case "ok", "done", "passed", "succeeded", "active", "valid", "ready", "scheduled": ok
-        case "running", "info": info
-        case "warn", "warning", "blocked", "needs_setup", "planned", "interrupted", "disabled": warn
-        case "fail", "failed", "error", "timeout", "quarantined": fail
-        default: .secondary
-        }
-    }
-}
-
-// MARK: - Color hex helper (mirrors the iOS NativeAgentTheme initializer so the
-// Mac + iOS apps share one teal identity by hex value, not by eyeballed literals)
-extension Color {
-    init(hex: UInt, opacity: Double = 1) {
-        self.init(
-            .sRGB,
-            red:   Double((hex >> 16) & 0xFF) / 255,
-            green: Double((hex >> 8)  & 0xFF) / 255,
-            blue:  Double( hex        & 0xFF) / 255,
-            opacity: opacity
-        )
-    }
-}
-
-// MARK: - Brand palette — teal identity
-//
-// 2026-07-06: retheme from the old purple→pink chat accents to a blue-teal
-// (cyan/sky, Agent's color). Centralized here so the chat surfaces stop
-// carrying raw `Color.purple`/`Color.pink` literals — one source of truth for
-// the Mac accent, matched hex-for-hex to the iOS `NativeAgentPalette`.
-enum NativeAgentBrand {
-    /// Vibrant cyan-500 — primary accent: icons, tints, borders, indicators.
-    static let accent       = Color(hex: 0x06B6D4)
-    /// Deep cyan-700 — gradient end for filled surfaces; keeps white text readable.
-    static let accentDeep   = Color(hex: 0x0E7490)
-    /// Sky-400 — cool blue counter-tone for multi-stop gradients + glows.
-    static let accentCool    = Color(hex: 0x38BDF8)
-
-}
-
 /// The panel every page still reaches for: an eyebrow over one card. The
 /// material slab and the tinted accent border it used to draw were the second
 /// plate on a page that already sits on the sheet, so both are gone. `tint` and
@@ -388,24 +311,6 @@ struct AuroraBackground: View {
 
 // MARK: - The shell (ui-simplify 2026-09-02, Lane A)
 
-/// Kill switch for the 2026-09-02 shell. When this preference is ON the app
-/// renders the PREVIOUS sidebar/list shell, unchanged. Default OFF: the new
-/// shell is the shell. One key, read everywhere, so a rollback is one toggle.
-enum NativeAgentShellPreference {
-    static let classicShellKey = "uiClassicShell"
-
-    static func isClassic(_ defaults: UserDefaults = .standard) -> Bool {
-        defaults.bool(forKey: classicShellKey)
-    }
-
-    /// User, 2026-09-04: "developer surfaces always left on, we have room, let
-    /// people see." The new shell shows everything; the stored switch only
-    /// still gates the classic sidebar.
-    static func developerSurfacesShown(_ stored: Bool, defaults: UserDefaults = .standard) -> Bool {
-        isClassic(defaults) ? stored : true
-    }
-}
-
 /// The room's palette. Warm dark by default, warm light behind the same names,
 /// so a view names a ROLE (room, rail, list, text) and never an appearance.
 ///
@@ -427,11 +332,12 @@ enum NativeAgentShell {
     // and read as brown slabs against every other glass card. They use the
     // shared glass card again; the readable secondary text from the same pass stays.
     // Type
-    static let text       = dynamic(dark: 0xF6F3EE, light: 0x0B0B0C)
+    // User 09-27: all Mac native — the system label colours.
+    static let text       = Color(nsColor: .labelColor)
     // 2026-09-09: supporting text keeps its weight through the glass and
     // lamp compositing. Rendered before/after samples: mockups/simplicity/pass2.
-    static let secondary  = dynamic(dark: 0xC1C6CC, light: 0x35383E)
-    static let tertiary   = dynamic(dark: 0x858B91, light: 0x4C5055)
+    static let secondary  = Color(nsColor: .secondaryLabelColor)
+    static let tertiary   = Color(nsColor: .tertiaryLabelColor)
     // Felt state
     // User, 2026-09-03: the felt-state colours were dark-only hexes and failed
     // their contrast floors on the light room (teal 2.23:1, calm 2.04, trouble
@@ -453,9 +359,9 @@ enum NativeAgentShell {
     // carry a step more contrast there than in dark.
     static let softFill   = primaryTint(dark: 0.08, light: 0.11)
     /// Quieter fill for the tool row and the search field.
-    static let quietFill  = primaryTint(dark: 0.05, light: 0.075)
+    static let quietFill  = Color(nsColor: .quaternarySystemFill)
     /// The single hairline used by the composer and the quiet cards.
-    static let hairline   = primaryTint(dark: 0.10, light: 0.14)
+    static let hairline   = Color(nsColor: .separatorColor)
 
     /// The primary colour at an appearance-specific alpha: white on dark,
     /// black on light, so a fill or hairline can carry more weight in light.

@@ -1,141 +1,108 @@
 import Foundation
-import Darwin
-import AppKit
-@preconcurrency import EventKit
-import SwiftUI
-import NativeAgentShared
-import PersistenceCore
 import NativeAgentCore
-import MemoryV2
-import ToolRegistry
-import KnowledgeGraph
-import XConnector
-import SlackConnector
-import ProviderRouting
-import BackgroundLoops
-import ApprovalInbox
-import MCPDispatcher
-import ToolExecution
-import PersonaEngine
-import ChatOrchestration
-import TrustCenter
-import DreamREMCycle
-import DoctorChecks
-import CommandPalette
-import SelfImprovement
-import Research
-import MultimodalTTS
-import TriggerScheduler
-import WorkshopExecution
-import NotificationInbox
-import SystemOps
-import ScreenVision
-import TelegramBot
-import Dispatcher
-import MacControl
-import Onboarding
-import MacAssistantStatus
-import WorkflowOrchestration
-import Skills
-import Connectors
+import PersistenceCore
 import Browser
+import ApprovalInbox
+import ApprovalTransactions
+import Cognition
+import Dispatcher
 
 extension NativeClient {
+    static var browserActionRoutes: BrowserActionRoutes {
+        BrowserActionRoutes(effects: NativeBrowserRouteEffects())
+    }
+
     func runBrowser(url: String, dryRun: Bool) async throws -> BrowserRun {
-        try await runBrowser(
-            url: url,
-            dryRun: dryRun,
-            captureSource: false,
-            captureScreenshot: false
+        try await runBrowser(url: url, dryRun: dryRun, captureSource: false, captureScreenshot: false)
+    }
+
+    func runBrowser(url: String, dryRun: Bool, captureSource: Bool, captureScreenshot: Bool) async throws -> BrowserRun {
+        try await Self.browserActionRoutes.runBrowser(
+            url: url, dryRun: dryRun, captureSource: captureSource, captureScreenshot: captureScreenshot,
+            dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot(),
+            decode: Self.decodeBrowserRouteRun
         )
     }
 
-    func runBrowser(
-        url: String,
-        dryRun: Bool,
-        captureSource: Bool,
-        captureScreenshot: Bool
-    ) async throws -> BrowserRun {
-        // Browser Core owns every canonical operation transition and derived
-        // receipt. The app owns only the visible WKWebView effect adapter.
-        let bodyValue: JSONValue = .object([
-            "url": .string(url),
-            "dryRun": .bool(dryRun),
-            "readOnly": .bool(true),
-            "captureSource": .bool(false),
-            "captureScreenshot": .bool(false),
-        ])
-        let writer = makeBrowserWriter(
-            dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()
-        )
-        // `try`: nil means declined before any side effect; a THROW means a
-        // native write already began, so the error propagates.
-        if let envelope = try await writer.runBrowserAction(body: bodyValue) {
-            let decoded = try Self.decodeJSONValue(
-                envelope,
-                as: BrowserRun.self,
-                context: "runBrowser(swiftNative)"
-            )
-            if !dryRun {
-                await Self.observeBrowserMotorAction(runID: decoded.id)
-            }
-            return decoded
-        }
-        guard !dryRun else {
-            throw NSError(domain: "NativeAgentSwiftOnly", code: -410, userInfo: [
-                NSLocalizedDescriptionKey: "Browser dry-run body was not handled by the Swift browser writer."
-            ])
-        }
-        let runID = UUID().uuidString.lowercased()
-        let run = try await Self.executeVisibleBrowserRun(
-            parsed: try Self.validBrowserURL(url),
-            runID: runID,
-            approvalId: nil,
-            captureSource: captureSource,
-            captureScreenshot: captureScreenshot
-        )
-        return try Self.decodeJSONValue(run, as: BrowserRun.self, context: "runBrowser(swiftVisibleDirect)")
+    static func decodeBrowserRouteRun(_ value: JSONValue, _ context: String) throws -> BrowserRouteDecodedRun<BrowserRun> {
+        let run = try decodeJSONValue(value, as: BrowserRun.self, context: context)
+        return BrowserRouteDecodedRun(value: run, id: run.id, status: run.status)
     }
 
-    static func executeVisibleBrowserRun(
-        parsed: ValidBrowserURL,
+    static func executeApprovedBrowserRun(from approval: ApprovalRecord) async throws {
+        try await browserActionRoutes.executeApprovedBrowserRun(from: approval)
+    }
+
+    static func finishRejectedBrowserRun(from approval: ApprovalRecord, status: String) async throws {
+        try await browserActionRoutes.finishRejectedBrowserRun(from: approval, status: status)
+    }
+
+    static func observeBrowserMotorAction(
         runID: String,
-        approvalId: String?,
-        captureSource: Bool,
-        captureScreenshot: Bool
-    ) async throws -> JSONValue {
-        var status = "succeeded"
-        var opened = false
-        var screenshotReceipt: JSONValue = .null
-        var sourceReceipt: [String: JSONValue] = [
-            "url": .string(parsed.url.absoluteString),
-            "captureSource": .bool(captureSource),
-        ]
-        let browser = SwiftNativeBrowserClient.defaultClient()
-        let start = BrowserOperationStart(
-            id: runID,
-            url: parsed.url.absoluteString,
-            domain: parsed.domain,
-            initialState: .running,
-            visible: true,
-            approvalId: approvalId,
-            captureSource: captureSource,
-            captureScreenshot: captureScreenshot,
-            // BrowserWindowController owns and enforces the same 30-second
-            // navigation timeout. Core persists it for restart recovery.
-            deadlineSeconds: 30
-        )
-        let requestDigest = SwiftNativeBrowserClient.browserRequestDigest(for: start)
-        _ = try await browser.executeBrowserOperation(.start(start))
+        dataRoot: URL = PersistenceCore.defaultDataRoot()
+    ) async {
+        await browserActionRoutes.observeBrowserMotorAction(runID: runID, dataRoot: dataRoot)
+    }
 
+    /// `root` is injectable so the memory.repair executor (and its launch
+    /// reconciliation) can run against a test data root; every other caller
+    /// uses the production default.
+    static func annotateApprovalExecution(
+        id: String,
+        executedAction: JSONValue,
+        detail: String,
+        root: URL = SwiftNativeApprovalInbox.defaultDataRoot()
+    ) async throws {
+        try await ApprovalExecutionAnnotation.annotateApprovalExecution(
+            id: id,
+            executedAction: executedAction,
+            detail: detail,
+            root: root
+        )
+    }
+
+    static func jsonString(_ value: JSONValue, _ key: String) -> String? {
+        ApprovalTransactionCoordinator.jsonString(value, key)
+    }
+
+    func cancelBrowserRun(id: String?) async throws -> BrowserRun {
+        try await Self.browserActionRoutes.cancelBrowserRun(
+            id: id,
+            dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot(),
+            decode: Self.decodeBrowserRouteRun
+        )
+    }
+}
+
+private struct NativeBrowserRouteEffects: BrowserRouteEffects {
+    func appendNativeActionReceipt(action: NativeActionRecord, status: String, dryRun: Bool, output: JSONValue) async throws -> NativeActionReceipt {
+        try await NativeClient.appendNativeActionReceipt(action: action, status: status, dryRun: dryRun, output: output)
+    }
+
+    @MainActor
+    func navigate(_ url: URL, runID: String) async throws -> BrowserNavigationResult {
+        let controller = BrowserWindowController.shared
+        // Navigation must not imply fronting (User's 3:30am dream-time popups):
+        // load quietly; only the explicit show surfaces front the window.
+        controller.ensureWindowLoadedQuietly()
+        let nav = try await controller.navigate(url, runID: runID)
+        return BrowserNavigationResult(url: nav.url, title: nav.title, httpStatus: nav.httpStatus)
+    }
+
+    @MainActor func currentURL() -> String? { BrowserWindowController.shared.currentURL() }
+    @MainActor func readText() async throws -> String { try await BrowserWindowController.shared.readText() }
+    @MainActor func readLinks() async throws -> [BrowserLink] { try await BrowserWindowController.shared.readLinks() }
+    @MainActor func screenshot() async throws -> Data { try await BrowserWindowController.shared.screenshot() }
+
+    func beginNavigation(_ url: URL, runID: String, captureSource: Bool, captureScreenshot: Bool) async -> BrowserNavigationTask {
         let cancellationLatch = BrowserRunCancellationLatch()
         let activeToken = await BrowserActiveRunRegistry.shared.register(runID: runID) {
             cancellationLatch.cancel()
         }
         let captureTask = await MainActor.run {
             let task = Task { @MainActor in
-                try await navigateVisibleBrowser(
-                    parsed.url,
+                try await NativeClient.browserActionRoutes.navigateVisibleBrowser(
+                    url,
                     runID: runID,
                     captureSource: captureSource,
                     captureScreenshot: captureScreenshot
@@ -149,406 +116,28 @@ extension NativeClient {
             }
             return task
         }
-        defer {
-            Task { @MainActor in
-                BrowserActiveRunRegistry.shared.unregister(runID: runID, token: activeToken)
-            }
-        }
-        do {
-            let result = try await withTaskCancellationHandler {
-                try await captureTask.value
-            } onCancel: {
-                captureTask.cancel()
-            }
-            try Task.checkCancellation()
-            opened = true
-            status = "succeeded"
-            sourceReceipt["ipcUrl"] = .string(result.nav.url)
-            sourceReceipt["ipcTitle"] = .string(result.nav.title)
-            if let code = result.nav.httpStatus {
-                sourceReceipt["httpStatus"] = .int(Int64(code))
-            }
-            if let chars = result.textChars {
-                sourceReceipt["textChars"] = .int(Int64(chars))
-            }
-            if captureSource, let text = result.text {
-                try Task.checkCancellation()
-                let persisted = try await persistBrowserTextCapture(
-                    id: runID,
-                    url: parsed.url,
-                    text: text,
-                    links: result.links
-                )
-                for (key, value) in persisted {
-                    sourceReceipt[key] = value
-                }
-            }
-            if captureScreenshot, let png = result.screenshot {
-                try Task.checkCancellation()
-                screenshotReceipt = .object(try await persistBrowserScreenshotCapture(
-                    id: runID,
-                    url: parsed.url,
-                    png: png
-                ))
-            }
-            try Task.checkCancellation()
-        } catch is CancellationError {
-            status = "canceled"
-            sourceReceipt["canceled"] = .bool(true)
-        } catch {
-            status = "failed"
-            sourceReceipt["openError"] = .string(error.localizedDescription)
-        }
-
-        let terminalState: BrowserOperationTerminalState
-        switch status {
-        case "succeeded": terminalState = .succeeded
-        case "canceled": terminalState = .canceled
-        default: terminalState = .failed
-        }
-        let completion = BrowserOperationCompletion(
-            id: runID,
-            requestDigest: requestDigest,
-            state: terminalState,
-            opened: opened,
-            sourceReceipt: .object(sourceReceipt),
-            screenshotReceipt: screenshotReceipt
-        )
-        guard let committed = try await browser.executeBrowserOperation(.complete(completion)).run else {
-            throw NSError(domain: "NativeAgentBrowser", code: 500, userInfo: [
-                NSLocalizedDescriptionKey: "Browser canonical completion returned no run"
-            ])
-        }
-        // The Core reducer makes terminal state absorbing, so an explicit
-        // cancel committed during WebKit/capture always defeats late success.
-        await observeBrowserMotorAction(runID: runID)
-        return committed
-    }
-
-    static func observeBrowserMotorAction(
-        runID: String,
-        dataRoot: URL = PersistenceCore.defaultDataRoot()
-    ) async {
-        guard dataRoot.standardizedFileURL
-                == PersistenceCore.defaultDataRoot().standardizedFileURL,
-              let model = try? await SwiftNativeBrowserClient.defaultClient(dataRoot: dataRoot)
-                .motorActionReadModel(actionId: runID) else { return }
-        await NativeCognitionRuntime.shared.observeMotorActionState(model)
-    }
-
-    struct ValidBrowserURL {
-        var url: URL
-        var domain: String
-    }
-
-    static func validBrowserURL(_ raw: String) throws -> ValidBrowserURL {
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else {
-            throw NSError(domain: "NativeAgentBrowser", code: 400, userInfo: [
-                NSLocalizedDescriptionKey: "Browser URL is required"
-            ])
-        }
-        guard let url = URL(string: trimmed),
-              let comps = URLComponents(url: url, resolvingAgainstBaseURL: false),
-              let scheme = comps.scheme?.lowercased(),
-              scheme == "http" || scheme == "https" else {
-            throw NSError(domain: "NativeAgentBrowser", code: 400, userInfo: [
-                NSLocalizedDescriptionKey: "Only http/https browser URLs are allowed"
-            ])
-        }
-        guard let host = comps.host?.lowercased(), !host.isEmpty else {
-            throw NSError(domain: "NativeAgentBrowser", code: 400, userInfo: [
-                NSLocalizedDescriptionKey: "Browser URL must include a host"
-            ])
-        }
-        return ValidBrowserURL(url: url, domain: host)
-    }
-
-    static func executeApprovedBrowserRun(from approval: ApprovalRecord) async throws {
-        guard case .object(let payload) = approval.payload,
-              case .string(let rawURL)? = payload["url"],
-              case .string(let runID)? = payload["runId"] ?? payload["run_id"] else {
-            // Malformed payload: annotate FAILED so the approved record never
-            // reads as silently executed.
-            try? await annotateApprovalExecution(
-                id: approval.id,
-                executedAction: .object([
-                    "action": .string(approval.action),
-                    "error": .string("malformed payload: missing url/runId"),
-                ]),
-                detail: "Browser navigation FAILED: malformed payload (missing url/runId)")
-            return
-        }
-        do {
-            let captureSource = connectorInputBool(
-                payload["captureSource"] ?? payload["capture_source"],
-                default: false
-            )
-            let captureScreenshot = connectorInputBool(
-                payload["captureScreenshot"] ?? payload["capture_screenshot"],
-                default: false
-            )
-            let run = try await executeVisibleBrowserRun(
-                parsed: try validBrowserURL(rawURL),
-                runID: runID,
-                approvalId: approval.id,
-                captureSource: captureSource,
-                captureScreenshot: captureScreenshot
-            )
-            let status = jsonString(run, "status") ?? "succeeded"
-            try await annotateApprovalExecution(id: approval.id, executedAction: run, detail: "Browser navigation \(status)")
-        } catch {
-            // Mirror the self_improvement pattern: never leave an approved
-            // record without an execution annotation when the executor threw.
-            NSLog("[approvals] browser run failed for \(approval.id): \(error)")
-            try? await annotateApprovalExecution(
-                id: approval.id,
-                executedAction: .object([
-                    "action": .string(approval.action),
-                    "error": .string("\(error)"),
-                ]),
-                detail: "Browser navigation FAILED: \(error.localizedDescription)")
-            throw error
-        }
-    }
-
-    static func finishRejectedBrowserRun(from approval: ApprovalRecord, status: String) async throws {
-        guard case .object(let payload) = approval.payload,
-              case .string(let rawURL)? = payload["url"],
-              case .string(let runID)? = payload["runId"] ?? payload["run_id"],
-              let parsed = try? validBrowserURL(rawURL) else {
-            return
-        }
-        let browser = SwiftNativeBrowserClient.defaultClient()
-        let start = BrowserOperationStart(
-            id: runID,
-            url: parsed.url.absoluteString,
-            domain: parsed.domain,
-            initialState: .waitingApproval,
-            visible: true,
-            approvalId: approval.id
-        )
-        let digest = SwiftNativeBrowserClient.browserRequestDigest(for: start)
-        _ = try await browser.executeBrowserOperation(.start(start))
-        let terminal: BrowserOperationTerminalState = status == "denied" ? .denied : .canceled
-        let result = try await browser.executeBrowserOperation(.complete(.init(
-            id: runID,
-            requestDigest: digest,
-            state: terminal,
-            opened: false,
-            sourceReceipt: .object([
-                "url": .string(parsed.url.absoluteString),
-                "decision": .string(status),
-            ])
-        )))
-        guard let committed = result.run else {
-            throw NSError(domain: "NativeAgentBrowser", code: 500, userInfo: [
-                NSLocalizedDescriptionKey: "Browser rejection returned no canonical run"
-            ])
-        }
-        let committedStatus = Self.jsonString(committed, "status") ?? status
-        try await annotateApprovalExecution(
-            id: approval.id,
-            executedAction: committed,
-            detail: "Browser navigation \(committedStatus)"
-        )
-        await observeBrowserMotorAction(runID: runID)
-    }
-
-    struct VisibleBrowserCapture: Sendable {
-        var url: URL
-        var nav: NavResult
-        var text: String?
-        var textChars: Int?
-        var links: [BrowserLink]?
-        var screenshot: Data?
+        return BrowserNavigationTask(task: captureTask, token: activeToken)
     }
 
     @MainActor
-    static func navigateVisibleBrowser(
-        _ url: URL,
-        runID: String,
-        captureSource: Bool,
-        captureScreenshot: Bool
-    ) async throws -> VisibleBrowserCapture {
-        let controller = BrowserWindowController.shared
-        // Navigation must not imply fronting (User's 3:30am dream-time popups):
-        // load quietly; only the explicit show surfaces front the window.
-        controller.ensureWindowLoadedQuietly()
-        let nav = try await controller.navigate(url, runID: runID)
-        try Task.checkCancellation()
-        let text = captureSource ? (try await controller.readText()) : nil
-        try Task.checkCancellation()
-        let links = captureSource ? (try? await controller.readLinks()) : nil
-        try Task.checkCancellation()
-        let textChars: Int?
-        if let text {
-            textChars = text.count
-        } else {
-            textChars = try? await controller.readText().count
-        }
-        let screenshot = captureScreenshot ? (try await controller.screenshot()) : nil
-        try Task.checkCancellation()
-        return VisibleBrowserCapture(
-            url: url,
-            nav: nav,
-            text: text,
-            textChars: textChars,
-            links: links,
-            screenshot: screenshot
-        )
+    func finishNavigation(runID: String, token: UUID) {
+        BrowserActiveRunRegistry.shared.unregister(runID: runID, token: token)
     }
 
-    @MainActor
-    static func captureCurrentVisibleBrowser(
-        readText: Bool,
-        readLinks: Bool,
-        screenshot: Bool
-    ) async throws -> VisibleBrowserCapture {
-        let controller = BrowserWindowController.shared
-        guard let current = controller.currentURL(),
-              let url = URL(string: current),
-              let scheme = url.scheme?.lowercased(),
-              scheme == "http" || scheme == "https" else {
-            throw NSError(domain: "NativeAgentBrowser", code: 400, userInfo: [
-                NSLocalizedDescriptionKey: "Visible browser is not on an http/https page"
-            ])
-        }
-        let nav = NavResult(url: current, title: "", httpStatus: nil)
-        let text = readText ? (try await controller.readText()) : nil
-        let links = readLinks ? (try await controller.readLinks()) : nil
-        let png = screenshot ? (try await controller.screenshot()) : nil
-        return VisibleBrowserCapture(
-            url: url,
-            nav: nav,
-            text: text,
-            textChars: text?.count,
-            links: links,
-            screenshot: png
-        )
+    func cancelNavigation(runID: String) async {
+        _ = await BrowserActiveRunRegistry.shared.cancel(runID: runID)
     }
 
-    static func persistBrowserTextCapture(
-        id: String,
-        url: URL,
-        text: String,
-        links: [BrowserLink]?
-    ) async throws -> [String: JSONValue] {
-        let browser = SwiftNativeBrowserClient.defaultClient()
-        var artifacts: [BrowserCaptureCache.Kind: Data] = [.text: Data(text.utf8)]
-        if let links { artifacts[.links] = try JSONEncoder().encode(links) }
-        let paths = try await BrowserCaptureCache.shared.store(
-            id: id, artifacts: artifacts, browserRoot: browser.sourcesDir.deletingLastPathComponent())
-        guard let textPath = paths[.text] else { throw CocoaError(.fileWriteUnknown) }
-        var receipt: [String: JSONValue] = [
-            "url": .string(url.absoluteString),
-            "textPath": .string(textPath.path),
-            "textChars": .int(Int64(text.count)),
-            "textPreview": .string(NativeAppSecretRedactor.redactText(String(text.prefix(3_000)))),
-            "captureRetention": BrowserCaptureCache.shared.policy.receipt,
-        ]
-        if let links, let linksPath = paths[.links] {
-            receipt["linksPath"] = .string(linksPath.path)
-            receipt["linkCount"] = .int(Int64(links.count))
-            receipt["linksPreview"] = try JSONValue.fromEncodable(Array(links.prefix(25)))
-        }
-        return receipt
+    func observeMotorAction(_ model: MotorActionReadModel) async {
+        await NativeAgentEngine.liveCognition.observeMotorActionState(model)
     }
 
-    static func persistBrowserLinksCapture(
-        id: String,
-        url: URL,
-        links: [BrowserLink]
-    ) async throws -> [String: JSONValue] {
-        let browser = SwiftNativeBrowserClient.defaultClient()
-        let data = try JSONEncoder().encode(links)
-        let paths = try await BrowserCaptureCache.shared.store(
-            id: id, artifacts: [.links: data], browserRoot: browser.sourcesDir.deletingLastPathComponent())
-        guard let path = paths[.links] else { throw CocoaError(.fileWriteUnknown) }
-        return [
-            "url": .string(url.absoluteString),
-            "linksPath": .string(path.path),
-            "linkCount": .int(Int64(links.count)),
-            "linksPreview": try JSONValue.fromEncodable(Array(links.prefix(25))),
-            "captureRetention": BrowserCaptureCache.shared.policy.receipt,
-        ]
+    func annotateApprovalExecution(id: String, executedAction: JSONValue, detail: String) async throws {
+        try await NativeClient.annotateApprovalExecution(id: id, executedAction: executedAction, detail: detail)
     }
 
-    static func persistBrowserScreenshotCapture(
-        id: String,
-        url: URL,
-        png: Data
-    ) async throws -> [String: JSONValue] {
-        let browser = SwiftNativeBrowserClient.defaultClient()
-        let paths = try await BrowserCaptureCache.shared.store(
-            id: id, artifacts: [.screenshot: png], browserRoot: browser.screenshotsDir.deletingLastPathComponent())
-        guard let path = paths[.screenshot] else { throw CocoaError(.fileWriteUnknown) }
-        // A screenshot exists to be LOOKED at. 2026-09-13: it came back as a
-        // path, so seeing it cost a second turn with read_file — the same
-        // complaint Agent raised about image_generate. The thumbnail rides
-        // back on this result; the full-size PNG stays at pngPath. Outside a
-        // model turn (the wander lane) there is no sink and `shown` is false.
-        let shown = LocalToolImage.showProducedImage(at: path, name: "\(id).png")
-        return [
-            "url": .string(url.absoluteString),
-            "pngPath": .string(path.path),
-            "bytes": .int(Int64(png.count)),
-            "shownToModel": .bool(shown.shown),
-            "visionNote": .string(shown.note),
-            "captureRetention": BrowserCaptureCache.shared.policy.receipt,
-        ]
+    func showProducedImage(at path: URL, name: String) -> (shown: Bool, note: String) {
+        let shown = LocalToolImage.showProducedImage(at: path, name: name)
+        return (shown.shown, shown.note)
     }
-
-    /// `root` is injectable so the memory.repair executor (and its launch
-    /// reconciliation) can run against a test data root; every other caller
-    /// uses the production default.
-    static func annotateApprovalExecution(
-        id: String,
-        executedAction: JSONValue,
-        detail: String,
-        root: URL = SwiftNativeApprovalInbox.defaultDataRoot()
-    ) async throws {
-        _ = try await SwiftNativeApprovalInbox(root: root).annotateExecution(
-            id,
-            executedAction: executedAction,
-            detail: detail
-        )
-    }
-
-    static func jsonString(_ value: JSONValue, _ key: String) -> String? {
-        guard case .object(let obj) = value else { return nil }
-        if case .string(let s)? = obj[key] { return s }
-        return nil
-    }
-
-    func cancelBrowserRun(id: String?) async throws -> BrowserRun {
-        // Subsystem #27 wave 34 W17: cancel_browser_run is a pure flock'd
-        // runs.json read-find-mutate-write + one receipt append — fully ported.
-        // SwiftNativeBrowserClient handles it in-process; any IO failure fails
-        // closed instead of replaying the cancel.
-        var body: [String: Any] = ["dryRun": true]
-        if let id, !id.isEmpty {
-            body["id"] = id
-        }
-        var swiftBody: [String: JSONValue] = ["dryRun": .bool(true)]
-        if let id, !id.isEmpty {
-            swiftBody["id"] = .string(id)
-        }
-        let writer = makeBrowserWriter(
-            dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()
-        )
-        // `try`: a THROW means the cancel already persisted to runs.json. nil
-        // only occurs for a non-object body.
-        if let envelope = try await writer.cancelBrowserRun(body: .object(swiftBody)) {
-            let run = try Self.decodeJSONValue(envelope, as: BrowserRun.self, context: "cancelBrowserRun(swiftNative)")
-            if run.status == "canceled" {
-                _ = await BrowserActiveRunRegistry.shared.cancel(runID: run.id)
-            }
-            return run
-        }
-        throw NSError(domain: "NativeAgentSwiftOnly", code: -410, userInfo: [
-            NSLocalizedDescriptionKey: "Browser cancel body was not handled by the Swift browser writer."
-        ])
-    }
-
 }

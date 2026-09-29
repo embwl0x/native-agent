@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import TrustCenter
 #if canImport(ApplicationServices)
 import ApplicationServices
 #endif

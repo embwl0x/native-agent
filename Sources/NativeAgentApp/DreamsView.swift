@@ -1,13 +1,15 @@
+import NativeAgentCore
 // PATCH-2026-05-29: dreams-tab DreamsView — surfaces + controls the dream diary
 // and REM consolidation cycle. Backend: Swift-native DreamREMCycle runtime.
-//   GET  /v1/dream/diary?limit=N -> {entries:[DreamEntry], enabled:Bool}
-//   GET  /v1/dream/<YYYY-MM-DD>  -> DreamEntry (404 if missing)
+//   engine.cognitionView.dreamDiary(limit:) -> core DreamEntry rows + gate
+//   engine.cognitionView.dreamEntry(date:)  -> one night (not-found if missing)
 //   POST /v1/dream/run           -> run a dream pass now
 //   POST /v1/rem/run             -> run a REM consolidation pass now
 // Kill switches (via deep-merged /v1/trust patch):
 //   personalityPolicy.dream_cycle_enabled (deep dream gate)
 //   trainingPolicy.rem_cycle_enabled       (REM gate)
 import SwiftUI
+import DreamREMCycle
 import PersistenceCore
 
 /// The manual Dream action must distinguish a verified disabled policy from an
@@ -122,7 +124,7 @@ enum DreamDiaryListPresentation: Equatable {
 struct DreamDiaryLoadGeneration: Equatable {
     enum Settlement: Equatable {
         case superseded
-        case current(DreamDiaryResponse?)
+        case current(DreamDiary?)
     }
 
     private(set) var latestRequest = 0
@@ -134,7 +136,7 @@ struct DreamDiaryLoadGeneration: Equatable {
         return latestRequest
     }
 
-    mutating func settle(request: Int, response: DreamDiaryResponse?) -> Settlement {
+    mutating func settle(request: Int, response: DreamDiary?) -> Settlement {
         guard request == latestRequest else { return .superseded }
         isLoading = false
         return .current(response)
@@ -266,7 +268,7 @@ struct DreamsView: View {
     // shipped default instead.
     @MainActor
     private var remEnabled: Bool {
-        appModel.trustPolicy?.trainingPolicy?.rem_cycle_enabled ?? true
+        appModel.engine.trust.policy?.trainingPolicy?.rem_cycle_enabled ?? true
     }
 
     var body: some View {
@@ -516,7 +518,7 @@ struct DreamsView: View {
         if case .loading = entryDetailPresentation {
             AdvancedWaitingLine("Reading this dream…")
         } else if case .entry = entryDetailPresentation, let entry = selectedEntry {
-            let reading = DreamReaderText.reading(entry.content)
+            let reading = DreamReaderText.reading(entry.text)
             ScrollView {
                 VStack(alignment: .leading, spacing: 12) {
                     // Lead with the dream's own title; the date is a caption.
@@ -528,7 +530,7 @@ struct DreamsView: View {
                         Text(reading.title ?? night)
                             .font(ShellType.bodySemibold)
                             .foregroundStyle(NativeAgentShell.text)
-                        let written = entry.modified_at.map { "written " + shortTimestamp($0) }
+                        let written = entry.modifiedAt.map { "written " + shortTimestamp($0) }
                         if let caption = reading.title != nil
                             ? [night, written].compactMap { $0 }.joined(separator: " · ")
                             : written.map({ "W" + $0.dropFirst() }) {
@@ -538,7 +540,7 @@ struct DreamsView: View {
                         }
                     }
 
-                    if entry.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    if entry.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                         Text("This entry is empty.")
                             .font(ShellType.label)
                             .foregroundStyle(NativeAgentShell.secondary)
@@ -674,7 +676,7 @@ struct DreamsView: View {
         if !savingDream { dreamCycleOn = response.enabled }
         // Only reconcile REM once the policy it comes from has actually been
         // read — the diary response says nothing about the REM gate.
-        if !savingRem, appModel.trustPolicy != nil { remCycleOn = remEnabled }
+        if !savingRem, appModel.engine.trust.policy != nil { remCycleOn = remEnabled }
 
         // Re-derive the selection against the freshly loaded entries.
         if entries.isEmpty {
@@ -697,9 +699,9 @@ struct DreamsView: View {
 
     @MainActor
     private func loadREMPolicy() async {
-        guard appModel.trustPolicy == nil || remPolicyLoadFailed else { return }
+        guard appModel.engine.trust.policy == nil || remPolicyLoadFailed else { return }
         do {
-            appModel.trustPolicy = try await appModel.getTrustPolicy()
+            appModel.engine.trust.policy = try await appModel.engine.trust.load()
             remPolicyLoadFailed = false
         } catch {
             remPolicyLoadFailed = true
@@ -715,7 +717,7 @@ struct DreamsView: View {
         entryLoadError = nil
         // Prefer the already-fetched diary entry (it carries full content).
         if let cached = entries.first(where: { $0.date == date }),
-           !cached.content.isEmpty {
+           !cached.text.isEmpty {
             selectedEntry = cached
             _ = entryLoadGeneration.settle(request: request, entry: cached)
             return
@@ -757,7 +759,7 @@ struct DreamsView: View {
 
     private var remRunAvailability: DreamsREMRunAvailability {
         DreamsREMRunAvailability.resolve(
-            policy: appModel.trustPolicy,
+            policy: appModel.engine.trust.policy,
             policyLoadFailed: remPolicyLoadFailed
         )
     }
@@ -886,7 +888,7 @@ private struct DreamDateRow: View {
     /// The first real line of the dream. A byte count tells a reader nothing
     /// about which night this was; my own opening words do.
     private var excerpt: String {
-        let lines = (entry.content ?? "").split(whereSeparator: \.isNewline)
+        let lines = entry.text.split(whereSeparator: \.isNewline)
         let first = lines.lazy
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .first { line in

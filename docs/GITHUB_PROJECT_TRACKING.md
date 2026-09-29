@@ -108,7 +108,6 @@ rollup exists, the individual Check Runs determine `passing`, `pending`,
 Focused checks:
 
 ```bash
-swift test --package-path Modules/NativeAgentCore --filter github --no-parallel
 swift build --jobs 4
 ./script/check_architecture_blueprint.swift --repo .
 ```

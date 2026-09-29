@@ -335,9 +335,9 @@ public actor RebuildLock {
 public func readAutonomyTrustPolicy(
     dataRoot: URL? = nil,
     persistence: any PersistenceCoreProtocol = SwiftNativePersistenceCore()
-) async -> AutonomyTrustPolicyView {
+) async throws -> AutonomyTrustPolicyView {
     let root = dataRoot ?? PersistenceCore.defaultDataRoot()
     let path = root.appendingPathComponent("trust").appendingPathComponent("policy.json")
-    let value = await persistence.readJSON(path, defaultValue: .object([:]))
+    let value = try await persistence.readJSON(path, ifMissing: .object([:]))
     return AutonomyTrustPolicyView.parse(value)
 }

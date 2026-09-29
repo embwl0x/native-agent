@@ -154,7 +154,7 @@ public struct SubconsciousVitalsCheck: DoctorCheck {
                     + " not be read (\(summary.unreadableDays.joined(separator: ", ")))."
                     + " Her subconscious vitals are UNMEASURED \(window.describedAs) — this"
                     + " row is not reporting healthy, it is reporting that it could not look.",
-                repair: "Check permissions and encoding on data/turn_traces/<day>.jsonl."
+                human_action: "Open Diagnostics → Doctor and include the named unreadable turn-trace day files in a support request."
             )
         }
 
@@ -165,30 +165,50 @@ public struct SubconsciousVitalsCheck: DoctorCheck {
                 detail: "data/cognition/organism_state.json exists but \(reason)."
                     + " Her chemistry is UNMEASURED, which is a finding about this row's"
                     + " coverage, not a clean reading.",
-                repair: "Inspect data/cognition/organism_state.json — the organism writes"
-                    + " chemicalState on every save."
+                human_action: "Open Diagnostics → Doctor and include the organism_state.json read failure in a support request."
             )
         }
 
+        var coverageParts: [String] = []
+        if !summary.truncatedDays.isEmpty {
+            coverageParts.append(
+                "\(summary.truncatedDays.count) day file(s) were tailed to the read budget"
+                    + " (\(summary.truncatedDays.joined(separator: ", "))), so earlier turns"
+                    + " that day were not scanned"
+            )
+        }
+        if summary.malformedLines > 0 {
+            coverageParts.append("\(summary.malformedLines) trace line(s) did not parse")
+        }
+        let coverageDetail = coverageParts.isEmpty ? "" : " " + coverageParts.joined(separator: "; ") + "."
+
         if summary.isEmptyFeed {
+            let level = chemistryLine(chemistry).level
             return CheckResult(
-                id: id, title: title, status: "warn",
+                id: id, title: title, status: level ?? "ok",
                 detail: "UNMEASURED \(window.describedAs) — no turn-trace day files under"
                     + " data/turn_traces. "
                     + chemistryLine(chemistry).sentence,
-                repair: nil
+                repair: chemistryLine(chemistry).repair,
+                human_action: level == nil ? nil
+                    : "Open Diagnostics → Doctor and include the Subconscious Vitals detail in a support request."
             )
         }
         guard !eligibleTurns.isEmpty else {
+            let level = chemistryLine(chemistry).level ?? (summary.malformedLines > 0 ? "warn" : "ok")
             return CheckResult(
-                id: id, title: title, status: "warn",
+                id: id, title: title,
+                // Keep actual observation faults visible; tailing alone is not one yet.
+                status: level,
                 detail: "UNMEASURED \(window.describedAs) — \(summary.daysPresent.count)"
                     + " trace day(s) read and \(summary.matchedRows) context.snapshot row(s)"
                     + " in window, but none on a capsule surface"
                     + " (\(capsuleSurfaces.sorted().joined(separator: "/")))."
                     + " Nothing about her subconscious can be measured. "
-                    + chemistryLine(chemistry).sentence,
-                repair: nil
+                    + chemistryLine(chemistry).sentence + coverageDetail,
+                repair: chemistryLine(chemistry).repair,
+                human_action: level == "ok" ? nil
+                    : "Open Diagnostics → Doctor and include the Subconscious Vitals detail in a support request."
             )
         }
 
@@ -226,14 +246,13 @@ public struct SubconsciousVitalsCheck: DoctorCheck {
             }
         } else {
             parts.append("capsule attachment UNMEASURED — no eligible turn could be judged")
-            raise("warn")
         }
         if !capsuleUnjudged.isEmpty {
+            if eligibleTurns.count >= minimumRateTurns { raise("warn") }
             parts.append(
                 "\(capsuleUnjudged.count) turn(s) carried neither the capsule flag nor a"
                     + " readable preview and were UNJUDGED rather than counted as missing"
             )
-            raise("warn")
         }
 
         // 2. Felt-word mass.
@@ -266,7 +285,7 @@ public struct SubconsciousVitalsCheck: DoctorCheck {
             }
         } else {
             parts.append("felt vocabulary UNMEASURED — no turn yielded a readable feeling line")
-            raise("warn")
+            if eligibleTurns.count >= minimumRateTurns { raise("warn") }
         }
 
         // 3. The Sound rut line.
@@ -292,7 +311,7 @@ public struct SubconsciousVitalsCheck: DoctorCheck {
             }
         } else {
             parts.append("Sound line UNMEASURED — no turn yielded a readable Sound line")
-            raise("warn")
+            if eligibleTurns.count >= minimumRateTurns { raise("warn") }
         }
 
         // 4. Inner-line variety.
@@ -321,29 +340,24 @@ public struct SubconsciousVitalsCheck: DoctorCheck {
             if let repair = chemLine.repair { repairs.append(repair) }
         }
 
-        if !summary.truncatedDays.isEmpty {
-            parts.append(
-                "\(summary.truncatedDays.count) day file(s) were tailed to the read budget"
-                    + " (\(summary.truncatedDays.joined(separator: ", "))), so earlier turns"
-                    + " that day were not scanned"
-            )
-            raise("warn")
-        }
-        if summary.malformedLines > 0 {
-            parts.append("\(summary.malformedLines) trace line(s) did not parse")
+        if !coverageParts.isEmpty {
+            parts.append(contentsOf: coverageParts)
+            // A bounded read is coverage, not a fault; the detail names it.
         }
 
         return CheckResult(
             id: id, title: title, status: status,
             detail: parts.joined(separator: "; ") + ".",
-            repair: repairs.isEmpty ? nil : repairs.joined(separator: " ")
+            repair: repairs.isEmpty ? nil : repairs.joined(separator: " "),
+            human_action: status == "ok" ? nil
+                : "Open Diagnostics → Doctor and include the Subconscious Vitals detail in a support request."
         )
     }
 
     // MARK: - Organism chemistry
 
     private enum Chemistry {
-        case absent
+        case unmeasured(String)
         case unreadable(String)
         case measured([String: Double])
     }
@@ -352,19 +366,28 @@ public struct SubconsciousVitalsCheck: DoctorCheck {
         let path = root
             .appendingPathComponent("cognition", isDirectory: true)
             .appendingPathComponent("organism_state.json")
-        guard FileManager.default.fileExists(atPath: path.path) else { return .absent }
+        guard FileManager.default.fileExists(atPath: path.path) else {
+            return .unmeasured("no data/cognition/organism_state.json")
+        }
         guard let data = try? Data(contentsOf: path) else {
             return .unreadable("could not be read")
         }
         guard let value = try? JSONValue.parse(data), case .object(let object) = value else {
             return .unreadable("did not parse as JSON")
         }
-        guard case .object(let state)? = object["chemicalState"] else {
+        guard let chemicalState = object["chemicalState"] else {
             return .unreadable("carries no chemicalState object")
+        }
+        guard case .object(let state) = chemicalState else {
+            return .unreadable("carries a non-object chemicalState")
         }
         var measured: [String: Double] = [:]
         for dimension in chemistryDimensions {
-            if let number = state[dimension]?.doubleValue { measured[dimension] = number }
+            guard let value = state[dimension] else { continue }
+            guard let number = value.doubleValue, number.isFinite else {
+                return .unreadable("carries a non-numeric \(dimension) in chemicalState")
+            }
+            measured[dimension] = number
         }
         guard !measured.isEmpty else {
             return .unreadable(
@@ -378,10 +401,10 @@ public struct SubconsciousVitalsCheck: DoctorCheck {
         _ chemistry: Chemistry
     ) -> (sentence: String, level: String?, repair: String?) {
         switch chemistry {
-        case .absent:
+        case .unmeasured(let reason):
             return (
-                "organism chemistry UNMEASURED — no data/cognition/organism_state.json",
-                "warn",
+                "organism chemistry UNMEASURED — \(reason)",
+                nil,
                 nil
             )
         case .unreadable(let reason):

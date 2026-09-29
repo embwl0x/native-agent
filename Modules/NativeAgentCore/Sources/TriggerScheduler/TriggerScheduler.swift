@@ -234,7 +234,7 @@ public struct TriggerFireResult: Sendable, Equatable {
 // live in `Sources/NativeAgentApp/`. TriggerScheduler is a NativeAgentCore
 // target whose deps are ["PersistenceCore", "WorkshopExecution"] — it cannot import the
 // app. So the push sender is an INJECTED CLOSURE, mirroring how
-// `AppChatToolDispatcher` injects its own sender. The app binds it to
+// `AppToolExecutor` injects its own sender. The app binds it to
 // `MacSyncEngine.shared.sendNotificationToPairedDevices` — the same call the
 // DeskNotify loop already makes.
 
@@ -532,7 +532,7 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
         // Match daemon list_configs / list_triggers_raw: read JSON; if absent
         // or not an array, return the per-scheduler default. Bad entries
         // inside the array are skipped (compactMap).
-        let raw = await persistence.readJSON(path, defaultValue: .array(defaultValue))
+        let raw = try await persistence.readJSON(path, ifMissing: .array(defaultValue))
         let items: [JSONValue]
         if case .array(let arr) = raw {
             items = arr

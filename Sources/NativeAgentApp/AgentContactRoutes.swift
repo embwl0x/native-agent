@@ -1,7 +1,8 @@
+import GrokLink
 import Foundation
 import CoreFoundation
 import Network
-import CryptoKit
+import Agents
 import ChatOrchestration
 import NativeAgentCore
 import PersistenceCore
@@ -81,7 +82,7 @@ extension ClaudeBridge {
             }
             Task {
                 do {
-                    try await GrokInboundReply.receive(GrokReplyInput.parse(body), principal: principal, dataRoot: dataRoot)
+                    try await NativeAgentEngine.live.agents.grok.receive(GrokReplyInput.parse(body), principal: principal, dataRoot: dataRoot)
                     writeJSON(conn, status: 200, obj: ["status": "answered"])
                 } catch {
                     writeJSON(conn, status: 409, obj: ["error": "unknown_expired_or_already_answered_message"])
@@ -108,7 +109,7 @@ extension ClaudeBridge {
         }
         if path.hasPrefix("/a2a/") {
             Task {
-                let endpoint = AgentContactA2AEndpoint(tasks: tasks ?? AgentContactRuntime.tasks, port: advertisedPort ?? activePort,
+                let endpoint = AgentContactA2AEndpoint(tasks: tasks ?? NativeAgentEngine.live.agents.tasks, port: advertisedPort ?? activePort,
                     grpcPort: advertisedGRPCPort ?? NativeAgentA2AGRPCListener.shared.port)
                 let response = await endpoint.handleREST(method: method, target: path, body: body,
                     principal: principal, version: headers["a2a-version"])
@@ -136,17 +137,22 @@ extension ClaudeBridge {
             }
             switch NativeAgentMCPWire.parse(body, defaultSession: principal.conversationID(protocolName: "mcp")) {
             case .message(let message, let project):
-                handleContactMessage(conn: conn, body: message, tasks: tasks ?? AgentContactRuntime.tasks,
+                // SSE only to a relay that says it reads it: relays spawned before
+                // this change advertise text/event-stream but accept only JSON.
+                let wait = NativeAgentMCPWire.waitRequest(body)
+                let mcpWait = (seconds: wait.seconds,
+                               progressToken: headers["x-nativeagent-relay-sse"] == "1" ? wait.progressToken : nil)
+                handleContactMessage(conn: conn, body: message, tasks: tasks ?? NativeAgentEngine.live.agents.tasks,
                               peer: peerTurnContext(principal: principal, protocolName: "mcp",
                                                     messageID: Self.mcpRequestID(message),
                                                     // The message, not the JSON-RPC envelope: a retry under
                                                     // the same request_id carries a new JSON-RPC id.
                                                     requestBody: message),
-                              responseProjection: project)
+                              responseProjection: project, mcpWait: mcpWait)
             case .reply(let request, let session, let offset, let project):
                 Task {
                     writeJSON(conn, status: 200, obj: project(await peerReplyReceipt(requestID: request, sessionID: session,
-                        offset: offset, principal: principal, tasks: tasks ?? AgentContactRuntime.tasks)))
+                        offset: offset, principal: principal, tasks: tasks ?? NativeAgentEngine.live.agents.tasks)))
                 }
             case .immediate(let status, let response): writeJSON(conn, status: status, obj: response)
             case .acceptedNotification:
@@ -167,7 +173,7 @@ extension ClaudeBridge {
                 return
             }
             Task {
-                let response = await AgentContactA2AEndpoint(tasks: tasks ?? AgentContactRuntime.tasks, port: advertisedPort ?? activePort,
+                let response = await AgentContactA2AEndpoint(tasks: tasks ?? NativeAgentEngine.live.agents.tasks, port: advertisedPort ?? activePort,
                     grpcPort: advertisedGRPCPort ?? NativeAgentA2AGRPCListener.shared.port)
                     .handle(body, principal: principal, version: headers["a2a-version"])
                 switch response {
@@ -200,7 +206,7 @@ extension ClaudeBridge {
             Task {
                 let result = await peerReplyReceipt(requestID: requestID, sessionID: sessionID,
                     offset: Self.peerInteger(json["offset"]) ?? 0, maxChars: Self.peerInteger(json["max_chars"]) ?? 8000,
-                    principal: principal, tasks: tasks ?? AgentContactRuntime.tasks)
+                    principal: principal, tasks: tasks ?? NativeAgentEngine.live.agents.tasks)
                 writeJSON(conn, status: result["status"] as? String == "invalid_request" ? 400 : 200, obj: result)
             }
         case "/agent/message":
@@ -208,7 +214,7 @@ extension ClaudeBridge {
                 writeJSON(conn, status: 405, obj: ["error": "method_not_allowed"])
                 return
             }
-            handleContactMessage(conn: conn, body: body, tasks: tasks ?? AgentContactRuntime.tasks,
+            handleContactMessage(conn: conn, body: body, tasks: tasks ?? NativeAgentEngine.live.agents.tasks,
                           peer: peerTurnContext(principal: principal, protocolName: "agent-message",
                                                 messageID: Self.mcpRequestID(body),
                                                 requestBody: body))
@@ -220,24 +226,7 @@ extension ClaudeBridge {
         return handled
     }
 
-    /// Everything the inbound peer lanes know about ONE peer request: who the
-    /// caller proved it is (never the shared bridge bearer alone), which
-    /// protocol it arrived on, the id that protocol carries, and a digest of
-    /// the exact bytes. See `AgentBridgePrincipal` and
-    /// `AgentPeerReplayClaimStore`.
-    struct PeerTurnContext: Sendable {
-        let principal: AgentBridgePrincipal
-        let protocolName: String
-        let messageID: String?
-        let bodyDigest: String
-
-        var claimKey: String? {
-            guard let messageID, !messageID.isEmpty else { return nil }
-            return AgentPeerReplayClaimStore.key(
-                principal: principal.id, protocolName: protocolName, messageID: messageID
-            )
-        }
-    }
+    typealias PeerTurnContext = ClaudeBridgeMessageRuntime.PeerTurnContext
 
     private func peerTurnContext(principal: AgentBridgePrincipal, protocolName: String, messageID: String?,
                                  requestBody: Data) -> PeerTurnContext {
@@ -268,55 +257,19 @@ extension ClaudeBridge {
          "authorship": "agent", "surface": "agent-bridge"]
     }
 
-    static func validGenericAgentMessage(_ json: [String: Any]) -> Bool {
-        guard Set(json.keys).isSubset(of: ["text", "sessionId", "request_id"]),
-              let text = json["text"] as? String, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-              text.utf8.count <= 64000 else { return false }
-        if let raw = json["sessionId"] {
-            guard let session = raw as? String, genericAgentSessionID(requested: session) != nil else { return false }
-        }
-        if let raw = json["request_id"] {
-            guard let id = raw as? String, UUID(uuidString: id) != nil else { return false }
-        }
-        return true
-    }
-
-    /// Generic mounted-surface identity, before enqueue/persistence. A supplied
-    /// identity is continued exactly or rejected; it never falls back to the
-    /// user's selected chat. The acknowledgement retains newly created IDs.
-    /// A peer's conversations live under its own prefix, so a peer can never
-    /// name the person's session (or another peer's) and land a turn in it
-    /// (Astra comb, 2026-09-16). `owner` is the authenticated principal id;
-    /// a requested id must carry that peer's prefix or it is refused.
-    static func genericAgentSessionID(requested: String?, owner: String? = nil) -> String? {
-        let prefix = owner.map { genericAgentSessionPrefix(owner: $0) }
-        guard let requested else {
-            return (prefix ?? "") + (owner.map { "mcp-" + $0 } ?? UUID().uuidString.lowercased())
-        }
-        guard requested.utf8.count <= 128,
-              NativeAgentChatSessionID.normalizedPathComponent(requested) == requested else { return nil }
-        if let prefix, !requested.hasPrefix(prefix) { return nil }
-        return requested
-    }
-
-    static func genericAgentSessionPrefix(owner: String) -> String {
-        let digest = SHA256.hash(data: Data(owner.utf8))
-        return "agent-" + digest.map { String(format: "%02x", $0) }.joined().prefix(12) + "-"
-    }
-
     private func peerReplyReceipt(requestID: String, sessionID: String, offset: Int = 0,
                                   maxChars: Int = 8000, principal: AgentBridgePrincipal, tasks: AgentContactTasks) async -> [String: Any] {
         let protocolSession = NativeAgentMCPWire.validSession(sessionID) || NativeAgentA2AWire.validContext(sessionID)
         let storedSession = protocolSession ? principal.storedConversation(sessionID) : sessionID
-        guard storedSession.hasPrefix(Self.genericAgentSessionPrefix(owner: principal.id)) else {
+        guard storedSession.hasPrefix(AgentBridgePrincipal.genericAgentSessionPrefix(owner: principal.id)) else {
             return ["status": "invalid_request"]
         }
-        let context = String(storedSession.dropFirst(Self.genericAgentSessionPrefix(owner: principal.id).count))
+        let context = String(storedSession.dropFirst(AgentBridgePrincipal.genericAgentSessionPrefix(owner: principal.id).count))
         if let task = try? await tasks.get("na3.\(context).\(requestID)", owner: principal.id) {
             return Self.contactReply(task, requestID: requestID, sessionID: sessionID, offset: offset, maxChars: maxChars)
         }
-        var receipt = Self.agentReplyReceipt(requestID: requestID, sessionID: storedSession,
-            offset: offset, maxChars: maxChars, logURL: Self.messageReplyURL())
+        var receipt = ClaudeBridgeMessageRuntime.agentReplyReceipt(requestID: requestID, sessionID: storedSession,
+            offset: offset, maxChars: maxChars, logURL: ClaudeBridgeMessageRuntime.messageReplyURL())
         if receipt["session_id"] as? String == storedSession { receipt["session_id"] = sessionID }
         return receipt
     }
@@ -324,24 +277,25 @@ extension ClaudeBridge {
     /// The peer doors share A2A's retained execution; the legacy builder handler stays separate.
     private func handleContactMessage(conn: NWConnection, body: Data,
                                       tasks: AgentContactTasks, peer: PeerTurnContext,
-                                      responseProjection: (@Sendable (Int, [String: Any]) -> [String: Any])? = nil) {
+                                      responseProjection: (@Sendable (Int, [String: Any]) -> [String: Any])? = nil,
+                                      mcpWait: (seconds: Int, progressToken: NativeAgentMCPWire.ID?)? = nil) {
         func reply(_ status: Int, _ object: [String: Any]) {
             writeJSON(conn, status: responseProjection == nil ? status : 200,
                       obj: responseProjection?(status, object) ?? object)
         }
         guard let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
-              Self.validGenericAgentMessage(json), let text = json["text"] as? String else {
+              ClaudeBridgeMessageRuntime.validGenericAgentMessage(json), let text = json["text"] as? String else {
             reply(400, ["status": "rejected", "detail": "The message is invalid. Work: nothing ran."]); return
         }
         let principal = peer.principal
         let requested = json["sessionId"] as? String
         let protocolSession = peer.protocolName == "mcp"
         let stored = protocolSession ? requested.map(principal.storedConversation)
-            : Self.genericAgentSessionID(requested: requested, owner: principal.id)
-        guard let stored, stored.hasPrefix(Self.genericAgentSessionPrefix(owner: principal.id)) else {
+            : ClaudeBridgeMessageRuntime.genericAgentSessionID(requested: requested, owner: principal.id)
+        guard let stored, stored.hasPrefix(AgentBridgePrincipal.genericAgentSessionPrefix(owner: principal.id)) else {
             reply(403, ["status": "rejected", "detail": "This conversation belongs to another contact. Work: nothing ran."]); return
         }
-        let context = String(stored.dropFirst(Self.genericAgentSessionPrefix(owner: principal.id).count))
+        let context = String(stored.dropFirst(AgentBridgePrincipal.genericAgentSessionPrefix(owner: principal.id).count))
         let session = protocolSession ? context : stored
         let request = json["request_id"] as? String ?? UUID().uuidString
         let send = NativeAgentA2AWire.Send(rpcID: request, context: context, request: request,
@@ -349,13 +303,77 @@ extension ClaudeBridge {
         Task {
             do {
                 let task = try await tasks.send(send, principal: principal, digest: peer.bodyDigest, protocolName: peer.protocolName)
-                reply(200, ["status": "ok", "ack": "enqueued", "requestId": request,
-                    "sessionId": session, "task_id": task.id])
+                let ack: [String: Any] = ["status": "ok", "ack": "enqueued", "requestId": request,
+                    "sessionId": session, "task_id": task.id]
+                guard let mcpWait, mcpWait.seconds > 0, let responseProjection else { reply(200, ack); return }
+                await Self.writeWaitedReply(conn: conn, ack: ack, taskID: task.id, requestID: request, sessionID: session,
+                    owner: principal.id, tasks: tasks, wait: mcpWait, project: responseProjection)
             } catch {
                 reply(409, ["status": "rejected", "requestId": request, "sessionId": session,
                     "detail": (error as? AgentContactFailure)?.message ?? "The message could not be accepted. Work: outcome unknown."])
             }
         }
+    }
+
+    /// Holds an MCP `agent_message` open until the reply settles or the
+    /// caller's bound passes, so hosts get the answer without polling. With a
+    /// progress token the answer is an SSE stream (Streamable HTTP): the reply
+    /// so far as `notifications/progress`, then the tool result. Without one
+    /// it is the same single JSON response, only later. The task, its receipt
+    /// and replay claim are untouched: leaving early only ends this wait, and
+    /// `agent_reply` still reads the same retained reply.
+    private static func writeWaitedReply(conn: NWConnection, ack: [String: Any], taskID: String, requestID: String,
+                                         sessionID: String, owner: String, tasks: AgentContactTasks,
+                                         wait: (seconds: Int, progressToken: NativeAgentMCPWire.ID?),
+                                         project: @escaping @Sendable (Int, [String: Any]) -> [String: Any]) async {
+        @Sendable func send(_ data: Data) async -> Bool {
+            await withCheckedContinuation { done in
+                conn.send(content: data, completion: .contentProcessed { done.resume(returning: $0 == nil) })
+            }
+        }
+        @Sendable func frame(_ object: [String: Any]) -> Data {
+            var data = Data("event: message\ndata: ".utf8)
+            data.append((try? JSONSerialization.data(withJSONObject: object)) ?? Data("{}".utf8))
+            data.append(Data("\n\n".utf8))
+            return data
+        }
+        let token = wait.progressToken
+        if token != nil, await !send(Data("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n".utf8)) {
+            conn.cancel(); return
+        }
+        if let events = try? await tasks.subscribe(taskID, owner: owner) {
+            let agent = PeerFacingIdentity.agentName
+            await withTaskGroup(of: Void.self) { group in
+                group.addTask {
+                    var step = 0, last = Date.distantPast
+                    for await event in events {
+                        let task: AgentContactTask
+                        switch event {
+                        case .status(let current, let final):
+                            if final { return }
+                            task = current
+                        case .snapshot(let current), .artifact(let current, _, _, _): task = current
+                        }
+                        guard let token, Date().timeIntervalSince(last) >= 0.5 else { continue }
+                        let message = task.state == .inputRequired ? (task.detail ?? "Waiting for the person")
+                            : task.text.isEmpty ? "\(agent) is working" : String(task.text.suffix(2000))
+                        last = Date(); step += 1
+                        guard await send(frame(NativeAgentMCPWire.progress(token, step: step, message: message))) else { return }
+                    }
+                }
+                group.addTask { try? await Task.sleep(for: .seconds(wait.seconds)) }
+                await group.next()
+                group.cancelAll()
+            }
+        }
+        var receipt = ack
+        if let task = try? await tasks.get(taskID, owner: owner) {
+            receipt.merge(contactReply(task, requestID: requestID, sessionID: sessionID, offset: 0, maxChars: 8000)) { ack, _ in ack }
+        }
+        let response = project(200, receipt)
+        guard token != nil else { BridgeCore.writeJSON(conn, status: 200, obj: response); return }
+        _ = await send(frame(response))
+        conn.cancel()
     }
 
     static func contactReply(_ task: AgentContactTask, requestID: String, sessionID: String,
@@ -382,4 +400,14 @@ extension ClaudeBridge {
         return number.intValue
     }
 
+}
+
+extension ClaudeBridge {
+    static func writeA2AJSON(_ connection: NWConnection, status: Int, object: [String: Any]) {
+        guard let body = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]) else { connection.cancel(); return }
+        let reason = status == 200 ? "OK" : (status == 404 ? "Not Found" : (status == 500 ? "Internal Server Error" : "Bad Request"))
+        var bytes = Data("HTTP/1.1 \(status) \(reason)\r\nContent-Type: application/a2a+json\r\nCache-Control: no-store\r\nContent-Length: \(body.count)\r\nConnection: close\r\n\r\n".utf8)
+        bytes.append(body)
+        connection.send(content: bytes, completion: .contentProcessed { _ in connection.cancel() })
+    }
 }

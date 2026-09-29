@@ -75,7 +75,7 @@ public actor SwiftNativeTelegramBot: TelegramBotProtocol {
         let persistence = SwiftNativePersistenceCore()
         let telegramDir = dataRoot.appendingPathComponent("telegram", isDirectory: true)
         let stateURL = telegramDir.appendingPathComponent("state.json")
-        let state = await persistence.readJSON(stateURL, defaultValue: .object([:]))
+        let state = try await persistence.readJSON(stateURL, ifMissing: .object([:]))
         let stateObj: [String: JSONValue]
         if case .object(let obj) = state {
             stateObj = obj

@@ -1,4 +1,6 @@
+import GrokLink
 import SwiftUI
+import Agents
 import ChatOrchestration
 import PersistenceCore
 
@@ -80,7 +82,7 @@ struct GrokSecureSetupCard: View {
             do {
                 guard let current = try AgentPeerStore(dataRoot: dataRoot).list().first(where: { $0.id == contact.id }),
                       ["creating", "secure-paste"].contains(current.grokSetup ?? "") else { return }
-                try await DesktopAgentConversationRoute.shared.importGrokRoutine(peer: contact.id, dataRoot: dataRoot)
+                try await NativeAgentEngine.live.agents.desktop.importGrokRoutine(peer: contact.id, dataRoot: dataRoot)
                 ready()
             } catch {
                 try? AgentPeerStore(dataRoot: dataRoot).updateGrok(contact.id) { $0.grokSetup = "secure-paste" }

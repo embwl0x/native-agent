@@ -13,7 +13,7 @@ extension NativeClient {
         model: String? = nil,
         providerID: String? = nil,
         force: Bool = false
-    ) async throws -> CompactionResult {
+    ) async throws -> ChatSessionCompactionOutcome {
         let trimmedModel = model?.trimmingCharacters(in: .whitespacesAndNewlines)
         let resolvedModel = trimmedModel.flatMap { $0.isEmpty ? nil : $0 }
         // User, 2026-09-13: no hardcoded model on a call path. Compaction is a
@@ -40,16 +40,6 @@ extension NativeClient {
                 object: outcome.sessionId
             )
         }
-        return CompactionResult(
-            compacted: outcome.compacted,
-            session_id: outcome.sessionId,
-            messages_before: outcome.messagesBefore,
-            messages_after: outcome.messagesAfter,
-            summary_chars: outcome.summaryChars,
-            messages_replaced: outcome.messagesReplaced,
-            reason: outcome.reason,
-            percent: nil,
-            error: nil
-        )
+        return outcome
     }
 }

@@ -36,17 +36,22 @@ public enum SnapshotTailOpLog {
     // Replay memos are valid only while both feed files retain their stat
     // identities. Missing bases are normal before the first compaction;
     // unreadable identities return nil and must never authorize a cache hit.
-    enum FileStamp: Sendable, Equatable {
+    public enum FileStamp: Sendable, Equatable {
         case absent
         case present(device: Int32, inode: UInt64, size: Int64, seconds: Int, nanoseconds: Int)
     }
 
-    struct FeedStamp: Sendable, Equatable {
-        let ops: FileStamp
-        let base: FileStamp
+    public struct FeedStamp: Sendable, Equatable {
+        public let ops: FileStamp
+        public let base: FileStamp
+
+        public init(ops: FileStamp, base: FileStamp) {
+            self.ops = ops
+            self.base = base
+        }
     }
 
-    static func fileStamp(_ url: URL) -> FileStamp? {
+    public static func fileStamp(_ url: URL) -> FileStamp? {
         var info = stat()
         if stat(url.path, &info) == 0 {
             return .present(

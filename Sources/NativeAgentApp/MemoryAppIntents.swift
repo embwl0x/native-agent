@@ -10,6 +10,9 @@ private func formatMemoryUnavailable(_ error: Error) -> String {
 }
 
 struct QueryMemoryIntent: AppIntent {
+    @available(macOS 27, *)
+    static var allowedExecutionTargets: IntentExecutionTargets { .main }
+
     static let title: LocalizedStringResource = "Query Assistant Memory"
     static let description: IntentDescription = IntentDescription("Search the assistant's accumulated memory for relevant context.")
     static let openAppWhenRun = false
@@ -39,6 +42,10 @@ struct QueryMemoryIntent: AppIntent {
                 return "\(i + 1). [\(score)] \(hit.preview)"
             }
             let text = lines.joined(separator: "\n")
+            if #available(macOS 27, *), systemContext.isVoiceOnly {
+                let spoken = response.hits.prefix(5).map(\.preview).joined(separator: "\n")
+                return .result(value: text, dialog: IntentDialog(stringLiteral: spoken))
+            }
             return .result(value: text, dialog: IntentDialog(stringLiteral: text))
         } catch {
             let msg = formatMemoryUnavailable(error)
@@ -48,6 +55,9 @@ struct QueryMemoryIntent: AppIntent {
 }
 
 struct StoreMemoryIntent: AppIntent {
+    @available(macOS 27, *)
+    static var allowedExecutionTargets: IntentExecutionTargets { .main }
+
     static let title: LocalizedStringResource = "Remember"
     static let description: IntentDescription = IntentDescription("Store a new memory in the assistant's accumulated memory.")
     static let openAppWhenRun = false
@@ -71,6 +81,9 @@ struct StoreMemoryIntent: AppIntent {
                 metadata: nil
             )
             let msg = "Stored memory \(record.id)."
+            if #available(macOS 27, *), systemContext.isVoiceOnly {
+                return .result(value: msg, dialog: "I'll remember that.")
+            }
             return .result(value: msg, dialog: IntentDialog(stringLiteral: msg))
         } catch {
             let msg = formatMemoryUnavailable(error)
@@ -80,6 +93,9 @@ struct StoreMemoryIntent: AppIntent {
 }
 
 struct ListPendingMemoryProposalsIntent: AppIntent {
+    @available(macOS 27, *)
+    static var allowedExecutionTargets: IntentExecutionTargets { .main }
+
     static let title: LocalizedStringResource = "List Pending Memory Proposals"
     static let description: IntentDescription = IntentDescription("Return the count and list of the assistant's pending memory proposals.")
     static let openAppWhenRun = false
@@ -90,7 +106,7 @@ struct ListPendingMemoryProposalsIntent: AppIntent {
             if pending.isEmpty {
                 return .result(value: "0 pending proposals.", dialog: "No pending memory proposals.")
             }
-            let lines = pending.prefix(20).enumerated().map { (i, p) -> String in
+            let lines = pending.enumerated().map { (i, p) -> String in
                 "\(i + 1). \(p.content)"
             }
             let header = "\(pending.count) pending proposal\(pending.count == 1 ? "" : "s"):"

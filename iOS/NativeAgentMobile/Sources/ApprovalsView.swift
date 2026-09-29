@@ -49,6 +49,50 @@ enum ApprovalDecisionRoute: Equatable {
     }
 }
 
+/// An approval in plain words on the phone: the kind of ask instead of its
+/// dotted action id, and the reason without internal tags or raw markdown.
+enum ApprovalText {
+    static let agentDecision = "Agent decides her studio canon."
+
+    /// "self_improvement.apply" → "Self-improvement"; unknown ids read as words.
+    static func kind(_ action: String) -> String {
+        let id = action.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let head = id.split(separator: ".").first.map(String.init) ?? id
+        switch head {
+        case "self_improvement", "improvement": return "Self-improvement"
+        case "skill": return "New skill"
+        case "memory", "rem": return "Memory"
+        case "autonomy": return "Autonomy"
+        case "mission", "execution", "workshop": return "Task step"
+        default: return id.isEmpty ? "Before I go ahead" : AliveWords.humanized(id)
+        }
+    }
+
+    static func title(_ approval: PendingApproval) -> String {
+        approval.title.isEmpty ? kind(approval.action) : approval.title
+    }
+
+    /// "[run_memory_hygiene] Run memory hygiene…" → "Run memory hygiene…";
+    /// a markdown draft loses its heading marks, slug headings and backticks.
+    static func readable(_ raw: String) -> String {
+        var text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let tag = text.firstMatch(of: /^\[[A-Za-z0-9_.\-]+\]\s*/) { text.removeSubrange(tag.range) }
+        var lines: [String] = []
+        for rawLine in text.components(separatedBy: .newlines) {
+            var line = rawLine.trimmingCharacters(in: .whitespaces)
+            if let marks = line.firstMatch(of: /^#{1,6}\s*/) {
+                line.removeSubrange(marks.range)
+                // "# learned-workspace-then-workspace-8c211c66": a generated name.
+                if !line.contains(" "), line.contains(where: { "-_.".contains($0) }) { continue }
+            }
+            line = line.replacingOccurrences(of: "`", with: "").replacingOccurrences(of: "**", with: "")
+            if line.isEmpty, lines.last?.isEmpty ?? true { continue }
+            lines.append(line)
+        }
+        return lines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
 /// The warning slot is reserved for a real asynchronous handoff. A healthy
 /// snapshot does not need a persistent warning just because it arrived through
 /// iCloud.
@@ -261,7 +305,7 @@ final class ApprovalsStore: ObservableObject {
             _ = try? await center.requestAuthorization(options: [.alert, .sound, .badge])
             let content = UNMutableNotificationContent()
             content.title = "NativeAgent approval needed"
-            content.body = approval.title.isEmpty ? approval.action : approval.title
+            content.body = ApprovalText.title(approval)
             content.sound = .default
             var userInfo = ["screen": "activity", "source": "approval", "approvalId": approval.id]
             let eventID = NativeAgentDeviceEventIdentity.notification(userInfo: userInfo)
@@ -282,8 +326,13 @@ final class ApprovalsStore: ObservableObject {
             content.body = "\(count) new actions are waiting for review."
             content.sound = .default
             content.userInfo = ["screen": "activity", "source": "approval_summary"]
-            let request = UNNotificationRequest(identifier: "nativeagent.approval.summary.\(UUID().uuidString)", content: content, trigger: nil)
-            try? await center.add(request)
+            do {
+                let request = UNNotificationRequest(identifier: "nativeagent.approval.summary.\(UUID().uuidString)",
+                    content: try await CommunicationNotification.decorate(content), trigger: nil)
+                try await center.add(request)
+            } catch {
+                NSLog("[NativeAgentMobile] Approval summary notification failed: %@", error.localizedDescription)
+            }
         }
     }
 }
@@ -314,6 +363,14 @@ struct ApprovalsView: View {
         MobileDesignSamples.rows(store.approvals).filter { $0.status.lowercased() != "pending" }
     }
 
+    private var headerLine: String {
+        switch pending.count {
+        case 0: return resolved.isEmpty ? "Nothing to decide." : "You're all caught up."
+        case 1: return "One thing is waiting on your yes."
+        default: return "\(AliveWords.spelled(pending.count)) things are waiting on your yes."
+        }
+    }
+
     var body: some View {
         Group {
             if embedInNavigationStack {
@@ -326,38 +383,31 @@ struct ApprovalsView: View {
 
     @ViewBuilder
     private var approvalsContent: some View {
-        VStack(spacing: 0) {
-            // Error / warning banners
-            VStack(spacing: 0) {
-                if let warn = store.bannerWarning {
-                    BannerView(message: warn, style: .warning)
-                        .transition(.move(edge: .top).combined(with: .opacity))
-                }
-                if let err = store.bannerError {
-                    BannerView(message: err, style: .error)
-                        .transition(.move(edge: .top).combined(with: .opacity))
+        // E6: a stale queue must not read as a measured-empty one.
+        AlivePage(title: "Approvals", line: headerLine, freshnessGroup: "approvals") {
+            if store.isLoading { ProgressView().controlSize(.small) }
+        } content: {
+            // "Pair to view" is already said by the header and its Pair with Mac.
+            let bannerError = store.bannerError == "Pair to view" ? nil : store.bannerError
+            if store.bannerWarning != nil || bannerError != nil {
+                VStack(spacing: 8) {
+                    if let warn = store.bannerWarning {
+                        BannerView(message: warn, style: .warning)
+                            .transition(.move(edge: .top).combined(with: .opacity))
+                    }
+                    if let err = bannerError {
+                        BannerView(message: err, style: .error)
+                            .transition(.move(edge: .top).combined(with: .opacity))
+                    }
                 }
             }
-            .animation(AppMotion.snappy, value: store.bannerError)
-            .animation(AppMotion.snappy, value: store.bannerWarning)
             approvalsList
         }
-        .mobileReadingScreen()
-        .navigationTitle("Approvals")
+        .animation(AppMotion.snappy, value: store.bannerError)
+        .animation(AppMotion.snappy, value: store.bannerWarning)
         // Sweep R4 C11.3: an approval decision made against a stale snapshot is
         // exactly the case where a silent sync failure hurts most.
         .macSyncErrorBanner()
-        .safeAreaInset(edge: .top, spacing: 0) { MacStatusChip().frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 16) }
-        // E6: and a stale queue must not read as a measured-empty one.
-        .macSnapshotFreshnessBadge(group: "approvals")
-        .toolbar {
-
-            ToolbarItem(placement: .navigationBarTrailing) {
-                if store.isLoading {
-                    ProgressView().scaleEffect(0.8)
-                }
-            }
-        }
         .refreshable {
             await store.refresh(client: bridgeClient, pairingStore: pairingStore)
         }
@@ -375,54 +425,63 @@ struct ApprovalsView: View {
     @ViewBuilder
     private var approvalsList: some View {
         if store.isLoading && MobileDesignSamples.rows(store.approvals).isEmpty {
-            ProgressView("Loading approvals…")
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            ProgressView("Checking with your Mac…")
+                .tint(AlivePalette.secondary)
+                .foregroundStyle(AlivePalette.secondary)
+                .frame(maxWidth: .infinity)
+                .padding(.top, 48)
         } else if MobileDesignSamples.rows(store.approvals).isEmpty && store.bannerWarning == nil {
-            MobileReadingEmptyState(
-                title: "No actions need approval",
-                systemImage: "checkmark.shield",
-                kind: .empty,
-                description: "Tool calls, memory changes, Mac control, connector writes, Desk tasks, and harness improvements show up here when they need a decision."
-            )
-        } else {
-            List {
-                if !pending.isEmpty {
-                    Section("Pending (\(pending.count))") {
-                        ForEach(pending) { approval in
-                            ApprovalCard(
-                                approval: approval,
-                                isDeciding: store.decidingApprovalIDs.contains(approval.id)
-                            ) { decision in
-                                Task {
-                                    await store.decide(
-                                        id: approval.id,
-                                        decision: decision,
-                                        client: bridgeClient,
-                                        pairingStore: pairingStore
-                                    )
-                                }
-                            }
-                            .listRowBackground(Color.clear)
-                            .listRowSeparator(.hidden)
-                            .listRowInsets(EdgeInsets(top: 6, leading: 16, bottom: 6, trailing: 16))
-                        }
-                    }
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Nothing is waiting on you.")
+                    .font(.system(.title3, design: .serif))
+                    .foregroundStyle(AlivePalette.text)
+                Text("When I want to use a tool, change a memory, act on your Mac or write somewhere, I'll ask here first.")
+                    .font(.subheadline)
+                    .foregroundStyle(AlivePalette.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Button("Check again") {
+                    Task { await store.refresh(client: bridgeClient, pairingStore: pairingStore) }
                 }
-
-                if !resolved.isEmpty {
-                    Section("Resolved") {
-                        ForEach(resolved.prefix(resolvedLimit)) { approval in
-                            ResolvedRow(approval: approval)
-                        }
-                        if resolved.count > resolvedLimit {
-                            MobileLoadedRecordsDisclosure(title: "Show more decisions", remaining: resolved.count - resolvedLimit) {
-                                resolvedLimit += 10
+                .aliveSecondaryButton()
+                .font(.subheadline.weight(.semibold))
+                .padding(.top, 4)
+            }
+            .padding(20)
+            .aliveCard()
+        } else {
+            // Native sections, one row per approval (User 09-27: all native).
+            if !pending.isEmpty {
+                Section("Waiting for you") {
+                    ForEach(pending) { approval in
+                        ApprovalCard(
+                            approval: approval,
+                            isDeciding: store.decidingApprovalIDs.contains(approval.id)
+                        ) { decision in
+                            Task {
+                                await store.decide(
+                                    id: approval.id,
+                                    decision: decision,
+                                    client: bridgeClient,
+                                    pairingStore: pairingStore
+                                )
                             }
                         }
                     }
                 }
             }
-            .listStyle(.plain)
+
+            if !resolved.isEmpty {
+                Section("Decided") {
+                    ForEach(resolved.prefix(resolvedLimit)) { approval in
+                        ResolvedRow(approval: approval)
+                    }
+                    if resolved.count > resolvedLimit {
+                        Button("Show \(min(10, resolved.count - resolvedLimit)) more") {
+                            resolvedLimit += 10
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -437,176 +496,272 @@ struct ApprovalCard: View {
     var isDeciding = false
     let onDecide: (String) -> Void
 
-    @State private var expanded = false
-
     private var canSendDecision: Bool {
         pairingStore.isICloudSigned && bridge.available && bridgeClient.bridgeStatus != .deviceOffline
     }
 
-    private var riskColor: Color {
-        switch approval.risk.lowercased() {
-        case "low":    return .green
-        case "medium": return NativeAgentPalette.agentAccent
-        case "high":   return .orange
-        case "critical": return .red
-        default:       return .secondary
-        }
+    private var isAgentDecision: Bool {
+        !ActivityScreenPresentation.canDecideRemotely(action: approval.action)
     }
 
-    private var isMacOnly: Bool {
-        approval.localOnly == true || approval.remoteResolvable == false
+    /// "Medium risk · 4m ago": what kind of ask, and when.
+    private var kindLine: String {
+        var parts: [String] = []
+        let risk = approval.risk.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !risk.isEmpty { parts.append("\(risk.capitalized) risk") }
+        if let createdAtStr = approval.createdAt,
+           let date = ISO8601DateFormatter().date(from: createdAtStr) {
+            parts.append(relativeTime(from: date))
+        }
+        return parts.joined(separator: " · ")
     }
 
     var body: some View {
-        MobileReadingSurface {
-            VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                AliveWaitingDot()
+                    .alignmentGuide(.firstTextBaseline) { $0[VerticalAlignment.center] + 4 }
+                Text(kindLine.isEmpty ? "Before I go ahead" : kindLine)
+                    .font(.caption)
+                    .foregroundStyle(AlivePalette.secondary)
+            }
 
-                // Header row: action name + risk badge
-                MobileAdaptiveRow(alignment: .top) {
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text(approval.title.isEmpty ? approval.action : approval.title)
-                            .font(.headline)
-                            .fixedSize(horizontal: false, vertical: true)
-                        Text(approval.action)
-                            .font(.callout)
-                            .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
-                    }
-                    Spacer()
-                    RiskBadge(risk: approval.risk, color: riskColor)
-                }
-
-                // Reason
-                if let reason = approval.reason, !reason.isEmpty {
-                    Text(reason)
-                        .font(.body)
-                        .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(ApprovalText.title(approval))
+                    .font(.system(.title3, design: .serif))
+                    .foregroundStyle(AlivePalette.text)
+                    .fixedSize(horizontal: false, vertical: true)
+                if !approval.title.isEmpty {
+                    Text(ApprovalText.kind(approval.action))
+                        .font(.subheadline.weight(.medium))
+                        .foregroundStyle(AlivePalette.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
+            }
 
-                // Created-at relative time
-                if let createdAtStr = approval.createdAt,
-                   let date = ISO8601DateFormatter().date(from: createdAtStr) {
-                    Text(relativeTime(from: date))
-                        .font(.caption)
-                        .foregroundStyle(.tertiary)
+            if let reason = approval.reason.map(ApprovalText.readable), !reason.isEmpty {
+                Text(reason)
+                    .font(.body)
+                    .foregroundStyle(AlivePalette.text.opacity(0.88))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            // Never raw payload on the card: a plain line, or a quiet Details.
+            PayloadPreview(approval: approval)
+
+            if isAgentDecision {
+                Text(ApprovalText.agentDecision)
+                    .font(.footnote)
+                    .foregroundStyle(AlivePalette.secondary)
+            } else {
+                // Unpaired, the page's note already says so; this line is for
+                // a paired phone that cannot reach the Mac right now.
+                if !canSendDecision && pairingStore.usesICloudTransport {
+                    Text("Still waiting. Pair with your Mac over iCloud to answer from here; a decision is never retried on its own.")
+                        .font(.footnote)
+                        .foregroundStyle(AlivePalette.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
-
-                // Payload preview (mono, truncated)
-                PayloadPreview(approval: approval, expanded: $expanded)
-
-                // Action buttons
-                if isMacOnly {
-                    Label("Review this one on the Mac app", systemImage: "macwindow.badge.exclamationmark")
-                        .font(.callout)
-                        .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.vertical, 8)
-                } else {
-                    if !canSendDecision {
-                        Text("Still pending. Connect iCloud and pair with the Mac to send a decision. Decisions are not automatically retried.")
-                            .font(.callout)
-                            .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
+                HStack(spacing: 10) {
+                    Button {
+                        withAnimation(AppMotion.snappy) { onDecide("deny") }
+                    } label: {
+                        Text("Deny").frame(maxWidth: .infinity, minHeight: 30)
                     }
-                    MobileActionRow {
-                        // Approve gradient fill
-                        Button {
-                            withAnimation(AppMotion.snappy) { onDecide("approve") }
-                        } label: {
-                            Label(isDeciding ? "Approving" : "Approve", systemImage: isDeciding ? "hourglass" : "checkmark")
-                                .font(.headline)
-                                .foregroundStyle(NativeAgentMobileTheme.Colors.onAccent)
-                                .frame(minHeight: 44)
-                                .frame(maxWidth: .infinity)
-                                .padding(.horizontal, 16)
-                                .padding(.vertical, 10)
-                                .background {
-                                    Capsule().fill(NativeAgentMobileTheme.Colors.accentText)
-                                }
-                        }
-                        .buttonStyle(.plain)
-                        .disabled(isDeciding || !canSendDecision)
+                    .aliveSecondaryButton()
+                    .disabled(isDeciding || !canSendDecision)
 
-                        // Deny — bordered
-                        Button {
-                            withAnimation(AppMotion.snappy) { onDecide("deny") }
-                        } label: {
-                            Label("Deny", systemImage: "xmark")
-                                .font(.headline)
-                                .foregroundStyle(NativeAgentMobileTheme.Colors.accentText)
-                                .frame(minHeight: 44)
-                                .frame(maxWidth: .infinity)
-                                .padding(.horizontal, 16)
-                                .padding(.vertical, 10)
-                                .background {
-                                    Capsule()
-                                        .strokeBorder(NativeAgentMobileTheme.Colors.accentText, lineWidth: 1.2)
-                                }
-                        }
-                        .buttonStyle(.plain)
-                        .disabled(isDeciding || !canSendDecision)
+                    Button {
+                        withAnimation(AppMotion.snappy) { onDecide("approve") }
+                    } label: {
+                        Text(isDeciding ? "Approving…" : "Approve").frame(maxWidth: .infinity, minHeight: 30)
                     }
+                    .alivePrimaryButton()
+                    .disabled(isDeciding || !canSendDecision)
                 }
+                .font(.body.weight(.semibold))
+                .controlSize(.large)
             }
         }
+        .aliveRow()
+        .aliveCard()
         .opacity(isDeciding ? 0.72 : 1)
     }
 
     private func relativeTime(from date: Date) -> String {
         let interval = Date().timeIntervalSince(date)
-        if interval < 60 { return "\(Int(interval))s ago" }
+        if interval < 60 { return "just now" }
         if interval < 3600 { return "\(Int(interval / 60))m ago" }
-        return "\(Int(interval / 3600))h ago"
+        if interval < 86_400 { return "\(Int(interval / 3600))h ago" }
+        return date.formatted(.dateTime.month(.abbreviated).day())
     }
 }
 
 // MARK: - Payload preview
 
+/// What will be sent, said on the card in plain lines ("To: Sam", "Message:
+/// …") above Approve: nobody says yes to something they cannot see, and
+/// nobody reads JSON. Keys become words; braces, quotes and ids never show.
+/// The full raw view stays one tap away in "Details". When the Mac sent
+/// nothing, one plain line says so; nothing is ever synthesized.
 struct PayloadPreview: View {
     let approval: PendingApproval
-    @Binding var expanded: Bool
+    /// Chat's inline card is shorter: fewer lines before "Details".
+    var maxLines = 6
+    @State private var showsDetails = false
 
-    // Build a pretty-printed JSON string from the approval for display
-    var payloadText: String {
-        if let preview = approval.payloadPreview, !preview.isEmpty {
-            return preview
-        }
-        // This is context inferred from the approval envelope, not the real
-        // Mac-side payload. Never render it as though it were canonical.
-        var dict: [String: Any] = [
-            "action": approval.action,
-        ]
-        if let r = approval.reason { dict["reason"] = r }
-        if let json = try? JSONSerialization.data(withJSONObject: dict, options: [.prettyPrinted, .sortedKeys]),
-           let str = String(data: json, encoding: .utf8) {
-            return "Preview generated from action/reason — Mac did not publish the real payload.\n\n\(str)"
-        }
-        return "Preview generated from action/reason — Mac did not publish the real payload.\n\n{ \"action\": \"\(approval.action)\" }"
+    static let missingLine = "Full details appear once your Mac sends them."
+
+    /// The Mac's own payload, or nil.
+    var payload: String? {
+        guard let preview = approval.payloadPreview?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !preview.isEmpty else { return nil }
+        return preview
     }
 
-    private let maxLines = 6
+    var body: some View {
+        if let payload {
+            let lines = Self.readableLines(payload)
+            VStack(alignment: .leading, spacing: 6) {
+                if let lines {
+                    ForEach(Array(lines.prefix(maxLines).enumerated()), id: \.offset) { _, line in
+                        (Text(line.label + ": ").foregroundStyle(AlivePalette.secondary)
+                            + Text(line.value).foregroundStyle(AlivePalette.text))
+                            .font(.subheadline)
+                            .lineLimit(3)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                } else {
+                    // The Mac wrote a sentence, not a payload: its first
+                    // paragraph in plain words; the rest stays in Details.
+                    Text(ApprovalText.readable(payload).components(separatedBy: "\n\n").first ?? payload)
+                        .font(.subheadline)
+                        .foregroundStyle(AlivePalette.text)
+                        .lineLimit(4)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                let hidden = max(0, (lines?.count ?? 0) - maxLines)
+                Button(hidden > 0 ? "Details \u{00b7} \(hidden) more" : "Details") { showsDetails = true }
+                    .font(.footnote.weight(.semibold))
+                    .foregroundStyle(AlivePalette.secondary)
+                    .buttonStyle(.plain)
+                    .frame(minHeight: 44)
+                    .contentShape(Rectangle())
+                    .accessibilityHint("Shows everything your Mac sent for this request")
+            }
+            .sheet(isPresented: $showsDetails) {
+                ApprovalDetailsSheet(title: ApprovalText.title(approval),
+                                     payload: payload) { showsDetails = false }
+            }
+        } else {
+            Text(Self.missingLine)
+                .font(.footnote)
+                .foregroundStyle(AlivePalette.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    struct Line: Equatable {
+        let label: String
+        let value: String
+    }
+
+    /// A JSON payload as readable lines, or nil when it is not a JSON object
+    /// (the Mac's own human preview). A connector call's `input` (or
+    /// arguments) is what will be sent, so it leads.
+    static func readableLines(_ payload: String) -> [Line]? {
+        guard let data = payload.data(using: .utf8),
+              let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return nil }
+        var body = object
+        for key in ["input", "arguments", "args", "params", "parameters"] {
+            if let inner = object[key] as? [String: Any], !inner.isEmpty { body = inner; break }
+        }
+        var lines: [Line] = []
+        for key in readingOrder(body.keys) where !isID(key) {
+            if let nested = body[key] as? [String: Any] {
+                for inner in readingOrder(nested.keys) where !isID(inner) {
+                    if let value = words(nested[inner]) { lines.append(Line(label: label(inner), value: value)) }
+                }
+            } else if let value = words(body[key]) {
+                lines.append(Line(label: label(key), value: value))
+            }
+        }
+        return lines
+    }
+
+    /// Who and where first, then what, then the message, then the rest:
+    /// the order a person reads an envelope, not the alphabet.
+    private static func readingOrder<S: Sequence>(_ keys: S) -> [String] where S.Element == String {
+        let lead = ["to", "recipient", "recipients", "channel", "chat", "calendar", "list", "account",
+                    "cc", "bcc", "subject", "title", "name", "when", "date", "start", "start_date",
+                    "startdate", "end", "end_date", "enddate", "message", "text", "body", "content", "notes"]
+        func rank(_ key: String) -> Int {
+            let flat = key.lowercased().replacingOccurrences(of: "-", with: "_")
+            return lead.firstIndex(of: flat) ?? lead.firstIndex(of: flat.replacingOccurrences(of: "_", with: "")) ?? lead.count
+        }
+        return keys.sorted { (rank($0), $0) < (rank($1), $1) }
+    }
+
+    private static func isID(_ key: String) -> Bool {
+        let lower = key.lowercased()
+        return lower == "id" || lower.hasSuffix("_id") || lower.hasSuffix("-id") || lower.hasSuffix("uuid")
+            || (key.hasSuffix("Id") || key.hasSuffix("ID")) && key.count > 2
+    }
+
+    /// "startDate" / "start_date" → "Start date".
+    private static func label(_ key: String) -> String {
+        var spaced = ""
+        for (index, char) in key.enumerated() {
+            if index > 0, char.isUppercase, let last = spaced.last, last.isLowercase { spaced.append(" ") }
+            spaced.append(char)
+        }
+        let words = AliveWords.humanized(spaced.lowercased())
+        return words.prefix(1).uppercased() + words.dropFirst()
+    }
+
+    /// A value as words: strings as they are (dates readable), numbers,
+    /// Yes/No, short lists joined. Nested structures stay in Details.
+    private static func words(_ value: Any?) -> String? {
+        let text: String
+        switch value {
+        case let string as String:
+            let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return nil }
+            text = AliveWords.date(trimmed) != nil ? AliveWords.readable(trimmed) : trimmed
+        case let number as NSNumber:
+            text = CFGetTypeID(number) == CFBooleanGetTypeID() ? (number.boolValue ? "Yes" : "No") : number.stringValue
+        case let list as [Any]:
+            let items = list.compactMap { $0 is [String: Any] || $0 is [Any] ? nil : words($0) }
+            guard !items.isEmpty else { return nil }
+            text = items.count > 4 ? items.prefix(4).joined(separator: ", ") + ", +\(items.count - 4) more"
+                : items.joined(separator: ", ")
+        default:
+            return nil
+        }
+        let flat = text.replacingOccurrences(of: "\n", with: " ")
+        return flat.count > 160 ? String(flat.prefix(159)) + "\u{2026}" : flat
+    }
+}
+
+/// The approval's details: exactly what the Mac sent, off the card.
+private struct ApprovalDetailsSheet: View {
+    let title: String
+    let payload: String
+    let onDone: () -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            ScrollView(expanded ? .vertical : []) {
-                Text(payloadText)
-                    .font(.system(.caption, design: .monospaced))
-                    .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
-                    .lineLimit(expanded ? nil : maxLines)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+        NavigationStack {
+            AlivePage(title: title, line: "What your Mac sent for this request.", style: .pushed) {
+                Section {
+                    Text(payload)
+                        .font(.system(.footnote, design: .monospaced))
+                        .foregroundStyle(AlivePalette.secondary)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
             }
-            .frame(maxHeight: expanded ? 220 : nil)
-
-            Button {
-                withAnimation(AppMotion.snappy) { expanded.toggle() }
-            } label: {
-                Text(expanded ? "Show less" : "Show more")
-                    .font(.caption)
-                    .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
-            }
-            .buttonStyle(.plain)
+            .toolbar { Button("Done", action: onDone) }
         }
-        .padding(10)
-        .background(NativeAgentMobileTheme.Colors.contentSurface, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
     }
 }
 
@@ -617,12 +772,9 @@ struct RiskBadge: View {
     let color: Color
 
     var body: some View {
-        Text(risk.uppercased())
+        Text("\(risk.capitalized) risk")
             .font(.caption)
-            .foregroundStyle(.primary)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 3)
-            .background(NativeAgentMobileTheme.Colors.quietFill, in: Capsule())
+            .foregroundStyle(AlivePalette.secondary)
     }
 }
 
@@ -631,34 +783,37 @@ struct RiskBadge: View {
 struct ResolvedRow: View {
     let approval: PendingApproval
 
-    private var decisionColor: Color {
+    private var decisionWord: String? {
         switch approval.decision?.lowercased() {
-        case "approve", "approved": return .green
-        case "deny", "denied", "reject", "rejected": return .red
-        default:        return .secondary
+        case "approve", "approved": return "Approved"
+        case "deny", "denied", "reject", "rejected": return "Denied"
+        case "cancel", "canceled", "cancelled": return "Canceled"
+        case let other?: return AliveWords.humanized(other)
+        case nil: return nil
         }
     }
 
     var body: some View {
         MobileAdaptiveRow {
-            VStack(alignment: .leading, spacing: 4) {
-                Text(approval.title.isEmpty ? approval.action : approval.title)
-                    .font(.callout)
-                Text(approval.action)
-                    .font(.caption)
-                    .foregroundStyle(.tertiary)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(ApprovalText.title(approval))
+                    .font(.body)
+                    .foregroundStyle(AlivePalette.text)
+                    .fixedSize(horizontal: false, vertical: true)
+                if !approval.title.isEmpty {
+                    Text(ApprovalText.kind(approval.action))
+                        .font(.footnote)
+                        .foregroundStyle(AlivePalette.secondary)
+                }
             }
-            Spacer()
-            if let decision = approval.decision {
-                Text(decision.capitalized)
-                    .font(.caption)
-                    .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 2)
-                    .background(NativeAgentMobileTheme.Colors.quietFill, in: Capsule())
+            Spacer(minLength: 8)
+            if let decisionWord {
+                Text(decisionWord)
+                    .font(.subheadline)
+                    .foregroundStyle(AlivePalette.secondary)
             }
         }
-        .padding(.vertical, 2)
+        .aliveRow()
     }
 }
 
@@ -669,25 +824,12 @@ private struct BannerView: View {
     let message: String
     let style: Style
 
-    private var bgColor: Color {
-        NativeAgentMobileTheme.Colors.contentSurface
-    }
-
     private var icon: String {
-        style == .error ? "wifi.slash" : "exclamationmark.triangle"
+        style == .error ? "wifi.slash" : "clock"
     }
 
     var body: some View {
-        MobileAdaptiveRow(spacing: 8) {
-            Image(systemName: icon).font(.caption.weight(.semibold))
-            Text(message).font(.callout).fixedSize(horizontal: false, vertical: true)
-            Spacer()
-        }
-        .foregroundStyle(.primary)
-        .padding(.horizontal, 16)
-        .padding(.vertical, 10)
-        .background(bgColor)
-        .ignoresSafeArea(edges: .horizontal)
+        AliveStatusNote(systemImage: icon, text: message)
     }
 }
 

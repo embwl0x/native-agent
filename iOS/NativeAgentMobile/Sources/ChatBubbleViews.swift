@@ -13,66 +13,67 @@ struct BubbleView: View {
     var isTimedOut: Bool = false
     var onRetry: (() -> Void)? = nil
 
+    /// The Mac Simple thread: the agent's words are plain large text with
+    /// room between the lines, no bubble; the person's own lines are quieter
+    /// and smaller, on the same left edge.
     var body: some View {
-        HStack {
-            if message.role == .user { Spacer(minLength: dynamicTypeSize.isAccessibilitySize ? 16 : 40) }
-            VStack(alignment: message.role == .user ? .trailing : .leading, spacing: 6) {
-                // Collapsed "N tools used" / "N skills used" summary above the
-                // reply once the turn is done (assistant turns only).
-                if message.role == .assistant, !message.isStreaming, !message.toolEvents.isEmpty {
-                    ToolActivityView(events: message.toolEvents, isLive: false)
-                        .padding(.leading, 4)
-                }
-                if message.isStreaming {
-                    if !message.toolEvents.isEmpty, message.text.isEmpty {
-                        // She's working through tools — flip through them in one box.
-                        ToolActivityView(events: message.toolEvents, isLive: true)
-                    } else {
-                        HStack(spacing: 8) {
-                            Circle()
-                                .fill(NativeAgentMobileTheme.Colors.metadataText)
-                                .frame(width: 7, height: 7)
-                                .accessibilityHidden(true)
-                            Text(message.text.isEmpty ? streamingHint : message.text)
-                                .mobileTypography(.body)
-                                .foregroundStyle(.secondary)
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 8)
-                        .frame(minWidth: 150, maxWidth: .infinity, minHeight: 44, alignment: .leading)
-                        .background(NativeAgentMobileTheme.Colors.quietFill,
-                                    in: RoundedRectangle(cornerRadius: NativeAgentMobileTheme.Radius.panel))
-                    }
-                } else {
-                    VStack(alignment: message.role == .user ? .trailing : .leading, spacing: 8) {
-                        ForEach(imageAttachments) { attachment in
-                            AttachmentImagePreview(summary: attachment)
-                        }
-                        if attachmentCountWithoutPreview > 0 {
-                            HStack(spacing: 6) {
-                                Image(systemName: "photo.fill")
-                                Text(attachmentCountWithoutPreview == 1 ? "1 attachment" : "\(attachmentCountWithoutPreview) attachments")
-                            }
-                            .font(AppFont.tag)
-                            .foregroundStyle(NativeAgentMobileTheme.Colors.secondary)
-                        }
-                        if !message.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || message.attachments.isEmpty {
-                            Text(message.text.isEmpty ? " " : message.text)
-                                .mobileTypography(.body)
-                                .textSelection(.enabled)
-                        }
-                    }
-                    .mobileBubble(isUser: message.role == .user)
-                }
-                // 2026-09-13: "Keep waiting" is gone. Waiting is no longer
-                // something the person has to ask for — the phone never stops
-                // observing the request it already sent, so there is nothing
-                // here to press.
+        let isUser = message.role == .user
+        VStack(alignment: .leading, spacing: 6) {
+            // Collapsed "N tools used" / "N skills used" summary above the
+            // reply once the turn is done (assistant turns only).
+            if message.role == .assistant, !message.isStreaming, !message.toolEvents.isEmpty {
+                ToolActivityView(events: message.toolEvents, isLive: false)
             }
-            .frame(maxWidth: 620, alignment: message.role == .user ? .trailing : .leading)
-            if message.role == .assistant { Spacer(minLength: dynamicTypeSize.isAccessibilitySize ? 0 : 24) }
+            if message.isStreaming {
+                if !message.toolEvents.isEmpty, message.text.isEmpty {
+                    // Working through tools — flip through them in one line.
+                    ToolActivityView(events: message.toolEvents, isLive: true)
+                } else if message.text.isEmpty {
+                    HStack(spacing: 10) {
+                        HazePulse()
+                        Text(streamingHint)
+                            .mobileTypography(.body)
+                            .foregroundStyle(AlivePalette.secondary)
+                    }
+                    .frame(minHeight: 32, alignment: .leading)
+                } else {
+                    Text(message.text)
+                        .mobileTypography(.body)
+                        .lineSpacing(6)
+                        .foregroundStyle(AlivePalette.text)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            } else {
+                VStack(alignment: .leading, spacing: 8) {
+                    ForEach(imageAttachments) { attachment in
+                        AttachmentImagePreview(summary: attachment)
+                    }
+                    if attachmentCountWithoutPreview > 0 {
+                        HStack(spacing: 6) {
+                            Image(systemName: "photo.fill")
+                            Text(attachmentCountWithoutPreview == 1 ? "1 attachment" : "\(attachmentCountWithoutPreview) attachments")
+                        }
+                        .font(.footnote)
+                        .foregroundStyle(AlivePalette.secondary)
+                    }
+                    if !message.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || message.attachments.isEmpty {
+                        Text(message.text.isEmpty ? " " : message.text)
+                            .font(isUser ? .subheadline : .body)
+                            .lineSpacing(isUser ? 3 : 6)
+                            .foregroundStyle(isUser ? AlivePalette.secondary : AlivePalette.text)
+                            .textSelection(.enabled)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            }
+            // 2026-09-13: "Keep waiting" is gone. Waiting is no longer
+            // something the person has to ask for — the phone never stops
+            // observing the request it already sent, so there is nothing
+            // here to press.
         }
+        .frame(maxWidth: 620, alignment: .leading)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.trailing, isUser && !dynamicTypeSize.isAccessibilitySize ? 24 : 0)
     }
 
     private var imageAttachments: [ChatAttachmentSummary] {
@@ -160,13 +161,9 @@ enum MobileChatApprovalProjection {
         messages.last(where: { $0.role == .assistant })?.id ?? messages.last?.id
     }
 
-    /// A partial approval record must never unlock a remote decision. Same
-    /// rule the Activity tab applies — one predicate, one meaning.
+    /// Same decision ownership as Activity and the Approvals screen.
     static func canDecideOnPhone(_ approval: ApprovalRequest) -> Bool {
-        ActivityScreenPresentation.canDecideRemotely(
-            localOnly: approval.localOnly,
-            remoteResolvable: approval.remoteResolvable
-        )
+        ActivityScreenPresentation.canDecideRemotely(action: approval.action)
     }
 }
 
@@ -174,6 +171,9 @@ enum MobileChatApprovalProjection {
 /// go through `iCloudSyncEngine`'s signed action channel; "In Activity" hands
 /// the user to the canonical queue via the existing open-activity intent.
 struct InlineChatApprovalCard: View {
+    @EnvironmentObject private var pairingStore: PairingStore
+    @EnvironmentObject private var bridgeClient: MacBridgeClient
+    @ObservedObject private var bridge = iCloudBridge.shared
     let approval: ApprovalRequest
 
     @State private var isDeciding = false
@@ -182,65 +182,89 @@ struct InlineChatApprovalCard: View {
 
     private var canDecide: Bool { MobileChatApprovalProjection.canDecideOnPhone(approval) }
 
+    private var canSendDecision: Bool {
+        pairingStore.isICloudSigned && bridge.available && bridgeClient.bridgeStatus != .deviceOffline
+    }
+
+    /// Plain words for the risk the Mac assigned, shown only when it is worth
+    /// a second look.
+    private var riskWords: String? {
+        switch approval.risk.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "", "low", "none": return nil
+        case let risk: return "\(risk.capitalized) risk"
+        }
+    }
+
+    /// The approval sits in the thread as content: a card with the "needs
+    /// you" light, the question in the agent's words, and two answers.
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(alignment: .top, spacing: 8) {
-                Image(systemName: "exclamationmark.shield.fill")
-                    .foregroundStyle(.orange)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Needs approval")
-                        .font(AppFont.section)
-                    Text(approval.title.isEmpty ? approval.action : approval.title)
-                        .font(AppFont.label)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(2)
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                AliveStatusDot(state: .waiting)
+                    .scaleEffect(0.75)
+                Text(canDecide ? "I need your OK" : "Agent’s decision")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(AlivePalette.secondary)
+                if let riskWords {
+                    Text("· \(riskWords)")
+                        .font(.caption)
+                        .foregroundStyle(AlivePalette.secondary)
                 }
                 Spacer(minLength: 0)
-                Text(approval.risk.uppercased())
-                    .font(AppFont.tag)
-                    .foregroundStyle(.white)
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 2)
-                    .background(.orange, in: Capsule())
             }
-            if let reason = approval.reason, !reason.isEmpty {
+            Text(ApprovalText.title(approval))
+                .font(.body.weight(.semibold))
+                .foregroundStyle(AlivePalette.text)
+                .lineLimit(2)
+            if let reason = approval.reason.map(ApprovalText.readable), !reason.isEmpty {
                 Text(reason)
-                    .font(AppFont.body)
-                    .foregroundStyle(.secondary)
+                    .font(.subheadline)
+                    .foregroundStyle(AlivePalette.secondary)
                     .lineLimit(3)
+                    .fixedSize(horizontal: false, vertical: true)
             }
+            // What will be sent, in plain lines, before Approve.
+            PayloadPreview(approval: approval, maxLines: 4)
             if let decisionStatusText {
                 Text(decisionStatusText)
-                    .font(.caption)
-                    .foregroundStyle(decisionStatusIsError ? .red : .orange)
+                    .font(.footnote)
+                    .foregroundStyle(decisionStatusIsError ? Color.red : AlivePalette.secondary)
             }
             if !canDecide {
-                Label("Review this one on the Mac app", systemImage: "macwindow.badge.exclamationmark")
-                    .font(AppFont.label)
-                    .foregroundStyle(.orange)
+                Text(ApprovalText.agentDecision)
+                    .font(.footnote)
+                    .foregroundStyle(AlivePalette.secondary)
             }
-            HStack(spacing: 8) {
+            HStack(spacing: 10) {
                 if canDecide {
                     Button {
                         decide(approve: true)
                     } label: {
-                        Label("Approve", systemImage: "checkmark")
+                        Text("Approve")
+                            .font(.subheadline.weight(.semibold))
+                            .padding(.horizontal, 6)
+                            .frame(minHeight: 30)
+                            .fixedSize()
                     }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.small)
-                    .tint(.green)
-                    .disabled(isDeciding)
+                    .alivePrimaryButton()
+                    .disabled(isDeciding || !canSendDecision)
 
                     Button {
                         decide(approve: false)
                     } label: {
-                        Label("Deny", systemImage: "xmark")
+                        Text("Deny")
+                            .font(.subheadline.weight(.semibold))
+                            .padding(.horizontal, 6)
+                            .frame(minHeight: 30)
+                            .fixedSize()
                     }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                    .tint(.red)
-                    .disabled(isDeciding)
+                    .aliveSecondaryButton()
+                    .disabled(isDeciding || !canSendDecision)
                 }
+                if isDeciding {
+                    ProgressView().controlSize(.small)
+                }
+                Spacer(minLength: 0)
                 Button {
                     NotificationCenter.default.post(
                         name: .nativeagentOpenActivity,
@@ -248,30 +272,31 @@ struct InlineChatApprovalCard: View {
                         userInfo: ["screen": "approvals"]
                     )
                 } label: {
-                    Label("In Activity", systemImage: "arrow.up.right.square")
+                    Text("In Activity")
+                        .font(.footnote)
+                        .foregroundStyle(AlivePalette.secondary)
+                        .frame(minHeight: 44)
+                        .contentShape(Rectangle())
                 }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
+                .buttonStyle(.plain)
                 .disabled(isDeciding)
-
-                if isDeciding {
-                    ProgressView().controlSize(.small)
-                }
-                Spacer(minLength: 0)
             }
         }
-        .padding(10)
+        .padding(.horizontal, 16)
+        .padding(.top, 14)
+        .padding(.bottom, 4)
         .frame(maxWidth: 620, alignment: .leading)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .strokeBorder(Color.orange.opacity(0.25), lineWidth: 1)
-        }
+        .aliveCard(radius: 20)
         .accessibilityElement(children: .contain)
-        .accessibilityLabel("Approval needed for \(approval.title.isEmpty ? approval.action : approval.title)")
+        .accessibilityLabel("Approval needed for \(ApprovalText.title(approval))")
     }
 
     private func decide(approve: Bool) {
+        guard canDecide, canSendDecision, !isDeciding else { return }
+        #if DEBUG
+        // The -chatSampleExtras fixture is for screenshots only; never send it.
+        if approval.id == "sample-approval" { return }
+        #endif
         isDeciding = true
         decisionStatusText = nil
         decisionStatusIsError = false
@@ -328,10 +353,10 @@ struct ToolActivityView: View {
 
     private var liveBox: some View {
         HStack(spacing: 8) {
-            PulsingDot(color: NativeAgentPalette.agentAccent, size: 7)
+            HazePulse()
             Group {
                 if let latest {
-                    Text(latest.name)
+                    Text(Self.plainName(latest.name))
                         .id(latest.id)
                         .transition(.asymmetric(
                             insertion: .move(edge: .bottom).combined(with: .opacity),
@@ -339,23 +364,17 @@ struct ToolActivityView: View {
                 }
             }
             .font(AppFont.body)
-            .foregroundStyle(.secondary)
+            .foregroundStyle(AlivePalette.secondary)
             .lineLimit(1)
             .truncationMode(.tail)
             Spacer(minLength: 0)
         }
-        .padding(.horizontal, 12)
-        .frame(minWidth: 150, maxWidth: 260, minHeight: 40, maxHeight: 40, alignment: .leading)
-        .background(Color(.systemGray5), in: RoundedRectangle(cornerRadius: 16))
-        .overlay {
-            RoundedRectangle(cornerRadius: 16)
-                .strokeBorder(NativeAgentPalette.agentAccent.opacity(0.18), lineWidth: 0.8)
-        }
+        .frame(minWidth: 150, maxWidth: 300, minHeight: 32, maxHeight: 32, alignment: .leading)
         .animation(.easeOut(duration: 0.22), value: latest?.id)
     }
 
     private var collapsed: some View {
-        VStack(alignment: .leading, spacing: 4) {
+        HStack(alignment: .top, spacing: 16) {
             if !tools.isEmpty {
                 summaryRow(items: tools, noun: "tool",
                            icon: "wrench.and.screwdriver", expanded: $toolsExpanded)
@@ -367,29 +386,48 @@ struct ToolActivityView: View {
         }
     }
 
+    /// "calendar_read" reads as "Calendar read": the tool's own name, in
+    /// sentence case, not an identifier.
+    static func plainName(_ raw: String) -> String {
+        let spaced = raw.replacingOccurrences(of: "_", with: " ")
+            .replacingOccurrences(of: "-", with: " ")
+            .trimmingCharacters(in: .whitespaces)
+        guard let first = spaced.first else { return raw }
+        return first.uppercased() + spaced.dropFirst()
+    }
+
+    /// "Used 3 tools ›": one quiet line; tap to see which.
     @ViewBuilder
     private func summaryRow(items: [ToolEvent], noun: String, icon: String,
                             expanded: Binding<Bool>) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
+        VStack(alignment: .leading, spacing: 6) {
             Button {
                 withAnimation(.easeOut(duration: 0.15)) { expanded.wrappedValue.toggle() }
             } label: {
-                HStack(spacing: 6) {
-                    Image(systemName: icon).font(.caption2).foregroundStyle(.secondary)
-                    Text("\(items.count) \(noun)\(items.count == 1 ? "" : "s") used")
-                        .font(.caption2.weight(.semibold)).foregroundStyle(.secondary)
-                    Image(systemName: expanded.wrappedValue ? "chevron.up" : "chevron.down")
-                        .font(.caption2).foregroundStyle(.tertiary)
+                HStack(spacing: 5) {
+                    Text("Used " + AliveWords.count(items.count, noun))
+                        .font(.footnote)
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 9, weight: .semibold))
+                        .rotationEffect(.degrees(expanded.wrappedValue ? 90 : 0))
                 }
+                .foregroundStyle(AlivePalette.secondary)
+                .frame(minHeight: 28)
+                .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+            .accessibilityValue(expanded.wrappedValue ? "Expanded" : "Collapsed")
             if expanded.wrappedValue {
-                ForEach(items) { e in
-                    HStack(spacing: 6) {
-                        Image(systemName: icon).font(.caption2).foregroundStyle(.tertiary)
-                        Text(e.name).font(.caption2).foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: 4) {
+                    ForEach(items) { e in
+                        Text(Self.plainName(e.name))
+                            .font(.footnote)
+                            .foregroundStyle(AlivePalette.secondary)
                     }
-                    .padding(.leading, 2)
+                }
+                .padding(.leading, 10)
+                .overlay(alignment: .leading) {
+                    Rectangle().fill(AlivePalette.divider).frame(width: 1)
                 }
             }
         }

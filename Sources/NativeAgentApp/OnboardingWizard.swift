@@ -1,3 +1,5 @@
+import ProviderRouting
+import AppToolRuntime
 // PATCH-2026-05-07: onboarding-2 Generic onboarding wizard — name + persona type
 import SwiftUI
 import AppKit
@@ -265,16 +267,6 @@ struct OnboardingWizard: View {
         return environmentAppModel
     }
     @State private var state = OnboardingWizardState()
-#if DEBUG
-    private var isSnapshot = false
-
-    init(snapshotState: OnboardingWizardState) {
-        self.onComplete = {}
-        self._state = State(initialValue: snapshotState)
-        self.isSnapshot = true
-    }
-#endif
-
     init(onComplete: @escaping () -> Void) {
         self.onComplete = onComplete
     }
@@ -371,9 +363,6 @@ struct OnboardingWizard: View {
         .background(Color(nsColor: .windowBackgroundColor))
         .frame(minWidth: 600, idealWidth: 680, minHeight: 500, idealHeight: 640)
         .task {
-#if DEBUG
-            guard !isSnapshot else { return }
-#endif
             await loadOnboardingState()
         }
     }
@@ -656,7 +645,7 @@ struct OnboardingWizard: View {
     /// reset (which would back out good identity docs over a scaffold problem);
     /// the actionable retry is the repair itself.
     private func finishSuccessfulOnboarding() async {
-        let outcome = await appModel.runDoctor(repair: true)
+        let outcome = await appModel.runDoctor(repair: true, repairScope: .onboarding)
         guard outcome.didRun, outcome.failingScaffoldChecks.isEmpty else {
             state.scaffoldRepairFailed = true
             // Reset would back out the identity docs that DID commit. Never
@@ -970,7 +959,7 @@ private struct ProviderConnectStep: View {
     private func reload(connectedId: String? = nil) async {
         await state.reloadProviders(
             connectedId: connectedId,
-            list: { try await appModel.listProviders() },
+            list: { try await appModel.engine.providers.list() },
             adopt: { await appModel.adoptProviderForBlankSurfaces($0) }
         )
     }

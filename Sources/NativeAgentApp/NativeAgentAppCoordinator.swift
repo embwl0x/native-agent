@@ -1,3 +1,4 @@
+import CommandPalette
 import AppKit
 import Foundation
 
@@ -6,7 +7,7 @@ enum NativeAgentNavigationDestination: Equatable, Sendable {
     case activity(ActivitySection)
     case skillsTools(SkillsToolsSection)
 
-    static func commandEntry(_ entry: CoordinationCommandEntry) -> Self? {
+    static func commandEntry(_ entry: CommandPaletteEntry) -> Self? {
         switch entry.id {
         case "approvals":
             return .activity(.approvals)
@@ -230,7 +231,7 @@ final class NativeAgentAppCoordinator {
         return true
     }
 
-    func request(commandEntry: CoordinationCommandEntry) {
+    func request(commandEntry: CommandPaletteEntry) {
         guard let destination = NativeAgentNavigationDestination.commandEntry(commandEntry) else { return }
         request(destination)
     }

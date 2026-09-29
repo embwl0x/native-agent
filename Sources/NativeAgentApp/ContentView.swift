@@ -1,3 +1,4 @@
+import AppToolRuntime
 import SwiftUI
 import AppKit
 import CoreGraphics
@@ -14,43 +15,8 @@ import CoreSpotlight
 #endif
 #if canImport(CloudKit)
 import CloudKit
+import DeviceSync
 #endif
-
-// PATCH-2026-05-06: ui-consolidation — default selection chat, 5 visible + Advanced disclosure sidebar
-// PATCH-2026-05-10: startup-tour-gate — tour is manual only; startup must not block chat.
-enum SidebarAdvancedDisclosurePresentation {
-    static let preferenceKey = "sidebarShowAdvanced"
-    static let developerSurfacesPreferenceKey = "showDeveloperSurfaces"
-
-    static func isExpanded(in defaults: UserDefaults) -> Bool {
-        defaults.bool(forKey: preferenceKey)
-    }
-
-    static func setExpanded(_ isExpanded: Bool, in defaults: UserDefaults) {
-        defaults.set(isExpanded, forKey: preferenceKey)
-    }
-
-    @discardableResult
-    static func toggle(in defaults: UserDefaults) -> Bool {
-        let isExpanded = !isExpanded(in: defaults)
-        setExpanded(isExpanded, in: defaults)
-        return isExpanded
-    }
-
-    static func accessibilityValue(isExpanded: Bool) -> String {
-        isExpanded ? "Expanded" : "Collapsed"
-    }
-
-    static func visibleRows(
-        isExpanded: Bool,
-        developerSurfacesEnabled: Bool
-    ) -> [SidebarItem] {
-        guard isExpanded else { return [] }
-        return SidebarItem.visibleAdvancedItems(
-            developerSurfacesEnabled: developerSurfacesEnabled
-        )
-    }
-}
 
 struct ContentView: View {
     // Liquid Feel W4: page-switch transition respects Reduce Motion.
@@ -60,25 +26,11 @@ struct ContentView: View {
     @SceneStorage("selection") private var selectionRaw = SidebarItem.chat.rawValue
     @State private var hasMountedBots = false
     @SceneStorage("skillsToolsSection") private var skillsToolsSectionRaw = SkillsToolsSection.skills.rawValue
-    // ui-simplify 2026-09-02 (lane C): the classic shell drills into the
-    // moment/memory review from ActivityView's own NavigationStack. Behind the
-    // rail there is no such stack — Memories is its own place — so the same
-    // `.activity(.memoryProposals)` route selects Memories and says which tab.
-    @SceneStorage("memoryTab") private var memoryTabRaw = MemoryViewTab.active.rawValue
-    @AppStorage(SidebarAdvancedDisclosurePresentation.preferenceKey) private var showAdvanced = false
-    // B2.2: developer/internal surfaces (Turn Inspector, MCP, Cognition, …)
-    // render only when this UI-visibility preference is on. Fresh installs
-    // default OFF so a stranger cannot reach raw internals in one click.
-    // Surfaced as one toggle in Settings; NOT coupled to Trust's developerMode.
-    @AppStorage(SidebarAdvancedDisclosurePresentation.developerSurfacesPreferenceKey) private var showDeveloperSurfaces = false
     @AppStorage("nativeagent.showTour") private var showTour = false
-    // ui-simplify 2026-09-02: the kill switch. ON restores the previous
-    // List sidebar + nine primaries, unchanged.
-    @AppStorage(NativeAgentShellPreference.classicShellKey) private var classicShell = false
-    /// Simple | Advanced (SimpleViewMode.swift). The classic shell is always Advanced.
+    /// Simple | Advanced (SimpleViewMode.swift).
     @AppStorage(SimpleViewMode.key) private var viewModeRaw = ""
-    private var showsSimpleView: Bool { !classicShell && SimpleViewMode.resolved(viewModeRaw) == SimpleViewMode.simple }
-    private var showsAgentView: Bool { !classicShell && SimpleViewMode.resolved(viewModeRaw) == SimpleViewMode.agent }
+    private var showsSimpleView: Bool { SimpleViewMode.resolved(viewModeRaw) == SimpleViewMode.simple }
+    private var showsAgentView: Bool { SimpleViewMode.resolved(viewModeRaw) == SimpleViewMode.agent }
     @State private var tourReplayCoordinator = OnboardingTourReplayCoordinator.shared
     @State private var didCheckFirstRunOnboarding = false
     @State private var showFirstRunOnboarding = false
@@ -93,11 +45,11 @@ struct ContentView: View {
     /// click. Bumped on every route to Settings; it is SetupView's `.id`, so a
     /// bump remounts the stack at its root.
     @State private var settingsRootRouteVersion = 0
-    // B2.3 follow-up: Desk's New Task sheet is presented HERE, not in
-    // DeskHubView — a sheet attached to NavigationSplitView detail content
-    // presents only once per app run on macOS (the bridge never releases the
-    // presentation seat after dismiss). ContentView-level sheets re-present
-    // reliably (the command palette proves it), so the toolbar button posts
+    // B2.3 follow-up: Desk's New Task sheet is presented HERE, not in the
+    // Desk page — a sheet attached inside page content presented only once
+    // per app run on macOS (the bridge never releases the presentation seat
+    // after dismiss). ContentView-level sheets re-present reliably (the
+    // command palette proves it), so the Desk's New task button posts
     // .newWorkshopTaskRequest and the sheet lives on this attachment point.
     @State private var showNewWorkshopTask = false
     @State private var navigationMountID: UUID?
@@ -114,7 +66,7 @@ struct ContentView: View {
             // now (Knowledge graph, MCP, Dreams, Telegram, Mac integration)
             // reads as its rail page, so the rail shows a row and the page
             // has its frame.
-            if !classicShell, let home = SidebarItem.shellHome(for: item) { return home.parent }
+            if let home = SidebarItem.shellHome(for: item) { return home.parent }
             return item
         } set: {
             selectSidebarItem($0.normalized)
@@ -147,28 +99,6 @@ struct ContentView: View {
 
     private var isShowingBots: Bool { selection.wrappedValue.normalized == .bots }
 
-    // PATCH-2026-05-10: sidebar-flatten — pulled directly from SidebarItem
-    // so order/membership is defined in one place (Models.swift).
-    private var primaryItems: [SidebarItem] { SidebarItem.primaryItems }
-    // B2.2: the Advanced disclosure shows consumer-only rows by default and the
-    // full set (incl. developer surfaces) once showDeveloperSurfaces is on.
-    private var advancedDisclosureBinding: Binding<Bool> {
-        Binding(
-            get: { showAdvanced },
-            set: { isExpanded in
-                SidebarAdvancedDisclosurePresentation.setExpanded(isExpanded, in: .standard)
-                showAdvanced = isExpanded
-            }
-        )
-    }
-
-    private var advancedItems: [SidebarItem] {
-        SidebarAdvancedDisclosurePresentation.visibleRows(
-            isExpanded: showAdvanced,
-            developerSurfacesEnabled: NativeAgentShellPreference.developerSurfacesShown(showDeveloperSurfaces)
-        )
-    }
-
     var body: some View {
         // Render-cost audit: make the root's invalidation rate a NUMBER, not an
         // argument. Gated behind the existing `NATIVE_AGENT_RENDER_AUDIT=1`
@@ -184,104 +114,55 @@ struct ContentView: View {
             } else if showsAgentView {
                 AgentScreenView()
             } else {
-            ShellFrame(classic: classicShell) {
+            ShellFrame {
                 // ui-simplify 2026-09-02 (Lane A): the rail. Five places with
-                // their words under them, at a fixed 84pt. The classic List
-                // sidebar is preserved unchanged behind the `uiClassicShell`
-                // kill switch.
-                Group {
-                if !classicShell {
-                    // The rail's 84pt comes from its own .frame(width:) —
-                    // navigationSplitViewColumnWidth was left behind when the
-                    // shell moved out of NavigationSplitView and did nothing
-                    // inside an HStack but mislead the next reader.
-                    // The rail carries the same queue the classic sidebar
-                    // badges from — otherwise a pending approval is invisible
-                    // until he happens to open Today. One dot, no number.
-                    ShellSidebarRail(
-                        selection: selection,
-                        needsYou: Set(
-                            SidebarItem.shellPrimaryItems
-                                // Agent, 2026-09-02: a rail dot is a promise about the
-                                // page under it. Today's dot reads what Today's waiting
-                                // card reads: pending approvals and memories to review.
-                                .filter { item in
-                                    item.normalized == .activity
-                                        ? (appModel.approvals.contains { $0.status.lowercased() == "pending" }
-                                            || appModel.todayWaitingMemories > 0)
-                                        : sidebarBadgeCount(for: item) > 0
-                                }
-                                .map(\.normalized)
-                        )
-                    )
-                } else {
-                // S.5: when onboarding overlay is shown, hide the nav content from accessibility
-                // (OnboardingTourOverlay already carries .isModal; this prevents VoiceOver reaching behind it)
-                // 2026-06-06 sidebar-fix v6: restored to the standard
-                // List(selection:)+sidebar pattern that renders correctly.
-                // .scrollDisabled broke rendering; manual ScrollView+VStack
-                // broke rendering. The executions-click scroll-shift is a
-                // known issue tracked separately — at least the sidebar
-                // works again. isSelected is still passed for the orange
-                // highlight (since List's own selection styling differs).
-                List(selection: selection) {
-                    Section {
-                        ForEach(primaryItems) { item in
-                            SidebarItemLabel(
-                                item: item,
-                                badgeCount: sidebarBadgeCount(for: item),
-                                badgeIsStale: item == .activity && appModel.sidebarActivityRefreshStatus?.isStale == true
-                            )
-                            .tag(item)
-                        }
-                    }
-
-                    Section {
-                        DisclosureGroup(isExpanded: advancedDisclosureBinding) {
-                            ForEach(advancedItems) { item in
-                                SidebarItemLabel(
-                                    item: item,
-                                    badgeCount: sidebarBadgeCount(for: item),
-                                    badgeIsStale: item == .activity && appModel.sidebarActivityRefreshStatus?.isStale == true
-                                )
-                                .tag(item)
+                // their words under them, at a fixed 84pt.
+                // The rail's 84pt comes from its own .frame(width:) —
+                // navigationSplitViewColumnWidth was left behind when the
+                // shell moved out of NavigationSplitView and did nothing
+                // inside an HStack but mislead the next reader.
+                // The rail carries the pending queue as a badge — otherwise a
+                // pending approval is invisible until he happens to open
+                // Today. One dot, no number.
+                ShellSidebarRail(
+                    selection: selection,
+                    needsYou: Set(
+                        SidebarItem.primaryItems
+                            // Agent, 2026-09-02: a rail dot is a promise about the
+                            // page under it. Today's dot reads what Today's waiting
+                            // card reads: pending approvals and memories to review.
+                            .filter { item in
+                                item.normalized == .activity
+                                    ? (appModel.engine.approvals.records.contains { $0.status.lowercased() == "pending" }
+                                        || appModel.todayWaitingMemories > 0)
+                                    : sidebarBadgeCount(for: item) > 0
                             }
-                        } label: {
-                            Label("Advanced", systemImage: "chevron.right.2")
-                                .foregroundStyle(.secondary)
-                                .togglesDisclosure(advancedDisclosureBinding)
-                                .padding(.vertical, 2)
-                                .contentShape(Rectangle())
-                                .naInteractive(radius: NativeAgentRadius.control)
-                                .accessibilityIdentifier("sidebar.advanced.disclosure")
-                                .accessibilityValue(
-                                    SidebarAdvancedDisclosurePresentation.accessibilityValue(
-                                        isExpanded: showAdvanced
-                                    )
-                                )
-                        }
-                    }
-                }
-                .listStyle(.sidebar)
-                }
-                }
-                // Both shells share the title and the badge refresh below.
+                            .map(\.normalized)
+                    )
+                )
                 .navigationTitle("NativeAgent")
                 // Keep the Activity badge honest without pulling the full
                 // Activity surface while another tab is open. The full
-                // ActivityView owns detailed proposal/improvement refreshes.
+                // Today owns detailed proposal/improvement refreshes.
                 .task(id: scenePhase) {
                     guard scenePhase == .active else { return }
                     let root = PersistenceCore.defaultDataRoot()
                     let memoryDatabase = root
                         .appendingPathComponent("memory", isDirectory: true)
                         .appendingPathComponent("memory.sqlite")
-                    await ViewFileRefreshTask.run(paths: [
+                    var statusPaths = [
                         root.appendingPathComponent("workflows/approvals/requests.json"),
                         root.appendingPathComponent("notifications/inbox.jsonl"),
                         memoryDatabase,
                         URL(fileURLWithPath: memoryDatabase.path + "-wal"),
-                    ]) {
+                    ]
+                    if #available(macOS 27, *) {
+                        statusPaths += [
+                            root.appendingPathComponent("desk/desk_ops.jsonl"),
+                            root.appendingPathComponent("desk/desk_ops_base.json"),
+                        ]
+                    }
+                    await ViewFileRefreshTask.run(paths: statusPaths) {
                         await appModel.refreshSidebarActivityBadge()
                     }
                 }
@@ -358,59 +239,33 @@ struct ContentView: View {
                     case .chat: EmptyView()
                     case .bots: EmptyView()
                     // ui-simplify 2026-09-02: Today and Setup sit behind the
-                    // rail's words; the classic shell keeps its old pages.
-                    case .activity: if classicShell { ActivityView() } else { TodayView() }
-                    // ui-simplify 2026-09-03 (lane M): the new shell's Memories
-                    // is one centred column in her voice; the classic shell
-                    // keeps the status card and its three tabs untouched.
-                    case .memories:
-                        if classicShell {
-                            MemoryView(initialTab: MemoryViewTab(rawValue: memoryTabRaw) ?? .active)
-                                // MemoryView copies initialTab into @State
-                                // once; a route arriving while Memories is
-                                // already mounted must remount so the Pending
-                                // tab actually shows.
-                                .id(memoryTabRaw)
-                        } else {
-                            // Memories and the knowledge graph as tabs; a
-                            // moment-review request lands on the Memories tab
-                            // (applyActivitySection writes the tab first).
-                            MemoriesRailPage()
-                        }
+                    // rail's words.
+                    case .activity: TodayView()
+                    // Memories and the knowledge graph as tabs; a
+                    // moment-review request lands on the Memories tab
+                    // (applyActivitySection writes the tab first).
+                    case .memories: MemoriesRailPage()
                     case .skills: SkillsToolsView(selection: skillsToolsSection)
-                    // ui-simplify 2026-09-02 (lane D): the new shell's Desk is
-                    // one centred column in her voice; the classic shell keeps
-                    // the segmented hub untouched.
-                    case .desk:
-                        if classicShell {
-                            DeskHubView(rootRouteVersion: deskRootRouteVersion)
-                        } else {
-                            DeskPageView(rootRouteVersion: deskRootRouteVersion)
-                        }
-                    // User, 2026-09-04: on the rail, with tabs. The classic
-                    // shell keeps the bare pages.
-                    case .personality: if classicShell { PersonalityView() } else { PersonalityRailPage() }
+                    // ui-simplify 2026-09-02 (lane D): Desk is one centred
+                    // column in her voice.
+                    case .desk: DeskPageView(rootRouteVersion: deskRootRouteVersion)
+                    // User, 2026-09-04: on the rail, with tabs.
+                    case .personality: PersonalityRailPage()
                     case .connectors: ConnectorsRailPage()
-                    case .trust: if classicShell { TrustCenterView() } else { TrustRailPage() }
+                    case .trust: TrustRailPage()
                     case .providers:
-                        if classicShell { ProviderSettingsView() }
-                        else { ShellRailPage(title: "Providers", subtitle: SidebarItem.providers.shellPageSubtitle, wide: true, alive: true) { ProviderSettingsView() } }
+                        ShellRailPage(title: "Providers", subtitle: SidebarItem.providers.shellPageSubtitle, wide: true, alive: true) { ProviderSettingsView() }
                     case .macIntegration: MacIntegrationView()
                     case .settings:
-                        if classicShell {
-                            SlimSettingsView()
-                        } else {
-                            // A route to Settings is a route to its ROOT, and
-                            // the stack inside SetupView owns its own path —
-                            // nothing can unwind it from out here. `.id` does
-                            // it the only way an unbound stack allows: a fresh
-                            // SetupView, standing on Settings.
-                            SetupView().id(settingsRootRouteVersion)
-                        }
+                        // A route to Settings is a route to its ROOT, and
+                        // the stack inside SetupView owns its own path —
+                        // nothing can unwind it from out here. `.id` does
+                        // it the only way an unbound stack allows: a fresh
+                        // SetupView, standing on Settings.
+                        SetupView().id(settingsRootRouteVersion)
                     // ── Advanced / routed child surfaces ──────────────────────
                     case .capabilities:
-                        if classicShell { CapabilitiesView() }
-                        else { ShellRailPage(title: "Capabilities", subtitle: SidebarItem.capabilities.shellPageSubtitle, alive: true) { CapabilitiesView() } }
+                        ShellRailPage(title: "Capabilities", subtitle: SidebarItem.capabilities.shellPageSubtitle, alive: true) { CapabilitiesView() }
                     case .knowledge: KnowledgeGraphView()
                     case .dreams: DreamsView()
                     // B2.4/B2.6 (fence-B handoff): the Observatory's surviving
@@ -424,11 +279,10 @@ struct ContentView: View {
                     // contract for all route-only surfaces.
                     case .cognition: DiagnosticsView(initialMode: .cognition)
                     case .inspector: DiagnosticsView(initialMode: .inspector)
-                    case .diagnostics: if classicShell { DiagnosticsView() } else { DiagnosticsRailPage() }
+                    case .diagnostics: DiagnosticsRailPage()
                     case .telegram: TelegramView()
                     case .inboxPolicy:
-                        if classicShell { InboxSettingsView() }
-                        else { ShellRailPage(title: "Notifications", alive: true) { InboxSettingsView() } }
+                        ShellRailPage(title: "Notifications", alive: true) { InboxSettingsView() }
                     case .mcp: MCPHubView()
                     // ── Legacy aliases (unreachable post-normalize, kept exhaustive) ───
                     // .autoImprovement → .activity and .panels → .diagnostics
@@ -468,14 +322,10 @@ struct ContentView: View {
                         // sidebar's smaller file-watch refresh remains the
                         // low-cost owner between Activity visits.
                         //
-                        // Today (the non-classic landing) already runs that
-                        // exact refresh as the initial read of its own file
-                        // watcher, so doing it here too paid for the five
-                        // queue fetches twice on every arrival. The classic
-                        // ActivityView has no such watcher and still needs it.
-                        if classicShell {
-                            await appModel.refreshForSidebarItem(.activity)
-                        }
+                        // Today already runs that exact refresh as the
+                        // initial read of its own file watcher, so doing it
+                        // here too paid for the five queue fetches twice on
+                        // every arrival.
                     } else {
                         await appModel.refreshForSidebarItem(item)
                     }
@@ -483,19 +333,6 @@ struct ContentView: View {
                 }
             }
             }
-            }
-            .toolbar {
-                // ui-simplify 2026-09-02: the "N warnings" pill is the first
-                // thing a stranger used to read — before they had said hello.
-                // It moved to Diagnostics (Settings ▸ Advanced ▸ Diagnostics),
-                // where someone is actually looking for it. The chat header's
-                // one status dot carries the felt state now. Nothing was
-                // deleted; the classic shell still shows it here.
-                if classicShell {
-                    ToolbarItem(placement: .primaryAction) {
-                        HealthPill()
-                    }
-                }
             }
             // S.5: hide NavigationSplitView from VoiceOver while onboarding overlay is active
             .accessibilityHidden(showTour || showFirstRunOnboarding)
@@ -507,9 +344,6 @@ struct ContentView: View {
                         showTour = false
                     },
                     onSelectTab: { item in
-                        if item.isAdvanced {
-                            showAdvanced = true
-                        }
                         selectionRaw = item.rawValue
                     }
                 )
@@ -519,7 +353,10 @@ struct ContentView: View {
         .overlay(alignment: .bottom) {
             SystemToastBar(center: appModel.systemToasts)
         }
-        .viewModeSwitch(hidden: classicShell)
+        .onReceive(NativeAgentEngine.liveDeviceSync.bridge.$accountFailure) { failure in
+            appModel.showICloudAccountFailure(failure)
+        }
+        .viewModeSwitch()
         .animation(
             NativeAgentMotion.respecting(NativeAgentMotion.standard, reduceMotion: reduceMotion),
             value: showTour
@@ -535,7 +372,7 @@ struct ContentView: View {
             }
             // User, 2026-09-04: a saved selection naming a page that is a tab
             // now opens its rail page ON that tab, the same path a route takes.
-            if !classicShell, let saved = SidebarItem(rawValue: selectionRaw),
+            if let saved = SidebarItem(rawValue: selectionRaw),
                let home = SidebarItem.shellHome(for: saved) {
                 let tab = (home.parent == .diagnostics && home.tab == "skills"
                     && skillsToolsSectionRaw == SkillsToolsSection.tools.rawValue) ? "tools" : home.tab
@@ -751,12 +588,9 @@ struct ContentView: View {
                 applyActivityRoot()
                 return
             }
-            if target.isAdvanced {
-                showAdvanced = true
-            }
             // A route names the page, not the tab: land on the page's first
             // tab (the multimodal notice must open Trust, not Mac integration).
-            if !classicShell, let first = SidebarItem.shellFirstTab(for: target) {
+            if let first = SidebarItem.shellFirstTab(for: target) {
                 UserDefaults.standard.set(first, forKey: ShellRailTab.storageKey(target))
             }
             selectSidebarItem(target)
@@ -767,7 +601,7 @@ struct ContentView: View {
         // User, 2026-09-04: a former Advanced page that is a tab now opens its
         // rail page on that tab. The tab key is written before the selection
         // so the page mounts already on it.
-        if !classicShell, let home = SidebarItem.shellHome(for: target) {
+        if let home = SidebarItem.shellHome(for: target) {
             UserDefaults.standard.set(home.tab, forKey: ShellRailTab.storageKey(home.parent))
             selectionRaw = home.parent.rawValue
             return
@@ -785,9 +619,8 @@ struct ContentView: View {
         // Behind the rail, Activity IS Today and it has no NavigationStack to
         // push onto. The memory/moment review lives on the Memories place's
         // Pending tab, so route there instead of stranding the request.
-        if !classicShell, section == .memoryProposals {
+        if section == .memoryProposals {
             appModel.pendingActivitySectionRaw = nil
-            memoryTabRaw = MemoryViewTab.pending.rawValue
             // The waiting card is on the Memories tab, not the graph.
             UserDefaults.standard.set("memories", forKey: ShellRailTab.storageKey(.memories))
             selectionRaw = SidebarItem.memories.rawValue
@@ -811,52 +644,13 @@ struct ContentView: View {
         skillsToolsSectionRaw = section.rawValue
         // User, 2026-09-04: Skills and Tools are two tabs of Diagnostics in
         // the new shell.
-        if !classicShell {
-            UserDefaults.standard.set(
-                section == .tools ? "tools" : "skills",
-                forKey: ShellRailTab.storageKey(.diagnostics)
-            )
-            selectionRaw = SidebarItem.diagnostics.rawValue
-            return
-        }
-        selectionRaw = SidebarItem.skills.rawValue
+        UserDefaults.standard.set(
+            section == .tools ? "tools" : "skills",
+            forKey: ShellRailTab.storageKey(.diagnostics)
+        )
+        selectionRaw = SidebarItem.diagnostics.rawValue
     }
 }
-
-private struct SidebarItemLabel: View {
-    var item: SidebarItem
-    var badgeCount: Int = 0
-    var badgeIsStale: Bool = false
-
-    var body: some View {
-        HStack(spacing: 8) {
-            Label(item.displayName, systemImage: item.systemImage)
-            Spacer(minLength: 8)
-            if badgeCount > 0 {
-                Text(badgeIsStale ? "\(badgeCount)?" : "\(badgeCount)")
-                    .font(.caption2.weight(.semibold))
-                    .foregroundStyle(.white)
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 2)
-                    .background(Color.orange, in: Capsule())
-                    .help(badgeIsStale ? "Partial or last-known count; one or more Activity sources were unavailable." : "")
-            } else if badgeIsStale {
-                Image(systemName: "exclamationmark.triangle.fill")
-                    .font(.caption2)
-                    .foregroundStyle(.yellow)
-                    .help("Activity count is unavailable because the last refresh failed.")
-            }
-        }
-        // Liquid Feel (User 2026-08-17, "the tabs... no love?"): macOS sidebars
-        // paint SELECTION natively but never hover — the roll-over feel is
-        // ours to add. Rides the label so the native selection tint stays.
-        .padding(.vertical, 2)
-        .contentShape(Rectangle())
-        .naInteractive(radius: NativeAgentRadius.control)
-        .accessibilityIdentifier("sidebar.item.\(item.rawValue)")
-    }
-}
-
 
 struct MetricTile: View {
     var title: String
@@ -1082,23 +876,24 @@ enum NativeScreenCapture {
 // instead of falling through to chat (where _chat_intent_skill_build can
 // detect natural-language skill requests).
 extension Notification.Name {
-    /// Fired by AppModel.sendChat after a turn lands so any ContextFillBar
-    /// instance can re-poll the session context.
-    static let chatTurnCompleted = Notification.Name("chatTurnCompleted")
     /// Fired by /nextgen slash command to navigate to the NextGen panel in Capabilities.
     static let openNextGenRequest = Notification.Name("NativeAgent.openNextGenRequest")
     static let openApprovalsRequest = Notification.Name("NativeAgent.openApprovalsRequest")
     static let openTelegramRequest = Notification.Name("NativeAgent.openTelegramRequest")
+    /// Opens Trust where screen capture and the other multimodal grants live.
+    static let openTrustMultimodalRequest = Notification.Name("openTrustMultimodalRequest")
     static let openCommandRouteRequest = Notification.Name("NativeAgent.openCommandRouteRequest")
     static let openCommandPaletteRequest = Notification.Name("NativeAgent.openCommandPaletteRequest")
-    /// B2.3 follow-up: posted by Desk's New Task toolbar button; ContentView
-    /// owns the sheet (detail-attached sheets present only once on macOS).
+    /// Posted by the Desk page's New task button; ContentView owns the sheet
+    /// (a sheet attached inside the page presents only once on macOS).
     static let newWorkshopTaskRequest = Notification.Name("NativeAgent.newWorkshopTaskRequest")
-    static let iCloudInboxDidProcess = Notification.Name("NativeAgent.iCloudInboxDidProcess")
+    /// Posted by the New Task sheet once the task exists, so an open Desk
+    /// re-reads its board instead of waiting for its next poll.
+    static let deskTaskCreated = Notification.Name("NativeAgent.deskTaskCreated")
     /// PATCH-2026-06-06: activity-flatten — posted by Cmd+Shift+A / Cmd+Shift+I
     /// (and any future direct-route into Activity's sub-queues). Object is an
-    /// `ActivitySection.rawValue` string; ActivityView resets its
-    /// NavigationPath and pushes the matching destination.
+    /// `ActivitySection.rawValue` string; Today opens the matching queue in
+    /// its sheet.
     static let openActivitySectionRequest = Notification.Name("NativeAgent.openActivitySectionRequest")
     static let openActivityRootRequest = Notification.Name("NativeAgent.openActivityRootRequest")
     /// Inbox "Act" on a chat-shaped item (morning brief, idle check-in, …):

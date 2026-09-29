@@ -209,8 +209,7 @@ or another cryptographic feature is added, reassess before submission.
 >    Apple account used on the iPhone or iPad.
 > 2. Complete Mac onboarding and configure the review provider using
 >    [REVIEW_PROVIDER_SETUP_OR_CREDENTIAL_INSTRUCTIONS].
-> 3. In the Mac app, open Connectors → iPhone (classic sidebar:
->    Settings → Pair iPhone / iPad).
+> 3. In the Mac app, switch to Advanced view and open Connectors → iPhone.
 > 4. Launch NativeAgent Mobile. Wait for the signed pairing material and choose
 >    Connect via iCloud.
 > 5. If waiting, tap Check for Mac. Only after the Mac's details arrive does

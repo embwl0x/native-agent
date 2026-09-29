@@ -320,11 +320,23 @@ struct KnowledgeGraphView: View {
     var body: some View {
         ZStack(alignment: .top) {
             List {
-                if let err = store.bannerError {
+                // E6: freshness of the Mac snapshot behind this graph, under the door.
+                VStack(alignment: .leading, spacing: 14) {
+                    AlivePageHeader(title: "Knowledge Graph", line: "The people, places and projects I know about.",
+                                    style: .pushed)
+                        .padding(.horizontal, 4)
+                    AliveFreshnessNote(group: "knowledge_graph")
+                }
+                .aliveListRow(top: 4, bottom: 10)
+                // Only over a graph already shown: before the first snapshot
+                // the empty state and the freshness note already say this.
+                if let err = store.bannerError, store.hasPublishedSnapshot {
                     Label(err, systemImage: "icloud.slash")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
+                        .font(.footnote)
+                        .foregroundStyle(AlivePalette.secondary)
                         .fixedSize(horizontal: false, vertical: true)
+                        .listRowBackground(Color.clear)
+                        .listRowSeparator(.hidden)
                 }
                 switch KnowledgeGraphPresentation.contentState(
                     isLoading: store.isLoading && MobileDesignSamples.screen == nil,
@@ -338,32 +350,14 @@ struct KnowledgeGraphView: View {
                         .listRowBackground(Color.clear)
                         .listRowSeparator(.hidden)
                 case .unpublished:
-                    MobileReadingEmptyState(
-                        title: "Graph unavailable",
-                        systemImage: "icloud.slash",
-                        kind: .unavailable,
-                        description: KnowledgeGraphEmptyStatePresentation.unpublishedDescription
-                    )
-                        .listRowBackground(Color.clear)
-                        .listRowSeparator(.hidden)
+                    AliveCalmState(title: "Graph unavailable", line: KnowledgeGraphEmptyStatePresentation.unpublishedDescription)
+                    .aliveListRow()
                 case .emptyPublished:
-                    MobileReadingEmptyState(
-                        title: "No entities",
-                        systemImage: "circle.hexagongrid",
-                        kind: .empty,
-                        description: KnowledgeGraphEmptyStatePresentation.emptyPublishedDescription
-                    )
-                    .listRowBackground(Color.clear)
-                    .listRowSeparator(.hidden)
+                    AliveCalmState(title: "No entities", line: KnowledgeGraphEmptyStatePresentation.emptyPublishedDescription)
+                    .aliveListRow()
                 case .noMatches:
-                    MobileReadingEmptyState(
-                        title: "No matching entities",
-                        systemImage: "magnifyingglass",
-                        kind: .empty,
-                        description: "The published graph is available, but no entity matches this search."
-                    )
-                        .listRowBackground(Color.clear)
-                        .listRowSeparator(.hidden)
+                    AliveCalmState(title: "No matching entities", line: "The published graph is available, but no entity matches this search.")
+                    .aliveListRow()
                 case .content:
                     Section {
                         ForEach(displayEntities) { entity in
@@ -373,9 +367,16 @@ struct KnowledgeGraphView: View {
                                 KGEntityRowCell(entity: entity)
                             }
                             .buttonStyle(.plain)
+                            // Row chrome belongs on the row, not inside its label.
+                            .listRowBackground(Color.clear)
+                            .listRowSeparator(.hidden)
+                            .listRowInsets(EdgeInsets(top: 4, leading: 16, bottom: 4, trailing: 16))
                         }
                     } header: {
                         Text(KnowledgeGraphPresentation.entityCountHeader(visibleCount: displayEntities.count))
+                            .font(.footnote.weight(.semibold))
+                            .foregroundStyle(AlivePalette.secondary)
+                            .textCase(nil)
                     } footer: {
                         if let context = KnowledgeGraphPresentation.filterContext(
                             visibleCount: displayEntities.count,
@@ -383,12 +384,14 @@ struct KnowledgeGraphView: View {
                             isFiltered: !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                         ) {
                             Text(context)
+                                .font(.footnote)
+                                .foregroundStyle(AlivePalette.secondary)
                         }
                     }
+                    .listSectionSeparator(.hidden)
                 }
             }
             .listStyle(.plain)
-            .searchable(text: $searchText, prompt: "Search entities…")
             .refreshable { await store.refresh(client: bridgeClient) }
             .task { await store.refresh(client: bridgeClient) }
             .onChange(of: syncEngine.lastSyncAt) { _, _ in
@@ -397,15 +400,19 @@ struct KnowledgeGraphView: View {
 
         }
         .animation(AppMotion.snappy, value: store.bannerError)
-        .mobileReadingScreen()
-        .navigationTitle("Knowledge Graph")
-        .macSyncErrorBanner()
-        // E6: freshness of the Mac snapshot behind this graph.
-        .macSnapshotFreshnessBadge(group: "knowledge_graph")
-        .navigationBarTitleDisplayMode(.inline)
-        .safeAreaInset(edge: .top, spacing: 0) {
-                MacStatusChip().frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 16)
+        .alivePageChrome(title: "Knowledge Graph", root: false)
+        // The search floats over the list, like Memories: outside the chrome,
+        // so the list's bottom fade runs under it.
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            // Nothing to search until a graph has arrived.
+            if store.hasPublishedSnapshot || MobileDesignSamples.screen != nil || !searchText.isEmpty {
+                AliveSearchField(prompt: "Search people, places and projects", text: $searchText)
+                    .padding(.horizontal, AliveMetrics.pageInset)
+                    .padding(.top, 6)
+                    .padding(.bottom, 8)
             }
+        }
+        .macSyncErrorBanner()
         .sheet(item: $selectedEntity) { entity in
             KGEntityDetailSheet(entity: entity)
                 .environmentObject(bridgeClient)
@@ -420,42 +427,32 @@ private struct KGEntityRowCell: View {
 
     var body: some View {
         let meta = KGEntityMeta.presentation(for: entity.type)
-        MobileReadingSurface {
-            MobileAdaptiveRow(spacing: 12) {
-                Image(systemName: meta.icon)
-                    .font(.title3)
-                    .foregroundStyle(.secondary)
-                    .frame(width: 30)
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(entity.name)
-                        .font(.headline)
-                    Text(meta.label)
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
-                        .background(NativeAgentMobileTheme.Colors.quietFill)
-                        .clipShape(Capsule())
-                }
-                Spacer()
-                if let count = entity.mention_count, count > 0 {
-                    VStack {
-                        Text("\(count)")
-                            .font(.headline)
-                            .foregroundStyle(.secondary)
-                        Text("mentions")
-                            .font(.caption)
-                            .foregroundStyle(.tertiary)
-                    }
-                }
-                Image(systemName: "chevron.right")
-                    .font(.callout)
-                    .foregroundStyle(.tertiary)
+        let mentions = entity.mention_count.flatMap { $0 > 0 ? ($0 == 1 ? "1 mention" : "\($0) mentions") : nil }
+        HStack(spacing: 14) {
+            Image(systemName: meta.icon)
+                .font(.system(size: 19, weight: .regular))
+                .foregroundStyle(AlivePalette.secondary)
+                .frame(width: 28)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(entity.name)
+                    .font(.body.weight(.semibold))
+                    .foregroundStyle(AlivePalette.text)
+                    .fixedSize(horizontal: false, vertical: true)
+                Text(([meta.label] + [mentions].compactMap { $0 }).joined(separator: " \u{00B7} "))
+                    .font(.footnote)
+                    .foregroundStyle(AlivePalette.secondary)
             }
+            Spacer(minLength: 8)
+            Image(systemName: "chevron.right")
+                .font(.footnote.weight(.semibold))
+                .foregroundStyle(AlivePalette.secondary.opacity(0.7))
+                .accessibilityHidden(true)
         }
-        .listRowBackground(Color.clear)
-        .listRowSeparator(.hidden)
-        .listRowInsets(EdgeInsets(top: 4, leading: 16, bottom: 4, trailing: 16))
+        .aliveRow()
+        .aliveCard(radius: 18)
+        .contentShape(Rectangle())
+        .accessibilityElement(children: .combine)
     }
 }
 
@@ -480,15 +477,16 @@ private struct KGEntityDetailSheet: View {
                             MobileAdaptiveRow(spacing: 12) {
                                 Image(systemName: meta.icon)
                                     .font(.title2)
-                                    .foregroundStyle(.secondary)
-                                Text(entity.name).font(.title2.weight(.semibold))
+                                    .foregroundStyle(AlivePalette.secondary)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(entity.name)
+                                        .font(.system(.title2, design: .serif))
+                                        .foregroundStyle(AlivePalette.text)
+                                    Text(meta.label)
+                                        .font(.footnote)
+                                        .foregroundStyle(AlivePalette.secondary)
+                                }
                                 Spacer()
-                                Text(meta.label)
-                                    .font(.callout)
-                                    .foregroundStyle(.primary)
-                                    .padding(.horizontal, 8)
-                                    .padding(.vertical, 3)
-                                    .background(NativeAgentMobileTheme.Colors.quietFill, in: Capsule())
                             }
                             if let count = entity.mention_count {
                                 KGDetailRow(label: "Mentions", value: "\(count)")
@@ -506,7 +504,7 @@ private struct KGEntityDetailSheet: View {
                                 Divider()
                                 Text(summary)
                                     .font(.body)
-                                    .foregroundStyle(.secondary)
+                                    .foregroundStyle(AlivePalette.text)
                             }
                         }
                     }
@@ -531,19 +529,15 @@ private struct KGEntityDetailSheet: View {
                         }
                     } else if let nbr = neighbors {
                         if nbr.edges.isEmpty {
-                            MobileReadingEmptyState(
-                                title: "No relationships",
-                                systemImage: "arrow.triangle.branch",
-                                kind: .empty,
-                                description: "No edges recorded yet for this entity."
-                            )
+                            AliveCalmState(title: "No relationships", line: "No edges recorded yet for this entity.")
                             .frame(minHeight: 200)
                         } else {
                             MobileReadingSurface {
                                 VStack(alignment: .leading, spacing: 8) {
-                                    Label("Relationships (\(nbr.edges.count))", systemImage: "arrow.triangle.branch")
-                                        .font(.headline)
-                                    Divider()
+                                    Text("Connections")
+                                        .font(.footnote.weight(.semibold))
+                                        .foregroundStyle(AlivePalette.secondary)
+                                        .accessibilityAddTraits(.isHeader)
                                     ForEach(nbr.edges) { edge in
                                         KGEdgeRowView(edge: edge, neighbors: nbr.neighbors, rootId: entity.id)
                                         if edge.id != nbr.edges.last?.id { Divider() }
@@ -619,23 +613,17 @@ private struct KGEdgeRowView: View {
         )
         let direction = edge.from == rootId ? "→" : "←"
 
-        MobileAdaptiveRow(spacing: 8) {
-            Text(direction)
-                .font(.callout)
-                .foregroundStyle(.secondary)
-            Text("[\(edge.kind)]")
-                .font(.callout)
-                .foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: 2) {
             Text(otherName)
                 .font(.body)
-            Spacer()
-            if let w = edge.weight {
-                Text(String(format: "%.2f", w))
-                    .font(.caption)
-                    .foregroundStyle(.tertiary)
-            }
+                .foregroundStyle(AlivePalette.text)
+            Text("\(direction) \(edge.kind.replacingOccurrences(of: "_", with: " "))")
+                .font(.footnote)
+                .foregroundStyle(AlivePalette.secondary)
         }
-        .padding(.vertical, 2)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.vertical, 4)
+        .accessibilityElement(children: .combine)
     }
 }
 
@@ -648,10 +636,11 @@ private struct KGDetailRow: View {
         MobileAdaptiveRow(alignment: .top) {
             Text(label)
                 .font(.callout)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(AlivePalette.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             Text(value)
                 .font(.body)
+                .foregroundStyle(AlivePalette.text)
             Spacer()
         }
     }

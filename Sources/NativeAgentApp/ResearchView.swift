@@ -1,4 +1,5 @@
 import SwiftUI
+import Research
 import AppKit
 import CoreGraphics
 import ScreenCaptureKit
@@ -274,5 +275,5 @@ private enum ResearchViewState {
     case idle
     case loading
     case failed(String)
-    case loaded([ResearchResult])
+    case loaded([ResearchSearchResult])
 }

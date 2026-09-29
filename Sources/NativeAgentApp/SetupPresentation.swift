@@ -1,3 +1,4 @@
+import AppToolRuntime
 // Lane B (2026-09-02, ui-simplify): the value owners behind the Setup page.
 // Pure mapping + a single settings key owner, kept out of the view so the
 // switch wording and the storage it writes can be read in one place.

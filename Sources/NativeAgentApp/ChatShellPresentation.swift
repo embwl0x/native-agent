@@ -1,9 +1,11 @@
+import AppToolRuntime
 import Foundation
 import SwiftUI
 import ChatOrchestration
 import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
+import TrustCenter
 
 // ui-simplify 2026-09-02 (Lane A): value-only presentation rules for the new
 // shell. Everything here is a pure projection of state the app already owns —
@@ -345,27 +347,62 @@ enum ChatShellConversationRow {
 /// ("Originating message id: …", topic, status, then "--- Claude's reply ---").
 /// The room shows the reply and folds the slip, the way tool traffic folds.
 enum ChatShellEnvelope {
-    static let replyMarker = "--- Claude's reply ---"
+    static let replyMarkers = ["--- Claude's reply ---", "--- OMP's reply ---"]
     static let endMarker = "--- end reply ---"
+    static let completionNotice = "this is an asynchronous completion event for work you delegated."
 
-    static func isEnvelope(_ content: String) -> Bool {
-        let head = content.trimmingCharacters(in: .whitespacesAndNewlines).prefix(400).lowercased()
+    static func isEnvelope(_ content: String, envelope: ChatMessageOriginMetadata?) -> Bool {
+        // 2026-09-28: Only a recorded built-in lane may fold; peers can write every body marker.
+        // A row saved before envelopes were recorded has none, and folds on its opening alone.
+        if let envelope {
+            guard let agent = envelope.agent, ["codex", "claude", "omp"].contains(agent),
+                  envelope.surface == agent + "-bridge" else { return false }
+        }
+        let head = ChatShellConversationRow.stripBridgePrefix(content).prefix(400).lowercased()
         return head.hasPrefix("originating message id:")
             || head.hasPrefix("[claude-wake]")
-            || head.contains("originating message id:")
-            || content.contains(replyMarker)
+            || head.hasPrefix("[omp-wake]")
+            || codexTitle(content) != nil
     }
 
-    /// The words between the markers, or the whole text when there are none.
+    private static func codexTitle(_ content: String) -> String? {
+        let text = ChatShellConversationRow.stripBridgePrefix(content)
+        let rows = text.split(separator: "\n", maxSplits: 2, omittingEmptySubsequences: false)
+        guard rows.count == 3, rows[1].isEmpty,
+              rows[2].prefix(completionNotice.count).lowercased() == completionNotice,
+              text.contains("\nCodex result:\n") else { return nil }
+        let title = String(rows[0]).lowercased()
+        guard title.hasPrefix("codex replied to ") || title.hasPrefix("codex wakeup failed")
+            || title.hasPrefix("codex turn stalled") || title.hasPrefix("codex wakeup produced no reply")
+        else { return nil }
+        return title
+    }
+
+    /// The completion result, or the words between the legacy reply markers.
     static func reply(_ content: String) -> String {
+        if codexTitle(content) != nil {
+            guard let start = content.range(of: "\nCodex result:\n") else { return "" }
+            var result = content[start.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines)
+            if result.hasSuffix(" to ask whether Codex finished."),
+               let footer = result.range(of: "\n\nNow give ", options: .backwards) {
+                result = String(result[..<footer.lowerBound])
+            }
+            return result.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
         var text = content
-        if let start = text.range(of: replyMarker) { text = String(text[start.upperBound...]) }
+        if let start = replyMarkers.compactMap({ text.range(of: $0) }).min(by: { $0.lowerBound < $1.lowerBound }) {
+            text = String(text[start.upperBound...])
+        }
         if let end = text.range(of: endMarker) { text = String(text[..<end.lowerBound]) }
         return text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     /// Completion status with the slip's duration, when present.
     static func headline(_ content: String) -> String {
+        // 2026-09-28: Codex records failure, stalls and missing replies in its title, without a status line.
+        if let title = codexTitle(content), !title.hasPrefix("codex replied to ") {
+            return "The connected agent didn't finish"
+        }
         let line = content.split(whereSeparator: \.isNewline)
             .first { $0.lowercased().hasPrefix("duration:") }
             .map { $0.dropFirst("duration:".count).trimmingCharacters(in: .whitespaces) } ?? ""

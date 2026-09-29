@@ -1,11 +1,13 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import TrustCenter
 #if canImport(ApplicationServices)
 import ApplicationServices
 #endif
 #if canImport(AppKit)
 import AppKit
+import os
 #endif
 
 // MARK: - The PERCEPTION COMPILER (native-look item 2)
@@ -208,6 +210,10 @@ public struct MacLookAffordance: Sendable, Equatable {
     /// worse than a drifted one.
     public let handleAmbiguity: String?
     public var handleAmbiguous: Bool { handleAmbiguity != nil }
+    /// An editable field's placeholder, a second name it answers to, and its
+    /// compile-time redaction verdict (same contract as `labelJSON`).
+    public let placeholder: String?
+    public let placeholderJSON: JSONValue?
 
     public init(
         handle: String,
@@ -223,9 +229,13 @@ public struct MacLookAffordance: Sendable, Equatable {
         path: [Int],
         labelJSON: JSONValue? = nil,
         valueJSON: JSONValue? = nil,
-        handleAmbiguity: String? = nil
+        handleAmbiguity: String? = nil,
+        placeholder: String? = nil,
+        placeholderJSON: JSONValue? = nil
     ) {
         self.handleAmbiguity = handleAmbiguity
+        self.placeholder = placeholder
+        self.placeholderJSON = placeholderJSON
         self.handle = handle
         self.role = role
         self.subrole = subrole
@@ -262,6 +272,10 @@ public struct MacLookAffordance: Sendable, Equatable {
             "path": .array(path.map { .int(Int64($0)) }),
         ]
         if let subrole { object["subrole"] = .string(subrole) }
+        if let placeholder {
+            object["placeholder"] = placeholderJSON
+                ?? MacScreenViewTextRedaction.redactedLegendString(placeholder, valueChars: valueChars)
+        }
         // Coordinates remain implementation evidence for the four-verb fusion;
         // the legacy look tool is no longer model-visible. Keeping the frame on
         // the percept means an AX-named link/row cannot lose its physical point
@@ -803,6 +817,38 @@ public enum MacPerceptionCompiler {
         "AXToolbar", "AXSheet", "AXMenuBar", "AXMenu",
     ]
 
+    /// Pick `budget` of `members` (indices into `paths`, in ranked order)
+    /// spread over the tree: where the paths branch, each branch gets an even
+    /// share (a small branch keeps all of its members and its unused share goes
+    /// to the others), recursively. Returns a subset of `members`.
+    static func fairShare(_ members: [Int], paths: [[Int]], budget: Int, depth: Int) -> [Int] {
+        guard members.count > budget else { return members }
+        guard budget > 0 else { return [] }
+        // Branch on the path component at `depth`; a path that ends here is its own branch.
+        var order: [Int] = []
+        var branches: [Int: [Int]] = [:]
+        for member in members {
+            let path = paths[member]
+            let key = depth < path.count ? path[depth] : -1 - member
+            if branches[key] == nil { order.append(key) }
+            branches[key, default: []].append(member)
+        }
+        if order.count == 1 {
+            return fairShare(members, paths: paths, budget: budget, depth: depth + 1)
+        }
+        var left = budget
+        var shares: [Int: Int] = [:]
+        let bySize = order.sorted { (branches[$0]?.count ?? 0) < (branches[$1]?.count ?? 0) }
+        for (index, key) in bySize.enumerated() {
+            let share = min(branches[key]?.count ?? 0, left / (bySize.count - index))
+            shares[key] = share
+            left -= share
+        }
+        return order.flatMap { key in
+            fairShare(branches[key] ?? [], paths: paths, budget: shares[key] ?? 0, depth: depth + 1)
+        }
+    }
+
     /// Advertises `AXPress`, or is one of the roles that is interactive whether
     /// or not the app bothered to advertise an action. Same two-family logic as
     /// `MacScreenViewBuilder.isMarkable`, narrowed: this list is what she can
@@ -908,9 +954,12 @@ public enum MacPerceptionCompiler {
         app: MacAXAppInfo?,
         windowTitle: String?,
         focusPath: [Int]? = nil,
-        maxAffordances: Int = MacPerceptionCompiler.maxAffordances
+        maxAffordances: Int = MacPerceptionCompiler.maxAffordances,
+        /// The act's identity check: the element at a handle's path is judged
+        /// against the whole walk, never against which controls a cap kept.
+        uncapped: Bool = false
     ) -> MacLookPercept {
-        let cap = max(1, min(maxAffordances, MacPerceptionCompiler.maxAffordances))
+        let cap = uncapped ? Int.max : max(1, min(maxAffordances, MacPerceptionCompiler.maxAffordances))
         let snapshot = captioned(snapshot)
         var byPath: [String: MacAXNode] = [:]
         for node in snapshot.nodes { byPath[key(node.path)] = node }
@@ -1203,7 +1252,9 @@ public enum MacPerceptionCompiler {
                 // The control's own title is the value's caption — the "CVV"
                 // box showing `123`, the "API key" field showing the key.
                 valueJSON: shownValue.map { redacted($0, of: node, under: title) },
-                handleAmbiguity: ambiguity(at: node.path)
+                handleAmbiguity: ambiguity(at: node.path),
+                placeholder: cleaned(attributes.placeholder),
+                placeholderJSON: cleaned(attributes.placeholder).map { redacted($0, of: node, under: nil) }
             ))
         }
 
@@ -1235,7 +1286,37 @@ public enum MacPerceptionCompiler {
             .map(\.element)
         if affordances.count > cap {
             omitted = affordances.count - cap
-            affordances = Array(affordances.prefix(cap))
+            // FAIR CAP: the budget is shared across the window's regions, not
+            // spent front to back. Claude's transcript (90+ message buttons)
+            // used to fill all 60 slots and the simulator pane after it vanished
+            // from the read. Tier order still wins: the top tier is shared out
+            // first, the next tier gets what is left. Kept controls stay in
+            // ranked order, so nothing moves but which ones survive.
+            // Never shared out: the focused control, a selected one, and
+            // anything in a dialog or sheet. A lone modal button must not lose
+            // its slot to a busy branch.
+            func protected(_ affordance: MacLookAffordance) -> Bool {
+                if affordance.path == focusPath || affordance.selected == true { return true }
+                return (0..<affordance.path.count).contains { depth in
+                    guard let ancestor = byPath[key(Array(affordance.path.prefix(depth)))]?.attributes else { return false }
+                    return ancestor.role == "AXSheet"
+                        || ["AXDialog", "AXSystemDialog", "AXSheet"].contains(ancestor.subrole ?? "")
+                }
+            }
+            var kept = Set(affordances.indices.filter { protected(affordances[$0]) }.prefix(cap))
+            var remaining = cap - kept.count
+            let tiers = Dictionary(grouping: affordances.indices.filter { !kept.contains($0) }) {
+                rankTier(affordances[$0])
+            }
+            for tier in tiers.keys.sorted() where remaining > 0 {
+                let members = tiers[tier] ?? []
+                let chosen = members.count <= remaining
+                    ? members
+                    : Self.fairShare(members, paths: affordances.map(\.path), budget: remaining, depth: 0)
+                kept.formUnion(chosen)
+                remaining -= chosen.count
+            }
+            affordances = affordances.indices.filter { kept.contains($0) }.map { affordances[$0] }
         }
 
         // 3. Focus — only when the source could actually tell us. An absent
@@ -1870,6 +1951,11 @@ public actor MacLookFrameStore {
 /// frame has expired — rather than by a timer, because a timer would be exactly
 /// the resident background thing this plan forbids.
 public enum MacChromiumAccessibility {
+    public enum Flag: String, CaseIterable, Sendable {
+        case enhancedUserInterface = "AXEnhancedUserInterface"
+        case manualAccessibility = "AXManualAccessibility"
+    }
+
     /// Known Chromium/Electron-family bundle ids on User's Mac.
     public static let bundleIdentifiers: Set<String> = [
         "com.google.Chrome",
@@ -1891,8 +1977,12 @@ public enum MacChromiumAccessibility {
     /// Does this walk look like an un-enhanced Chromium shell? True when the
     /// bundle id is known, OR the window exposed no `AXWebArea` and came back
     /// implausibly small for an app window.
-    public static func looksChromium(bundleId: String?, snapshot: MacAXTreeSnapshot?) -> Bool {
+    public static func looksChromium(bundleId: String?, pid: Int32? = nil, snapshot: MacAXTreeSnapshot?) -> Bool {
         if let bundleId, bundleIdentifiers.contains(bundleId) { return true }
+        // 2026-09-28: any app that ships a Chromium renderer, listed or not.
+        // Hermes with only Enhanced left on showed a window of buttons — never
+        // a bare shell — so the by-shape test below stopped waking it.
+        if let pid, !(bundleId?.hasPrefix("com.apple.") ?? false), shipsChromium(pid: pid) { return true }
         // Apple's own processes are never Chromium shells. Without this the
         // shell heuristic matched `com.apple.loginwindow` (a locked screen:
         // one window, zero controls) on 2026-08-22 and every glance at the
@@ -1908,53 +1998,83 @@ public enum MacChromiumAccessibility {
         return !snapshot.nodes.contains { MacPerceptionCompiler.isInteractive($0.attributes) }
     }
 
+    private static let shipsChromiumCache = OSAllocatedUnfairLock(initialState: [String: Bool]())
+
+    /// The running process's own bundle carries a Chromium renderer helper:
+    /// Electron and CEF apps beside their framework, Chrome-style apps inside
+    /// it. Read from the process (two installs can share a bundle id) and
+    /// scanned once per bundle path per launch.
+    static func shipsChromium(pid: Int32) -> Bool {
+        guard let app = NSRunningApplication(processIdentifier: pid)?.bundleURL else { return false }
+        if let known = shipsChromiumCache.withLock({ $0[app.path] }) { return known }
+        let files = FileManager.default
+        let frameworks = app.appendingPathComponent("Contents/Frameworks", isDirectory: true)
+        let entries = (try? files.contentsOfDirectory(atPath: frameworks.path)) ?? []
+        let isRenderer = { (name: String) in name.hasSuffix("Renderer).app") }
+        let found = entries.contains { name in
+            name == "Electron Framework.framework" || name == "Chromium Embedded Framework.framework"
+                || isRenderer(name)
+                || (name.hasSuffix(".framework") && ((try? files.contentsOfDirectory(
+                    atPath: frameworks.appendingPathComponent("\(name)/Versions/Current/Helpers").path
+                )) ?? []).contains(where: isRenderer))
+        }
+        shipsChromiumCache.withLock { $0[app.path] = found }
+        return found
+    }
+
     public static func hasWebArea(_ snapshot: MacAXTreeSnapshot?) -> Bool {
         snapshot?.nodes.contains { $0.attributes.role == "AXWebArea" } ?? false
     }
 
     /// Bounded settle after the flag. The spike measured ~4 s to a full web
-    /// tree; 2 s was too short on one read.
-    public static let settleSeconds: Double = 4.0
+    /// tree; 2 s was too short on one read. The poll exits the moment the tree
+    /// is populated, so the ceiling only costs time when nothing arrives.
+    public static let settleSeconds: Double = 6.0
     public static let pollSeconds: Double = 0.5
 }
 
-/// Which app currently has the enhanced-AX flag set, so the next look can clear
-/// it when the frontmost app changes or the frame dies. Tiny by design: it
-/// holds a pid, not a snapshot, and nothing reads it on any path but `look`.
+/// Which apps and flags this module changed, so the next look can clear only
+/// those flags when the target app changes or the frame dies.
 public actor MacChromiumAccessibilityState {
     public static let shared = MacChromiumAccessibilityState()
 
-    private var enhancedPid: Int32?
+    private var owned: [Int32: Set<MacChromiumAccessibility.Flag>] = [:]
 
     public init() {}
 
-    public func current() -> Int32? { enhancedPid }
-    public func note(pid: Int32?) { enhancedPid = pid }
+    public func current() -> [Int32: Set<MacChromiumAccessibility.Flag>] { owned }
+    public func note(pid: Int32, flags: Set<MacChromiumAccessibility.Flag>) {
+        owned[pid] = flags.isEmpty ? nil : flags
+    }
 }
 
 #if canImport(ApplicationServices) && os(macOS)
 
 public extension SystemMacAXElementSource {
-    /// Set both enhanced-accessibility flags on an APPLICATION element and
+    /// Set the requested enhanced-accessibility flags on an APPLICATION element and
     /// report what they READ BACK as. Chrome's set returns
     /// `kAXErrorCannotComplete` while the flag takes effect, so the status is
     /// discarded on purpose and only the read-back is reported.
+    /// Values are tri-state: true is on, false is off, absent is unknown.
     ///
     /// On the AX execution lane, like every other AX transaction in this module
     /// (`MacAXExecutionLane` — AppKit/SwiftUI handlers are main-thread isolated
     /// and an off-lane AX call can crash the TARGET app).
     @discardableResult
-    static func setEnhancedAccessibility(pid: Int32, enabled: Bool) -> Bool {
+    static func setEnhancedAccessibility(
+        pid: Int32, flags: Set<MacChromiumAccessibility.Flag>, enabled: Bool
+    ) -> [MacChromiumAccessibility.Flag: Bool] {
         MacAXExecutionLane.sync {
             // Self-process fence — writing AX flags onto our own app element
             // is the same in-process AppKit re-entry class as the 2026-08-28
             // P1 deadlock in the reader. Unreachable once snapshots refuse
             // self, kept as the last wall for a direct caller.
-            guard pid != getpid() else { return false }
+            guard pid != getpid() else { return [:] }
             let app = AXUIElementCreateApplication(pid)
             let value: CFTypeRef = (enabled ? kCFBooleanTrue : kCFBooleanFalse)
-            _ = AXUIElementSetAttributeValue(app, "AXEnhancedUserInterface" as CFString, value)
-            _ = AXUIElementSetAttributeValue(app, "AXManualAccessibility" as CFString, value)
+            for flag in MacChromiumAccessibility.Flag.allCases where flags.contains(flag) {
+                _ = AXUIElementSetAttributeValue(app, flag.rawValue as CFString, value)
+            }
             return readsEnhancedAccessibility(app: app)
         }
     }
@@ -1978,24 +2098,24 @@ public extension SystemMacAXElementSource {
         }
     }
 
-    /// Is either flag already on, before this module touches it?
-    static func enhancedAccessibilityIsOn(pid: Int32) -> Bool {
+    /// Read each flag independently; absent entries are unknown, not false.
+    static func enhancedAccessibilityFlags(pid: Int32) -> [MacChromiumAccessibility.Flag: Bool] {
         MacAXExecutionLane.sync {
-            guard pid != getpid() else { return false }
+            guard pid != getpid() else { return [:] }
             return readsEnhancedAccessibility(app: AXUIElementCreateApplication(pid))
         }
     }
 
-    /// Read-back on either flag. `true` means the app really is in
-    /// enhanced-accessibility mode, whatever the setter returned.
-    private static func readsEnhancedAccessibility(app: AXUIElement) -> Bool {
-        for attribute in ["AXEnhancedUserInterface", "AXManualAccessibility"] {
+    /// Only successful Boolean reads are evidence, whatever the setter returned.
+    private static func readsEnhancedAccessibility(app: AXUIElement) -> [MacChromiumAccessibility.Flag: Bool] {
+        var flags: [MacChromiumAccessibility.Flag: Bool] = [:]
+        for flag in MacChromiumAccessibility.Flag.allCases {
             var raw: CFTypeRef?
-            guard AXUIElementCopyAttributeValue(app, attribute as CFString, &raw) == .success,
+            guard AXUIElementCopyAttributeValue(app, flag.rawValue as CFString, &raw) == .success,
                   let raw, CFGetTypeID(raw) == CFBooleanGetTypeID() else { continue }
-            if CFBooleanGetValue((raw as! CFBoolean)) { return true }
+            flags[flag] = CFBooleanGetValue((raw as! CFBoolean))
         }
-        return false
+        return flags
     }
 }
 

@@ -1,4 +1,5 @@
 import Foundation
+import TrustCenter
 
 /// The manual REM button has three distinct policy states. An unresolved
 /// authority read cannot be presented as an enabled cycle, and an explicit

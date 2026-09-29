@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import Skills
 
 // MARK: - CapabilityFoundry summary
 //

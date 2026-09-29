@@ -29,77 +29,25 @@ struct ShellTab<Key: Hashable>: Identifiable {
     var id: Key { key }
 }
 
+/// The page's sections as the Mac's own segmented control (User 09-27: all
+/// controls native; her colour arrives through the app tint).
 struct ShellTabs<Key: Hashable>: View {
     let tabs: [ShellTab<Key>]
     @Binding var selection: Key
 
-    @Namespace private var bar
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-
     var body: some View {
-        HStack(spacing: 22) {
-            ForEach(tabs) { tab in
-                ShellTabWord(
-                    id: "shell.tab.\(tab.key)",
-                    title: tab.title,
-                    isSelected: tab.key == selection,
-                    onSelect: { selection = tab.key },
-                    barNamespace: bar
-                )
+        HStack(spacing: 0) {
+            Picker("Sections", selection: $selection) {
+                ForEach(tabs) { tab in
+                    Text(tab.title).tag(tab.key)
+                }
             }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .fixedSize()
             Spacer(minLength: 0)
         }
-        .animation(
-            NativeAgentMotion.respecting(NativeAgentMotion.standard, reduceMotion: reduceMotion),
-            value: selection
-        )
-        .accessibilityElement(children: .contain)
         .accessibilityLabel("Sections")
-    }
-}
-
-private struct ShellTabWord: View {
-    let id: String
-    let title: String
-    let isSelected: Bool
-    let onSelect: () -> Void
-    var barNamespace: Namespace.ID
-
-    @State private var hovering = false
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-
-    var body: some View {
-        Button(action: onSelect) {
-            Text(title)
-                .font(ShellType.rail)
-                .foregroundStyle(isSelected ? NativeAgentShell.text
-                    : (hovering ? NativeAgentShell.text.opacity(0.75) : NativeAgentShell.secondary))
-                // The fade belongs to the word; the selection transaction
-                // must reach the bar untouched (see ShellRailItem).
-                .animation(
-                    NativeAgentMotion.respecting(NativeAgentMotion.quick, reduceMotion: reduceMotion),
-                    value: hovering
-                )
-                .lineLimit(1)
-                .padding(.vertical, 6)
-                .overlay(alignment: .bottom) {
-                    let marker = RoundedRectangle(cornerRadius: 1)
-                        .fill(NativeAgentShell.text)
-                        .frame(height: 2)
-                    if reduceMotion {
-                        marker.opacity(isSelected ? 1 : 0)
-                            .animation(NativeAgentMotion.crossfade, value: isSelected)
-                    } else if isSelected {
-                        marker.matchedGeometryEffect(id: "shell.tabs.bar", in: barNamespace)
-                    }
-                }
-                .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .onHover { hovering = $0 }
-        .help(title)
-        .accessibilityIdentifier(id)
-        .accessibilityAddTraits(isSelected ? [.isSelected] : [])
     }
 }
 

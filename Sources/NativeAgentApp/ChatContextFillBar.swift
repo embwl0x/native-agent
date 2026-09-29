@@ -7,6 +7,7 @@ import Speech
 import AVFoundation
 import UniformTypeIdentifiers
 import NativeAgentShared
+import ChatOrchestration
 import MemoryV2
 import PersistenceCore
 import ProviderRouting
@@ -69,11 +70,10 @@ enum ContextFillCompactionPresentation {
         return isCompacting ? .compacting : .ready
     }
 
-    static func failureMessage(for result: CompactionResult) -> String? {
+    static func failureMessage(for result: ChatSessionCompactionOutcome) -> String? {
         guard !result.compacted else { return nil }
-        let detail = result.error?.trimmingCharacters(in: .whitespacesAndNewlines)
-            ?? result.reason?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let suffix = detail.flatMap { $0.isEmpty ? nil : $0 }
+        let detail = result.reason.trimmingCharacters(in: .whitespacesAndNewlines)
+        let suffix = detail.isEmpty ? nil : detail
         return suffix.map { "Context compaction did not run: \($0)" }
             ?? "Context compaction did not run. Try again after the next context refresh."
     }
@@ -82,7 +82,7 @@ enum ContextFillCompactionPresentation {
 struct ContextFillBar: View {
     let sessionId: String
     typealias StatusLoader = @MainActor (String, String) async throws -> SessionContextStatus
-    typealias CompactAction = @MainActor (String, String, String, Bool) async throws -> CompactionResult
+    typealias CompactAction = @MainActor (String, String, String, Bool) async throws -> ChatSessionCompactionOutcome
 
     private let statusLoader: StatusLoader?
     private let compactAction: CompactAction?
@@ -311,7 +311,7 @@ struct ContextFillBar: View {
         lastError = nil
         lastErrorWasCompaction = false
         do {
-            let result: CompactionResult
+            let result: ChatSessionCompactionOutcome
             if let compactAction {
                 result = try await compactAction(
                     sessionId, appModel.chatModel, appModel.chatProvider, true

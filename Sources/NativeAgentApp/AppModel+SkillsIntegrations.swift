@@ -62,7 +62,7 @@ enum ToolApprovalEligibility {
     /// these checks at promotion time; this UI/app-model gate prevents known
     /// terminal or unloaded records from looking actionable in the meantime.
     static func refusal(for tool: ToolRecord) -> String? {
-        let status = (tool.status ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let status = tool.status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard ["proposed", "draft", "drafted"].contains(status) else {
             if status == "quarantined" {
                 return "Quarantined tools must be reviewed before they can be approved."
@@ -227,7 +227,7 @@ extension AppModel {
     func setToolAutoRun(_ tool: ToolRecord, autoRun: Bool) async {
         do {
             let updated = try await client.updateTool(id: tool.id, autoRun: autoRun)
-            let reloaded = try await client.getTools()
+            let reloaded = try await engine.tools.listAuthored()
             guard let confirmed = reloaded.first(where: { $0.id == updated.id }),
                   confirmed.autoRun == autoRun else {
                 recordToolOperationStatus(
@@ -236,7 +236,7 @@ extension AppModel {
                 )
                 return
             }
-            tools = reloaded
+            engine.tools.authored = reloaded
             recordToolOperationStatus(
                 autoRun ? "Tool auto-run enabled" : "Tool auto-run disabled",
                 outcome: .succeeded
@@ -253,7 +253,7 @@ extension AppModel {
                 id: tool.id,
                 reason: "User quarantined from NativeAgent UI."
             )
-            let reloaded = try await client.getTools()
+            let reloaded = try await engine.tools.listAuthored()
             guard let confirmed = reloaded.first(where: { $0.id == updated.id }),
                   confirmed.status == "quarantined" else {
                 recordToolOperationStatus(
@@ -262,7 +262,7 @@ extension AppModel {
                 )
                 return
             }
-            tools = reloaded
+            engine.tools.authored = reloaded
             recordToolOperationStatus("Tool quarantined", outcome: .succeeded)
         } catch {
             recordToolOperationStatus("Tool quarantine failed: \(error.localizedDescription)", outcome: .failed)
@@ -281,7 +281,7 @@ extension AppModel {
                 allowRisky: userRequested,
                 userRequested: userRequested
             )
-            let reloaded = try await client.getTools()
+            let reloaded = try await engine.tools.listAuthored()
             guard let confirmed = reloaded.first(where: { $0.id == updated.id }),
                   confirmed.status == "active" else {
                 recordToolOperationStatus(
@@ -290,7 +290,7 @@ extension AppModel {
                 )
                 return
             }
-            tools = reloaded
+            engine.tools.authored = reloaded
             recordToolOperationStatus("Tool activated", outcome: .succeeded)
         } catch {
             recordToolOperationStatus("Tool activation failed: \(error.localizedDescription)", outcome: .failed)
@@ -441,7 +441,7 @@ extension AppModel {
             return outcome
         }
         let normalizedEffort = normalizedReasoningEffort(
-            from: modelCatalog,
+            from: engine.providers.catalog,
             model: telegramModel,
             selected: telegramReasoningEffort
         )
@@ -507,9 +507,9 @@ extension AppModel {
         let baseline = telegramSettingsDraftBaseline
         telegramStatusRefreshError = nil
         do {
-            let status = try await client.getTelegramStatus()
+            let status = try await engine.telegram.load(manager: client.backgroundLoopsManager.coreManager)
             guard !Task.isCancelled, telegramSettingsReadID == requestID else { return false }
-            telegramStatus = status
+            engine.telegram.status = status
             telegramTokenConfigured = status.tokenConfigured
             // Refresh untouched fields only. Navigation and a read completing
             // late must not silently discard an authorization draft.
@@ -560,7 +560,7 @@ extension AppModel {
         defer { isClearingTelegramLogs = false }
         do {
             let receipt = try await client.clearTelegramLogs()
-            telegramStatus = receipt.status
+            engine.telegram.status = receipt.status
             telegramStatusRefreshError = nil
             telegramClearLogsOutcome = .completed(receipt)
             statusText = TelegramClearLogsPresentation.summary(for: receipt)
@@ -583,7 +583,7 @@ extension AppModel {
         case unavailable(String)
         /// A report came back. `failingChecks` are its `status == fail|error`
         /// rows — the run completing says nothing about them.
-        case completed(status: String, failingChecks: [DoctorCheck])
+        case completed(status: String, failingChecks: [CheckResult])
 
         /// True when the run produced a report at all. This is the old Bool's
         /// meaning; callers that only wanted "did it run" keep using it.
@@ -596,7 +596,7 @@ extension AppModel {
         /// user-configured subsystems (Telegram token, SearXNG URL). Those are
         /// real Doctor findings but they are NOT the app-owned scaffold, and
         /// blocking onboarding on them would strand a user who skipped setup.
-        var failingScaffoldChecks: [DoctorCheck] {
+        var failingScaffoldChecks: [CheckResult] {
             guard case .completed(_, let failing) = self else { return [] }
             return failing.filter { !$0.id.hasPrefix("live.") }
         }
@@ -616,29 +616,41 @@ extension AppModel {
 
     @MainActor
     @discardableResult
-    func runDoctor(repair: Bool) async -> DoctorRunOutcome {
+    func runDoctor(repair: Bool, repairScope: DoctorRepairScope = .automatic) async -> DoctorRunOutcome {
         // PATCH-2026-05-30: surface in-flight state to the UI so the user
         // sees a spinner + "Running…" text instead of an apparent freeze.
         // Block concurrent invocations — clicking Run while a run is in
         // flight should be a no-op, not a queued duplicate.
-        guard !doctorRunning else {
+        let doctor = engine.doctor
+        guard !doctor.isRunning else {
             return .unavailable("Health checks are already running.")
         }
-        doctorRunning = true
-        doctorRunStartedAt = Date()
+        doctor.isRunning = true
+        doctor.runStartedAt = Date()
         // gpt-5.5 review (B2 wave): invalidate the snapshot-reuse freshness
         // stamp for the whole run — Support Snapshot must never reuse a report
         // from BEFORE an in-flight run (the stamp re-lands on success only).
-        doctorReportCompletedAt = nil
+        doctor.reportCompletedAt = nil
         statusText = repair ? "Running repair…" : "Running health checks…"
         defer {
-            doctorRunning = false
-            doctorRunStartedAt = nil
+            doctor.isRunning = false
+            doctor.runStartedAt = nil
         }
         do {
-            let report = try await client.runDoctor(repair: repair)
-            doctorReport = report
-            doctorReportCompletedAt = Date()
+            var report = try await client.runDoctor(repair: repair, repairScope: repairScope)
+            let buttonRepair: Bool
+            if case .button = repairScope {
+                buttonRepair = repair && doctor.report?.checks.contains {
+                    $0.id == "status.desk_attention" && $0.repair_available == true
+                } == true
+            } else {
+                buttonRepair = false
+            }
+            let status = await DoctorStatusChecks.run(appModel: self, repairDesk: buttonRepair)
+            report = NativeClient.mergeDoctorReport(report, liveChecks: status.checks)
+            report.repaired = report.repaired || status.repaired
+            doctor.report = report
+            doctor.reportCompletedAt = Date()
             statusText = repair
                 ? DoctorSafeRepairIssuesPresentation.completionMessage(report: report)
                 : "Health checks finished"
@@ -660,14 +672,14 @@ extension AppModel {
     @discardableResult
     func repairSafeDoctorIssues() async -> DoctorRunOutcome {
         let state = DoctorSafeRepairIssuesPresentation.state(
-            report: doctorReport,
-            isRunning: doctorRunning
+            report: engine.doctor.report,
+            isRunning: engine.doctor.isRunning
         )
         guard state.canRun else {
             statusText = state.detail
             return .unavailable(state.detail)
         }
-        return await runDoctor(repair: true)
+        return await runDoctor(repair: true, repairScope: .button)
     }
 
     /// Reconcile the cheap live-owner rows in an existing Doctor report.
@@ -675,9 +687,12 @@ extension AppModel {
     /// the toolbar while also avoiding a second full Doctor run on tab entry.
     @MainActor
     func refreshLiveDoctorCoverage() async {
-        guard let current = doctorReport else { return }
+        guard let current = engine.doctor.report else { return }
         let liveChecks = await client.liveDoctorCoverageChecks()
-        doctorReport = NativeClient.mergeDoctorReport(current, liveChecks: liveChecks)
+        let statusChecks = await DoctorStatusChecks.run(appModel: self, repairDesk: false).checks
+        let withoutRetiredProbe = DoctorReport(status: current.status, repaired: current.repaired,
+                                               checks: current.checks.filter { $0.id != "status.app_health" && $0.id != "status.living_sources" })
+        engine.doctor.report = NativeClient.mergeDoctorReport(withoutRetiredProbe, liveChecks: liveChecks + statusChecks)
     }
 
     private func splitIDs(_ value: String) -> [String] {

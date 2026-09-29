@@ -1,5 +1,4 @@
 import Foundation
-import MacControl
 import NativeAgentCore
 import PersistenceCore
 
@@ -23,7 +22,7 @@ extension SwiftNativeSecurityCenter {
     ) async -> FullMacYoloAuthorityAssessment {
         do {
             let snapshot = try await trustCenter.loadAuthorizationSnapshotChecked()
-            let originAssessment = await assessOrigin(origin, policy: snapshot.policy)
+            let originAssessment = try await assessOrigin(origin, policy: snapshot.policy)
             return Self.fullMacYoloAuthority(
                 tool: tool,
                 surface: origin.surface,
@@ -55,7 +54,7 @@ extension SwiftNativeSecurityCenter {
                 reason: "Full Mac is not turned on"
             )
         }
-        let canonicalTool = Self.canonicalToolName(tool)
+        let canonicalTool = Self.policyToolName(tool)
         if SwiftNativeTrustCenter.hasExplicitBlockOverride(
             tool,
             overrides: snapshot.userConfiguredAutonomyOverrides
@@ -123,9 +122,13 @@ extension SwiftNativeSecurityCenter {
     /// `WorkshopSurfaceVocabulary.gateSpellings` rather than being open-coded
     /// here, per this vocabulary's own rule (no caller may hand-write an
     /// `== "missions"` check). Same three strings, same membership.
+    // "app" is the name the Mac chat saves its own turns under; a turn
+    // resumed from one of her cards replays under that saved envelope, and it
+    // is still the person's own Mac chat (User 09-27: "she's on full mac there
+    // should be none of that"). A peer's card saves as "agent-bridge".
     static let fullMacYoloLocalSurfaces: Set<String> = Set(
         [
-            "chat", "desk", "codex-bridge", "claude-bridge",
+            "chat", "app", "desk", "codex-bridge", "claude-bridge",
             "connector_action", "nextgen_action", "native_actions", "mcp_ui",
         ]
             + WorkshopSurfaceVocabulary.gateSpellings

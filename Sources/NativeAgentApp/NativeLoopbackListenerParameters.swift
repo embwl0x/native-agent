@@ -2,47 +2,6 @@ import Foundation
 import Darwin
 import Network
 
-/// Preferred ports stay stable for existing clients. When one is occupied,
-/// resident loopback services walk the next few consecutive ports and finally
-/// ask the OS for an ephemeral port. The selected port must be published by the
-/// service's authenticated descriptor; callers must not guess it.
-enum NativeLoopbackPortCandidate: Sendable, Equatable {
-    case fixed(UInt16)
-    case automatic
-
-    var networkPort: NWEndpoint.Port {
-        switch self {
-        case .fixed(let port):
-            return NWEndpoint.Port(rawValue: port) ?? .any
-        case .automatic:
-            return .any
-        }
-    }
-}
-
-struct NativeLoopbackPortPlan: Sendable, Equatable {
-    static let defaultConsecutiveFallbacks = 15
-
-    let candidates: [NativeLoopbackPortCandidate]
-
-    init(
-        preferredPort: UInt16,
-        consecutiveFallbacks: Int = defaultConsecutiveFallbacks
-    ) {
-        let boundedFallbacks = max(0, consecutiveFallbacks)
-        let upper = min(Int(UInt16.max), Int(preferredPort) + boundedFallbacks)
-        var planned = (Int(preferredPort)...upper).map {
-            NativeLoopbackPortCandidate.fixed(UInt16($0))
-        }
-        planned.append(.automatic)
-        candidates = planned
-    }
-
-    subscript(index: Int) -> NativeLoopbackPortCandidate? {
-        candidates.indices.contains(index) ? candidates[index] : nil
-    }
-}
-
 enum NativeLoopbackListenerParameters {
     static func tcp() -> NWParameters {
         let parameters = NWParameters.tcp
@@ -51,8 +10,9 @@ enum NativeLoopbackListenerParameters {
         return parameters
     }
 
-    static func makeListener(candidate: NativeLoopbackPortCandidate) throws -> NWListener {
-        try NWListener(using: tcp(), on: candidate.networkPort)
+    static func makeListener(port: UInt16) throws -> NWListener {
+        guard port != 0, let fixed = NWEndpoint.Port(rawValue: port) else { throw NWError.posix(.EINVAL) }
+        return try NWListener(using: tcp(), on: fixed)
     }
 
     static func isAddressInUse(_ error: NWError) -> Bool {
@@ -70,82 +30,45 @@ enum NativeLoopbackListenerParameters {
     }
 }
 
-enum NativePrivateFile {
-    /// Atomically replaces one private discovery/credential file with mode
-    /// 0600 set at creation, so no chmod-after-write exposure window exists.
-    @discardableResult
-    static func write(_ data: Data, to destination: URL) -> Bool {
-        let destinationPath = destination.path
-        let temporaryPath = destinationPath + ".tmp"
-        _ = temporaryPath.withCString { Darwin.unlink($0) }
-
-        let descriptor = temporaryPath.withCString {
-            Darwin.open($0, O_WRONLY | O_CREAT | O_EXCL, mode_t(0o600))
-        }
-        guard descriptor >= 0 else { return false }
-        let wroteAll = data.withUnsafeBytes { bytes -> Bool in
-            guard let base = bytes.baseAddress else { return data.isEmpty }
-            var offset = 0
-            while offset < data.count {
-                let wrote = Darwin.write(
-                    descriptor,
-                    base.advanced(by: offset),
-                    data.count - offset
-                )
-                guard wrote > 0 else { return false }
-                offset += wrote
-            }
-            return true
-        }
-        // temp+rename is only atomic against a CRASH. Against power loss the
-        // rename can reach the directory while the temp file's data is still
-        // in the page cache, publishing a torn/empty file at the destination —
-        // exactly the input that makes a durable journal unreadable. fsync the
-        // bytes before they are published; a failed fsync is a failed write.
-        let synced = wroteAll && Darwin.fsync(descriptor) == 0
-        Darwin.close(descriptor)
-        guard synced else {
-            _ = temporaryPath.withCString { Darwin.unlink($0) }
-            return false
-        }
-        let renamed = temporaryPath.withCString { source in
-            destinationPath.withCString { Darwin.rename(source, $0) }
-        }
-        if renamed != 0 {
-            _ = temporaryPath.withCString { Darwin.unlink($0) }
-            return false
-        }
-        return true
-    }
-}
-
 /// Socket-lifecycle tissue shared by the three resident loopback adapters.
-/// It owns only listener identity, collision retry, and cancellation. Tokens,
-/// descriptors, request policy, effects, and verification remain with each
-/// bridge/browser owner.
-final class NativeLoopbackPortFallbackListener: @unchecked Sendable {
+/// It owns only listener identity and cancellation. Tokens, descriptors,
+/// request policy, effects, and verification remain with each bridge/browser
+/// owner. Each install listens on its own fixed port (InstallPaths
+/// .loopbackPorts); a port another process holds is a failure naming that
+/// process, never a hop to another port.
+final class NativeLoopbackListener: @unchecked Sendable {
     private struct Callbacks: @unchecked Sendable {
         let ready: @Sendable (UInt16) -> Void
         let connection: @Sendable (NWConnection) -> Void
         let terminated: @Sendable () -> Void
     }
 
-    private let plan: NativeLoopbackPortPlan
+    private let port: UInt16
     private let label: String
     private let queue: DispatchQueue
     private let lock = NSLock()
     private var listener: NWListener?
     private var callbacks: Callbacks?
     private var generation: UInt64 = 0
+    private var boundPort: UInt16?
+    private var failure: String?
 
-    init(preferredPort: UInt16, label: String) {
-        self.plan = NativeLoopbackPortPlan(preferredPort: preferredPort)
-        self.label = label
-        queue = DispatchQueue(label: "nativeagent.loopback.\(label)", qos: .userInitiated)
+    /// What Doctor shows: the install's fixed port, whether it is bound, and
+    /// why the listener gave up, if it did.
+    struct Health: Sendable {
+        let port: UInt16
+        let boundPort: UInt16?
+        let isActive: Bool
+        let failure: String?
     }
 
-    init(plan: NativeLoopbackPortPlan, label: String) {
-        self.plan = plan
+    var health: Health {
+        lock.lock(); defer { lock.unlock() }
+        return Health(port: port, boundPort: boundPort, isActive: callbacks != nil, failure: failure)
+    }
+
+    init(port: UInt16, label: String) {
+        self.port = port
         self.label = label
         queue = DispatchQueue(label: "nativeagent.loopback.\(label)", qos: .userInitiated)
     }
@@ -168,6 +91,8 @@ final class NativeLoopbackPortFallbackListener: @unchecked Sendable {
         }
         generation &+= 1
         let attempt = generation
+        boundPort = nil
+        failure = nil
         callbacks = Callbacks(
             ready: onReady,
             connection: onConnection,
@@ -175,7 +100,7 @@ final class NativeLoopbackPortFallbackListener: @unchecked Sendable {
         )
         lock.unlock()
         queue.async { [weak self] in
-            self?.install(candidateIndex: 0, generation: attempt)
+            self?.install(generation: attempt)
         }
         return true
     }
@@ -186,27 +111,17 @@ final class NativeLoopbackPortFallbackListener: @unchecked Sendable {
         let oldListener = listener
         listener = nil
         callbacks = nil
+        boundPort = nil
         lock.unlock()
         oldListener?.cancel()
     }
 
-    private func install(candidateIndex: Int, generation attempt: UInt64) {
-        guard let candidate = plan[candidateIndex] else {
-            finish(generation: attempt)
-            return
-        }
-
+    private func install(generation attempt: UInt64) {
         let nextListener: NWListener
         do {
-            nextListener = try NativeLoopbackListenerParameters.makeListener(candidate: candidate)
+            nextListener = try NativeLoopbackListenerParameters.makeListener(port: port)
         } catch {
-            if NativeLoopbackListenerParameters.isAddressInUse(error),
-               plan[candidateIndex + 1] != nil {
-                install(candidateIndex: candidateIndex + 1, generation: attempt)
-            } else {
-                NSLog("[\(label)] listener creation failed: \(error)")
-                finish(generation: attempt)
-            }
+            fail(error, generation: attempt)
             return
         }
 
@@ -216,12 +131,7 @@ final class NativeLoopbackPortFallbackListener: @unchecked Sendable {
             case .ready:
                 self?.ready(ident: ident, generation: attempt)
             case .failed(let error):
-                self?.failed(
-                    ident: ident,
-                    candidateIndex: candidateIndex,
-                    generation: attempt,
-                    error: error
-                )
+                self?.failed(ident: ident, generation: attempt, error: error)
             case .cancelled:
                 self?.cancelled(ident: ident, generation: attempt)
             default:
@@ -248,22 +158,18 @@ final class NativeLoopbackPortFallbackListener: @unchecked Sendable {
         guard generation == attempt,
               let listener,
               ObjectIdentifier(listener) == ident,
-              let port = listener.port?.rawValue,
-              port != 0 else {
+              let bound = listener.port?.rawValue,
+              bound == port else {
             lock.unlock()
             return
         }
+        boundPort = bound
         let ready = callbacks?.ready
         lock.unlock()
-        ready?(port)
+        ready?(bound)
     }
 
-    private func failed(
-        ident: ObjectIdentifier,
-        candidateIndex: Int,
-        generation attempt: UInt64,
-        error: NWError
-    ) {
+    private func failed(ident: ObjectIdentifier, generation attempt: UInt64, error: NWError) {
         lock.lock()
         guard generation == attempt,
               let listener,
@@ -272,16 +178,32 @@ final class NativeLoopbackPortFallbackListener: @unchecked Sendable {
             return
         }
         self.listener = nil
-        let shouldRetry = NativeLoopbackListenerParameters.isAddressInUse(error)
-            && plan[candidateIndex + 1] != nil
         lock.unlock()
+        fail(error, generation: attempt)
+    }
 
-        if shouldRetry {
-            install(candidateIndex: candidateIndex + 1, generation: attempt)
-        } else {
+    /// A taken port is said with its holder; any other error as it came.
+    private func fail(_ error: Error, generation attempt: UInt64) {
+        guard NativeLoopbackListenerParameters.isAddressInUse(error) else {
             NSLog("[\(label)] listener failed: \(error)")
+            recordFailure("\(error)", generation: attempt)
             finish(generation: attempt)
+            return
         }
+        let port = port, label = label
+        recordFailure("port \(port) is held by another process", generation: attempt)
+        finish(generation: attempt)
+        Task.detached(priority: .utility) { [weak self] in
+            let holder = await Self.listeningProcess(on: port) ?? "a process lsof could not name"
+            NSLog("[\(label)] port \(port) is held by \(holder); not listening")
+            self?.recordFailure("port \(port) is held by \(holder)", generation: attempt)
+        }
+    }
+
+    private func recordFailure(_ detail: String, generation attempt: UInt64) {
+        lock.lock()
+        if generation == attempt { failure = detail }
+        lock.unlock()
     }
 
     private func cancelled(ident: ObjectIdentifier, generation attempt: UInt64) {
@@ -294,6 +216,8 @@ final class NativeLoopbackPortFallbackListener: @unchecked Sendable {
         }
         self.listener = nil
         lock.unlock()
+        NSLog("[\(label)] listener was cancelled")
+        recordFailure("the listener was cancelled", generation: attempt)
         finish(generation: attempt)
     }
 
@@ -322,9 +246,38 @@ final class NativeLoopbackPortFallbackListener: @unchecked Sendable {
             return
         }
         listener = nil
+        boundPort = nil
         let terminated = callbacks?.terminated
         callbacks = nil
         lock.unlock()
         terminated?()
+    }
+
+    /// `lsof` for the process listening on a loopback port: "name (pid N)".
+    static func listeningProcess(on port: UInt16) async -> String? {
+        await withCheckedContinuation { continuation in
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
+            process.arguments = ["-nPb", "-iTCP:\(port)", "-sTCP:LISTEN", "-Fpc"]
+            let pipe = Pipe()
+            process.standardOutput = pipe
+            process.standardError = FileHandle.nullDevice
+            process.terminationHandler = { _ in
+                let output = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+                var pid: String?
+                var command: String?
+                for line in output.split(separator: "\n") {
+                    if line.hasPrefix("p"), pid == nil { pid = String(line.dropFirst()) }
+                    if line.hasPrefix("c"), command == nil { command = String(line.dropFirst()) }
+                }
+                guard let pid else { return continuation.resume(returning: nil) }
+                continuation.resume(returning: "\(command ?? "unknown") (pid \(pid))")
+            }
+            do {
+                try process.run()
+            } catch {
+                continuation.resume(returning: nil)
+            }
+        }
     }
 }

@@ -127,8 +127,12 @@ extension MacFourVerbs {
                     maxWhereSteps: options.maxWhereSteps,
                     maxLabelChars: options.maxLabelChars
                 ),
-                note: "\(matchingControls.count) of \(screen.totalControls) actionable match; "
-                    + "the rest of the screen is unchanged."
+                note: "\(matchingControls.count) of \(screen.totalControls) actionable match"
+                    // A capped read is not the whole window: say what it left out.
+                    + (asksForControls && screen.unclassifiedOmittedTargets > 0
+                        ? " (\(screen.unclassifiedOmittedTargets) more weren't kept in this read; name one and I'll find it)"
+                        : "")
+                    + "; the rest of the screen is unchanged."
             )
         }
 
@@ -167,11 +171,21 @@ extension MacFourVerbs {
     static func parseVerb(_ raw: String) -> (String, ScrollDirection) {
         let words = normalize(raw).split(separator: " ").map(String.init)
         // The words an agent naturally reaches for name the same verbs.
-        let synonyms = ["set": "type", "fill": "type", "enter": "type", "choose": "select", "pick": "select", "tap": "click", "chord": "key", "shortcut": "key", "keys": "key"]
-        let head = words.first.map { synonyms[$0] ?? $0 } ?? ""
+        let synonyms = ["set": "type", "fill": "type", "enter": "type", "choose": "select", "pick": "select", "tap": "click", "menu": "click", "chord": "key", "shortcut": "key", "keys": "key"]
+        // A person right-clicks and double-clicks: "right_click" is a click
+        // with the right button (see isRightClick), "double click" its own hand.
+        let joined = words.joined(separator: "_").replacingOccurrences(of: "-", with: "_")
+        let head = isRightClick(raw) ? "click"
+            : ["double_click", "doubleclick", "dbl_click"].contains(joined) ? "double_click"
+            : words.first.map { synonyms[$0] ?? $0 } ?? ""
         let direction: ScrollDirection = words.contains("up") ? .up
             : words.contains("left") ? .left : words.contains("right") ? .right : .down
         return (head, direction)
+    }
+
+    static func isRightClick(_ raw: String) -> Bool {
+        let joined = normalize(raw).split(separator: " ").joined(separator: "_").replacingOccurrences(of: "-", with: "_")
+        return ["right_click", "rightclick", "secondary_click", "context_click"].contains(joined)
     }
 
     static func pastTense(_ verb: MacActVerb, direction: ScrollDirection) -> String {

@@ -970,7 +970,7 @@ public struct ContextSelectionConfiguration: Equatable, Sendable {
     /// ambient ones only.
     public let maximumCorrectionAtomsPerTurn: Int
     public let minimumRelevance: Double
-    /// Cosine below which a `.memory` atom is refused ADMISSION to the packet,
+    /// Cosine below which a `.memory` or `.correction` atom is refused ADMISSION to the packet,
     /// however well it ranked on everything else. `0` is the kill switch for
     /// the whole 2026-09-02 precision pass — this floor AND
     /// `shortMessageMemoryRowCap` — and restores the pre-floor selector
@@ -984,8 +984,11 @@ public struct ContextSelectionConfiguration: Equatable, Sendable {
     /// problem on small talk, and a rank threshold is the honest instrument.
     ///
     /// It is deliberately narrow:
-    ///   - `.memory` atoms only. Identity, correction, instruction, relationship
-    ///     and mandatory atoms are authority, not recall breadth.
+    ///   - `.memory` and `.correction` atoms only (corrections since
+    ///     2026-09-26: ambient ones rode nearly every turn). Identity,
+    ///     instruction, relationship and mandatory atoms are authority, not
+    ///     recall breadth; a scoped correction the message triggers is
+    ///     mandatory and never reaches the floor.
     ///   - It never fires when the query has no embedding (cold embedder): with
     ///     nothing to compare, every cosine is 0 and the floor would delete the
     ///     memory lane instead of trimming it.
@@ -995,7 +998,8 @@ public struct ContextSelectionConfiguration: Equatable, Sendable {
     ///     Differ` is the same distinction one layer down.
     ///   - Four exemptions carry an atom over the floor regardless of cosine:
     ///     a whole-message lexical hit, a shared identifier, message coverage
-    ///     >= 0.5, or activation >= 0.5 (attention/working set).
+    ///     >= 0.5, or activation >= 0.5 (attention/working set; for a
+    ///     correction, the working set only).
     public let memorySemanticFloor: Double
     /// Effective `.memory` row cap on a message of at most
     /// `shortMessageTokenCount` content tokens — the same token set (and the

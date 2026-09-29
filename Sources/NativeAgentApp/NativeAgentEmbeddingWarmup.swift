@@ -74,7 +74,8 @@ func maybeWarmEmbeddingsForFastMode() async {
 /// bounded off-main candidate build and atomic switch. Failure leaves the
 /// previous corpus untouched and writes a diagnosable receipt for the UI/
 /// operator rather than poisoning ordinary chat with mixed vectors.
-func reconcileMemoryEmbeddingEpochAtLaunch() async {
+@discardableResult
+func reconcileMemoryEmbeddingEpochAtLaunch() async -> Bool {
     let memory = SwiftNativeMemoryV2.shared
     let dataRoot = PersistenceCore.defaultDataRoot()
     let receipt = dataRoot
@@ -98,7 +99,7 @@ func reconcileMemoryEmbeddingEpochAtLaunch() async {
         let state = try await memory.memoryEmbeddingEpochState()
         guard let providerEpoch = await memory.embeddingEpoch() else {
             writeReceipt(["status": "failed", "error": "embedding provider unavailable"])
-            return
+            return false
         }
         guard state.activeEpoch != providerEpoch.rawValue else {
             writeReceipt([
@@ -106,7 +107,7 @@ func reconcileMemoryEmbeddingEpochAtLaunch() async {
                 "active_epoch": providerEpoch.rawValue,
                 "protected": true,
             ])
-            return
+            return true
         }
         // 2026-09-06: a memory written or forgotten while the batches were
         // embedding invalidates the candidate snapshot, and activation refuses
@@ -145,9 +146,11 @@ func reconcileMemoryEmbeddingEpochAtLaunch() async {
             "protected": true,
         ])
         NSLog("[memory-epoch] activated %@ across %d canonical rows", report.epoch, report.total)
+        return true
     } catch {
         writeReceipt(["status": "failed", "error": String(describing: error)])
         NSLog("[memory-epoch] activation failed; prior corpus retained: %@", String(describing: error))
+        return false
     }
 }
 

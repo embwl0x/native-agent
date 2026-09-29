@@ -1,11 +1,13 @@
 // Self-Improvement tab — the home for the weekly WeeklySelfImprovementLoop.
 // A simple on/off switch + the latest digest + a manual run. The one-tap
-// "apply" proposals surface in Activity → Approvals; this view links there.
+// "apply" proposals surface in Approvals (Today ▸ Approvals and past
+// decisions); the training candidates the pass staged are listed here.
 import SwiftUI
 import Foundation
 import BackgroundLoops
 
 struct SelfImprovementView: View {
+    @Environment(AppModel.self) private var appModel
     // The switch. The weekly loop's gate reads this exact key from
     // UserDefaults.standard (see makeWeeklySelfImprovementLoop).
     @AppStorage("selfImprovementEnabled") private var enabled = true
@@ -36,7 +38,7 @@ struct SelfImprovementView: View {
                 .padding(14)
                 .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: NativeAgentRadius.panel))
 
-                Label("Proposals you can apply with one tap appear in Activity → Approvals.",
+                Label("Proposals you can apply with one tap appear in Approvals on Today.",
                       systemImage: "checkmark.seal")
                     .font(.callout).foregroundStyle(.secondary)
 
@@ -50,6 +52,26 @@ struct SelfImprovementView: View {
                     .disabled(!enabled || running)
                     if !runNote.isEmpty {
                         Text(runNote).font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+
+                // ── Training candidates ───────────────────────────────────
+                // The same two queues, and the same human-actionable filters,
+                // the Activity page previewed. View-only, as they were there.
+                if !candidates.isEmpty {
+                    Divider()
+                    Text("Staged for a look").font(.headline)
+                    ForEach(candidates, id: \.id) { candidate in
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(candidate.title)
+                                .font(.callout.weight(.semibold))
+                                .lineLimit(1)
+                            Text(candidate.summary)
+                                .font(.callout)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(3)
+                                .textSelection(.enabled)
+                        }
                     }
                 }
 
@@ -83,6 +105,16 @@ struct SelfImprovementView: View {
         .task { await loadDigest() }
     }
 
+    private var candidates: [(id: String, title: String, summary: String)] {
+        appModel.trainingProposals.filter(AppModel.isHumanActionableTrainingProposal).map {
+            (id: "training:\($0.proposal_id)", title: $0.target_doc, summary: $0.proposed)
+        } + appModel.promotionCandidates.filter(AppModel.isHumanActionablePromotionCandidate).map {
+            (id: "promotion:\($0.candidate_id)",
+             title: "Promotion · \($0.tier ?? "?")",
+             summary: $0.reason ?? "Harness staged a promotion candidate.")
+        }
+    }
+
     @MainActor
     private func runNow() async {
         running = true
@@ -111,12 +143,14 @@ struct SelfImprovementView: View {
             runNote += " Request cleanup could not be verified: \(NativeClient.safeDoctorDetail(error.localizedDescription))."
         }
         await loadDigest()
+        // The pass may have staged new candidates; re-read the queues.
+        _ = await appModel.refreshForSidebarItem(.activity)
     }
 
     static func manualRunNote(for outcome: LoopTickOutcome) -> String {
         switch outcome {
         case .completed:
-            return "Done — new proposals (if any) are in Activity → Approvals."
+            return "Done — new proposals (if any) are in Approvals on Today."
         case .skipped(let reason, _):
             if outcome.isCoalescedSkip {
                 return "Already running — joined the active pass."

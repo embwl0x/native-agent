@@ -106,9 +106,9 @@ public actor SwiftNativeKnowledgeGraphIndexer {
     private var perIDTails: [String: Task<Void, Never>] = [:]
     private var perIDPending: [String: Int] = [:]
 
-    /// The pool now resolves lazily through the shared KnowledgeGraphPoolCache
-    /// (one pool per path process-wide, invalidated on file replace). The
-    /// schema-ensure runs at pool creation inside the cache. NOTE: unlike the
+    /// The pool resolves lazily through KnowledgeGraphPoolCache to the owning
+    /// MemoryStorage's pool; that storage's migrator owns the kg_* schema.
+    /// NOTE: unlike the
     /// pre-U5 eager open, an unopenable database throws at first USE, not at
     /// init — callers that `try?` the init and swallow per-call errors see the
     /// same net behavior, one open later.
@@ -160,13 +160,13 @@ public actor SwiftNativeKnowledgeGraphIndexer {
         return trimmed
     }
 
-    /// Resolve the shared pool. The indexer never creates memory.sqlite:
-    /// a bare DatabasePool open here minted a store with an EMPTY
-    /// grdb_migrations ledger, and MemoryStorage's next init replayed its
-    /// migrations against the existing kg tables and bricked the chain
-    /// (stable-failure #4 / Desk 751.7). MemoryStorage owns creation; a
-    /// missing file means there is nothing to index yet and the caller
-    /// fails loud with `.databaseMissing`.
+    /// Resolve the owning MemoryStorage's pool. The indexer never opens or
+    /// creates memory.sqlite: a bare DatabasePool open here once minted a
+    /// store with an EMPTY grdb_migrations ledger, and MemoryStorage's next
+    /// init replayed its migrations against the existing kg tables and
+    /// bricked the chain (stable-failure #4 / Desk 751.7). A missing file
+    /// means there is nothing to index yet and the caller fails loud with
+    /// `.databaseMissing`.
     func pool() async throws -> DatabasePool {
         try await KnowledgeGraphPoolCache.shared.pool(at: sqlitePath)
     }
@@ -547,62 +547,6 @@ public actor SwiftNativeKnowledgeGraphIndexer {
     private static func compactWhitespace(_ text: String) -> String {
         text.replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
             .trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    /// Idempotent kg_* schema completion for an EXISTING file. Internal so the
-    /// shared KnowledgeGraphPoolCache can run it once per pool open.
-    ///
-    /// Ownership (stable-failure #4 / Desk 751.7, 2026-08-27): MemoryStorage's
-    /// migrator is the schema owner for every store it creates
-    /// (v2_knowledge_graph + v8_kg_memory_index), and the KnowledgeGraph side
-    /// NEVER creates memory.sqlite itself — the pool cache throws
-    /// `.databaseMissing` and the indexer's create-on-missing fallback is gone.
-    /// That removal is what closed the brick path (a graph-first bare file had
-    /// an empty grdb_migrations ledger, so MemoryStorage's next init replayed
-    /// v2 against the existing tables and the whole chain failed). This
-    /// IF NOT EXISTS completion remains for stores the migrator never owned:
-    /// hand-built test fixtures and minimal/legacy stores, which the module
-    /// deliberately tolerates for reads and hook-driven indexing.
-    static func ensureSchema(_ pool: DatabasePool) throws {
-        try pool.write { db in
-            try db.execute(sql: """
-                CREATE TABLE IF NOT EXISTS kg_entities (
-                  id TEXT PRIMARY KEY,
-                  name TEXT NOT NULL,
-                  type TEXT NOT NULL DEFAULT 'concept',
-                  summary TEXT,
-                  aliases_json TEXT,
-                  mention_count INTEGER DEFAULT 0,
-                  first_seen TEXT,
-                  last_seen TEXT,
-                  provenance TEXT,
-                  metadata_json TEXT
-                );
-                CREATE INDEX IF NOT EXISTS idx_kg_entities_type ON kg_entities(type);
-                CREATE INDEX IF NOT EXISTS idx_kg_entities_last_seen ON kg_entities(last_seen);
-
-                CREATE TABLE IF NOT EXISTS kg_relationships (
-                  id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  from_id TEXT NOT NULL,
-                  to_id TEXT NOT NULL,
-                  type TEXT NOT NULL,
-                  weight REAL,
-                  mention_count INTEGER DEFAULT 0,
-                  provenance TEXT,
-                  metadata_json TEXT,
-                  UNIQUE(from_id, to_id, type)
-                );
-                CREATE INDEX IF NOT EXISTS idx_kg_rel_from ON kg_relationships(from_id);
-                CREATE INDEX IF NOT EXISTS idx_kg_rel_to ON kg_relationships(to_id);
-
-                CREATE TABLE IF NOT EXISTS kg_memory_index (
-                  memory_id TEXT PRIMARY KEY,
-                  content_hash TEXT NOT NULL,
-                  indexed_at TEXT NOT NULL,
-                  index_version TEXT NOT NULL
-                );
-                """)
-        }
     }
 
     static func upsertEntity(

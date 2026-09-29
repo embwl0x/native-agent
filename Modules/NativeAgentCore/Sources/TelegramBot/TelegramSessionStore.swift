@@ -1,6 +1,9 @@
+import FeedPolicy
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import TurnTrace
+import Transcripts
 import ProviderRouting
 
 public struct TelegramSessionCommandResult: Sendable, Equatable {
@@ -514,7 +517,7 @@ public struct TelegramSessionStore: Sendable {
 
     public func recentSessions(limit: Int = 8) async throws -> [TelegramRecentSession] {
         let cappedLimit = max(1, min(limit, 25))
-        let rows = await SwiftNativePersistenceCore().readJSON(sessionsPath, defaultValue: .array([]))
+        let rows = try await SwiftNativePersistenceCore().readJSON(sessionsPath, ifMissing: .array([]))
         guard case .array(let array) = rows else { return [] }
         let sessions = array
             .compactMap(Self.recentSession(from:))
@@ -557,7 +560,7 @@ public struct TelegramSessionStore: Sendable {
         let path = sessionDir(sessionId: sessionId).appendingPathComponent("scratch.json")
         let persistence = SwiftNativePersistenceCore()
         try await persistence.withFileLock(path) {
-            let current = await persistence.readJSON(path, defaultValue: .object([:]))
+            let current = try await persistence.readJSON(path, ifMissing: .object([:]))
             var root: [String: JSONValue]
             if case .object(let obj) = current { root = obj } else { root = [:] }
             root[cleanedKey] = .string(cleanedValue)
@@ -827,7 +830,7 @@ public struct TelegramSessionStore: Sendable {
         guard !requested.isEmpty else {
             throw TelegramSessionStoreError.missingSessionId
         }
-        let rows = await SwiftNativePersistenceCore().readJSON(sessionsPath, defaultValue: .array([]))
+        let rows = try await SwiftNativePersistenceCore().readJSON(sessionsPath, ifMissing: .array([]))
         guard case .array(let array) = rows else {
             throw TelegramSessionStoreError.sessionNotFound(requested)
         }

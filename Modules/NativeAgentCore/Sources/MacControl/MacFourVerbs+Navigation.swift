@@ -32,7 +32,7 @@ extension MacFourVerbs {
         let moved: String
         var verificationDestination = trimmed
         var settlesAsynchronously = false
-        if let url = Self.webURL(trimmed) {
+        if let url = Self.webURL(trimmed) ?? Self.settingsPaneURL(trimmed) {
             do {
                 result = try await host.dispatch(action: "open_target", body: ["url": .string(url.absoluteString)])
             } catch {
@@ -180,6 +180,15 @@ extension MacFourVerbs {
         return url
     }
 
+    /// The one custom scheme `go` opens: a System Settings pane link
+    /// (`x-apple.systempreferences:com.apple.wifi-settings-extension`). It
+    /// shows a pane and changes nothing.
+    static func settingsPaneURL(_ text: String) -> URL? {
+        guard let url = URL(string: text),
+              url.scheme?.lowercased() == "x-apple.systempreferences" else { return nil }
+        return url
+    }
+
     static func filePath(_ text: String) -> URL? {
         if let url = URL(string: text), url.scheme?.lowercased() == "file" { return url }
         var path = text
@@ -255,6 +264,11 @@ extension MacFourVerbs {
             guard !hostWords.isEmpty else { return nil }
             let visible = normalize(sighting.place + " " + sighting.render)
             return hostWords.contains { visible.contains(normalize($0)) } ? true : nil
+        }
+        // A pane id does not spell its window title ("Wi‑Fi"): Settings in
+        // front is as far as the screen can prove.
+        if settingsPaneURL(requested) != nil {
+            return sighting.bundleIdentifier == "com.apple.systempreferences" ? nil : false
         }
         if let path = filePath(requested) {
             let leaf = normalize(path.lastPathComponent)

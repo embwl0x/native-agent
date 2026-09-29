@@ -289,7 +289,7 @@ public actor SwiftNativeToolExecution: ToolExecutionProtocol {
             guard FileManager.default.fileExists(atPath: entry.path, isDirectory: &isDir),
                   isDir.boolValue else { continue }
             let manifestPath = entry.appendingPathComponent("manifest.json")
-            let raw = await persistence.readJSON(manifestPath, defaultValue: .null)
+            let raw = try await persistence.readJSON(manifestPath, ifMissing: .null)
             if case .null = raw { continue }
             guard case .object(var obj) = raw else { continue }
             // Synthesize required fields if the on-disk manifest lacks them
@@ -379,9 +379,9 @@ public actor SwiftNativeToolExecution: ToolExecutionProtocol {
             .appendingPathComponent("tools", isDirectory: true)
             .appendingPathComponent("active", isDirectory: true)
         let toolRoot = try Self.resolveActiveToolRoot(record: record, id: trimmed, activeRoot: activeRoot)
-        let manifestRaw = await persistence.readJSON(
+        let manifestRaw = try await persistence.readJSON(
             toolRoot.appendingPathComponent("manifest.json"),
-            defaultValue: .null
+            ifMissing: .null
         )
         guard case .object(let manifest) = manifestRaw else {
             throw ToolExecutionError.underlying("active tool manifest is missing or unreadable: \(trimmed)")

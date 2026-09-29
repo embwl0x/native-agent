@@ -49,7 +49,6 @@ public struct UnavailableMacPointerPositionSource: MacPointerPositionSource {
 }
 
 public func defaultMacPointerPositionSource() -> any MacPointerPositionSource {
-    if NSClassFromString("XCTestCase") != nil { return UnavailableMacPointerPositionSource() }
     return SystemMacPointerPositionSource()
 }
 

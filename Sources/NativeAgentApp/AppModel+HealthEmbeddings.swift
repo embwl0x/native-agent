@@ -110,14 +110,14 @@ extension AppModel {
         }
         if includeApprovals {
             do {
-                approvals = try await client.getApprovals()
+                engine.approvals.records = try await engine.approvals.list()
             } catch {
                 guard !Task.isCancelled else { return }
                 // FIX: previously only print()'d, leaving stale approvals on
                 // screen. Clear the list and surface the failure so the UI
                 // doesn't show outdated/phantom approvals.
                 print("[NativeAgent] getApprovals failed: \(error)")
-                approvals = []
+                engine.approvals.records = []
                 statusText = "Approvals unavailable: \(error.localizedDescription)"
             }
         }
@@ -129,8 +129,9 @@ extension AppModel {
     /// when every visible verdict was identical.
     @MainActor
     func setHealthCardIfMeaningfullyChanged(_ next: HealthCard) {
-        if healthCard?.overall != next.overall || healthCard?.subsystems != next.subsystems {
-            healthCard = next
+        let current = engine.doctor.healthCard
+        if current?.overall != next.overall || current?.subsystems != next.subsystems {
+            engine.doctor.healthCard = next
         }
     }
 

@@ -8,9 +8,7 @@ source "$SCRIPT_DIR/lib/nativeagent_bridge.sh"
 
 DATA_ROOT="${NATIVE_AGENT_DATA_ROOT:-$REPO_ROOT/data}"
 ORGANISM_STATE_PATH="${NATIVE_AGENT_ORGANISM_STATE_PATH:-$DATA_ROOT/cognition/organism_state.json}"
-EVAL_PATH="${NATIVE_AGENT_ORGANISM_EVAL_PATH:-$DATA_ROOT/cognition/organism_longitudinal_eval.jsonl}"
 IOS_SNAPSHOT_PATH="${NATIVE_AGENT_ORGANISM_IOS_SNAPSHOT:-}"
-RUN_SIMULATION=0
 # Doctor is a health gate by default.  Callers that intentionally want a
 # diagnostic-only report must opt into --lenient rather than accidentally
 # treating a failed doctor as a healthy process.
@@ -20,14 +18,13 @@ FAIL_COUNT=0
 usage() {
   cat >&2 <<'USAGE'
 usage:
-  script/organism_doctor.sh [--simulate] [--strict|--lenient]
+  script/organism_doctor.sh [--strict|--lenient]
 
 Checks live NativeAgent organism health through:
   - NativeAgentApp process
   - local bridge /codex/state
   - persisted data/cognition/organism_state.json
   - optional iOS organism_living_status.json snapshot
-  - optional longitudinal eval JSONL
 
 Environment overrides:
   NATIVE_AGENT_BRIDGE_URL
@@ -35,9 +32,7 @@ Environment overrides:
   NATIVE_AGENT_DATA_ROOT
   NATIVE_AGENT_ORGANISM_STATE_PATH
   NATIVE_AGENT_ORGANISM_IOS_SNAPSHOT
-  NATIVE_AGENT_ORGANISM_EVAL_PATH
 
---simulate also runs the safe body-scenario proof loop and clears it after.
 The default (and --strict) exits nonzero when any check reports FAIL; warnings
 stay diagnostic.  --lenient prints the same report but always exits zero after
 the checks complete.
@@ -46,7 +41,6 @@ USAGE
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --simulate) RUN_SIMULATION=1 ;;
     --strict) STRICT=1 ;;
     --lenient) STRICT=0 ;;
     -h|--help) usage; exit 0 ;;
@@ -275,38 +269,9 @@ else
   status INFO "organism_living_status" "source absent; set NATIVE_AGENT_ORGANISM_IOS_SNAPSHOT to inspect iOS snapshot directly"
 fi
 
-section "Longitudinal Eval"
-if [ -f "$EVAL_PATH" ]; then
-  eval_lines="$(wc -l <"$EVAL_PATH" | tr -d ' ')"
-  last_eval="$(tail -n 1 "$EVAL_PATH")"
-  last_run="$(printf '%s\n' "$last_eval" | jq -r '.runId // "unknown"' 2>/dev/null || echo unknown)"
-  last_day="$(printf '%s\n' "$last_eval" | jq -r '.dayIndex // "unknown"' 2>/dev/null || echo unknown)"
-  last_label="$(printf '%s\n' "$last_eval" | jq -r '.label // "unknown"' 2>/dev/null || echo unknown)"
-  unique_days="$(jq -r '.dayIndex // empty' "$EVAL_PATH" 2>/dev/null | sort -nu | wc -l | tr -d ' ')"
-  status PASS "eval JSONL" "lines=$eval_lines lastRun=$last_run lastDay=$last_day lastLabel=$last_label uniqueDays=$unique_days"
-  if [ "${unique_days:-0}" -lt 2 ]; then
-    status INFO "multi-day proof" "harness exists, but fewer than 2 distinct dayIndex values"
-  fi
-else
-  status INFO "eval JSONL" "missing at $EVAL_PATH; run script/organism_longitudinal_eval.sh"
-fi
-
-if [ "$RUN_SIMULATION" -eq 1 ]; then
-  section "Simulation Proof"
-  sim_out="$tmpdir/organism_doctor_eval.jsonl"
-  NATIVE_AGENT_ORGANISM_EVAL_RUN_ID="doctor-$(date -u +%Y%m%dT%H%M%SZ)" \
-  NATIVE_AGENT_ORGANISM_EVAL_DAY_INDEX=0 \
-  NATIVE_AGENT_ORGANISM_EVAL_NOTE="doctor" \
-    "$REPO_ROOT/script/organism_longitudinal_eval.sh" "$sim_out" >/dev/null
-  jq -r '"label=\(.label) posture=\(.behavior.posture // "unknown") claims=\(.behavior.toolClaims // "unknown") strategy=\(.behavior.toolStrategy // "unknown") loops=\(.behavior.loopBudget // "unknown")"' "$sim_out"
-  status PASS "simulation cleared" "longitudinal eval clears debug override at end"
-fi
-
 section "Next Troubleshooting Step"
 if [ "$bridge_rc" -ne 0 ]; then
   echo "Start/reinstall the app: $REPO_ROOT/script/install_app.sh"
-elif [ -f "$ORGANISM_STATE_PATH" ] && [ "$RUN_SIMULATION" -eq 0 ]; then
-  echo "Run $REPO_ROOT/script/organism_doctor.sh --simulate to verify posture deltas."
 else
   echo "Open $REPO_ROOT/docs/build_plans/nativeagent-organism-troubleshooting.md for symptom-specific checks."
 fi

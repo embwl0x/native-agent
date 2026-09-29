@@ -1,3 +1,4 @@
+import FeedPolicy
 import CryptoKit
 import Foundation
 import NativeAgentCore
@@ -19,7 +20,23 @@ extension TelegramPollLoop {
     func writeStatePatch(_ patch: [String: JSONValue]) async {
         let store = SwiftNativePersistenceCore()
         let path = telegramDir.appendingPathComponent("state.json")
-        let current = await store.readJSON(path, defaultValue: .object([:]))
+        let current: JSONValue
+        do {
+            current = try await store.readJSON(path, ifMissing: .object([:]))
+        } catch {
+            // Never write over a state file that did not read back. Logged
+            // here, not through recordError, which writes state.json too.
+            await TelegramErrorLog.append(
+                .object([
+                    "id": .string(UUID().uuidString),
+                    "at": .string(_tgNowString()),
+                    "context": .string("state_read"),
+                    "error": .string(String(describing: error)),
+                ]),
+                to: telegramDir.appendingPathComponent("errors.jsonl")
+            )
+            return
+        }
         var obj: [String: JSONValue]
         if case .object(let currentObj) = current {
             obj = currentObj
@@ -61,7 +78,13 @@ extension TelegramPollLoop {
     func resolveBotUsername() async -> String? {
         let store = SwiftNativePersistenceCore()
         let path = telegramDir.appendingPathComponent("state.json")
-        let state = await store.readJSON(path, defaultValue: .object([:]))
+        let state: JSONValue
+        do {
+            state = try await store.readJSON(path, ifMissing: .object([:]))
+        } catch {
+            await recordError(context: "state_read", error: String(describing: error))
+            return nil
+        }
         let fingerprint = Self.botTokenFingerprint(token)
         if case .object(let root) = state,
            let cached = _tgJSONString(root["botUsername"]),
@@ -91,7 +114,13 @@ extension TelegramPollLoop {
         guard let syncCommandMenu else { return }
         let store = SwiftNativePersistenceCore()
         let path = telegramDir.appendingPathComponent("state.json")
-        let state = await store.readJSON(path, defaultValue: .object([:]))
+        let state: JSONValue
+        do {
+            state = try await store.readJSON(path, ifMissing: .object([:]))
+        } catch {
+            await recordError(context: "state_read", error: String(describing: error))
+            return
+        }
         if case .object(let root) = state,
            case .object(let menu)? = root["commandMenu"],
            _tgJSONInt(menu["commandCount"]) == TelegramCommandRegistry.commands.count,

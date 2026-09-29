@@ -10,7 +10,7 @@
 //
 // U5 W-C (2026-06-11):
 //   - The pool is no longer constructed fresh per query — it resolves through
-//     KnowledgeGraphPoolCache (one pool per path, invalidated on file replace).
+//     KnowledgeGraphPoolCache to the owning MemoryStorage's pool.
 //   - `loadFromMemoryV2` now THROWS instead of returning an empty store on
 //     failure. Empty-vs-error: a MISSING database is `.databaseMissing` (the
 //     reader legitimately falls back to the JSON file); an EXISTING database

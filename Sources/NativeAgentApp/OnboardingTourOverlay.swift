@@ -1,3 +1,4 @@
+import AppToolRuntime
 // PATCH-2026-05-08: polish-wave — primary sidebar coach-mark onboarding tour
 import SwiftUI
 

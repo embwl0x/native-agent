@@ -333,7 +333,7 @@ extension SwiftNativeMCPDispatcher {
         let stamp = Self.isoTimestamp(clockNow)
         do {
             try await persistence.withFileLock(path) {
-                let existing = await persistence.readJSON(path, defaultValue: .object([:]))
+                let existing = try await persistence.readJSON(path, ifMissing: .object([:]))
                 var dict: [String: JSONValue]
                 if case .object(let obj) = existing { dict = obj } else { dict = [:] }
                 guard await MCPToolsCachePublications.shared.isCurrent(
@@ -380,7 +380,7 @@ extension SwiftNativeMCPDispatcher {
             throw MCPDispatcherError.serverNotFound(serverId)
         }
         guard server.transport == "stdio" || (server.transport == "http" && server.id != "searxng-local") else {
-            return await cachedResourcesJSON(forServer: serverId)
+            return try await cachedResourcesJSON(forServer: serverId)
         }
         let expectedIdentity = try server.executionIdentity()
         let cacheKey = liveCacheKey(kind: "resources", server: server, executionIdentity: expectedIdentity, pool: pool)
@@ -524,12 +524,12 @@ extension SwiftNativeMCPDispatcher {
         }
     }
 
-    private func cachedResourcesJSON(forServer serverId: String) async -> [JSONValue] {
+    private func cachedResourcesJSON(forServer serverId: String) async throws -> [JSONValue] {
         let path = root
             .appendingPathComponent("mcp", isDirectory: true)
             .appendingPathComponent("cache", isDirectory: true)
             .appendingPathComponent("resources.json")
-        let raw = await persistence.readJSON(path, defaultValue: .object([:]))
+        let raw = try await persistence.readJSON(path, ifMissing: .object([:]))
         guard case .object(let dict) = raw,
               case .object(let entry) = dict[serverId] ?? .null,
               case .array(let resources) = entry["resources"] ?? .null

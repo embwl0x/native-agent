@@ -18,6 +18,14 @@ extension MacFourVerbs {
         func cancelled() -> MacFourVerbsReply {
             MacFourVerbsReply(ok: false, text: "I stopped waiting.", detail: ["outcome": .string("cancelled")])
         }
+        func refusal(_ reply: MacFourVerbsReply) -> MacFourVerbsReply {
+            guard reply.detail["status"] == .string("in_process_route") else { return reply }
+            return MacFourVerbsReply(
+                ok: false,
+                text: "wait watches the frontmost external Mac app until its screen settles or the requested text appears; it is not a general sleep. NativeAgent is in front, and screen waiting cannot observe its own app. Use app_page_read(page: current) to inspect NativeAgent, or wait(agent: name) for a contact's in-flight reply.",
+                detail: reply.detail
+            )
+        }
         guard !Task.isCancelled else { return cancelled() }
 
         func matched(_ hit: Sighting, _ elapsed: Double) -> MacFourVerbsReply {
@@ -45,7 +53,7 @@ extension MacFourVerbs {
         // 1 — the baseline. One render, before anything is subscribed to.
         let first: Sighting
         switch await sight(part: nil) {
-        case .blind(let reply): return reply
+        case .blind(let reply): return refusal(reply)
         case .seen(let seen): first = seen
         }
         var last = first
@@ -98,7 +106,7 @@ extension MacFourVerbs {
             // 3 — render ONCE, because something happened (or, with no
             // subscription, because the coarse fallback said to look again).
             switch await sight(part: nil) {
-            case .blind(let reply): return reply
+            case .blind(let reply): return refusal(reply)
             case .seen(let seen): last = seen
             }
             guard !Task.isCancelled else { return cancelled() }

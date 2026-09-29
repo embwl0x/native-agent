@@ -6,6 +6,7 @@ struct Family {
     let label: String
     let directory: String
     let prefix: String
+    var additionalDirectories: [String] = []
 }
 
 struct Options {
@@ -370,18 +371,17 @@ func appendTransitionShadowAuthorizationOwnershipErrors(repo: URL, errors: inout
 func appendRetiredProductionAdaptiveEffortErrors(repo: URL, errors: inout [String]) throws {
     let productionBoundaryFiles = [
         "Modules/NativeAgentCore/Sources/ApprovalInbox/ApprovalInbox.swift",
-        "Modules/NativeAgentCore/Sources/ChatOrchestration/ChatOrchestrationClient+Client.swift",
-        "Modules/NativeAgentCore/Sources/ChatOrchestration/ChatOrchestration+ToolLoop.swift",
-        "Modules/NativeAgentCore/Sources/ChatOrchestration/ChatOrchestrationClient+Factories.swift",
-        "Modules/NativeAgentCore/Sources/ChatOrchestration/ChatOrchestrationClient+MessagePersistence.swift",
-        "Modules/NativeAgentCore/Sources/ChatOrchestration/ChatOrchestrationClient+StructuredChat.swift",
-        "Modules/NativeAgentCore/Sources/ChatOrchestration/ChatOrchestrationClient+TextCompatibility.swift",
-        "Sources/NativeAgentApp/AppChatToolDispatcher.swift",
+        "Modules/NativeAgentCore/Sources/ChatTurnRuntime/ChatOrchestrationClient+Client.swift",
+        "Modules/NativeAgentCore/Sources/ChatTurnRuntime/ChatOrchestration+ToolLoop.swift",
+        "Modules/NativeAgentCore/Sources/ChatTurnRuntime/ChatOrchestrationClient+Factories.swift",
+        "Modules/NativeAgentCore/Sources/ChatTurnRuntime/ChatOrchestrationClient+MessagePersistence.swift",
+        "Modules/NativeAgentCore/Sources/ChatTurnRuntime/ChatOrchestrationClient+StructuredChat.swift",
+        "Modules/NativeAgentCore/Sources/AppToolRuntime/AppChatToolDispatcher.swift",
         "Sources/NativeAgentApp/AppModel.swift",
         "Sources/NativeAgentApp/AppModel+ViewClientOps.swift",
-        "Sources/NativeAgentApp/ChatBrainControlBar.swift",
         "Sources/NativeAgentApp/ChatView+SlashCommands.swift",
         "Sources/NativeAgentApp/NativeClient+ApprovalExecutors.swift",
+        "Modules/NativeAgentCore/Sources/ApprovalTransactions/ApprovalTransactionCoordinator.swift",
         "Sources/NativeAgentApp/NativeClient+CutoverSeams.swift",
     ]
     for path in productionBoundaryFiles {
@@ -399,6 +399,7 @@ func appendRetiredProductionAdaptiveEffortErrors(repo: URL, errors: inout [Strin
     let forbiddenFiles = [
         "Modules/NativeAgentCore/Sources/ApprovalInbox/ApprovalInbox+AdaptiveReasoningEffort.swift",
         "Modules/NativeAgentCore/Sources/ChatOrchestration/ChatOrchestrationClient+AdaptiveReasoningEffort.swift",
+        "Modules/NativeAgentCore/Sources/ChatTurnRuntime/ChatOrchestrationClient+AdaptiveReasoningEffort.swift",
         "Modules/NativeAgentCore/Sources/PersistenceCore/AdaptiveReasoningEffortStore.swift",
     ]
     for path in forbiddenFiles where FileManager.default.fileExists(
@@ -411,17 +412,17 @@ func appendRetiredProductionAdaptiveEffortErrors(repo: URL, errors: inout [Strin
 func appendResidentMindConvergenceErrors(repo: URL, errors: inout [String]) throws {
     let contracts: [(path: String, required: [String], forbidden: [String])] = [
         (
-            "Modules/NativeAgentCore/Sources/ChatOrchestration/ChatOrchestrationClient+Client.swift",
+            "Modules/NativeAgentCore/Sources/ChatTurnRuntime/ChatOrchestrationClient+Client.swift",
             ["checkedRouteAdmission"],
             []
         ),
         (
-            "Modules/NativeAgentCore/Sources/ChatOrchestration/ChatOrchestrationClient+StreamFacade.swift",
+            "Modules/NativeAgentCore/Sources/ChatTurnRuntime/ChatOrchestrationClient+StreamFacade.swift",
             ["checkedRouteAdmission"],
             []
         ),
         (
-            "Modules/NativeAgentCore/Sources/ChatOrchestration/ChatOrchestration+TurnEngine.swift",
+            "Modules/NativeAgentCore/Sources/ChatTurnRuntime/ChatOrchestration+TurnEngine.swift",
             ["provider.admissionReused"],
             []
         ),
@@ -436,12 +437,12 @@ func appendResidentMindConvergenceErrors(repo: URL, errors: inout [String]) thro
             ["try await persistSnapshot(", "try await persistThoughtSeedFamily(", "try await recordReceiptChecked("]
         ),
         (
-            "Modules/NativeAgentCore/Sources/PersistenceCore/TurnTrace.swift",
+            "Modules/NativeAgentCore/Sources/TurnTrace/TurnTrace.swift",
             ["_PersistPump", "capacity: 4096"],
             []
         ),
         (
-            "Modules/NativeAgentCore/Sources/PersistenceCore/InstalledPhysiologySoak.swift",
+            "Modules/NativeAgentCore/Sources/Cognition/InstalledPhysiologySoak.swift",
             [
                 "minimumLatencySampleCount = 20",
                 "currentMeasurementEpoch = \"resident-live-latency-v3\"",
@@ -493,12 +494,13 @@ func appendResidentMindConvergenceErrors(repo: URL, errors: inout [String]) thro
 }
 
 func actualFamilyFiles(repo: URL, family: Family) throws -> Set<String> {
-    let dir = repo.appendingPathComponent(family.directory, isDirectory: true)
-    let urls = try FileManager.default.contentsOfDirectory(
-        at: dir,
-        includingPropertiesForKeys: [.isRegularFileKey],
-        options: [.skipsHiddenFiles]
-    )
+    let urls = try ([family.directory] + family.additionalDirectories).flatMap { directory in
+        try FileManager.default.contentsOfDirectory(
+            at: repo.appendingPathComponent(directory, isDirectory: true),
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        )
+    }
     return Set(urls
         .filter { $0.pathExtension == "swift" && $0.lastPathComponent.hasPrefix(family.prefix) }
         .map(\.lastPathComponent))
@@ -523,20 +525,24 @@ let fileIndex = swiftFilesByBasename(under: sourceRoots)
 let enforcedFamilies: [Family] = [
     Family(label: "AppDelegate", directory: "Sources/NativeAgentApp", prefix: "AppDelegate+"),
     Family(label: "AppModel", directory: "Sources/NativeAgentApp", prefix: "AppModel+"),
+    Family(label: "EngineRuntime", directory: "Modules/NativeAgentCore/Sources/EngineRuntime", prefix: "Engine"),
     Family(label: "BackgroundLoopsAssembly", directory: "Sources/NativeAgentApp", prefix: "BackgroundLoopsAssembly+"),
     Family(label: "NativeClient", directory: "Sources/NativeAgentApp", prefix: "NativeClient+"),
-    Family(label: "SchedulerDueJobRunner", directory: "Sources/NativeAgentApp", prefix: "SchedulerDueJobRunner+"),
-    Family(label: "NativeOAuthFlow", directory: "Sources/NativeAgentApp", prefix: "NativeOAuthFlow+"),
-    Family(label: "MacSyncEngine", directory: "Sources/NativeAgentApp", prefix: "MacSyncEngine+"),
+    Family(label: "ApprovalTransactionCoordinator", directory: "Modules/NativeAgentCore/Sources/ApprovalTransactions", prefix: "ApprovalTransactionCoordinator"),
+    Family(label: "SchedulerDueJobRunner", directory: "Modules/NativeAgentCore/Sources/SchedulerExecution", prefix: "SchedulerDueJobRunner+"),
+    Family(label: "NativeOAuthFlow", directory: "Modules/NativeAgentCore/Sources/ProviderRouting", prefix: "NativeOAuthFlow+", additionalDirectories: ["Modules/NativeAgentCore/Sources/Connectors"]),
+    Family(label: "NativeOAuthPlatform", directory: "Sources/NativeAgentApp", prefix: "NativeOAuthPlatform+"),
+    Family(label: "MacSyncEngine", directory: "Modules/NativeAgentCore/Sources/DeviceSync", prefix: "MacSyncEngine+"),
     Family(label: "MacAppleScriptBridge", directory: "Sources/NativeAgentApp", prefix: "MacAppleScriptBridge+"),
     Family(label: "ChatView", directory: "Sources/NativeAgentApp", prefix: "ChatView+"),
     Family(label: "KnowledgeGraphView", directory: "Sources/NativeAgentApp", prefix: "KnowledgeGraphView+"),
     Family(label: "TrustCenter", directory: "Modules/NativeAgentCore/Sources/TrustCenter", prefix: "TrustCenter+"),
     Family(label: "SecurityCenter", directory: "Modules/NativeAgentCore/Sources/TrustCenter", prefix: "SecurityCenter+"),
     Family(label: "TelegramPollLoop", directory: "Modules/NativeAgentCore/Sources/TelegramBot", prefix: "TelegramPollLoop+"),
-    Family(label: "ChatOrchestrationClient", directory: "Modules/NativeAgentCore/Sources/ChatOrchestration", prefix: "ChatOrchestrationClient+"),
+    Family(label: "ChatOrchestrationClient", directory: "Modules/NativeAgentCore/Sources/ChatTurnRuntime", prefix: "ChatOrchestrationClient+"),
     Family(label: "Research", directory: "Modules/NativeAgentCore/Sources/Research", prefix: "Research+"),
-    Family(label: "SwiftToolDispatcher", directory: "Modules/NativeAgentCore/Sources/ChatOrchestration", prefix: "SwiftToolDispatcher+"),
+    Family(label: "SwiftToolDispatcher", directory: "Modules/NativeAgentCore/Sources/ChatToolRuntime", prefix: "SwiftToolDispatcher+"),
+    Family(label: "BuiltInToolSchemaFactory", directory: "Modules/NativeAgentCore/Sources/ChatToolRuntime", prefix: "BuiltInToolSchemaFactory+"),
 ]
 
 var errors: [String] = []

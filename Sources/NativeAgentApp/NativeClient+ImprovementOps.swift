@@ -7,25 +7,15 @@ import TriggerScheduler
 
 extension NativeClient {
     func startImprovement(objective: String) async throws -> ImprovementRun {
-        // Map the canonical orchestrator result to the app presentation model.
-        let core = try await SelfImprovementOrchestrator.shared.startImprovement(objective: objective)
-        return ImprovementRun(
-            id: core.id,
-            objective: core.objective ?? objective,
-            status: core.status ?? "pending",
-            phase: core.phase ?? "pending",
-            createdAt: core.createdAt ?? ISO8601DateFormatter().string(from: Date()),
-            summary: core.summary,
-            completedAt: core.completedAt,
-            model: core.model,
-            worktree: core.worktree,
-            exitReason: core.exitReason,
-            promotedCommitSha: core.promotedCommitSha,
-            revertCommitSha: core.revertCommitSha
-        )
+        var run = try await SelfImprovementOrchestrator.shared.startImprovement(objective: objective)
+        run.objective = run.objective ?? objective
+        run.status = run.status ?? "pending"
+        run.phase = run.phase ?? "pending"
+        run.createdAt = run.createdAt ?? ISO8601DateFormatter().string(from: Date())
+        return run
     }
 
-    func createRecurringImprovement(objective: String, intervalSeconds: Int) async throws -> SchedulerJob {
+    func createRecurringImprovement(objective: String, intervalSeconds: Int) async throws -> ScheduledJob {
         let writer = makeSchedulerJobWriter(
             connectorActionIDs: Self.connectorActionIDSet(),
             dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()
@@ -39,9 +29,7 @@ extension NativeClient {
                 "objective": .string(trimmed.isEmpty ? "Make NativeAgent meaningfully better." : trimmed),
             ]),
         ])
-        let jobJSON = try await writer.createJob(body: body)
-        let data = try jobJSON.serializedData(pretty: false)
-        return try JSONDecoder().decode(SchedulerJob.self, from: data)
+        return try ScheduledJob(row: try await writer.createJob(body: body))
     }
 
     func runHarnessBenchmark() async throws -> HarnessBenchmarkRun {
@@ -50,7 +38,7 @@ extension NativeClient {
 
         // Failed reads produce failed checks with their actual error text.
         do {
-            let tools = try await getTools()
+            let tools = try await ToolsFacade(dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()).listAuthored()
             checks.append(HarnessBenchmarkCheck(
                 id: "tools_manifest",
                 title: "Tool manifest loads",
@@ -138,33 +126,16 @@ extension NativeClient {
         )
     }
 
-    func promoteImprovement(runId: String) async throws -> ImprovementPromoteResult {
-        let r = try await SelfImprovementOrchestrator.shared.promote(runId: runId)
-        return ImprovementPromoteResult(
-            ok: r.ok,
-            commitSha: r.commitSha,
-            filesChanged: nil,
-            error: r.error,
-            warning: nil,
-            swiftChanged: r.swiftChanged
-        )
+    func promoteImprovement(runId: String) async throws -> PromoteOpResult {
+        try await SelfImprovementOrchestrator.shared.promote(runId: runId)
     }
 
-    func discardImprovement(runId: String) async throws -> ImprovementRevertResult {
-        // Discard uses the same revert operation, including its explicit
-        // no-op/error result for a never-promoted worktree.
+    func discardImprovement(runId: String) async throws -> RevertOpResult {
+        // Discard keeps the canonical revert operation's explicit no-op/error result.
         try await revertImprovement(runId: runId)
     }
 
-    func revertImprovement(runId: String) async throws -> ImprovementRevertResult {
-        let r = try await SelfImprovementOrchestrator.shared.revert(runId: runId)
-        return ImprovementRevertResult(
-            ok: r.ok,
-            revertCommitSha: nil,
-            originalCommitSha: nil,
-            warning: nil,
-            error: r.error
-        )
+    func revertImprovement(runId: String) async throws -> RevertOpResult {
+        try await SelfImprovementOrchestrator.shared.revert(runId: runId)
     }
-
 }

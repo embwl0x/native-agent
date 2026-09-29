@@ -1,3 +1,4 @@
+import AppToolRuntime
 import SwiftUI
 
 // Simple view has no pages, so the setup a card opens — "Open full setup",
@@ -13,7 +14,7 @@ extension View {
     }
 }
 
-private struct InlineCardSetupPresentation: ViewModifier {
+struct InlineCardSetupPresentation: ViewModifier {
     let cards: InlineInteractionChatBinding
     @Environment(AppModel.self) private var appModel
 

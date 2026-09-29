@@ -1,5 +1,6 @@
 import Foundation
 import PersistenceCore
+import Desk
 
 /// The durable inputs read by `LivingStatusPanel` that can change outside this
 /// process. This is deliberately a small, consumer-owned list: watching a

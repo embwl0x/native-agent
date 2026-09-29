@@ -52,7 +52,7 @@ public struct MemoryV2RecallResponse: Sendable, Equatable {
 
 // MARK: - ProposalRecord (memory promotion lifecycle)
 
-public struct ProposalRecord: Sendable, Codable, Equatable {
+public struct ProposalRecord: Sendable, Codable, Equatable, Identifiable {
     public var id: String
     public var content: String
     public var source: String?

@@ -4,6 +4,10 @@
 <dict>
 	<key>com.apple.security.app-sandbox</key>
 	<false/>
+	<key>com.apple.security.application-groups</key>
+	<array>
+		<string>$(NATIVEAGENT_MAC_APP_GROUP_ID)</string>
+	</array>
 	<!-- Required by macOS TCC for Calendar prompts from hardened-runtime builds. -->
 	<key>com.apple.security.personal-information.calendars</key>
 	<true/>

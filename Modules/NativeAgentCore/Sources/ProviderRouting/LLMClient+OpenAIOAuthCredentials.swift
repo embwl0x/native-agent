@@ -271,17 +271,6 @@ extension OpenAIOAuthDirectAdapter {
         return backup
     }
 
-    /// True when a signed-in ChatGPT OAuth credential is on disk at this
-    /// adapter's own resolved path (User, 2026-09-06 — see
-    /// `OAuthCredentialPresence`).
-    var hasStoredOAuthCredential: Bool {
-        guard let blob = loadAuthBlob(),
-              let tokens = blob["tokens"] as? [String: Any],
-              let access = tokens["access_token"] as? String
-        else { return false }
-        return !access.isEmpty
-    }
-
     /// Load the auth blob from disk. Returns `nil` when the file is missing
     /// or unparseable — mirroring Python's `_load_codex_auth` which returns
     /// `{}` in both cases. We use `nil` here so the "needs OAuth" path is a
@@ -391,12 +380,14 @@ extension OpenAIOAuthDirectAdapter {
         return authClaim["chatgpt_account_id"] as? String
     }
 
-    /// account_id resolution. Mirrors `_account_id()` exactly — checks the
-    /// persisted `tokens.account_id` first, then falls back to extracting
-    /// from the JWT.
-    func currentAccountID() -> String? {
+    /// The account header must belong to the token this request will send.
+    func currentAccountID(accessToken: String) throws -> String? {
+        if let account = Self.extractAccountIDFromJWT(accessToken) { return account }
         guard let blob = loadAuthBlob() else { return nil }
         let tokens = (blob["tokens"] as? [String: Any]) ?? [:]
+        guard tokens["access_token"] as? String == accessToken else {
+            throw OAuthRequestAccount.changed("openai_oauth_direct")
+        }
         if let acct = tokens["account_id"] as? String, !acct.isEmpty {
             return acct
         }

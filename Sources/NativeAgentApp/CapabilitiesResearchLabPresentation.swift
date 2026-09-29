@@ -1,4 +1,5 @@
 import Foundation
+import Research
 
 /// Result of sending a Research Lab request through the native research owner.
 /// A returned run can still describe an unavailable connector, so callers must

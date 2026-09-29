@@ -19,7 +19,6 @@ import SwiftUI
 /// reach of the receipts rail keep working.
 struct ChatComposerInput: View {
     let draft: ChatComposerDraft
-    let classicShell: Bool
     let placeholder: String
     /// "To: <agent>" before the field (Simple view); nil hides it.
     var recipient: String? = nil
@@ -54,6 +53,8 @@ struct ChatComposerInput: View {
     // The slash menu is composer-local state; nothing outside this view reads
     // it, so it no longer invalidates the chat.
     @State private var showSlashMenu = false
+    @State private var slashMenuHeight: CGFloat = 0
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @State private var slashFilter = ""
     /// Bumped when Tab leaves the draft: the composer's settings words are the
     /// next stop, not the rail.
@@ -66,7 +67,7 @@ struct ChatComposerInput: View {
 
     var body: some View {
         MacChatComposerControlStrip(
-            shell: !classicShell,
+            shell: true,
             isListening: voiceInput.isListening,
             screenCaptureAllowed: screenCaptureAllowed,
             screenCaptureDisabled: screenCaptureDisabled,
@@ -95,14 +96,14 @@ struct ChatComposerInput: View {
             )
             .textFieldStyle(.plain)
             .accessibilityLabel("Message")
-            .font(classicShell ? nil : ShellType.body)
+            .font(ShellType.body)
             .lineLimit(1...5)
             .focused($inputFocused)
             .shellComposerKeyboardTarget(
                 isFocused: inputFocused,
                 focus: { inputFocused = true },
                 tabInto: { backwards in
-                    guard !backwards, !classicShell else { return false }
+                    guard !backwards else { return false }
                     focusWordToken += 1
                     inputFocused = false
                     return true
@@ -143,18 +144,41 @@ struct ChatComposerInput: View {
                     slashFilter = ""
                 }
             }
-            .popover(isPresented: $showSlashMenu, arrowEdge: .bottom) {
-                SlashCommandMenu(filter: slashFilter, onSelect: { command in
-                    if command.hasSuffix(" ") {
-                        draft.edit("/" + command)
-                    } else {
-                        onSlashCommand(command)
+            // Drawn in the window, not a popover: a macOS popover takes key
+            // focus, so typing stopped the moment the menu appeared (User
+            // 09-27). The field keeps the keyboard; the list filters as you
+            // type and still takes a click.
+            .overlay(alignment: .topLeading) {
+                if showSlashMenu {
+                    SlashCommandMenu(filter: slashFilter, onSelect: { command in
+                        if command.hasSuffix(" ") {
+                            draft.edit("/" + command)
+                        } else {
+                            onSlashCommand(command)
+                        }
+                        showSlashMenu = false
+                        inputFocused = true
+                    }, onDismiss: {
+                        showSlashMenu = false
+                    }, extraTools: capabilitiesStore.slashCommandTools())
+                    .fixedSize()
+                    // Her glass, a deeper tint than the plate so what can be
+                    // clicked stands off the transcript (User 09-27: blend, not solid).
+                    .glassEffect(
+                        reduceTransparency ? .identity : .clear.tint(.black.opacity(0.5)),
+                        in: RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    )
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 14, style: .continuous)
+                            .strokeBorder(NativeAgentShell.hairline, lineWidth: 1)
+                            .allowsHitTesting(false)
                     }
-                    showSlashMenu = false
-                    inputFocused = true
-                }, onDismiss: {
-                    showSlashMenu = false
-                }, extraTools: capabilitiesStore.slashCommandTools())
+                    .shadow(color: .black.opacity(0.3), radius: 16, y: 6)
+                    .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { slashMenuHeight = $0 }
+                    // Above the box, clear of the draft (User 09-27, like Claude Code).
+                    .offset(y: -(slashMenuHeight + 22))
+                    .zIndex(10)
+                }
             }
             .background(
                 DropZoneView(onDrop: { providers in

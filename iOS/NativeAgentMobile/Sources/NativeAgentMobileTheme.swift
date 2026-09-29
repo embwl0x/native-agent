@@ -1,6 +1,14 @@
 import SwiftUI
 import UIKit
 
+extension Color {
+    init(hex: UInt, opacity: Double = 1) {
+        self.init(.sRGB, red: Double((hex >> 16) & 0xFF) / 255,
+                  green: Double((hex >> 8) & 0xFF) / 255,
+                  blue: Double(hex & 0xFF) / 255, opacity: opacity)
+    }
+}
+
 /// Shared iOS vocabulary: native type and materials with the Mac's quiet hierarchy.
 /// Content stays quiet; Liquid Glass belongs to floating controls and navigation.
 enum NativeAgentMobileTheme {
@@ -14,12 +22,7 @@ enum NativeAgentMobileTheme {
         static let secondary = Color.secondary
         /// Opaque secondary ink for reading plates; system secondary blends too faintly into glass.
         static let readingSecondary = adaptive(dark: 0xB8B7B5, light: 0x555451)
-        /// Resolve at the SwiftUI root's scheme before handing selection to native tab chrome.
-        static func selectedTab(for scheme: ColorScheme) -> Color {
-            scheme == .dark ? Color(hex: 0x65CCD2) : Color(hex: 0x006B73)
-        }
         static let tertiary = adaptive(dark: 0xA4AAB0, light: 0x4C5055)
-        static let needsYou = adaptive(dark: 0x06B6D4, light: 0x0B5F76)
         static let trouble = adaptive(dark: 0xFF9F0A, light: 0x864800)
         static let calm = adaptive(dark: 0x34C759, light: 0x136224)
         static let accentDecoration = Color(hex: 0x65CCD2)
@@ -69,8 +72,6 @@ enum NativeAgentMobileTheme {
         static let panel: CGFloat = 8
         static let card: CGFloat = 8
         static let composer: CGFloat = 16
-        static let userBubble = RectangleCornerRadii(
-            topLeading: 14, bottomLeading: 14, bottomTrailing: 4, topTrailing: 14)
     }
 
     enum Layout {
@@ -79,10 +80,7 @@ enum NativeAgentMobileTheme {
         static let userBubbleMaxWidth: CGFloat = 640
         static let replyLineSpacing: CGFloat = 8
         static let controlHeight: CGFloat = 44
-        static let composerTop: CGFloat = 12
-        static let composerBottom: CGFloat = 12
         static let hairline: CGFloat = 1
-        static let focusedFill: Double = 0.04
         static func roomGlassTint(dark: Bool) -> Double { dark ? 0.46 : 0.30 }
     }
 
@@ -137,35 +135,6 @@ extension View {
         mobileGlassSurface(radius: NativeAgentMobileTheme.Radius.composer)
     }
 
-    func mobileComposer(isFocused: Bool = false) -> some View {
-        padding(.horizontal, NativeAgentMobileTheme.Spacing.lg)
-            .padding(.top, NativeAgentMobileTheme.Layout.composerTop)
-            .padding(.bottom, NativeAgentMobileTheme.Layout.composerBottom)
-            .mobileGlassSurface(radius: NativeAgentMobileTheme.Radius.composer, interactive: true)
-            .overlay {
-                if isFocused {
-                    RoundedRectangle(cornerRadius: NativeAgentMobileTheme.Radius.composer)
-                        .fill(Color.primary.opacity(NativeAgentMobileTheme.Layout.focusedFill))
-                        .allowsHitTesting(false)
-                }
-            }
-    }
-
-    /// Matches the current Mac shell: a soft user bubble and an unboxed reply.
-    func mobileBubble(isUser: Bool) -> some View {
-        mobileTypography(.body)
-            .lineSpacing(isUser ? 2 : NativeAgentMobileTheme.Layout.replyLineSpacing)
-            .padding(.horizontal, isUser ? NativeAgentMobileTheme.Spacing.lg : 0)
-            .padding(.vertical, isUser ? NativeAgentMobileTheme.Spacing.md : NativeAgentMobileTheme.Spacing.xs)
-            .background {
-                if isUser {
-                    UnevenRoundedRectangle(cornerRadii: NativeAgentMobileTheme.Radius.userBubble)
-                        .fill(NativeAgentMobileTheme.Colors.softFill)
-                }
-            }
-            .foregroundStyle(NativeAgentMobileTheme.Colors.text)
-    }
-
     func mobileDivider() -> some View {
         overlay(NativeAgentMobileTheme.Colors.hairline)
             .frame(height: NativeAgentMobileTheme.Layout.hairline)
@@ -180,36 +149,13 @@ extension View {
             .accessibilityAddTraits(.isHeader)
     }
 
-    /// Use on decorative backgrounds only, never on transcript text or controls.
-    @ViewBuilder func mobileBackgroundExtension() -> some View {
-        if #available(iOS 26.0, *) { backgroundExtensionEffect() } else { self }
-    }
 }
 
 struct MobileGlassContainer<Content: View>: View {
     var spacing: CGFloat = NativeAgentMobileTheme.Spacing.md
     @ViewBuilder var content: () -> Content
     var body: some View {
-        if #available(iOS 26.0, *) {
-            GlassEffectContainer(spacing: spacing, content: content)
-        } else {
-            content()
-        }
-    }
-}
-
-struct MobileRoomBackground: View {
-    var body: some View {
-        ZStack {
-            NativeAgentMobileTheme.Colors.canvas
-            RadialGradient(colors: [Color(hex: 0xB78960).opacity(0.09), .clear],
-                           center: .topLeading, startRadius: 0, endRadius: 440)
-            RadialGradient(colors: [NativeAgentMobileTheme.Colors.accentDecoration.opacity(0.035), .clear],
-                           center: .bottomTrailing, startRadius: 0, endRadius: 320)
-        }
-        .mobileBackgroundExtension()
-        .ignoresSafeArea()
-        .allowsHitTesting(false)
+        GlassEffectContainer(spacing: spacing, content: content)
     }
 }
 
@@ -231,7 +177,6 @@ private struct MobileGlassSurface: ViewModifier {
     let radius: CGFloat
     let interactive: Bool
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
-    @Environment(\.colorScheme) private var colorScheme
     @Environment(\.colorSchemeContrast) private var contrast
     func body(content: Content) -> some View {
         let shape = RoundedRectangle(cornerRadius: radius, style: .continuous)
@@ -239,12 +184,8 @@ private struct MobileGlassSurface: ViewModifier {
         if reduceTransparency {
             content.background(NativeAgentMobileTheme.Colors.navigationGlass, in: shape)
                 .overlay(shape.strokeBorder(contrast == .increased ? Color.primary.opacity(0.5) : NativeAgentMobileTheme.Colors.hairline, lineWidth: 1))
-        } else if #available(iOS 26.0, *) {
-            content.glassEffect(interactive ? .regular.interactive() : .regular, in: shape)
         } else {
-            content.background(.regularMaterial, in: shape)
-                .overlay(shape.strokeBorder(NativeAgentMobileTheme.Colors.hairline, lineWidth: 1))
-                .shadow(color: .black.opacity(colorScheme == .dark ? 0.18 : 0.06), radius: 12, y: 4)
+            content.glassEffect(interactive ? .regular.interactive() : .regular, in: shape)
         }
         }
     }

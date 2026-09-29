@@ -22,7 +22,7 @@ extension SwiftNativeResearchClient {
     /// process — re-acquiring would self-deadlock). Mirrors the daemon's
     /// `_catalog_sources_unlocked` lock-free-inner precedent.
     private func readLabRunsSorted() async throws -> [JSONValue] {
-        let raw = await persistence.readJSON(labRunsPath, defaultValue: .array([]))
+        let raw = try await persistence.readJSON(labRunsPath, ifMissing: .array([]))
         guard case .array(let rows) = raw else { return [] }
         // Python: sorted(runs, key=createdAt, reverse=True). Stable sort with
         // empty-string default for missing createdAt (matches Python's
@@ -72,7 +72,7 @@ extension SwiftNativeResearchClient {
         }
 
         let connector: String
-        let cfg = await persistence.readJSON(configPath, defaultValue: .object([:]))
+        let cfg = try await persistence.readJSON(configPath, ifMissing: .object([:]))
         if case .object(let obj) = cfg,
            case .string(let base) = obj["searxng_base_url"] ?? .null, !base.isEmpty {
             connector = "searxng"

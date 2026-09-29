@@ -479,12 +479,12 @@ public actor ProviderVitalsSensor: LLMCallLifecycleObserving {
         now: Date = Date(),
         maxAge: TimeInterval = 6 * 60 * 60,
         futureSkewAllowance: TimeInterval = 5 * 60
-    ) async -> Bool {
+    ) async throws -> Bool {
         let root = dataRoot ?? PersistenceCore.defaultDataRoot()
         let path = root
             .appendingPathComponent("telemetry", isDirectory: true)
             .appendingPathComponent("provider_vitals.json")
-        let value = await persistence.readJSON(path, defaultValue: .null)
+        let value = try await persistence.readJSON(path, ifMissing: .null)
         guard case .object(let snapshot) = value,
               case .string("provider.vitals.v1")? = snapshot["schema"],
               let generatedAt = Self.date(snapshot["generatedAt"]),

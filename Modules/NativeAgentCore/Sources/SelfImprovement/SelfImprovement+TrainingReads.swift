@@ -130,8 +130,8 @@ extension SwiftNativeSelfImprovement {
     }
 
     /// Read an object, or nil for missing, malformed, or non-object JSON.
-    func readJSONObject(_ url: URL) async -> [String: JSONValue]? {
-        let raw = await trainingPromotionPersistence().readJSON(url, defaultValue: .null)
+    func readJSONObject(_ url: URL) async throws -> [String: JSONValue]? {
+        let raw = try await trainingPromotionPersistence().readJSON(url, ifMissing: .null)
         guard case .object(let obj) = raw else { return nil }
         return obj
     }
@@ -140,12 +140,12 @@ extension SwiftNativeSelfImprovement {
 
     /// Newest-first graded runs projected to the five summary fields below;
     /// absent fields are null.
-    public func listTrainingRunsLocal() async -> JSONValue {
+    public func listTrainingRunsLocal() async throws -> JSONValue {
         let dir = trainingJournalDir().appendingPathComponent("drill_runs", isDirectory: true)
         let files = Self.sortedJSONFiles(in: dir, suffix: "-graded.json", reversedName: true)
         var out: [JSONValue] = []
         for f in files {
-            guard let obj = await readJSONObject(f) else { continue }
+            guard let obj = try await readJSONObject(f) else { continue }
             out.append(.object([
                 "run_id": obj["run_id"] ?? .null,
                 "suite_name": obj["suite_name"] ?? .null,
@@ -162,22 +162,22 @@ extension SwiftNativeSelfImprovement {
     /// Return the full graded-run JSON, with nil for a missing file and an
     /// empty object for parse failure. Valid non-object JSON passes through.
     /// The run ID is appended verbatim; callers supply the stored run identifier.
-    public func getTrainingRunLocal(runId: String) async -> JSONValue? {
+    public func getTrainingRunLocal(runId: String) async throws -> JSONValue? {
         let dir = trainingJournalDir().appendingPathComponent("drill_runs", isDirectory: true)
         let f = dir.appendingPathComponent("\(runId)-graded.json")
         guard FileManager.default.fileExists(atPath: f.path) else { return nil }
-        return await trainingPromotionPersistence().readJSON(f, defaultValue: .object([:]))
+        return try await trainingPromotionPersistence().readJSON(f, ifMissing: .object([:]))
     }
 
     // MARK: GET /v1/training/proposals
 
     /// Full proposal objects in forward filename order; no field projection.
-    public func listTrainingProposalsLocal() async -> JSONValue {
+    public func listTrainingProposalsLocal() async throws -> JSONValue {
         let dir = trainingJournalDir().appendingPathComponent("proposals", isDirectory: true)
         let files = Self.sortedJSONFiles(in: dir, reversedName: false)
         var out: [JSONValue] = []
         for f in files {
-            guard let obj = await readJSONObject(f) else { continue }
+            guard let obj = try await readJSONObject(f) else { continue }
             out.append(.object(obj))
         }
         return .array(out)
@@ -187,12 +187,12 @@ extension SwiftNativeSelfImprovement {
 
     /// Newest-first candidates projected to the stored candidate field set.
     /// Extra fields are omitted and missing fields become null.
-    public func listPromotionCandidatesLocal() async -> JSONValue {
+    public func listPromotionCandidatesLocal() async throws -> JSONValue {
         let dir = trainingJournalDir().appendingPathComponent("promotion_candidates", isDirectory: true)
         let files = Self.sortedJSONFiles(in: dir, reversedName: true)
         var out: [JSONValue] = []
         for f in files {
-            guard let obj = await readJSONObject(f) else { continue }
+            guard let obj = try await readJSONObject(f) else { continue }
             out.append(Self.projectCandidateRun(obj))
         }
         return .array(out)
@@ -201,12 +201,12 @@ extension SwiftNativeSelfImprovement {
     // MARK: GET /v1/promotion/pending
 
     /// Forward filename order, pending status only, projected to stage fields.
-    public func listPromotionPendingLocal() async -> JSONValue {
+    public func listPromotionPendingLocal() async throws -> JSONValue {
         let dir = trainingJournalDir().appendingPathComponent("promotion_stages", isDirectory: true)
         let files = Self.sortedJSONFiles(in: dir, reversedName: false)
         var out: [JSONValue] = []
         for f in files {
-            guard let obj = await readJSONObject(f) else { continue }
+            guard let obj = try await readJSONObject(f) else { continue }
             if case .string(let status)? = obj["status"], status == "pending" {
                 out.append(Self.projectStage(obj))
             }
@@ -219,11 +219,11 @@ extension SwiftNativeSelfImprovement {
     /// Read the evaluations array and sort descending by `pythonStrOr(createdAt)`.
     /// Non-array storage returns empty. Preserve input order for equal keys by
     /// carrying the original index as the ascending tiebreaker.
-    public func listEvalsLocal() async -> JSONValue {
+    public func listEvalsLocal() async throws -> JSONValue {
         let url = trainingPromotionDataRoot()
             .appendingPathComponent("evals", isDirectory: true)
             .appendingPathComponent("runs.json")
-        let raw = await trainingPromotionPersistence().readJSON(url, defaultValue: .array([]))
+        let raw = try await trainingPromotionPersistence().readJSON(url, ifMissing: .array([]))
         guard case .array(let arr) = raw else { return .array([]) }
         let keyed: [(key: String, idx: Int, value: JSONValue)] = arr.enumerated().map { (i, item) in
             var key = ""

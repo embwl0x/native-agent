@@ -1,3 +1,5 @@
+import FeedPolicy
+import Privacy
 import Foundation
 import NativeAgentCore
 import PersistenceCore
@@ -26,7 +28,7 @@ import PersistenceCore
 //        now reproduced natively (see FLIP PREREQ below — CLOSED).
 //
 // The OTHER seven /v1/connectors/* routes are NOT in this module — they are
-// KEPT with documented retirement paths (see CUTOVER_PLAN.md §6.55, §6.260):
+// KEPT, for these reasons:
 //   - GET /v1/connectors, GET /v1/connectors/proof, GET /v1/connectors/actions:
 //       list_connectors() does a read-merge-write-back of connectors/registry.json
 //       AND derives enabled/authState/healthStatus from the daemon OAuth token
@@ -132,7 +134,7 @@ public final class SwiftNativeConnectorsClient: ConnectorsClient {
 
     public func listWorkspaces() async throws -> [JSONValue] {
         // Python: read_json(workspaces_path, []); if not list -> [].
-        let raw = await persistence.readJSON(workspacesPath, defaultValue: .array([]))
+        let raw = try await persistence.readJSON(workspacesPath, ifMissing: .array([]))
         if case .array(let arr) = raw { return arr }
         return []
     }

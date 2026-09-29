@@ -55,7 +55,7 @@ enum CapabilitiesFoundryIndexPresentation {
         if let byKind = counts.byKind {
             var actualByKind: [String: Int] = [:]
             for record in summary.records {
-                actualByKind[record.kind, default: 0] += 1
+                actualByKind[record.kind ?? "", default: 0] += 1
             }
             guard byKind == actualByKind else {
                 return .inconsistent("the stated kind counts do not match the entries")

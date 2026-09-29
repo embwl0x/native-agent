@@ -27,6 +27,10 @@ public enum PeerTurnEffectPolicy {
         if ["agent_message", "agent_read", "bot_ask"].contains(name) { return false }
         let destructive: Set<String> = ["destructive", "filesystem_delete", "system_permission_reset"]
         if !destructive.isDisjoint(with: capabilities) { return true }
+        // Match the executor's sandbox parsing. Omitted or invalid values
+        // execute as workspace-write and must keep the peer approval card.
+        if name == "invoke_codex", case .string(let sandbox)? = input["sandbox"],
+           sandbox.lowercased() == "read-only" { return false }
         // Arbitrary code and unknown external effects cannot be established as
         // non-destructive from a peer's description. Keep their existing ask.
         if capabilities.contains("shell") || capabilities.contains("process_spawn") { return true }
@@ -97,7 +101,7 @@ public enum PeerTurnEffectPolicy {
         "rewrite_memory", "forget_memory", "rebuild_knowledge_graph",
         "hold_view", "release_view",
         "studio_canon_resolve", "bot_ask", "answer_card",
-        "mac_calendar_modify_event", "mac_nudge",
+        "mac_calendar_modify_event",
         // Desk STATE transitions whose names carry no effect verb.
         "desk_blocked_on", "desk_breakdown",
         // Shell, builder and Mac verbs. Sol, 2026-09-15: `screen`, `wait`,
@@ -105,7 +109,7 @@ public enum PeerTurnEffectPolicy {
         // READ/PERCEPTION tools — looking at the screen changes nothing, and
         // gating them made her blind on a peer turn for no safety. Only the
         // verbs that MOVE the Mac stay.
-        "shell", "bash", "git", "apply_patch", "run_tests",
+        "shell", "bash", "git", "apply_patch",
         "swift_build", "swift_test", "act", "go", "mac_wake",
         // Outward sends and other agents.
         "agent_message", "claude_message", "codex_message", "omp_message",
@@ -273,7 +277,8 @@ public enum PeerTurnEffectPolicy {
     public static func memoryProvenanceRefusal(
         tool: String,
         input: [String: JSONValue],
-        peer: PeerIdentity
+        peer: PeerIdentity,
+        readPeerData: Bool = false
     ) -> String? {
         guard normalized(tool) == "commit_memory" else { return nil }
         let who = peer.display
@@ -287,7 +292,8 @@ public enum PeerTurnEffectPolicy {
         let kind = string(input["provenance"])?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard kind == "told" else {
-            return "The request came from \(who), a peer — you can keep your own "
+            let origin = readPeerData ? "This turn read data from" : "The request came from"
+            return "\(origin) \(who), a peer — you can keep your own "
                 + "note about it, but a peer cannot speak for the person. Set "
                 + "provenance=\"told\" and provenance_by=\"\(who)\", so the note "
                 + "records what \(who) reported rather than established fact."
@@ -303,7 +309,8 @@ public enum PeerTurnEffectPolicy {
         // ask for, so any non-empty name passes rather than blocking her note.
         guard !accepted.isEmpty else { return nil }
         guard accepted.contains(by.lowercased()) else {
-            return "This turn came from \(who), so provenance_by has to be "
+            let origin = readPeerData ? "This turn read data from" : "This turn came from"
+            return "\(origin) \(who), so provenance_by has to be "
                 + "\(who) — a peer cannot attribute its claim to someone else."
         }
         return nil

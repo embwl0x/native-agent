@@ -44,17 +44,26 @@ enum KGTimeWindow: String, CaseIterable, Identifiable {
 struct KnowledgeGraphView: View {
     // PATCH-2026-05-07: kg-1 Memory > Graph tab — entity list + detail card
     @Environment(AppModel.self) var appModel
-    @State var entities: [KGEntity] = []
-    @State var edges: [KGEdge] = []
-    @State var totalEntities: Int = 0
-    @State var totalEdges: Int? = nil
-    @State var loading = false
-    @State var graphLoadGate = LatestAsyncRequestGate()
+    var entities: [KnowledgeGraphEntity] { memory.graphEntities }
+    var edges: [KnowledgeGraphEdge] { memory.graphEdges }
+    var totalEntities: Int { memory.graphTotalEntities }
+    var totalEdges: Int? { memory.graphTotalEdges }
+    var loading: Bool { memory.graphLoading }
+    /// This page's own action error (enable, maintenance). The graph read's
+    /// error is the shared graph's, so every mounted page shows it.
     @State var errorMsg: String? = nil
     // Keep the origin alongside the visible error. A maintenance failure can
     // arrive after an older graph-load failure; only the latter makes retained
     // rows stale.
     @State var errorOrigin: KnowledgeGraphPresentation.ErrorOrigin? = nil
+    /// Both errors when both stand; a failed shared read marks rows stale.
+    var shownError: String? {
+        let errors = [memory.graphLoadError, errorMsg].compactMap { $0 }
+        return errors.isEmpty ? nil : errors.joined(separator: "\n")
+    }
+    var shownErrorOrigin: KnowledgeGraphPresentation.ErrorOrigin? {
+        memory.graphLoadError != nil ? .graphLoad : errorOrigin
+    }
     @State var policyReadError: String? = nil
     @State var searchText = ""
     @State var filterType: String = "all"
@@ -71,7 +80,7 @@ struct KnowledgeGraphView: View {
     /// selected id is no longer visible under the active filters.  The
     /// on-change handler also clears stale state, while this read prevents a
     /// one-render detail-pane leak before SwiftUI delivers that handler.
-    var selectedEntity: KGEntity? {
+    var selectedEntity: KnowledgeGraphEntity? {
         guard let id = KnowledgeGraphPresentation.reconciledSelection(
             selectedId,
             visibleIDs: displayedEntityIDs
@@ -121,9 +130,9 @@ struct KnowledgeGraphView: View {
     @State var gcPreviewCandidateIDs: Set<String> = []
     @State var showGCConfirm = false
 
-    // Source from AppModel's canonical client; the handle is passed into
-    // KGEntityDetailView so all reads use the same in-process owner.
-    var api: NativeClient { appModel.client }
+    // The graph and every entity read come from one facade, passed into
+    // KGEntityDetailView so all reads use the same root.
+    var memory: MemoryFacade { appModel.engine.memory }
 
     let entityTypes = KnowledgeGraphFilterCatalog.entityTypes
     // Multi-select catalog — same list, minus "all" (selection-empty IS all).
@@ -132,7 +141,7 @@ struct KnowledgeGraphView: View {
     /// `nil` is an unread policy, not an off graph. The empty state must never
     /// offer an enable action based on a missing authority read.
     var knowledgeGraphEnabled: Bool? {
-        appModel.trustPolicy?.memoryPolicy?.knowledge_graph_enabled
+        appModel.engine.trust.policy?.memoryPolicy?.knowledge_graph_enabled
     }
 
     var enableButtonControl: KnowledgeGraphEnableActionPresentation.ButtonControl {
@@ -166,7 +175,7 @@ struct KnowledgeGraphView: View {
         return nil
     }
 
-    var displayEntities: [KGEntity] {
+    var displayEntities: [KnowledgeGraphEntity] {
         KnowledgeGraphPresentation.filteredEntities(
             entities,
             filterType: filterType,
@@ -201,31 +210,8 @@ struct KnowledgeGraphView: View {
         )
     }
 
-    /// Alive glass (2026-09-23) is the Advanced shell's; the classic shell
-    /// keeps its material strip and settings cards.
-    @AppStorage(NativeAgentShellPreference.classicShellKey) private var classicShell = false
-
-    /// The page's card: the settings card in the classic shell, one alive
-    /// group card (rows split by hairlines) in the Advanced shell.
-    @ViewBuilder
-    private func kgCard<C: View>(@ViewBuilder _ content: () -> C) -> some View {
-        if classicShell {
-            AdvancedCard { content() }
-        } else {
-            AliveGroupCard { content() }
-        }
-    }
-
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            if classicShell {
-                KGNativeStackHeader(
-                    status: nativeStack,
-                    totalEntities: totalEntities,
-                    totalEdges: totalEdges ?? 0
-                )
-            }
-
             if knowledgeGraphEnabled == true {
                 Button {
                     Task { await enableKnowledgeGraph(enabled: false) }
@@ -237,16 +223,13 @@ struct KnowledgeGraphView: View {
 
             // 2026-06-06: filter row — kind multi-select + time-window picker.
             // Sits above the search bar and view-mode toggle; applies to both.
-            // In the Advanced shell the counts strip is this card's first row.
-            kgCard {
-                if !classicShell {
-                    KGNativeStackHeader(
-                        status: nativeStack,
-                        totalEntities: totalEntities,
-                        totalEdges: totalEdges ?? 0,
-                        plain: true
-                    )
-                }
+            // The counts strip is this card's first row.
+            AliveGroupCard {
+                KGNativeStackHeader(
+                    status: nativeStack,
+                    totalEntities: totalEntities,
+                    totalEdges: totalEdges ?? 0
+                )
                 HStack(spacing: 8) {
                     Menu {
                         Button(selectedKinds.isEmpty ? "✓ All kinds" : "All kinds") {
@@ -304,9 +287,10 @@ struct KnowledgeGraphView: View {
 
                 // Search + (legacy single-type) filter bar
                 HStack(spacing: 8) {
-                    TextField("Search entities…", text: $searchText)
-                        .textFieldStyle(.plain)
-                        .font(ShellType.label)
+                    NativeSearchField(text: $searchText, prompt: "Search entities…",
+                                      identifier: "knowledgeGraph.search",
+                                      accessibilityLabel: "Search entities")
+                        .frame(maxWidth: 260)
                     Spacer()
                     Picker("Type", selection: $filterType) {
                         ForEach(entityTypes, id: \.self) { t in
@@ -366,11 +350,11 @@ struct KnowledgeGraphView: View {
             // because the rendered graph is still current.
             if case let .retainedDataBanner(err, isStale) = KnowledgeGraphPresentation.errorPlacement(
                 isLoading: loading,
-                error: errorMsg,
+                error: shownError,
                 entityCount: entities.count,
-                errorOrigin: errorOrigin
+                errorOrigin: shownErrorOrigin
             ) {
-                kgCard {
+                AliveGroupCard {
                     HStack(alignment: .firstTextBaseline, spacing: 8) {
                         VStack(alignment: .leading, spacing: 2) {
                             Text(err)
@@ -394,7 +378,7 @@ struct KnowledgeGraphView: View {
 
             switch KnowledgeGraphPresentation.content(
                 isLoading: loading,
-                error: errorMsg,
+                error: shownError,
                 entityCount: entities.count,
                 displayedEntityCount: displayEntities.count,
                 renderableGraphEntityCount: renderableGraphEntityCount,
@@ -491,7 +475,7 @@ struct KnowledgeGraphView: View {
 
                             if let entity = selectedEntity {
                                 KGEntityDetailView(
-                                    entity: entity, api: api,
+                                    entity: entity, memory: memory,
                                     selectableEntityIDs: displayedEntityIDs,
                                     onSelectEntity: selectRelatedEntity
                                 )
@@ -553,17 +537,11 @@ struct KnowledgeGraphView: View {
             guard !Task.isCancelled else { return }
             nativeStack = await KGNativeStackStatus.load(graphCounts: (totalEntities, totalEdges ?? 0))
         }
-        .onDisappear {
-            // Toolbar reads also share this gate, so late results cannot
-            // repaint an unmounted page or continue walking graph pages.
-            _ = graphLoadGate.begin()
-            loading = false
-        }
         // Selection sync: when the active filter set drops the currently
         // selected id from `displayEntities`, clear it so the detail pane
         // doesn't keep showing a node the user can no longer see. Watch the
-        // sorted id-list signature rather than the array itself (KGEntity is
-        // not Equatable) — cheaper and matches what the canvas keys layout on.
+        // sorted id-list signature rather than the array itself — cheaper and
+        // matches what the canvas keys layout on.
         .onChange(of: displayedEntitySignature) { _, _ in
             selectedId = selectionReconciliation.selectedID
         }
@@ -585,7 +563,7 @@ struct KnowledgeGraphView: View {
 
             if let entity = selectedEntity {
                 KGEntityDetailView(
-                    entity: entity, api: api,
+                    entity: entity, memory: memory,
                     selectableEntityIDs: displayedEntityIDs,
                     onSelectEntity: selectRelatedEntity
                 )

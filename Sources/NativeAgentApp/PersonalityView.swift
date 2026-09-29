@@ -145,41 +145,6 @@ enum PersonalityStarterCreateAction {
 }
 
 struct PersonalityView: View {
-    #if DEBUG
-    private var snapshotOnly = false
-
-    @MainActor
-    static func renderCopyReview(to directory: URL) throws {
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        let root = FileManager.default.temporaryDirectory.appendingPathComponent("personality-copy-\(UUID().uuidString)")
-        defer { try? FileManager.default.removeItem(at: root) }
-        let app = AppModel(dataRootOverride: root, startBackgroundTasks: false,
-                           activeChatSessionIDWriter: { _ in }, chatSnapshotPublisher: {})
-        app.personalityDocs = ["SOUL", "VOICE", "USER", "GROWTH", "AGENTS"].map {
-            PersonalityDoc(id: $0, title: $0, filename: "\($0).md",
-                           content: $0 == "USER" ? "Prefers clear explanations and practical examples." : "Be thoughtful, curious, and clear. Follow through on commitments.")
-        }
-        for selected in ["SOUL", "USER"] {
-            var state = PersonalityDocumentDraftState()
-            let content = state.select(selected, documents: app.personalityDocs)
-            var view = PersonalityView()
-            view.snapshotOnly = true
-            view._documentDraftState = State(initialValue: state)
-            view._personalityDocDraft = State(initialValue: content)
-            for scheme in [ColorScheme.light, .dark] {
-                try BotsShelfSnapshots.write(ShellFrame(classic: false) {
-                    ShellSidebarRail(selection: .constant(.personality), botsPreviewOverride: false)
-                } detail: {
-                    ShellPageFrame(title: "Personality", showsBack: false, wide: true) {
-                        view.environment(app)
-                    }
-                },
-                    name: "personality-\(selected.lowercased())-\(scheme == .dark ? "dark" : "light")",
-                    size: CGSize(width: 1280, height: 900), scheme: scheme, directory: directory, scale: 1)
-            }
-        }
-    }
-    #endif
     @Environment(AppModel.self) private var appModel
     @State private var draft = PersonalityProfile.defaultProfile
     @State private var isLoadingProfile = true
@@ -197,7 +162,6 @@ struct PersonalityView: View {
     @State private var isReloadingDocuments = false
     @State private var isSavingName = false
     @State private var nameSaveFeedback: PersonalityNameSaveFeedback?
-    @AppStorage(NativeAgentShellPreference.classicShellKey) private var classicShell = false
 
     /// SOUL.md is the identity marker everywhere else in the system
     /// (PersonaRootResolver, onboarding guards) — same rule here. Presence
@@ -221,15 +185,7 @@ struct PersonalityView: View {
     }
 
     var body: some View {
-        #if DEBUG
-        if snapshotOnly {
-            docsPanel
-        } else {
-            pageBody
-        }
-        #else
         pageBody
-        #endif
     }
 
     private var pageBody: some View {
@@ -268,11 +224,6 @@ struct PersonalityView: View {
                     }
                     .padding(.bottom, 32)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    // The new shell's `ShellPageFrame` already insets the
-                    // column; the classic shell hands a page the bare pane,
-                    // so the page keeps its own margin there.
-                    .padding(.horizontal, classicShell ? 20 : 0)
-                    .padding(.top, classicShell ? 20 : 0)
                 }
             }
         }

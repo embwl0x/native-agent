@@ -1,5 +1,6 @@
 import Foundation
 import PersistenceCore
+import TurnTrace
 
 // MARK: - One Thread, Many Surfaces — Phase 0 Doctor row
 //

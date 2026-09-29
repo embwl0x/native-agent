@@ -1,9 +1,12 @@
+import NativeAgentCore
 import SwiftUI
 import AppKit
 import NativeAgentShared
 import PersistenceCore
+import Desk
 import StandingBots
 import DreamREMCycle
+import MemoryV2
 
 // PATCH-2026-06-06: command-palette — Cmd+K modal that lets the user jump to any
 // sidebar tab, any chat session, or any well-known recent action without
@@ -38,12 +41,6 @@ enum CommandPaletteRecentAction: String, CaseIterable, Sendable {
     case refreshActivity = "refresh_activity"
     case reloadAll = "reload_all"
     case openDoctor = "open_doctor"
-
-    static func visible(showDeveloperSurfaces: Bool) -> [Self] {
-        allCases.filter { showDeveloperSurfaces || !$0.isDeveloperOnly }
-    }
-
-    var isDeveloperOnly: Bool { self == .openDoctor }
 
     var presentation: (title: String, subtitle: String, systemImage: String) {
         switch self {
@@ -94,12 +91,11 @@ enum CommandPalettePresentation {
 
     static func itemPool(
         sessions: [ChatSession],
-        showDeveloperSurfaces: Bool,
         saved: [PaletteItem] = []
     ) -> [PaletteItem] {
         let tabCases: [SidebarItem] =
             SidebarItem.primaryItems
-            + SidebarItem.visibleAdvancedItems(developerSurfacesEnabled: showDeveloperSurfaces)
+            + SidebarItem.advancedItems
             + [.telegram]
         let tabs = tabCases.map { item in
             PaletteItem(
@@ -123,9 +119,7 @@ enum CommandPalettePresentation {
         }
         // Destinations and chats rank first on an equal match; the saved things
         // sit behind them, so ⌘K still opens a page when that is what was typed.
-        return tabs + chats + saved + CommandPaletteRecentAction.visible(
-            showDeveloperSurfaces: NativeAgentShellPreference.developerSurfacesShown(showDeveloperSurfaces)
-        ).map { action in
+        return tabs + chats + saved + CommandPaletteRecentAction.allCases.map { action in
             let presentation = action.presentation
             return PaletteItem(
                 id: "action.\(action.rawValue)",
@@ -160,7 +154,7 @@ enum CommandPaletteSavedThings {
     /// a list a person can rank in their head.
     static let perSource = 40
 
-    static func load(dataRoot: URL, memories: [MemoryRecord]) async -> [PaletteItem] {
+    static func load(dataRoot: URL, memories: [MemoryV2.MemoryRecord]) async -> [PaletteItem] {
         var items: [PaletteItem] = []
         items += await deskItems(dataRoot: dataRoot)
         items += await botReplies(dataRoot: dataRoot)
@@ -230,14 +224,14 @@ enum CommandPaletteSavedThings {
         }
     }
 
-    private static func memoryItems(_ memories: [MemoryRecord]) -> [PaletteItem] {
+    private static func memoryItems(_ memories: [MemoryV2.MemoryRecord]) -> [PaletteItem] {
         memories.sorted { ($0.updatedAt ?? $0.createdAt) > ($1.updatedAt ?? $1.createdAt) }
             .prefix(perSource)
             .map { record in
                 PaletteItem(
                     id: "memory.\(record.id)",
                     title: firstLine(record.text),
-                    subtitle: "Memory · \(record.layer)",
+                    subtitle: "Memory · \(record.layer ?? "")",
                     systemImage: "brain",
                     kind: .memory(record.id)
                 )
@@ -248,10 +242,6 @@ enum CommandPaletteSavedThings {
 /// Cmd+K command palette. Presented as a sheet from ContentView.
 struct CommandPaletteView: View {
     @Environment(AppModel.self) private var appModel
-    // B2.2: keep the gate real — a stranger must not be able to Cmd+K straight
-    // to a developer surface (Turn Inspector, MCP, …). Off → those rows are not
-    // in the pool at all, matching the hidden sidebar disclosure.
-    @AppStorage("showDeveloperSurfaces") private var showDeveloperSurfaces = false
     @Binding var isPresented: Bool
 
     @State private var query: String = ""
@@ -390,7 +380,7 @@ struct CommandPaletteView: View {
         .task {
             savedThings = await CommandPaletteSavedThings.load(
                 dataRoot: PersistenceCore.defaultDataRoot(),
-                memories: appModel.memories
+                memories: appModel.engine.memory.memories
             )
         }
     }
@@ -469,8 +459,7 @@ struct CommandPaletteView: View {
 
     private func itemPool() -> [PaletteItem] {
         CommandPalettePresentation.itemPool(
-            sessions: appModel.chatSessions,
-            showDeveloperSurfaces: NativeAgentShellPreference.developerSurfacesShown(showDeveloperSurfaces),
+            sessions: appModel.engine.transcripts.sessions,
             saved: savedThings
         )
     }
@@ -500,7 +489,7 @@ struct CommandPaletteView: View {
                 NativeAgentAppCoordinator.shared.request(.sidebar(s.normalized))
             }
         case .chatSession(let sid):
-            if let session = appModel.chatSessions.first(where: { $0.id == sid }) {
+            if let session = appModel.engine.transcripts.sessions.first(where: { $0.id == sid }) {
                 Task { await appModel.selectChatSession(session) }
             }
             NativeAgentAppCoordinator.shared.request(.sidebar(.chat))

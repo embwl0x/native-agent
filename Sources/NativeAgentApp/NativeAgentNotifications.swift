@@ -1,38 +1,10 @@
+import AppToolRuntime
 import Foundation
 import MacControl
 import PersistenceCore
 import UserNotifications
-
-struct NativeAgentNotificationPostResult: Sendable {
-    let identifier: String
-    let status: String
-    let delivery: String
-    let posted: Bool
-    let visibleAlertsEnabled: Bool
-    let authorizationStatus: String
-    let alertSetting: String
-    let soundSetting: String
-    let badgeSetting: String
-    let error: String?
-
-    func deliveryFields() -> [String: JSONValue] {
-        var obj: [String: JSONValue] = [
-            "status": .string(status),
-            "delivery": .string(delivery),
-            "posted": .bool(posted),
-            "visibleAlertsEnabled": .bool(visibleAlertsEnabled),
-            "authorizationStatus": .string(authorizationStatus),
-            "alertSetting": .string(alertSetting),
-            "soundSetting": .string(soundSetting),
-            "badgeSetting": .string(badgeSetting),
-            "notificationId": .string(identifier),
-        ]
-        if let error {
-            obj["error"] = .string(error)
-        }
-        return obj
-    }
-}
+import ChatOrchestration
+import DeviceSync
 
 /// The identity a banner carries and what a click on it does. A click OPENS
 /// the item — it never approves, runs, or closes anything.
@@ -59,7 +31,7 @@ struct NativeAgentMacControlNotificationAdapter: NotificationCenterAdapter {
         message: String,
         soundName: String?
     ) async throws -> NotificationPostReceipt {
-        let result = await NativeAgentNotifications.postAndReport(
+        let result = await NativeAgentNotifications.postMessage(
             title: title, body: message, soundName: soundName)
         guard result.posted else {
             throw MacControlError.notificationFailed(result.error ?? result.delivery)
@@ -72,6 +44,20 @@ struct NativeAgentMacControlNotificationAdapter: NotificationCenterAdapter {
 }
 
 enum NativeAgentNotifications {
+    /// Tool-authored messages can be answered. Bind the route at posting time,
+    /// never to whichever conversation happens to be visible when Reply lands.
+    /// Messages outside a turn own a new, retained notification conversation.
+    static func postMessage(title: String, body: String, soundName: String? = nil) async -> NativeAgentNotificationPostResult {
+        let route = ChatToolSessionContext.verifiedSessionId.map {
+            [NativeAgentNotificationActions.sessionKey: $0]
+        } ?? [NativeAgentNotificationActions.newConversationKey: "true"]
+        return await postAndReport(
+            title: title, body: body,
+            userInfo: route,
+            soundName: soundName
+        )
+    }
+
     static func post(title: String, body: String) {
         Task {
             _ = await postAndReport(title: title, body: body)
@@ -117,6 +103,7 @@ enum NativeAgentNotifications {
         let content = UNMutableNotificationContent()
         content.title = notificationTitle
         content.body = body
+        content.categoryIdentifier = NativeAgentNotificationActions.category(for: userInfo)
         content.sound = soundName.flatMap {
             $0.isEmpty ? nil : UNNotificationSound(named: UNNotificationSoundName(rawValue: $0))
         } ?? .default

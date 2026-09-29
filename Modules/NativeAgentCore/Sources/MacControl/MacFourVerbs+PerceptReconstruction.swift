@@ -79,7 +79,9 @@ extension MacFourVerbs {
                     frame: frame(affordance["frame"]),
                     path: path(affordance["path"]),
                     labelJSON: labelJSON,
-                    valueJSON: valueJSON
+                    valueJSON: valueJSON,
+                    // Clear text only: a withheld placeholder names nothing.
+                    placeholder: string(affordance["placeholder"])
                 )
             },
             unlabeledByRole: object(output["unlabeled"] ?? .null).reduce(into: [:]) { out, entry in

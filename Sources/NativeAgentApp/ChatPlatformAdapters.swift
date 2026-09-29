@@ -283,27 +283,6 @@ func telegramReasoningEffortMismatch(
     return "Saved think level '\(selected)' is unsupported for \(model). Save to use \(normalized)."
 }
 
-/// The Telegram config used to carry its own model tuple.  The routing store is
-/// now the single runtime authority, so a stale legacy tuple can never win a
-/// status read simply because it happened to be written more recently.
-struct TelegramBrainResolution: Equatable {
-    let model: String?
-    let reasoningEffort: String?
-    let ignoresLegacyTuple: Bool
-}
-
-func resolveTelegramBrain(
-    routing: SurfacePreference?,
-    legacyModel: String?,
-    legacyReasoningEffort: String?
-) -> TelegramBrainResolution {
-    TelegramBrainResolution(
-        model: routing?.model,
-        reasoningEffort: routing?.reasoningEffort,
-        ignoresLegacyTuple: legacyModel != nil || legacyReasoningEffort != nil
-    )
-}
-
 func parseTelegramNumericIDs(_ value: String) -> TelegramNumericIDParseResult {
     let tokens = value
         .split { $0 == "," || $0 == " " || $0 == "\n" || $0 == "\t" }

@@ -325,7 +325,11 @@ run_preflight() {
   local command_name
   for command_name in "${required_commands[@]}"; do
     if ! command -v "$command_name" >/dev/null 2>&1; then
-      local_fail "Required command is unavailable: $command_name"
+      if [[ "$command_name" == "xcodegen" ]]; then
+        local_fail "xcodegen is required; install it with: brew install xcodegen"
+      else
+        local_fail "Required command is unavailable: $command_name"
+      fi
     fi
   done
   [[ "$LOCAL_FAILURES" == "0" ]] || return
@@ -350,8 +354,9 @@ run_preflight() {
 
   local settings
   settings="$(xcodebuild -project "$PROJECT" -scheme "$SCHEME" \
+    -onlyUsePackageVersionsFromResolvedFile -skipPackageUpdates \
     -configuration Release -destination 'generic/platform=iOS' \
-    -showBuildSettings NATIVEAGENT_MOBILE_SOURCE_KEY=mobile_app 2>/dev/null)" || {
+    -showBuildSettings NATIVEAGENT_MOBILE_SOURCE_KEY=mobile_app)" || {
       local_fail "Could not resolve Release build settings."
       return
     }
@@ -546,6 +551,7 @@ create_archive() {
   rm -rf "$ARCHIVE_PATH"
   printf '[ARCHIVE] %s\n' "$ARCHIVE_PATH"
   xcodebuild archive \
+    -onlyUsePackageVersionsFromResolvedFile -skipPackageUpdates \
     -project "$PROJECT" \
     -scheme "$SCHEME" \
     -configuration Release \

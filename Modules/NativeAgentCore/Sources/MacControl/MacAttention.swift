@@ -67,10 +67,67 @@ public enum NativeAgentMotorEpoch {
         return uptime - last
     }
 
+    /// Walk 3 (09-25): the person check compared the system idle clock with
+    /// `lastAgentMotorUptime`, which accessibility actions (raise, press,
+    /// focus) also stamp — but those never reset the idle clock. So her own
+    /// real click or key, followed within 3 s by a raise or restore, read as
+    /// "the person, 1s ago". Only events posted to the HID tap are compared:
+    /// measured 09-25, a `postToPid` event leaves the idle clock untouched, so
+    /// a stamp for it could only hide the person's own keystroke.
+    private nonisolated(unsafe) static var lastPostedHIDUptime = -Double.infinity
+
+    /// Call just before posting an event to the HID tap (`.cghidEventTap`).
+    public static func notePostedHIDEvent() {
+        let uptime = ProcessInfo.processInfo.systemUptime
+        lock.lock()
+        lastPostedHIDUptime = uptime
+        lastAgentMotorUptime = max(lastAgentMotorUptime, uptime)
+        lock.unlock()
+    }
+
+    /// Age of her last HID-tap post, `.infinity` when there has been none.
+    static func secondsSinceLastPostedHIDEvent() -> TimeInterval {
+        let uptime = ProcessInfo.processInfo.systemUptime
+        lock.lock()
+        let hid = lastPostedHIDUptime
+        lock.unlock()
+        return hid.isFinite ? uptime - hid : .infinity
+    }
+
     static func resetForTesting() {
         lock.lock()
         lastAgentMotorUptime = -Double.infinity
+        lastPostedHIDUptime = -Double.infinity
         lock.unlock()
+    }
+}
+
+/// Her-screen 09-25 — is the PERSON at the keyboard or mouse right now? An act
+/// that needs the front takes it on its own only when they are not.
+public enum MacPersonInput {
+    /// Typing and pointing leave gaps well under this; a chat message sent to
+    /// her is older than this by the time her call lands.
+    public static let activeWindow: TimeInterval = 3
+
+    /// Our own posted event is noted just before it is posted, so the system's
+    /// newest input is ours only when the two ages agree this closely. A human
+    /// keystroke seconds after our click is still the human's.
+    static let ownEventTolerance: TimeInterval = 0.1
+
+    /// Seconds since the person's last input when that is under `activeWindow`;
+    /// nil when they are idle, or the newest input was NativeAgent's own.
+    public static func activeSecondsAgo() -> Double? {
+        #if canImport(CoreGraphics) && os(macOS)
+        let idle = CGEventSource.secondsSinceLastEventType(
+            .combinedSessionState, eventType: CGEventType(rawValue: ~0) ?? .null
+        )
+        guard idle.isFinite, idle >= 0, idle < activeWindow,
+              abs(idle - NativeAgentMotorEpoch.secondsSinceLastPostedHIDEvent()) > ownEventTolerance
+        else { return nil }
+        return idle
+        #else
+        return nil
+        #endif
     }
 }
 
@@ -280,11 +337,6 @@ public struct SystemMacAttentionEventSource: MacAttentionEventSource {
 #endif
 
 public func defaultMacAttentionEventSource() -> any MacAttentionEventSource {
-    // Never install global monitors in a test runner. Focused tests inject a
-    // manual source and therefore cannot observe or interfere with the host.
-    if NSClassFromString("XCTestCase") != nil {
-        return UnavailableMacAttentionEventSource()
-    }
     #if canImport(AppKit) && canImport(CoreGraphics) && os(macOS)
     return SystemMacAttentionEventSource()
     #else

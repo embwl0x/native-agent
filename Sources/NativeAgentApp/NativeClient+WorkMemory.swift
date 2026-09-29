@@ -12,18 +12,6 @@ import Skills
 import Connectors
 
 extension NativeClient {
-    func getWorkshopExecutions() async throws -> [WorkshopExecutionRecord] {
-        // WAVE 32 W07: same SwiftNative read as getQueuedMissions(), decoded
-        // into the camelCase-tolerant Models.swift WorkshopExecutionRecord via the shared
-        // lossy decoder so the native path is decode-equivalent to the HTTP
-        // getList (a malformed element drops, not the whole batch).
-        // See CUTOVER_PLAN.md §6.82.
-        let runner = makeWorkshopExecutionRunner()
-        let merged = await runner.listWorkshopExecutionsMerged()
-        let data = try JSONValue.array(merged).serializedData(pretty: false)
-        return try Self.decodeLossyArray(data, context: "getWorkshopExecutions(swift Workshop; surface=executions)")
-    }
-
     func getRuns() async throws -> [RunRecord] {
         // Lenient contract: any read/decode problem collapses to []. Callers
         // that must distinguish honest-absence from failure (the R25 snapshot
@@ -61,52 +49,6 @@ extension NativeClient {
         return Array(rows.prefix(200))
     }
 
-    func getMemories(ids: [String]? = nil) async throws -> [MemoryRecord] {
-        // Canonical SQLite supplies bounded browsing and exact search hits.
-        // Round-trip through JSON because the shared MemoryRecord memberwise
-        // initializer is internal.
-        let dataRoot = dataRootOverride ?? PersistenceCore.defaultDataRoot()
-        let storage = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
-        let stored: [StoredMemory]
-        if let ids {
-            var matches: [StoredMemory] = []
-            for id in ids {
-                if let memory = try await storage.memory(id: id), memory.status == "active",
-                   !MemoryLifecycle.recallExcluded.contains(memory.lifecycle) {
-                    matches.append(memory)
-                }
-            }
-            stored = matches
-        } else {
-            stored = try await storage.listMemories(persona: nil, status: "active", limit: 200)
-        }
-        let rows: [[String: Any]] = stored.map { m in
-            var dict: [String: Any] = [
-                "id": m.id,
-                "layer": "semantic",
-                "text": m.content,
-                "importance": 0.0,
-                "confidence": m.confidence,
-                "createdAt": m.createdAt,
-                "updatedAt": m.updatedAt,
-            ]
-            if let s = m.source { dict["sourceRunId"] = s }
-            dict["status"] = m.status
-            // updateMemory() writes metadata.pinned; surface it on the row so
-            // the UI's pin badge reflects the real SQLite truth (was always
-            // false because the field was dropped on the way out).
-            var isPinned = false
-            if case .object(let obj)? = m.metadata,
-               case .bool(let b)? = obj["pinned"] {
-                isPinned = b
-            }
-            dict["pinned"] = isPinned
-            return dict
-        }
-        guard let data = try? JSONSerialization.data(withJSONObject: rows) else { return [] }
-        return try Self.decodeLossyArray(data, context: "getMemories(swift sqlite)")
-    }
-
     func getPersonality() async throws -> PersonalityProfile {
         return try await swiftPersonality()
     }
@@ -119,30 +61,6 @@ extension NativeClient {
         // single malformed registry row drops that row instead of blanking
         // the whole list (gpt-5.5 review finding #1, 2026-06-01).
         return try Self.decodeLossyArray(data, context: "getSkills(swiftNative)")
-    }
-
-    func getTools() async throws -> [ToolRecord] {
-        return try await swiftListTools()
-    }
-
-    func getTrustPolicy() async throws -> TrustPolicy {
-        // Wave-3 swift gate re-enabled 2026-05-31. SwiftNative
-        // TrustCenter._normalize_trust_policy now preserves the retired policy semantics:
-        // autonomyDefault validity, filePolicy.outsideWorkspaceDefault
-        // backfill, Full-Mac expiry/developerMode/confirmed-at stamps,
-        // per-surface providerPolicy fallback_chain backfill with the
-        // anthropic_oauth_direct insertion rule, and
-        // completion_guard_max_repairs floor. Backed by byte-equivalence
-        // tests in TrustCenterTests.
-        return try await swiftTrustPolicy()
-    }
-
-    func getBackups() async throws -> [BackupRecord] {
-        // DAEMON-DEAD PORT (2026-06-03): the old daemon wrote
-        // `<dataRoot>/backups/registry.json`; the first Swift read-only port
-        // looked only at `index.json`, which hid all existing backups. Read both,
-        // de-dupe by id, and sort newest-first for the Mac UI.
-        return try Self.readBackupRecords(root: PersistenceCore.defaultDataRoot())
     }
 
     func getConnectors() async throws -> [ConnectorRecord] {
@@ -179,62 +97,6 @@ extension NativeClient {
         return try Self.readLocalJSON(url, fallbackJSON: "{}")
     }
 
-    func getWatchdog() async throws -> WatchdogStatus {
-        let loopStatuses = await backgroundLoopsManager.status()
-        let running = await backgroundLoopsManager.isRunning()
-        let uptime = await backgroundLoopsManager.uptimeSeconds()
-        let failedLoops = loopStatuses.filter { $0.lastError != nil }
-        let lifecycleStatus = running ? (failedLoops.isEmpty ? "ok" : "degraded") : "stopped"
-        let newestRun = loopStatuses.compactMap(\.lastRun).max()
-        let lastActivity: JSONValue? = newestRun.map { lastRun in
-            .object([
-                "id": .string("background-loops-watchdog-\(Int64(lastRun.timeIntervalSince1970))"),
-                "kind": .string("background_loops"),
-                "title": .string("Swift background loop tick"),
-                "detail": .string("Latest registered loop tick."),
-                "status": .string(lifecycleStatus),
-                "executionId": .null,
-                "createdAt": .string(SwiftNativeManifestSigner.isoTimestamp(lastRun)),
-            ])
-        }
-        let loops: JSONValue = .array(loopStatuses.sorted { $0.loopId < $1.loopId }.map { loop in
-            .object([
-                "name": .string(loop.loopId),
-                "lastRunAt": loop.lastRun.map { .string(SwiftNativeManifestSigner.isoTimestamp($0)) } ?? .null,
-                "nextRunAt": loop.nextRun.map { .string(SwiftNativeManifestSigner.isoTimestamp($0)) } ?? .null,
-                "runCount": .int(Int64(loop.runCount)),
-                "lastError": loop.lastError.map { .string($0) } ?? .null,
-                "running": .bool(loop.running),
-                "executing": .bool(loop.executing),
-            ])
-        })
-        let status = BackgroundLoops.WatchdogStatus(
-            daemon: "swift",
-            uptimeSeconds: uptime,
-            daemonLifecycleStatus: lifecycleStatus,
-            daemonLifecycleDetail: running
-                ? (failedLoops.isEmpty
-                    ? "Swift background loops are running in NativeAgent.app."
-                    : "Swift background loops are running with \(failedLoops.count) loop failure(s): \(failedLoops.map(\.loopId).sorted().joined(separator: ", ")).")
-                : "Swift background loops are not running.",
-            launchAgentStatus: "not_applicable",
-            launchAgentDetail: "NativeAgent.app owns background loops; legacy daemon launch agents are retired.",
-            runningImprovements: loopStatuses.filter { $0.executing && $0.loopId == "self_improvement_sweep" }.count,
-            runningExecutions: loopStatuses.filter { $0.executing && ["mission_executor", "workshop_pump"].contains($0.loopId) }.count,
-            lastActivity: lastActivity,
-            repairAvailable: !failedLoops.isEmpty,
-            extras: .object([
-                "backend": .string("swift"),
-                "source": .string("app_background_loops_manager"),
-                "loopCount": .int(Int64(loopStatuses.count)),
-                "running": .bool(running),
-                "loops": loops,
-            ])
-        )
-        let data = try JSONEncoder().encode(status)
-        return try JSONDecoder().decode(WatchdogStatus.self, from: data)
-    }
-
     func getTrainingArtifacts() async throws -> [TrainingArtifact] {
         // Swift-native cutover port P2: was GET /v1/training. Read
         // `<dataRoot>/training/artifacts/index.json`; missing → `[]`.
@@ -243,19 +105,6 @@ extension NativeClient {
             .appendingPathComponent("artifacts", isDirectory: true)
             .appendingPathComponent("index.json")
         return try Self.readLocalJSON(url, fallbackJSON: "[]")
-    }
-
-    func getJobs() async throws -> [SchedulerJob] {
-        switch await schedulerJobsFeed() {
-        case .current(let jobs):
-            return jobs
-        case .sourceAbsent:
-            throw SchedulerJobsFeedError.sourceAbsent
-        case .partial(_, let rejectedRows):
-            throw SchedulerJobsFeedError.partial(rejectedRows: rejectedRows)
-        case .unavailable(let detail):
-            throw SchedulerJobsFeedError.unavailable(detail)
-        }
     }
 
     func getImprovements() async throws -> [ImprovementRun] {
@@ -268,21 +117,10 @@ extension NativeClient {
         // returns nil if a writer raced the read (seq moved) or no marker is
         // provable yet; with no verified-fresh native data, the Swift-only UI
         // returns an empty list rather than stale state. Mac-only (iOS has no
-        // local runs.json). See CUTOVER_PLAN.md §6.159; closes §6.158 #4.
-        // NativeClient.swift wraps
-        // the Mac ImprovementRun shape, which round-trips losslessly through the
-        // module's ImprovementRun via JSON.
+        // local runs.json).
         let actor = NativeClient._trainingPromotionActor()
-        if let verified = try? await actor.listImprovementsVerified(),
-           // Re-encode the module's ImprovementRun (custom Codable that
-           // round-trips all known keys + extras) to JSON, then decode into
-           // the Mac app's ImprovementRun (Models.swift) — the same shape
-            // the old route returned, so the UI is shape-equivalent. Any
-           // encode/decode mismatch (e.g. a run missing a Mac-required key)
-            // degrades to nil here and falls through to the Swift-only empty
-            // result below rather than throwing.
-           let data = try? JSONEncoder().encode(verified),
-           let runs = try? JSONDecoder.nativeAgent.decode([ImprovementRun].self, from: data) {
+        if let runs = try? await actor.listImprovementsVerified(),
+           runs.allSatisfy({ $0.objective != nil && $0.status != nil && $0.phase != nil && $0.createdAt != nil }) {
             return runs
         }
         // No verified-fresh native data in the Swift-only runtime; return empty.
@@ -299,7 +137,8 @@ extension NativeClient {
         let fallback = #"""
         {"enabled":false,"status":"unavailable","runningCount":0,"succeededCount":0,"failedCount":0,"interruptedCount":0,"totalCount":0,"stagedCount":0,"recurringImproveJobs":[],"personalityGrowthEntries":0,"smokeJobCount":0,"oldInterruptedCount":0,"repairableReceiptFailureCount":0,"dataRoot":"","createdAt":""}
         """#
-        return try Self.readLocalJSON(url, fallbackJSON: fallback)
+        let row: JSONValue = try Self.readLocalJSON(url, fallbackJSON: fallback)
+        return try ImprovementSummary(persistedRow: row)
     }
 
 
@@ -322,26 +161,9 @@ extension NativeClient {
 
         config.autoDoctor = Self.readAutoDoctorConfig(dataRoot: dataRoot)
 
-        if let cfg = TelegramBot.TelegramConfig.loadFromDisk(dataRoot: dataRoot) {
-            let telegramBrain = try? await SwiftNativeProviderRouting(dataRoot: dataRoot)
-                .computeModelPreferences()["telegram"]
-            let resolvedTelegramBrain = resolveTelegramBrain(
-                routing: telegramBrain,
-                legacyModel: cfg.model,
-                legacyReasoningEffort: cfg.reasoningEffort
-            )
-            var telegram = TelegramConfig()
-            telegram.enabled = cfg.enabled
-            telegram.tokenConfigured = !cfg.botToken.isEmpty
-            telegram.allowedChatIds = cfg.allowedChatIds.sorted().map { String($0) }
-            telegram.allowedUserIds = cfg.allowedUserIds.sorted().map { String($0) }
-            telegram.requireMention = cfg.requireMention
-            telegram.model = resolvedTelegramBrain.model
-            telegram.reasoningEffort = resolvedTelegramBrain.reasoningEffort
-            config.telegram = telegram
-        }
+        config.telegram = await TelegramFacade(dataRoot: dataRoot).configuration()
 
-        config.codexAuth = try? await getCodexAuthStatus()
+        config.codexAuth = try? await ProvidersFacade(dataRoot: PersistenceCore.defaultDataRoot()).codexAuthStatus()
         config.modelRouting = Self.readModelRoutingConfig(dataRoot: dataRoot)
         return config
     }

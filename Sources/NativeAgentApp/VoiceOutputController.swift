@@ -1,3 +1,4 @@
+import AppToolRuntime
 // PATCH-2026-05-06: multimodal-ui Sprint 3.2 — voice output via AVSpeechSynthesizer + optional OpenAI TTS
 import Foundation
 import AVFoundation
@@ -6,6 +7,7 @@ import NativeAgentCore
 import MultimodalTTS
 import PersistenceCore
 import ProviderRouting
+import TrustCenter
 
 enum VoiceOutputMode: String, CaseIterable, Identifiable {
     case local = "local"
@@ -13,67 +15,54 @@ enum VoiceOutputMode: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
-/// The selected playback route plus the provenance for a local fallback.
-/// Local speech is a legitimate configured choice, but it must not hide an
-/// unread Trust policy behind the same success-shaped mode label.
+/// The selected playback route, or why it could not be read. An unreadable
+/// Trust policy reads nothing aloud — it no longer falls back to the Mac voice
+/// behind a notice (S12, 2026-09-26).
 enum VoiceOutputModeResolution: Equatable {
     case openAI
     case localConfigured
-    case localPolicyUnavailable
-
-    var mode: VoiceOutputMode {
-        switch self {
-        case .openAI: .openai
-        case .localConfigured, .localPolicyUnavailable: .local
-        }
-    }
-
-    var notice: String? {
-        guard case .localPolicyUnavailable = self else { return nil }
-        return "Voice policy is unavailable. Reading aloud with the Mac voice instead."
-    }
+    case policyUnreadable(reason: String)
 }
 
 /// Read-aloud has one selection owner: the loaded Trust Center policy.  The
 /// old `voiceUseOpenAI` AppStorage mirror could outlive a denied policy write,
 /// leaving the settings screen and either chat read site on different modes.
 enum VoiceOutputModeSelection {
-    static func resolve(for trustPolicy: TrustPolicy?) -> VoiceOutputModeResolution {
-        guard let trustPolicy else { return .localPolicyUnavailable }
-        return trustPolicy.multimodalPolicy?.tts_openai == true ? .openAI : .localConfigured
+    static func resolve(for trustPolicy: TrustPolicy) -> VoiceOutputModeResolution {
+        trustPolicy.multimodalPolicy?.tts_openai == true ? .openAI : .localConfigured
     }
 
-    static func mode(for trustPolicy: TrustPolicy?) -> VoiceOutputMode {
-        resolve(for: trustPolicy).mode
+    /// The policy as loaded. When none is loaded yet (first load still
+    /// pending, or an earlier load failed) this makes one checked read now
+    /// rather than guessing a voice: it answers with the policy, or with why
+    /// the policy could not be read.
+    @MainActor
+    static func resolve(trust: TrustFacade) async -> VoiceOutputModeResolution {
+        if let policy = trust.policy { return resolve(for: policy) }
+        do {
+            return resolve(for: try await trust.load())
+        } catch {
+            return .policyUnreadable(reason: error.localizedDescription)
+        }
     }
 }
 
-/// A selected OpenAI voice is allowed to fall back only for preflight failures
-/// that make a remote request impossible. Transport and decode failures remain
-/// loud: silently changing voices after a real request is misleading.
-enum OpenAIVoiceFailureDisposition: Equatable {
-    case fallbackToLocal(message: String)
-    case surfaceFailure(message: String)
-
-    static func resolve(_ error: Error) -> Self {
+/// A selected OpenAI voice that cannot speak says so and reads nothing — it
+/// never switches to the Mac voice (S12, 2026-09-26). Preflight failures get a
+/// plain sentence; every other failure surfaces its own description.
+enum OpenAIVoiceFailure {
+    static func message(for error: Error) -> String {
         switch error {
         case MultimodalTTSError.trustDenied:
-            return .fallbackToLocal(
-                message: "OpenAI voice is not allowed. Reading aloud with the Mac voice instead."
-            )
+            return "OpenAI voice is not allowed in Trust Center. Nothing was read aloud."
         case MultimodalTTSError.notConfigured:
-            return .fallbackToLocal(
-                message: "OpenAI voice needs an API key. Reading aloud with the Mac voice instead."
-            )
+            return "OpenAI voice needs an API key in Settings → Providers → OpenAI. Nothing was read aloud."
         case MultimodalTTSError.routeHasNoSpeech:
-            // Chat's provider has no speech API at all. Say so plainly and read
-            // with the Mac voice; never quietly call a different provider.
-            return .fallbackToLocal(
-                message: "The provider Chat runs on has no cloud voice. "
-                    + "Reading aloud with the Mac voice instead."
-            )
+            // Chat's provider has no speech API at all. Say so plainly; never
+            // quietly call a different provider or another voice.
+            return "The provider Chat runs on has no cloud voice. Nothing was read aloud."
         default:
-            return .surfaceFailure(message: error.localizedDescription)
+            return error.localizedDescription
         }
     }
 }
@@ -158,17 +147,33 @@ final class VoiceOutputController: NSObject {
         }
     }
 
-    /// Preserve the policy-read result through the playback boundary. The
-    /// actual fallback is still local AVSpeechSynthesizer, while the mounted
-    /// chat surface receives a truthful notice when policy evidence was absent.
+    /// Speak on the route `trust`'s policy selects. A stop() or a newer
+    /// speak() while the policy is still being read wins: this request then
+    /// plays nothing (dictation stopping playback must not be undone by a
+    /// read that finishes after it).
+    func speak(text: String, trust: TrustFacade, ownerID: String? = nil) async {
+        let generation = speechGeneration
+        let resolution = await VoiceOutputModeSelection.resolve(trust: trust)
+        guard generation == speechGeneration else { return }
+        await speak(text: text, resolution: resolution, ownerID: ownerID)
+    }
+
+    /// Speak on the route the Trust policy selects. An unreadable policy says
+    /// so on the owning surface and reads nothing.
     func speak(
         text: String,
         resolution: VoiceOutputModeResolution,
         ownerID: String? = nil
     ) async {
-        await speak(text: text, mode: resolution.mode, ownerID: ownerID)
-        if let notice = resolution.notice, isSpeaking {
-            errorMessage = notice
+        switch resolution {
+        case .openAI:
+            await speak(text: text, mode: .openai, ownerID: ownerID)
+        case .localConfigured:
+            await speak(text: text, mode: .local, ownerID: ownerID)
+        case .policyUnreadable(let reason):
+            stop()
+            guard !text.isEmpty, !VoicePreference.quiet() else { return }
+            errorMessage = "Voice policy could not be read (\(reason)). Nothing was read aloud."
             errorOwnerID = ownerID
         }
     }
@@ -277,17 +282,10 @@ final class VoiceOutputController: NSObject {
                 stop()
                 return
             }
-            switch OpenAIVoiceFailureDisposition.resolve(error) {
-            case .fallbackToLocal(let message):
-                errorMessage = message
-                errorOwnerID = speechOwnerID
-                speakLocal(text: text)
-            case .surfaceFailure(let message):
-                errorMessage = message
-                errorOwnerID = speechOwnerID
-                isSpeaking = false
-                speechOwnerID = nil
-            }
+            errorMessage = OpenAIVoiceFailure.message(for: error)
+            errorOwnerID = speechOwnerID
+            isSpeaking = false
+            speechOwnerID = nil
         }
     }
 
@@ -295,7 +293,7 @@ final class VoiceOutputController: NSObject {
     /// chose for the Chat group is the one asked to speak, and the model comes
     /// from that route's catalog entry. A route with no speech model refuses
     /// here — it never borrows another provider's voice or a model literal
-    /// (2026-09-13 rulings) — and the on-device voice reads instead.
+    /// (2026-09-13 rulings), and nothing is read aloud.
     nonisolated private static func liveOpenAISynthesis(text: String) async throws -> Data {
         let dataRoot = PersistenceCore.defaultDataRoot()
         let router = SwiftNativeProviderRouting(
@@ -308,11 +306,10 @@ final class VoiceOutputController: NSObject {
                 .appendingPathComponent("active.json")
         )
         let snapshot = try? await router.checkedRoutingSnapshot()
+        // S12a: Chat's chosen route only, never one inferred from its model.
         let chatProvider = snapshot.flatMap {
             ProviderRoutingSurfaceLookup.value($0.activeProviders, "chat")
-        } ?? snapshot
-            .flatMap { ProviderRoutingSurfaceLookup.value($0.preferences, "chat") }
-            .flatMap { router.inferProviderForModel($0.model) }
+        }
         guard let chatProvider,
               let model = FirstPartyModelCatalog.speechModel(forProviderID: chatProvider) else {
             throw MultimodalTTSError.routeHasNoSpeech(route: "Chat's provider")

@@ -7,8 +7,7 @@ import TrustCenter
 //
 // Native port of the `/v1/context/lookup` route's ONE divergence-free branch
 // (`type=lookup_feature_surface`, wave 35) PLUS the divergence-free PATHS of
-// GET /v1/context/latest and POST /v1/context/feedback (wave 36 W02). See
-// CUTOVER_PLAN.md §6.117 and §6.138.
+// GET /v1/context/latest and POST /v1/context/feedback (wave 36 W02).
 //
 // ── WAVE 36 W02 ADDENDUM (the real native port of latest + feedback) ─────────
 //
@@ -88,13 +87,13 @@ import TrustCenter
 //     3. NativeClient.getLatestContextReceipt + postContextFeedback routed
 //        through the seam (call the client; nil → existing HTTP path).
 //     4. `preview` stays HTTP until the routing engine itself is Swift-native
-//        (its own multi-wave prereq, CUTOVER_PLAN.md §6.76) — the latest/
+//        (its own multi-wave prereq) — the latest/
 //        feedback retirement does NOT depend on it.
 
 // MARK: - Subsystem #28 wave 35 W05 (2026-06-02) — Context.
 //
 // Native port of the `/v1/context/lookup` route's ONE divergence-free branch:
-// `type=lookup_feature_surface`. See CUTOVER_PLAN.md §6.117.
+// `type=lookup_feature_surface`.
 //
 // HONEST SCOPE (audited at source this wave; the SAME root blocker waves 31-W18,
 // 32-W14, 33-W13, 34-W15 all reached, re-verified — NOT relayed):
@@ -133,8 +132,7 @@ import TrustCenter
 // lookup today (only smoke scripts + the daemon-internal builtin tool
 // `builtin_tools.py:_exec_context_lookup`, which calls runtime.context_lookup
 // IN-PROCESS and does NOT traverse the HTTP route). The leash stays in the user's
-// hands — no script sets NATIVE_AGENT_SWIFT_SUBSYSTEMS. Retirement path for the
-// full route family: CUTOVER_PLAN.md §6.76 (single ordered prereq chain).
+// hands — no script sets NATIVE_AGENT_SWIFT_SUBSYSTEMS.
 
 // MARK: - Result type
 
@@ -221,7 +219,7 @@ public protocol ContextClient: Sendable {
     /// already-recorded startup context, where Python would GENERATE a receipt
     /// via the routing engine (`ensure_session_startup_context`). The daemon
     /// stays the single source of truth for that on-the-fly hydration.
-    func latestContextReceipt(sessionId: String) async -> JSONValue?
+    func latestContextReceipt(sessionId: String) async throws -> JSONValue?
 
     /// POST /v1/context/feedback. Appends the feedback event to
     /// `<dataRoot>/context/feedback/events.jsonl` and returns the
@@ -366,13 +364,13 @@ public actor SwiftNativeContextClient: ContextClient {
 
     // MARK: - GET /v1/context/latest
 
-    public func latestContextReceipt(sessionId: String) async -> JSONValue? {
+    public func latestContextReceipt(sessionId: String) async throws -> JSONValue? {
         // get_chat_messages(session_id, limit=80): returns [] if the session is
         // unknown, else tail_jsonl(path, 80, max_bytes=1MB). We approximate the
         // session-existence guard by checking sessions.json; an unknown session
         // yields [] and we fall through to the session-by-id branch (which also
         // returns nil/empty), exactly as Python does.
-        let sessionExists = await chatSessionExists(sessionId)
+        let sessionExists = try await chatSessionExists(sessionId)
         let messages: [JSONValue]
         if sessionExists {
             messages = (try? await store.tailJSONL(
@@ -395,7 +393,7 @@ public actor SwiftNativeContextClient: ContextClient {
         }
 
         // session = chat_session_by_id(session_id)
-        let session = await chatSessionByID(sessionId)
+        let session = try await chatSessionByID(sessionId)
 
         // startup_run_id = str((session or {}).get("startupContextRunId") or "")
         // Track PRESENCE separately from receipt-found: a present-but-stale
@@ -513,8 +511,8 @@ public actor SwiftNativeContextClient: ContextClient {
     /// sweep or deletion as a side effect.
     public func pruneLegacyReceipts(
         at current: Date = Date()
-    ) async -> LegacyContextReceiptFeed.RetentionReport {
-        let protected = await protectedLegacyReceiptRunIDs()
+    ) async throws -> LegacyContextReceiptFeed.RetentionReport {
+        let protected = try await protectedLegacyReceiptRunIDs()
         return await LegacyContextReceiptFeed.prune(
             dataRoot: dataRoot,
             protectedRunIDs: protected,
@@ -523,8 +521,8 @@ public actor SwiftNativeContextClient: ContextClient {
         )
     }
 
-    private func protectedLegacyReceiptRunIDs() async -> Set<String> {
-        let sessions = await store.readJSON(chatSessionsPath(), defaultValue: .array([]))
+    private func protectedLegacyReceiptRunIDs() async throws -> Set<String> {
+        let sessions = try await store.readJSON(chatSessionsPath(), ifMissing: .array([]))
         guard case .array(let rows) = sessions else { return [] }
         var protected: Set<String> = []
         for row in rows {
@@ -556,8 +554,8 @@ public actor SwiftNativeContextClient: ContextClient {
     /// normalization-and-write side effect — a READ must not mutate the index;
     /// the only field this route consumes (`startupContextRunId` /
     /// `startupContext`) is read straight from the stored object.
-    private func chatSessionByID(_ sessionID: String) async -> [String: JSONValue]? {
-        let value = await store.readJSON(chatSessionsPath(), defaultValue: .array([]))
+    private func chatSessionByID(_ sessionID: String) async throws -> [String: JSONValue]? {
+        let value = try await store.readJSON(chatSessionsPath(), ifMissing: .array([]))
         guard case .array(let sessions) = value else { return nil }
         for entry in sessions {
             guard case .object(let s) = entry else { continue }
@@ -568,8 +566,8 @@ public actor SwiftNativeContextClient: ContextClient {
         return nil
     }
 
-    private func chatSessionExists(_ sessionID: String) async -> Bool {
-        await chatSessionByID(sessionID) != nil
+    private func chatSessionExists(_ sessionID: String) async throws -> Bool {
+        try await chatSessionByID(sessionID) != nil
     }
 
     // MARK: - POST /v1/context/feedback

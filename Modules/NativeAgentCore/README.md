@@ -25,8 +25,8 @@ execution, persona, doctor checks, chat orchestration, memory, dreams/REM,
 self-improvement, trust, provider routing, background cognition, connectors,
 Workshop, workflows, and the cognition/organism runtime.
 
-`Sources/` groups implementations by module, `Tests/` groups their test targets,
-and `Package.swift` defines the actual products and dependency graph. In
+`Sources/` groups implementations by module, and `Package.swift` defines the
+actual products and dependency graph. In
 particular, `NativeAgentEvaluation` is evaluation support linked by ChatDrive
 and tests, not a second production cognition owner or a Mac app dependency.
 
@@ -59,27 +59,11 @@ fail closed with an explicit Swift error.
 
 ## Validation runbook
 
-From the repository root, assemble the complete change, build the integrated
-target, then choose the relevant final check. The
-[repository validation map](../../docs/README.md#validation-boundaries)
-describes the canonical gate, including Core XCTest/Swift Testing, Shared, Mac,
-script/bridge guards, and iOS. A Core-only test is not full-system proof.
+From the repository root, assemble the complete change and build the
+integrated target. There is no automated test suite.
 
 ```bash
-# Integrated Mac build
 swift build --jobs 4 --force-resolved-versions --skip-update
-
-# Core runtime changes
-swift test --package-path Modules/NativeAgentCore --no-parallel
-
-# Shared models or root Mac/relay tests
-swift test --package-path Modules/NativeAgentShared
-swift test --no-parallel
-
-# Full repo sweep when the surface is broad
-./script/test.sh
-# Require the iOS lane; an ordinary simulator skip is not proof.
-./script/test.sh --require-ios
 ```
 
 For app-runtime behavior changes, rebuild/install with `./script/install_app.sh`

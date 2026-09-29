@@ -1,4 +1,5 @@
 import Foundation
+import Cognition
 import PersistenceCore
 
 /// View-lifetime bridge from canonical file/store invalidations to one

@@ -421,6 +421,10 @@ struct ConnectorRecord: Identifiable, Codable, Hashable, Sendable {
     var healthStatus: String?
     var lastUsedAt: String?
     var updatedAt: String?
+    var authState: String?
+    var canToggle: Bool?
+    var canDisconnect: Bool?
+    var supportsSetup: Bool?
 }
 
 struct MemoryProposalRecord: Decodable, Identifiable, Hashable, Sendable {

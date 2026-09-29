@@ -12,7 +12,7 @@ extension SwiftNativeResearchClient {
     public func search(query: String, categories: String? = nil, timeRange: String? = nil) async throws -> ResearchSearchResponse {
         // Pull base from config; empty/missing → ResearchClientError.notConfigured
         // (matches Python's `raise ValueError("SearXNG base URL is not configured")`).
-        let raw = await persistence.readJSON(configPath, defaultValue: .object([:]))
+        let raw = try await persistence.readJSON(configPath, ifMissing: .object([:]))
         guard case .object(let obj) = raw,
               case .string(let rawBase) = obj["searxng_base_url"] ?? .null else {
             throw ResearchClientError.notConfigured

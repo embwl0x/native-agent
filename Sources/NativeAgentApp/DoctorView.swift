@@ -1,3 +1,4 @@
+import ProviderRouting
 import SwiftUI
 import AppKit
 import CoreGraphics
@@ -6,6 +7,7 @@ import ScreenVision
 import Speech
 import AVFoundation
 import UniformTypeIdentifiers
+import DoctorChecks
 import NativeAgentShared
 import MemoryV2
 import PersistenceCore
@@ -243,13 +245,13 @@ enum DoctorSafeRepairIssuesPresentation {
         var detail: String {
             switch self {
             case .needsDoctorReport:
-                return "Run health checks first to identify app-owned issues that can be repaired safely."
+                return "Repair checks everything and fixes what is broken."
             case .noSafeIssues:
-                return "The current health report has no safe repairs to run."
+                return "Nothing left for Repair to fix."
             case .ready(let plan):
-                return "\(plan.count) reported app-owned issue\(plan.count == 1 ? " can" : "s can") be repaired safely."
+                return "\(plan.count) issue\(plan.count == 1 ? "" : "s") to fix — press Repair."
             case .running:
-                return "Health checks are already running."
+                return "Repairing…"
             }
         }
 
@@ -276,22 +278,13 @@ enum DoctorSafeRepairIssuesPresentation {
         return plan.canRun ? .ready(plan) : .noSafeIssues
     }
 
-    static func plan(for checks: [DoctorCheck]) -> Plan {
-        Plan(checkIDs: checks.compactMap { check in
-            guard isAdverse(check.status), isSafeRepairInstruction(check.repair) else { return nil }
-            let id = check.id.trimmingCharacters(in: .whitespacesAndNewlines)
-            return id.isEmpty ? nil : id
-        })
+    static func plan(for checks: [CheckResult]) -> Plan {
+        Plan(checkIDs: DoctorSafeRepairPolicy.checkIDs(for: checks))
     }
 
-    /// The post-action `repair` field is a receipt, not a generic instruction.
-    /// These verbs are emitted only after app-owned state was changed.
-    static func appliedRepairCount(in checks: [DoctorCheck]) -> Int {
-        checks.filter { check in
-            let receipt = normalized(check.repair)
-            return ["completed:", "created ", "repaired:", "backed up", "seeded ", "reset ", "wiped "]
-                .contains(where: { receipt.hasPrefix($0) })
-        }.count
+    /// Count completion receipts separately from available repair handlers.
+    static func appliedRepairCount(in checks: [CheckResult]) -> Int {
+        DoctorSafeRepairPolicy.appliedRepairCount(in: checks)
     }
 
     static func completionMessage(report: DoctorReport) -> String {
@@ -307,15 +300,7 @@ enum DoctorSafeRepairIssuesPresentation {
     }
 
     private static func isAdverse(_ status: String) -> Bool {
-        ["warn", "warning", "fail", "failed", "error"].contains(normalized(status))
-    }
-
-    private static func isSafeRepairInstruction(_ value: String?) -> Bool {
-        normalized(value).hasPrefix("run repair safe issues")
-    }
-
-    private static func normalized(_ value: String?) -> String {
-        (value ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        DoctorSafeRepairPolicy.isAdverse(status)
     }
 }
 
@@ -324,8 +309,6 @@ struct DoctorView: View {
     @State private var loopVerdicts: [LoopHealthVerdict] = []
     @State private var runNotice: DoctorRunButtonPresentation.Notice?
     @State private var snapshotNotice: DoctorSupportSnapshotPresentation.Notice?
-    @State private var oauthLoginNotice: DoctorOAuthLoginButtonPresentation.Notice?
-    @State private var isOpeningOAuthLogin = false
 
     private var unhealthyLoops: [LoopHealthVerdict] {
         loopVerdicts.filter { $0.level != .ok }
@@ -341,8 +324,8 @@ struct DoctorView: View {
         return .green
     }
 
-    private var groupedChecks: [(String, [DoctorCheck])] {
-        guard let checks = appModel.doctorReport?.checks else { return [] }
+    private var groupedChecks: [(String, [CheckResult])] {
+        guard let checks = appModel.engine.doctor.report?.checks else { return [] }
         let order = [
             "Provider", "Runtime", "Cognition", "Connectors", "Data", "Tools",
             "Autonomy", "Release",
@@ -359,56 +342,51 @@ struct DoctorView: View {
     // did not write this app cannot read any of that. The plain summary leads;
     // every technical string still ships, one disclosure down.
     private var checkSummary: DoctorPlainCopy.Summary {
-        DoctorPlainCopy.summarize(appModel.doctorReport?.checks ?? [])
+        DoctorPlainCopy.summarize(appModel.engine.doctor.report?.checks ?? [])
     }
 
     private var reportFooter: DoctorReportFooterPresentation.State? {
         DoctorReportFooterPresentation.resolve(
-            report: appModel.doctorReport,
-            completedAt: appModel.doctorReportCompletedAt,
-            isRunning: appModel.doctorRunning,
+            report: appModel.engine.doctor.report,
+            completedAt: appModel.engine.doctor.reportCompletedAt,
+            isRunning: appModel.engine.doctor.isRunning,
             now: Date()
         )
     }
 
     private var safeRepairState: DoctorSafeRepairIssuesPresentation.State {
         DoctorSafeRepairIssuesPresentation.state(
-            report: appModel.doctorReport,
-            isRunning: appModel.doctorRunning
+            report: appModel.engine.doctor.report,
+            isRunning: appModel.engine.doctor.isRunning
         )
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Button(appModel.doctorRunning ? "Running health checks…" : "Run health checks", systemImage: "stethoscope") {
-                    beginDoctorRun(repair: false)
+                // User 09-29: one button. It runs every check, leaves what is
+                // right alone, fixes what is broken, and opens the one screen a
+                // person must act on. The support report is a right-click away.
+                Button(appModel.engine.doctor.isRunning ? "Repairing…" : "Repair", systemImage: "cross.case.fill") {
+                    beginRepair()
                 }
-                .disabled(appModel.doctorRunning)
+                .disabled(appModel.engine.doctor.isRunning)
                 .accessibilityIdentifier("doctor.run")
-                Button("Repair safe issues", systemImage: "cross.case.fill") {
-                    beginDoctorRun(repair: true)
+                .contextMenu {
+                    Button(appModel.supportDiagnosticsLoading ? "Preparing the report…" : "Make a support report") {
+                        beginSupportSnapshot()
+                    }
+                    .disabled(appModel.supportDiagnosticsLoading || appModel.engine.doctor.isRunning)
                 }
-                .disabled(!safeRepairState.canRun)
-                .help(safeRepairState.detail)
-                Button("Open providers", systemImage: "server.rack") {
-                    NativeAgentAppCoordinator.shared.request(.sidebar(.providers))
-                }
-                .accessibilityIdentifier("doctor.openProviders")
-                Button(appModel.supportDiagnosticsLoading ? "Preparing the report…" : "Make a support report", systemImage: "shippingbox") {
-                    beginSupportSnapshot()
-                }
-                .disabled(appModel.supportDiagnosticsLoading || appModel.doctorRunning)
-                .accessibilityIdentifier("doctor.supportSnapshot")
                 // PATCH-2026-05-30: in-flight indicator so the user sees the
                 // Doctor is working during the ~7-15s probe. Previously the
                 // UI looked frozen and people thought it wasn't running.
                 // TimelineView ticks once per second to show elapsed duration.
-                if appModel.doctorRunning {
+                if appModel.engine.doctor.isRunning {
                     HStack(spacing: 6) {
                         ProgressView()
                             .controlSize(.small)
-                        if let started = appModel.doctorRunStartedAt {
+                        if let started = appModel.engine.doctor.runStartedAt {
                             TimelineView(.periodic(from: started, by: 1.0)) { ctx in
                                 let elapsed = max(0, Int(ctx.date.timeIntervalSince(started)))
                                 Text("Running health checks · \(elapsed)s")
@@ -425,29 +403,9 @@ struct DoctorView: View {
                 }
             }
 
-            DisclosureGroup("Technical sign-in options") {
-                Text("If sign-in from Providers cannot finish, use the device sign-in fallback.")
-                    .font(.caption)
-                Button(isOpeningOAuthLogin ? DoctorOAuthLoginButtonPresentation.openingTitle : DoctorOAuthLoginButtonPresentation.buttonTitle, systemImage: "safari") {
-                    Task { await openOAuthLogin() }
-                }
-                .disabled(isOpeningOAuthLogin)
-                .accessibilityIdentifier("doctor.openOAuthLogin")
-            }
-
             Label(safeRepairState.detail, systemImage: safeRepairState.systemImage)
                 .font(.caption)
                 .foregroundStyle(AdvancedStatusWords.color(safeRepairState.status))
-
-            if let oauthLoginNotice {
-                Label(
-                    oauthLoginNotice.detail,
-                    systemImage: oauthLoginNotice.tone == .failure ? "exclamationmark.triangle.fill" : "key.fill"
-                )
-                .font(.callout)
-                .foregroundStyle(oauthLoginColor(for: oauthLoginNotice.tone))
-                .accessibilityIdentifier("doctor.oauth-login.notice")
-            }
 
             if let runNotice {
                 Label(runNotice.detail, systemImage: runNotice.status == "failed" ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
@@ -488,13 +446,8 @@ struct DoctorView: View {
                         .font(NativeAgentFont.label)
                         // Cancel + clear through the same Swift device-login
                         // subprocess owner used by the Setup view.
-                        HStack {
-                            Button("Cancel", systemImage: "xmark.circle") {
-                                Task { await appModel.cancelCodexDeviceLogin() }
-                            }
-                            Button("Clear", systemImage: "eraser") {
-                                Task { await appModel.clearCodexDeviceLogin() }
-                            }
+                        Button("Cancel", systemImage: "xmark.circle") {
+                            Task { await appModel.cancelCodexDeviceLogin() }
                         }
                         .padding(.top, 4)
                     }
@@ -557,11 +510,11 @@ struct DoctorView: View {
                     }
                 }
             }
-            .task(id: appModel.doctorRunning) {
+            .task(id: appModel.engine.doctor.isRunning) {
                 loopVerdicts = await DoctorLoopHealth.current()
             }
 
-            if appModel.doctorReport != nil {
+            if appModel.engine.doctor.report != nil {
                 // UI-2: the raw report status word and the support badge moved
                 // into healthSummaryPanel above, so the page leads with a
                 // sentence instead of "Ok".
@@ -608,31 +561,32 @@ struct DoctorView: View {
             } else {
                 NativeEmptyState(
                     title: "Health checks",
-                    detail: "Check the app, model connections, web search, Telegram, conversations, tools, and background work.",
-                    systemImage: "cross.case",
-                actionTitle: "Run health checks",
-                actionImage: "stethoscope"
-                ) {
-                    beginDoctorRun(repair: false)
-                }
+                    detail: "Repair checks the app, model connections, web search, Telegram, conversations, tools, and background work, and fixes what is broken.",
+                    systemImage: "cross.case"
+                )
             }
         }
         // No inset of its own: the page frame's column is the edge, as on
         // every alive page.
         .navigationTitle("Health checks")
-        .motionArrival(when: appModel.doctorReport != nil)
+        .motionArrival(when: appModel.engine.doctor.report != nil)
         .task {
             await appModel.refreshLiveDoctorCoverage()
         }
     }
 
-    private func beginDoctorRun(repair: Bool) {
+    private func beginRepair() {
         runNotice = nil
         Task {
-            let outcome = repair
-                ? await appModel.repairSafeDoctorIssues()
-                : await appModel.runDoctor(repair: false)
-            runNotice = DoctorRunButtonPresentation.notice(for: outcome, repair: repair)
+            let outcome = await appModel.runDoctor(repair: true, repairScope: .button)
+            runNotice = DoctorRunButtonPresentation.notice(for: outcome, repair: true)
+            // What only a person can do (sign in, choose a model) lives on
+            // Providers: take them there instead of leaving a note.
+            if appModel.engine.doctor.report?.checks.contains(where: {
+                $0.id == "live.providers" && DoctorSafeRepairPolicy.isAdverse($0.status)
+            }) == true {
+                NativeAgentAppCoordinator.shared.request(.sidebar(.providers))
+            }
         }
     }
 
@@ -641,24 +595,6 @@ struct DoctorView: View {
         Task {
             let outcome = await appModel.loadSupportDiagnostics()
             snapshotNotice = DoctorSupportSnapshotPresentation.notice(for: outcome)
-        }
-    }
-
-    @MainActor
-    private func openOAuthLogin() async {
-        guard !isOpeningOAuthLogin else { return }
-        isOpeningOAuthLogin = true
-        defer { isOpeningOAuthLogin = false }
-        oauthLoginNotice = DoctorOAuthLoginButtonPresentation.notice(
-            for: await appModel.openCodexLoginInBrowser()
-        )
-    }
-
-    private func oauthLoginColor(for tone: DoctorOAuthLoginButtonPresentation.Tone) -> Color {
-        switch tone {
-        case .progress: return .secondary
-        case .success: return NativeAgentShell.calm
-        case .failure: return NativeAgentShell.trouble
         }
     }
 
@@ -684,7 +620,7 @@ struct DoctorView: View {
                 Text(DoctorPlainCopy.detail(for: checkSummary))
                     .font(NativeAgentFont.body)
                     .foregroundStyle(.secondary)
-                if let report = appModel.doctorReport {
+                if let report = appModel.engine.doctor.report {
                     DisclosureGroup("Details") {
                         VStack(alignment: .leading, spacing: 2) {
                             Text("report status: \(report.status)")
@@ -703,14 +639,14 @@ struct DoctorView: View {
         }
     }
 
-    private func category(for check: DoctorCheck) -> String {
+    private func category(for check: CheckResult) -> String {
         Self.categoryID(for: check.id)
     }
 
     static func categoryID(for id: String) -> String {
         switch id {
         case "codex_login", "llm", "codex_login_helper", "live.providers": "Provider"
-        case "daemon_lifecycle", "legacy_launch_agent", "launch_agent", "live.background_loops",
+        case "daemon_lifecycle", "legacy_launch_agent", "launch_agent", "live.background_loops", "live.bridges",
              // Per-turn prompt-prefix cache health is a property of the running
              // app, not of stored data.
              "prompt_prefix_health": "Runtime"
@@ -718,7 +654,7 @@ struct DoctorView: View {
         // group so a capsule that stopped arriving reads as what it is.
         case "subconscious_vitals": "Cognition"
         case "searxng", "telegram", "connectors", "live.telegram", "live.search": "Connectors"
-        case "storage", "chat_sessions", "session_identity", "persona_engine", "backups", "write_test": "Data"
+        case "storage", "chat_sessions", "session_identity", "persona_engine", "backups", "write_test", "live.memory": "Data"
         case "tools", "live.tools": "Tools"
         case "autonomy", "live.autonomy": "Autonomy"
         default: "Release"
@@ -765,7 +701,7 @@ enum DoctorPlainCopy {
         }
     }
 
-    static func summarize(_ checks: [DoctorCheck]) -> Summary {
+    static func summarize(_ checks: [CheckResult]) -> Summary {
         var summary = Summary()
         for check in checks {
             switch bucket(for: check.status) {
@@ -788,7 +724,7 @@ enum DoctorPlainCopy {
 
     static func detail(for summary: Summary) -> String {
         guard summary.total > 0 else {
-            return "Press Run health checks to check how the app is doing."
+            return "Press Repair to check everything and fix what is broken."
         }
         var parts = ["\(summary.healthy) working"]
         if summary.warning > 0 { parts.append("\(summary.warning) need attention") }
@@ -848,7 +784,7 @@ enum DoctorPlainCopy {
 }
 
 struct DoctorCheckRow: View {
-    var check: DoctorCheck
+    var check: CheckResult
 
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
@@ -865,6 +801,16 @@ struct DoctorCheckRow: View {
                 .textSelection(.enabled)
             if let repair = check.repair, !repair.isEmpty {
                 Text(repair.withoutStaleNextGenPhaseCopy)
+                    .font(NativeAgentFont.label)
+                    .foregroundStyle(NativeAgentShell.secondary)
+            }
+            if let action = check.human_action, !action.isEmpty {
+                Text(action.withoutStaleNextGenPhaseCopy)
+                    .font(NativeAgentFont.label)
+                    .foregroundStyle(NativeAgentShell.secondary)
+            }
+            if let receipt = check.receipt, !receipt.isEmpty {
+                Text(receipt.withoutStaleNextGenPhaseCopy)
                     .font(NativeAgentFont.label)
                     .foregroundStyle(NativeAgentShell.secondary)
             }

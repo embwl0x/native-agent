@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import TurnTrace
 
 /// Typed subset of Bot API 10.2 rich blocks that improves ordinary assistant
 /// replies without exposing provider traces or requiring a second UI surface.

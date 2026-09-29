@@ -179,9 +179,9 @@ extension SwiftNativeSelfImprovement {
     ///   can pin a deterministic value.
     public func improvementGauntletStatusLocal(
         now: @Sendable () -> String = { SwiftNativeSelfImprovement.nowISO8601() }
-    ) async -> ImprovementGauntletStatus {
-        let raw = await trainingPromotionPersistence()
-            .readJSON(gauntletRunsPath(), defaultValue: .array([]))
+    ) async throws -> ImprovementGauntletStatus {
+        let raw = try await trainingPromotionPersistence()
+            .readJSON(gauntletRunsPath(), ifMissing: .array([]))
 
         // Python: `runs = runs if isinstance(runs, list) else []`. A non-array
         // (object, string, null from a corrupt file) collapses to empty.

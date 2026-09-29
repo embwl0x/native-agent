@@ -39,12 +39,9 @@ import WorkflowOrchestration
 import Skills
 import Connectors
 import Browser
+import Cognition
 
-private enum NextGenStatusFeedAvailability: Equatable {
-    case absent
-    case measured
-    case unavailable
-}
+
 
 extension NativeClient {
     /// All NextGen status projections must read the same root as the client
@@ -54,120 +51,17 @@ extension NativeClient {
         dataRootOverride ?? PersistenceCore.defaultDataRoot()
     }
 
-    private var nextGenPhasesPath: URL {
-        nextGenStatusDataRoot
-            .appendingPathComponent("runtime", isDirectory: true)
-            .appendingPathComponent("nextgen_phases.json")
-    }
 
     func getNextGenSummary() async throws -> NextGenSummary {
-        let phases = try await getNextGenPhases()
-        let receipts = try await getNextGenReceipts()
-        let sortedPhases = phases.sorted {
-            (($0.phaseNumber ?? Int.max), $0.id) < (($1.phaseNumber ?? Int.max), $1.id)
-        }
-        let readyPhases = sortedPhases.filter {
-            $0.ready == true || ["ready", "ok", "passed", "complete", "completed"].contains($0.displayStatus.lowercased())
-        }
-        let current = sortedPhases.first {
-            !readyPhases.contains($0)
-        } ?? sortedPhases.last
-        let phaseNumbers = sortedPhases.compactMap(\.phaseNumber)
-        let status: String = {
-            guard !sortedPhases.isEmpty else {
-                return FileManager.default.fileExists(atPath: nextGenPhasesPath.path)
-                    ? "unavailable"
-                    : "unmeasured"
-            }
-            return readyPhases.count == sortedPhases.count ? "ready" : "warn"
-        }()
-        var obj: [String: Any] = [
-            "status": status,
-            "readiness": status,
-            "roadmap": "Swift-native local next-gen snapshot",
-            "readyPhaseCount": readyPhases.count,
-            "totalPhaseCount": sortedPhases.count,
-            "actionCount": sortedPhases.reduce(0) { $0 + ($1.actions?.count ?? 0) },
-            "receiptCount": receipts.count,
-            "latestReceipts": receipts.prefix(10).map(Self.nextGenReceiptObject),
-            "createdAt": ISO8601DateFormatter().string(from: Date()),
-            "updatedAt": ISO8601DateFormatter().string(from: Date()),
-        ]
-        if let current {
-            obj["currentPhaseId"] = current.id
-            obj["currentPhaseName"] = current.displayName
-        }
-        if let minPhase = phaseNumbers.min(), let maxPhase = phaseNumbers.max() {
-            obj["phaseRange"] = ["start": minPhase, "end": maxPhase]
-        }
-        let data = try JSONSerialization.data(withJSONObject: obj)
-        return try JSONDecoder.nativeAgent.decode(NextGenSummary.self, from: data)
+        try await NextGenStatusProjection(dataRoot: nextGenStatusDataRoot).getNextGenSummary()
     }
 
     func getNextGenPhases() async throws -> [NextGenPhase] {
-        // DAEMON-KILL P1: read <dataRoot>/runtime/nextgen_phases.json.
-        let path = nextGenPhasesPath
-        guard FileManager.default.fileExists(atPath: path.path) else { return [] }
-        let data = try Data(contentsOf: path)
-        let decoder = JSONDecoder.nativeAgent
-        if let response = try? decoder.decode(NextGenPhasesResponse.self, from: data) {
-            return response.phases
-        }
-        if let phases = try? decoder.decode([NextGenPhase].self, from: data) {
-            return phases
-        }
-        throw NSError(
-            domain: "NativeAgentNextGenStatus",
-            code: -422,
-            userInfo: [NSLocalizedDescriptionKey: "next-gen phase feed is malformed"]
-        )
+        try await NextGenStatusProjection(dataRoot: nextGenStatusDataRoot).getNextGenPhases()
     }
 
     func getNextGenReceipts() async throws -> [NextGenReceipt] {
-        let root = nextGenStatusDataRoot
-        let paths = [
-            root
-                .appendingPathComponent("nextgen", isDirectory: true)
-                .appendingPathComponent("actions", isDirectory: true)
-                .appendingPathComponent("receipts.jsonl"),
-            root
-                .appendingPathComponent("runtime", isDirectory: true)
-                .appendingPathComponent("nextgen_receipts.jsonl"),
-        ]
-        let persistence = SwiftNativePersistenceCore()
-        var receipts: [NextGenReceipt] = []
-        for path in paths where FileManager.default.fileExists(atPath: path.path) {
-            // U5 W-A item 1 (:5682): propagate — a swallowed read rendered
-            // as "no receipts" (healthy-empty) instead of the real error.
-            let rows = try await persistence.tailJSONL(path, limit: 100, maxBytes: nil)
-            for row in rows {
-                guard let data = try? row.serializedData(pretty: false),
-                      let receipt = try? JSONDecoder.nativeAgent.decode(NextGenReceipt.self, from: data) else {
-                    continue
-                }
-                receipts.append(receipt)
-            }
-        }
-        var seen = Set<String>()
-        return receipts
-            .filter { seen.insert($0.id).inserted }
-            .sorted { ($0.createdAt ?? "") > ($1.createdAt ?? "") }
-    }
-
-    static func nextGenReceiptObject(_ receipt: NextGenReceipt) -> [String: Any] {
-        var obj: [String: Any] = [:]
-        if let v = receipt.receiptId { obj["receiptId"] = v }
-        if let v = receipt.actionId { obj["actionId"] = v }
-        if let v = receipt.phaseId { obj["phaseId"] = v }
-        if let v = receipt.name { obj["name"] = v }
-        if let v = receipt.status { obj["status"] = v }
-        if let v = receipt.dryRun { obj["dryRun"] = v }
-        if let v = receipt.approvalId { obj["approvalId"] = v }
-        if let v = receipt.detail { obj["detail"] = v }
-        if let v = receipt.output { obj["output"] = v }
-        if let v = receipt.createdAt { obj["createdAt"] = v }
-        if obj["receiptId"] == nil { obj["id"] = receipt.id }
-        return obj
+        try await NextGenStatusProjection(dataRoot: nextGenStatusDataRoot).getNextGenReceipts()
     }
 
     func getPersonalityGrowth() async throws -> PersonalityGrowthSummary {
@@ -199,237 +93,19 @@ extension NativeClient {
     }
 
     func getNotificationStatus() async throws -> NotificationRuntimeStatus {
-        // Subsystem #25b wave 38 W20 (2026-06-02): when .notificationStatus is ON,
-        // the in-process SwiftNativeNotificationStatus reads the co-located
-        // native_power/notifications/receipts.jsonl (tail 20, newest-first) +
-        // counts the pending entries in workflows/approvals/requests.json and
-        // serves the same notification_status() envelope without the HTTP
-        // round-trip. The reader is a PURE read (no write-back): the daemon only
-        // appends to receipts.jsonl (atomic line append) and read_json's the
-        // approvals file (its R-M-W is approvals_lock-guarded + write_json is
-        // tmp+os.replace atomic), so a status read never sees a torn file — no
-        // flock prereq. A root with neither authoritative feed is unmeasured,
-        // not a ready zero-count runtime.
-        let root = nextGenStatusDataRoot
-        let receiptsPath = root
-            .appendingPathComponent("native_power", isDirectory: true)
-            .appendingPathComponent("notifications", isDirectory: true)
-            .appendingPathComponent("receipts.jsonl")
-        let approvalsPath = root
-            .appendingPathComponent("workflows", isDirectory: true)
-            .appendingPathComponent("approvals", isDirectory: true)
-            .appendingPathComponent("requests.json")
-        let availability = Self.statusFeedAvailability([receiptsPath, approvalsPath])
-        guard availability == .measured else {
-            return NotificationRuntimeStatus(
-                status: availability == .absent ? "unmeasured" : "unavailable",
-                authorization: nil,
-                pendingApprovals: nil,
-                receiptCount: nil,
-                latestReceipt: nil,
-                createdAt: SwiftNativeManifestSigner.isoTimestamp(Date())
-            )
-        }
-        let client = SwiftNativeNotificationStatus(
-            receiptsPath: receiptsPath,
-            approvalsPath: approvalsPath
-        )
-        if let envelope = await client.notificationStatus() {
-            return try Self.decodeJSONValue(envelope, as: NotificationRuntimeStatus.self, context: "getNotificationStatus(swiftNative)")
-        }
-        // A reader that cannot produce an envelope has not measured status.
-        return NotificationRuntimeStatus(
-            status: "unmeasured",
-            authorization: nil,
-            pendingApprovals: nil,
-            receiptCount: nil,
-            latestReceipt: nil,
-            createdAt: SwiftNativeManifestSigner.isoTimestamp(Date())
-        )
+        try await RuntimeReadProjection.getNotificationStatus(dataRoot: nextGenStatusDataRoot)
     }
 
     func getBrowserStatus() async throws -> BrowserRuntimeStatus {
-        // Subsystem #27 wave 33 W17 (2026-06-01): when .browser is ON, the
-        // in-process SwiftNativeBrowserClient reads the co-located
-        // native_power/browser/{runs.json,receipts.jsonl} + trust-policy
-        // approvedDomains and serves the same browser_status() envelope without
-        // the HTTP round-trip. The reader is a PURE read (no write-back); the
-        // daemon's run/cancel R-M-W of runs.json is flock-guarded this wave so a
-        // status read never sees a torn file. A root with no browser run or
-        // receipt feed is unmeasured rather than an idle zero-count runtime.
-        let root = nextGenStatusDataRoot
-        let browserRoot = root
-            .appendingPathComponent("native_power", isDirectory: true)
-            .appendingPathComponent("browser", isDirectory: true)
-        let runsPath = browserRoot.appendingPathComponent("runs.json")
-        let receiptsPath = browserRoot.appendingPathComponent("receipts.jsonl")
-        let availability = Self.statusFeedAvailability([runsPath, receiptsPath])
-        guard availability == .measured else {
-            return BrowserRuntimeStatus(
-                status: availability == .absent ? "unmeasured" : "unavailable",
-                profilePath: nil,
-                sourcePath: nil,
-                screenshotPath: nil,
-                approvedDomains: nil,
-                domainPolicy: nil,
-                activeRuns: nil,
-                receiptCount: nil,
-                latestReceipt: nil,
-                createdAt: ISO8601DateFormatter().string(from: Date())
-            )
-        }
-        let client = makeBrowserClient(dataRoot: root)
-        if let envelope = await client.browserStatus() {
-            return try Self.decodeJSONValue(envelope, as: BrowserRuntimeStatus.self, context: "getBrowserStatus(swiftNative)")
-        }
-        // The read boundary could not establish browser status.
-        return BrowserRuntimeStatus(
-            status: "unmeasured",
-            profilePath: nil,
-            sourcePath: nil,
-            screenshotPath: nil,
-            approvedDomains: nil,
-            domainPolicy: nil,
-            activeRuns: nil,
-            receiptCount: nil,
-            latestReceipt: nil,
-            createdAt: ISO8601DateFormatter().string(from: Date())
-        )
+        try await RuntimeReadProjection.getBrowserStatus(dataRoot: nextGenStatusDataRoot)
     }
 
     func getMemoryVectorStatus() async throws -> MemoryVectorStatus {
-        // An absent feed is unmeasured. A present-but-unreadable feed is
-        // unavailable; neither state may impersonate a ready zero-count store.
-        let path = nextGenStatusDataRoot
-            .appendingPathComponent("memory", isDirectory: true)
-            .appendingPathComponent("vector_status.json")
-        guard FileManager.default.fileExists(atPath: path.path) else {
-            return MemoryVectorStatus(
-                status: "unmeasured",
-                provider: nil,
-                providerModel: nil,
-                providerConfigured: nil,
-                providerReason: "vector status has not been recorded for this data root",
-                dimensions: nil,
-                nodeCount: nil,
-                entityCount: nil,
-                updatedAt: nil,
-                createdAt: ISO8601DateFormatter().string(from: Date())
-            )
-        }
-        if let data = try? Data(contentsOf: path),
-           let decoded = try? JSONDecoder.nativeAgent.decode(MemoryVectorStatus.self, from: data) {
-            return decoded
-        }
-        return MemoryVectorStatus(
-            status: "unavailable",
-            provider: nil,
-            providerModel: nil,
-            providerConfigured: false,
-            providerReason: "vector status not available",
-            dimensions: nil,
-            nodeCount: nil,
-            entityCount: nil,
-            updatedAt: nil,
-            createdAt: ISO8601DateFormatter().string(from: Date())
-        )
+        try await MemoryStatusProjection.getMemoryVectorStatus(dataRoot: nextGenStatusDataRoot)
     }
 
     func getMemoryV2Status() async throws -> MemoryV2Status {
-        // fix3/F2: route truthfully through SwiftNativeMemoryV2.shared. Counts
-        // come from MemoryStorage; pinned reads metadata.pinned; pending
-        // proposals reads storage.listProposals(status: "pending"); embedding
-        // backend reflects the live runtime snapshot — CoreML when MiniLM
-        // loaded, mock when the user explicitly opted in (config or env),
-        // fail-closed otherwise.
-        let dataRoot = dataRootOverride ?? PersistenceCore.defaultDataRoot()
-        var memCount = 0
-        var activeCount = 0
-        var pinnedCount = 0
-        var pendingProposals: Int? = nil
-        var storageReadable = false
-        do {
-            let storage = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
-            let all = try await storage.listMemories(persona: nil, status: nil, limit: nil)
-            storageReadable = true
-            memCount = all.count
-            for m in all {
-                // ONE MEANING OF "active" (Astra comb 4, lane4 finding 6). The
-                // count read `status` alone while the browser also excludes the
-                // corrected/contradicted/deleted lifecycles, so the summary said
-                // "190 active" over a list that could only ever show 169: the 21
-                // `status=active, lifecycle=corrected` rows (`FDF6A630-…` and
-                // `BF12BC92-…`, both superseded sleep-schedule statements) were
-                // counted by one surface and excluded by the other. Same
-                // predicate as `listMemories(status: "active")`.
-                if m.status == "active", MemoryLifecycle.isRecallEligible(m.lifecycle) {
-                    activeCount += 1
-                }
-                // SQLite schema has no `pinned` column; updateMemory()
-                // encodes the flag under metadata.pinned. Surface the
-                // real count by inspecting the metadata blob.
-                if case .object(let obj)? = m.metadata,
-                   case .bool(true)? = obj["pinned"] {
-                    pinnedCount += 1
-                }
-            }
-            if let pending = try? await storage.listProposals(status: "pending") {
-                pendingProposals = pending.count
-            }
-        } catch {
-            storageReadable = false
-        }
-        let modelId = await SwiftNativeMemoryV2.shared.embedderModelId()
-        let dims = await SwiftNativeMemoryV2.shared.embedderDimensions()
-        // gpt-5.5 review-4 STILL-NEEDS-FIX: `embedderModelId()` returns
-        // "all-MiniLM-L6-v2" whenever config requests CoreML — even when the
-        // effective runtime is fail-closed (resources missing, embed() throws).
-        // Deriving `isReal` from `modelId != "mock"` therefore lied to the UI:
-        // a broken install surfaced as `realSemanticAvailable: true` with
-        // `fallbackReason: nil`. Drive off the runtime snapshot's
-        // `effectiveBackend` instead, which is the single source of truth
-        // computed inside ManagedEmbeddingProvider with all the branch logic.
-        let runtimeSnapshot = await SwiftNativeMemoryV2.shared.embeddingRuntimeSnapshot()
-        let effective = runtimeSnapshot?.effectiveBackend
-        let isReal = (effective == ManagedEmbeddingProvider.coreMLBackend)
-        let backend = modelId.map { "\($0)\(dims.map { "/d\($0)" } ?? "")" }
-        let fallback: String? = {
-            guard !isReal else { return nil }
-            switch effective {
-            case ManagedEmbeddingProvider.mockBackend:
-                return "Semantic embeddings are explicitly set to mock (config or NATIVE_AGENT_EMBEDDING_MOCK)"
-            case ManagedEmbeddingProvider.failClosedBackend:
-                return "CoreML semantic embeddings unavailable; recall is fail-closed until the MiniLM bundle is installed"
-            default:
-                // Snapshot was nil (runtime not yet wired) — surface that honestly.
-                return "Semantic embedding runtime is unavailable"
-            }
-        }()
-        // F2: surface hygiene_last_run.json so the UI can show "last run at X /
-        // next ~24h" instead of an empty hygiene slot that reads as "never".
-        let hygieneReport = Self.readHygieneLastRun(dataRoot: dataRoot)
-        return MemoryV2Status(
-            // An unreadable store is not an empty store. The Memory screen
-            // uses this provenance to avoid claiming no memories are saved
-            // when the real reader could not establish a count.
-            status: storageReadable ? (memCount > 0 ? "ready" : "empty") : "unavailable",
-            version: "swift-native",
-            embedding: MemoryV2Embedding(
-                activeBackend: backend,
-                realSemanticAvailable: isReal,
-                fallbackReason: fallback
-            ),
-            counts: MemoryV2Counts(
-                memories: memCount,
-                active: activeCount,
-                pinned: pinnedCount,
-                noisyReflections: nil,
-                pendingProposals: pendingProposals
-            ),
-            hygiene: hygieneReport,
-            vault: nil,
-            createdAt: ISO8601DateFormatter().string(from: Date())
-        )
+        try await MemoryStatusProjection.getMemoryV2Status(dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot())
     }
 
     /// F2: Read `<dataRoot>/memory/hygiene_last_run.json` and project it onto
@@ -438,50 +114,7 @@ extension NativeClient {
     /// the consolidation loop writes a fuller dict). Be tolerant: any
     /// recognizable timestamp is enough to flip the badge from empty.
     static func readHygieneLastRun(dataRoot: URL = PersistenceCore.defaultDataRoot()) -> MemoryHygieneReport? {
-        let path = dataRoot
-            .appendingPathComponent("memory")
-            .appendingPathComponent("hygiene_last_run.json")
-        guard let data = try? Data(contentsOf: path),
-              let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
-        else { return nil }
-        let createdAt = (obj["createdAt"] as? String)
-            ?? (obj["created_at"] as? String)
-            ?? (obj["lastRun"] as? String)
-            ?? (obj["last_run"] as? String)
-        // Prefer the report's own nextScheduled; derive lastRun + 7d only when
-        // absent. The cadence is WEEKLY (MemoryConsolidationHygieneRunner
-        // stages one approval card per week) — the old derived +24h made the
-        // Memory tab claim hygiene was overdue six days out of seven.
-        var nextScheduled: String? = (obj["nextScheduled"] as? String)
-            ?? (obj["next_scheduled"] as? String)
-        // Honest-status (2026-07-24): a staged/refused run completed nothing —
-        // its receipt intentionally carries no "next" stamp, and deriving one
-        // here would recreate the false cadence boundary the runner just
-        // stopped writing.
-        let statusValue = (obj["status"] as? String) ?? "idle"
-        if nextScheduled == nil,
-           statusValue != "staged", statusValue != "refused",
-           let createdAt, let dt = ISO8601DateFormatter().date(from: createdAt) {
-            nextScheduled = ISO8601DateFormatter().string(from: dt.addingTimeInterval(7 * 24 * 3600))
-        }
-        return MemoryHygieneReport(
-            id: obj["id"] as? String,
-            status: (obj["status"] as? String) ?? "idle",
-            reason: obj["reason"] as? String,
-            version: obj["version"] as? String,
-            createdAt: createdAt,
-            beforeCount: obj["beforeCount"] as? Int,
-            afterCount: obj["afterCount"] as? Int,
-            normalized: obj["normalized"] as? Int,
-            archivedDuplicates: obj["archivedDuplicates"] as? Int,
-            archivedReflections: obj["archivedReflections"] as? Int,
-            distilledFactsAdded: obj["distilledFactsAdded"] as? Int,
-            decayedMemories: obj["decayedMemories"] as? Int,
-            proposalHygiene: nil,
-            consolidationRunId: (obj["consolidationRunId"] as? String)
-                ?? (obj["consolidation_run_id"] as? String),
-            nextScheduled: nextScheduled
-        )
+        MemoryStatusProjection.readHygieneLastRun(dataRoot: dataRoot)
     }
 
     func runMemoryHygiene(dryRun: Bool = false) async throws -> MemoryHygieneReport {
@@ -518,7 +151,7 @@ extension NativeClient {
 
         // U3 wave-1 item 6 + review blocker (2026-06-10): this is the ONLY
         // direct-consolidate entry point, and both of its callers carry an
-        // explicit approval — the MemoryView "Run hygiene" button (manual
+        // explicit approval — the Memories upkeep "Run hygiene" button (manual
         // human action) and applyApprovedSelfImprovement's approved
         // run_memory_hygiene op. The weekly tick calls runOnce itself
         // (MemoryConsolidationHygieneRunner, 2026-09-22).
@@ -596,41 +229,11 @@ extension NativeClient {
         // wave 33 W09 — PORTED-DORMANT (gate: .selfImprovement, default OFF).
         // Reads improvements/gauntlet/runs.json locally (co-located on the Mac).
         // No trust gate on this route in the daemon. iOS keeps HTTP (network-only).
-        // See CUTOVER_PLAN §6.96.
         return try await swiftImprovementGauntlet()
     }
 
     func getProductionHardening() async throws -> ProductionHardeningSummary {
-        // The hardening report is an operator-produced authority. A missing
-        // report means no report has been recorded; an existing unreadable or
-        // malformed report is unavailable and must never be presented as the
-        // same neutral state. Keep the report on the client's injected root so
-        // the mounted panel, export action, and reload all agree on one store.
-        let path = (dataRootOverride ?? PersistenceCore.defaultDataRoot())
-            .appendingPathComponent("runtime", isDirectory: true)
-            .appendingPathComponent("hardening.json")
-        let now = ISO8601DateFormatter().string(from: Date())
-        guard FileManager.default.fileExists(atPath: path.path) else {
-            return ProductionHardeningSummary(
-                status: "unknown",
-                release: nil,
-                doctorStatus: nil,
-                createdAt: now,
-                detail: "No production hardening report has been recorded for this data root."
-            )
-        }
-        do {
-            let data = try Data(contentsOf: path)
-            return try JSONDecoder.nativeAgent.decode(ProductionHardeningSummary.self, from: data)
-        } catch {
-            return ProductionHardeningSummary(
-                status: "unavailable",
-                release: nil,
-                doctorStatus: nil,
-                createdAt: now,
-                detail: "Could not read production hardening report: \(error.localizedDescription)"
-            )
-        }
+        try await DoctorStatusProjection.getProductionHardening(dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot())
     }
 
     func getProductionExports() async throws -> [ProductionExport] {
@@ -660,59 +263,14 @@ extension NativeClient {
     /// root injectable lets a hermetic caller verify the production decoder
     /// and chronological tail without consulting personal runtime state.
     func getActivity(root: URL) async throws -> [ActivityEvent] {
-        // DAEMON-KILL P1: tail of <dataRoot>/activity/events.jsonl.
-        let path = root
-            .appendingPathComponent("activity", isDirectory: true)
-            .appendingPathComponent("events.jsonl")
-        let fileManager = FileManager.default
-        guard fileManager.fileExists(atPath: path.path) else { return [] }
-        let attributes = try fileManager.attributesOfItem(atPath: path.path)
-        let size = (attributes[.size] as? NSNumber)?.uint64Value ?? 0
-        guard size > 0 else { return [] }
-
-        let maximumBytes = UInt64(1_048_576)
-        let count = min(size, maximumBytes)
-        let startsMidFile = size > count
-        let handle = try FileHandle(forReadingFrom: path)
-        defer { try? handle.close() }
-        if startsMidFile {
-            try handle.seek(toOffset: size - count)
-        }
-        let data = handle.readData(ofLength: Int(count))
-        let lines = Self.decodeTailLines(data, dropFirstPartial: startsMidFile)
-        let tail = lines.suffix(200).map {
-            $0.trimmingCharacters(in: .whitespacesAndNewlines)
-        }.filter { !$0.isEmpty }
-        guard !tail.isEmpty else { return [] }
-
-        let decoder = JSONDecoder.nativeAgent
-        let events = tail.compactMap { line -> ActivityEvent? in
-            guard let data = line.data(using: .utf8) else { return nil }
-            return try? decoder.decode(ActivityEvent.self, from: data)
-        }
-        guard !events.isEmpty else {
-            throw NSError(
-                domain: "NativeAgentActivity",
-                code: -422,
-                userInfo: [NSLocalizedDescriptionKey: "activity ledger contains no readable event records"]
-            )
-        }
-        return events
+        try await RuntimeReadProjection.getActivity(root: root)
     }
 
-    private static func statusFeedAvailability(_ paths: [URL]) -> NextGenStatusFeedAvailability {
-        let fileManager = FileManager.default
-        var foundEvidence = false
-        for path in paths where fileManager.fileExists(atPath: path.path) {
-            foundEvidence = true
-            guard let attributes = try? fileManager.attributesOfItem(atPath: path.path),
-                  (attributes[.type] as? FileAttributeType) == .typeRegular,
-                  fileManager.isReadableFile(atPath: path.path) else {
-                return .unavailable
-            }
-        }
-        return foundEvidence ? .measured : .absent
+    func getActivityReadout(root: URL) async throws -> ActivityTailReadout {
+        try await RuntimeReadProjection.getActivityReadout(root: root)
     }
+
+
 
     // WAVE 37 (2026-06-02) W20 §6.159: single construction point for the
     // SwiftNative executions read seam. The four read getters (getWorkshopExecutions /
@@ -735,7 +293,7 @@ extension NativeClient {
         WorkshopExecution.SwiftNativeWorkshopRunner(
             planner: WorkshopExecution.SwiftNativeWorkshopPlannerLLM(
                 connectorActionsProvider: makeWorkshopPlannerConnectorActionsProvider(),
-                lifecycleObserver: NativeCognitionRuntime.shared))
+                lifecycleObserver: NativeAgentEngine.liveCognition))
     }
 
 }

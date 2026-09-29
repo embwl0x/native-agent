@@ -9,7 +9,7 @@ public final class SwiftNativeSystemRebuildClient: SystemRebuildClient {
     private let repoRoot: URL
     private let runner: any SubprocessRunner
     private let daemonAutonomy: Bool
-    private let policyProvider: @Sendable () async -> AutonomyTrustPolicyView
+    private let policyProvider: @Sendable () async throws -> AutonomyTrustPolicyView
     private let rebuildLock: RebuildLock
 
     /// - Parameters:
@@ -32,14 +32,14 @@ public final class SwiftNativeSystemRebuildClient: SystemRebuildClient {
         repoRoot: URL? = nil,
         runner: any SubprocessRunner = SystemSubprocessRunner(),
         daemonAutonomy: Bool = false,
-        policyProvider: (@Sendable () async -> AutonomyTrustPolicyView)? = nil,
+        policyProvider: (@Sendable () async throws -> AutonomyTrustPolicyView)? = nil,
         rebuildLock: RebuildLock? = nil
     ) {
         let resolvedRoot = repoRoot ?? Self.locateRepoRoot()
         self.repoRoot = resolvedRoot
         self.runner = runner
         self.daemonAutonomy = daemonAutonomy
-        self.policyProvider = policyProvider ?? { await readAutonomyTrustPolicy() }
+        self.policyProvider = policyProvider ?? { try await readAutonomyTrustPolicy() }
         self.rebuildLock = rebuildLock ?? RebuildLock()
     }
 
@@ -48,7 +48,7 @@ public final class SwiftNativeSystemRebuildClient: SystemRebuildClient {
         // user-set Trust Center toggle must be on; additionally the
         // per-action `systemRebuild.enabled` flag must be true (default
         // false). Mirrors Python L45110-L45125.
-        let policy = await policyProvider()
+        let policy = try await policyProvider()
         switch try await autonomyApprovalGate(
             action: .systemRebuild,
             daemonAutonomy: daemonAutonomy,

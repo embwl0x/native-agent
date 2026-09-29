@@ -6,6 +6,7 @@ import KnowledgeGraph
 import PersistenceCore
 #if canImport(CloudKit)
 import CloudKit
+import DeviceSync
 
 // The header receives entity/edge counts from the canonical checked graph read.
 // It must never substitute MemoryV2 row count or legacy JSON mtime for graph
@@ -76,17 +77,15 @@ struct KGNativeStackHeader: View {
     let status: KGNativeStackStatus
     let totalEntities: Int
     let totalEdges: Int
-    /// A row inside the Advanced shell's alive group card: no material strip
-    /// of its own, and shell inks (the system tertiary fails on the haze).
-    var plain: Bool = false
     var body: some View {
-        let quiet: Color = plain ? NativeAgentShell.secondary : .secondary
-        let strip = HStack(spacing: 12) {
+        // A row inside the alive group card: no material strip of its own,
+        // and shell inks (the system tertiary fails on the haze).
+        HStack(spacing: 12) {
             Text("\(totalEntities) entities").font(.caption.weight(.semibold))
-            Text("·").foregroundStyle(plain ? AnyShapeStyle(NativeAgentShell.secondary) : AnyShapeStyle(.tertiary))
+            Text("·").foregroundStyle(NativeAgentShell.secondary)
             Text("\(totalEdges) relationships").font(.caption.weight(.semibold))
-            Text("·").foregroundStyle(plain ? AnyShapeStyle(NativeAgentShell.secondary) : AnyShapeStyle(.tertiary))
-            Text("last-updated \(Self.relative(status.lastUpdated))").font(.caption).foregroundStyle(quiet)
+            Text("·").foregroundStyle(NativeAgentShell.secondary)
+            Text("last-updated \(Self.relative(status.lastUpdated))").font(.caption).foregroundStyle(NativeAgentShell.secondary)
             Spacer()
             Group {
                 Label("\(status.sqliteEntities) SQLite", systemImage: "cylinder.split.1x2")
@@ -94,15 +93,9 @@ struct KGNativeStackHeader: View {
                 Label(status.cloudKitState, systemImage: "icloud")
             }
             .font(.caption2)
-            .foregroundStyle(plain ? AnyShapeStyle(NativeAgentShell.secondary) : AnyShapeStyle(.primary))
+            .foregroundStyle(NativeAgentShell.secondary)
         }
-        if plain {
-            strip.foregroundStyle(NativeAgentShell.text)
-        } else {
-            strip
-                .padding(.vertical, 6).padding(.horizontal, 10)
-                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 8))
-        }
+        .foregroundStyle(NativeAgentShell.text)
     }
     private static func relative(_ date: Date?) -> String {
         guard let date else { return "—" }

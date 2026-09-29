@@ -1,8 +1,7 @@
-NativeAgent 0.4.11 refines navigation and makes synced activity clearer.
+NativeAgent 0.5.0 brings a refreshed iPhone and iPad interface, smoother conversations, and clearer approval cards.
 
-- All five tabs now use consistent outlined icons, including the selected tab.
-- Activity waits for its own data before presenting its state.
-- Freshness is reported separately for each group of synced information.
-- Desk reports omitted information so incomplete snapshots are clear.
+- Fixed a crash while processing a push in the background.
+- Fixed a crash when opening a notification.
+- Closing a pinned chat now reports a send failure clearly and settles on the Mac's answer.
 
-Requires NativeAgent on a Mac signed in to the same Apple Account. Update the Mac companion to 0.4.11 for the latest capabilities.
+Requires NativeAgent on a Mac signed in to the same Apple Account. Until the next Mac update, some proposal cards ask you to answer on your Mac.

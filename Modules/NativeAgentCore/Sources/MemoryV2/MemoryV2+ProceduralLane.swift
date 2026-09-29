@@ -2,6 +2,7 @@ import ApprovalInbox
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import Procedures
 
 // MARK: - The procedural lane (sweep item 38; procedural-memory-lane.md)
 //
@@ -27,7 +28,7 @@ import PersistenceCore
 //
 // That last clause needs the WHOLE turn, not the success-only slice (HIGH
 // review finding, 2026-09-01). The projection drops what failed, so
-// `read ok, write ok, run_tests failed` arrives here as `read → write`: a
+// `read ok, write ok, swift_build failed` arrives here as `read → write`: a
 // contiguous verified run that never happened, with the failure stitched out.
 // The projection now states the break instead of hiding it — one payload-free
 // `sequenceBreakMarker` line whenever the turn carried a non-success dispatch
@@ -374,8 +375,8 @@ public struct ProceduralLaneLedger: Sendable {
         self.persistence = persistence ?? SwiftNativePersistenceCore()
     }
 
-    public func load() async -> [String: ProceduralLedgerEntry] {
-        let raw = await persistence.readJSON(path, defaultValue: .null)
+    public func load() async throws -> [String: ProceduralLedgerEntry] {
+        let raw = try await persistence.readJSON(path, ifMissing: .null)
         return Self.decode(raw)
     }
 
@@ -413,7 +414,7 @@ public struct ProceduralLaneLedger: Sendable {
             at: path.deletingLastPathComponent(), withIntermediateDirectories: true
         )
         return try await persistence.withFileLock(path) {
-            let raw = await persistence.readJSON(path, defaultValue: .null)
+            let raw = try await persistence.readJSON(path, ifMissing: .null)
             var entries = Self.decode(raw)
             let result = await body(&entries)
             try await persistence.writeJSON(Self.encode(entries, limit: limit), to: path)
@@ -453,12 +454,12 @@ public struct ProceduralProposedSequenceStore: Sendable {
     }
 
     /// Oldest first, newest last.
-    public func load() async -> [String] {
-        Self.decode(await persistence.readJSON(path, defaultValue: .null))
+    public func load() async throws -> [String] {
+        Self.decode(try await persistence.readJSON(path, ifMissing: .null))
     }
 
-    public func contains(_ identity: String) async -> Bool {
-        await load().contains(identity)
+    public func contains(_ identity: String) async throws -> Bool {
+        try await load().contains(identity)
     }
 
     /// Idempotent append under the same cross-process lock the ledger holds.
@@ -472,7 +473,7 @@ public struct ProceduralProposedSequenceStore: Sendable {
         )
         try? await persistence.withFileLock(path) {
             var identities = Self.decode(
-                await persistence.readJSON(path, defaultValue: .null)
+                try await persistence.readJSON(path, ifMissing: .null)
             )
             guard !identities.contains(identity) else { return }
             identities.append(identity)
@@ -613,8 +614,12 @@ public actor ProceduralLane {
         // oldest-touched first — so it cannot be the only memory of "already
         // asked". This file is not evicted by counting pressure and outlives
         // the row by an order of magnitude.
-        if await proposedSequences.contains(identity) {
-            return .blocked(.alreadyProposedForSequence)
+        do {
+            if try await proposedSequences.contains(identity) {
+                return .blocked(.alreadyProposedForSequence)
+            }
+        } catch {
+            return .ignored
         }
 
         guard !mintingSequences.contains(identity) else {
@@ -679,12 +684,12 @@ public actor ProceduralLane {
     }
 
     /// Read-only view for tests and receipts. Identities only.
-    public func proposedSequenceIdentities() async -> [String] {
-        await proposedSequences.load()
+    public func proposedSequenceIdentities() async throws -> [String] {
+        try await proposedSequences.load()
     }
 
     /// Read-only view for tests and receipts. Payload-free.
-    public func ledgerEntries() async -> [ProceduralLedgerEntry] {
-        await ledger.load().values.sorted { $0.sequenceIdentity < $1.sequenceIdentity }
+    public func ledgerEntries() async throws -> [ProceduralLedgerEntry] {
+        try await ledger.load().values.sorted { $0.sequenceIdentity < $1.sequenceIdentity }
     }
 }

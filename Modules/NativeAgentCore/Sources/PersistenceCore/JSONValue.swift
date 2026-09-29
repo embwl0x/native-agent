@@ -22,7 +22,7 @@ extension JSONValue {
     }
 
     /// Transform string leaves without changing keys or non-string values.
-    func mapStrings(_ transform: (String) -> String) -> JSONValue {
+    package func mapStrings(_ transform: (String) -> String) -> JSONValue {
         switch self {
         case .string(let string):
             return .string(transform(string))

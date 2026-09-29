@@ -26,7 +26,7 @@ enum TelegramPanelPresentation {
         max(0, total - visibleLimit)
     }
 
-    static func readState(status: TelegramStatus?, refreshError: String?) -> ReadState {
+    static func readState(status: TelegramPresentationSnapshot?, refreshError: String?) -> ReadState {
         let detail = boundedDetail(refreshError)
         guard status != nil else {
             return detail.map { .unavailable(detail: $0) } ?? .loading
@@ -150,11 +150,11 @@ enum TelegramBotTokenPresentation {
     }
 }
 
-struct TelegramDiagnosticsClearReceipt: Hashable {
+struct TelegramDiagnosticsClearReceipt: Equatable {
     let clearedAt: String
     let removedFileCount: Int
     let removedRowCount: Int
-    let status: TelegramStatus
+    let status: TelegramPresentationSnapshot
 }
 
 enum TelegramClearLogsPresentation {
@@ -192,6 +192,7 @@ import CloudKit
 struct TelegramView: View {
     @Environment(AppModel.self) private var appModel
     @State private var showDisconnectConfirm = false
+    @State private var showAccessConfirm = false
     @State private var showClearLogsConfirm = false
     @State private var requestingVoicePermission = false
     @State private var voicePermissionMessage: String?
@@ -216,16 +217,16 @@ struct TelegramView: View {
             enabled: appModel.telegramEnabled,
             requireMention: appModel.telegramRequireMention,
             allowlist: allowlistPresentation,
-            savedEnabled: appModel.telegramStatus?.enabled,
-            savedRequireMention: appModel.telegramStatus?.requireMention,
-            savedAcceptedCount: appModel.telegramStatus.map {
+            savedEnabled: appModel.engine.telegram.status?.enabled,
+            savedRequireMention: appModel.engine.telegram.status?.requireMention,
+            savedAcceptedCount: appModel.engine.telegram.status.map {
                 Set($0.allowedChatIds + $0.allowedUserIds).count
             }
         )
     }
 
     private var telegramModelOptions: [ModelCatalogItem] {
-        modelOptions(from: appModel.modelCatalog, current: appModel.telegramModel, limit: 40)
+        modelOptions(from: appModel.engine.providers.catalog, current: appModel.telegramModel, limit: 40)
     }
 
     private var botTokenFieldState: TelegramBotTokenPresentation.FieldState {
@@ -270,6 +271,18 @@ struct TelegramView: View {
         }
         .navigationTitle("Telegram")
         .quietReadTask { await loadSettings() }
+        .confirmationDialog(
+            TelegramAccessConfirmation.title,
+            isPresented: $showAccessConfirm,
+            titleVisibility: .visible
+        ) {
+            Button(TelegramAccessConfirmation.action) {
+                Task { await appModel.saveTelegram() }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(TelegramAccessConfirmation.message)
+        }
         .confirmationDialog(
             "Clear Telegram diagnostics?",
             isPresented: $showClearLogsConfirm,
@@ -324,7 +337,7 @@ struct TelegramView: View {
                         tone: allowlistConfigured ? .calm : .trouble
                     )
 
-                    if let status = appModel.telegramStatus {
+                    if let status = appModel.engine.telegram.status {
                         TelegramMetaRow(label: "Poller", value: status.pollerEnabled ? "Running" : "Disabled")
                         TelegramMetaRow(label: "Last update", value: status.lastSeenUpdateId.map(String.init) ?? "None")
                         TelegramMetaRow(
@@ -483,7 +496,7 @@ struct TelegramView: View {
                     )
                     TelegramField(title: "How hard it thinks") {
                         Picker("Think level", selection: Bindable(appModel).telegramReasoningEffort) {
-                            ForEach(reasoningOptions(from: appModel.modelCatalog, model: appModel.telegramModel)) { effort in
+                            ForEach(reasoningOptions(from: appModel.engine.providers.catalog, model: appModel.telegramModel)) { effort in
                                 Text(effort.label).tag(effort.id)
                             }
                         }
@@ -493,14 +506,14 @@ struct TelegramView: View {
                         .fixedSize()
                         .onChange(of: appModel.telegramModel) { _, model in
                             appModel.telegramReasoningEffort = normalizedReasoningEffort(
-                                from: appModel.modelCatalog,
+                                from: appModel.engine.providers.catalog,
                                 model: model,
                                 selected: appModel.telegramReasoningEffort
                             )
                         }
                     }
                     if let mismatch = telegramReasoningEffortMismatch(
-                        from: appModel.modelCatalog,
+                        from: appModel.engine.providers.catalog,
                         model: appModel.telegramModel,
                         selected: appModel.telegramReasoningEffort
                     ) {
@@ -520,7 +533,13 @@ struct TelegramView: View {
             VStack(alignment: .leading, spacing: 12) {
                 HStack(spacing: 8) {
                     Button(appModel.isSavingTelegram ? "Saving…" : "Save") {
-                        Task { await appModel.saveTelegram() }
+                        let saved = appModel.engine.telegram.status
+                        if (appModel.telegramEnabled && saved?.enabled != true)
+                            || (!appModel.telegramRequireMention && saved?.requireMention != false) {
+                            showAccessConfirm = true
+                        } else {
+                            Task { await appModel.saveTelegram() }
+                        }
                     }
                     .disabled(appModel.isSavingTelegram || !invalidAllowlistTokens.isEmpty || !canSaveTelegram)
 
@@ -579,7 +598,7 @@ struct TelegramView: View {
 
     @ViewBuilder
     private var diagnosticsSections: some View {
-        if let status = appModel.telegramStatus {
+        if let status = appModel.engine.telegram.status {
             if case .stale(let detail) = TelegramPanelPresentation.readState(
                 status: status,
                 refreshError: appModel.telegramStatusRefreshError

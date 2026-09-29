@@ -1,8 +1,10 @@
+import AppToolRuntime
 // PATCH-2026-05-07: mac-control-ui-1 Mac Control Permissions panel — master toggle + category toggles + audit log
 import AppKit
 import MacControl
 import NativeAgentShared
 import SwiftUI
+import TrustCenter
 
 enum MacControlAdvancedDisclosurePresentation {
     static let preferenceKey = "macControl.showAdvancedControls"
@@ -17,83 +19,6 @@ enum MacControlAdvancedDisclosurePresentation {
 
     static func savePathIsVisible(isExpanded: Bool) -> Bool {
         isExpanded
-    }
-}
-
-// MARK: - TrustMacControlPolicy
-
-// Codable mirror of the daemon's macControlPolicy block in trust_policy()
-struct TrustMacControlPolicy: Codable, Hashable {
-    var enabled: Bool = false
-    var applesScriptAllowed: Bool = false
-    var jxaAllowed: Bool = false
-    var shortcutsAllowed: Bool = true
-    var accessibilityAllowed: Bool = false
-    var systemControlAllowed: Bool = false
-    var fileOpsAllowed: Bool = false
-    var shellAllowed: Bool = false
-    var notificationsAllowed: Bool = true
-    var spotlightAllowed: Bool = true
-    var approvalRequiredFor: [String] = ["shell", "file_ops", "applescript", "jxa", "accessibility"]
-    var remoteFromIosAllowed: Bool = false
-
-    enum CodingKeys: String, CodingKey {
-        case enabled
-        case applesScriptAllowed = "applescript_allowed"
-        case jxaAllowed = "jxa_allowed"
-        case shortcutsAllowed = "shortcuts_allowed"
-        case accessibilityAllowed = "accessibility_allowed"
-        case systemControlAllowed = "system_control_allowed"
-        case fileOpsAllowed = "file_ops_allowed"
-        case shellAllowed = "shell_allowed"
-        case notificationsAllowed = "notifications_allowed"
-        case spotlightAllowed = "spotlight_allowed"
-        case approvalRequiredFor = "approval_required_for"
-        case remoteFromIosAllowed = "remote_from_ios_allowed"
-    }
-
-    init(
-        enabled: Bool = false,
-        applesScriptAllowed: Bool = false,
-        jxaAllowed: Bool = false,
-        shortcutsAllowed: Bool = true,
-        accessibilityAllowed: Bool = false,
-        systemControlAllowed: Bool = false,
-        fileOpsAllowed: Bool = false,
-        shellAllowed: Bool = false,
-        notificationsAllowed: Bool = true,
-        spotlightAllowed: Bool = true,
-        approvalRequiredFor: [String] = ["shell", "file_ops", "applescript", "jxa", "accessibility"],
-        remoteFromIosAllowed: Bool = false
-    ) {
-        self.enabled = enabled
-        self.applesScriptAllowed = applesScriptAllowed
-        self.jxaAllowed = jxaAllowed
-        self.shortcutsAllowed = shortcutsAllowed
-        self.accessibilityAllowed = accessibilityAllowed
-        self.systemControlAllowed = systemControlAllowed
-        self.fileOpsAllowed = fileOpsAllowed
-        self.shellAllowed = shellAllowed
-        self.notificationsAllowed = notificationsAllowed
-        self.spotlightAllowed = spotlightAllowed
-        self.approvalRequiredFor = approvalRequiredFor
-        self.remoteFromIosAllowed = remoteFromIosAllowed
-    }
-
-    init(from decoder: Decoder) throws {
-        let snapshot = try MacControlPolicyWireSnapshot(from: decoder)
-        enabled = snapshot.enabled
-        applesScriptAllowed = snapshot.applesScriptAllowed
-        jxaAllowed = snapshot.jxaAllowed
-        shortcutsAllowed = snapshot.shortcutsAllowed
-        accessibilityAllowed = snapshot.accessibilityAllowed
-        systemControlAllowed = snapshot.systemControlAllowed
-        fileOpsAllowed = snapshot.fileOpsAllowed
-        shellAllowed = snapshot.shellAllowed
-        notificationsAllowed = snapshot.notificationsAllowed
-        spotlightAllowed = snapshot.spotlightAllowed
-        approvalRequiredFor = snapshot.approvalRequiredFor
-        remoteFromIosAllowed = snapshot.remoteFromIosAllowed
     }
 }
 
@@ -496,7 +421,7 @@ struct MacControlPermissionsView: View {
             guard loadsOnAppear else { return }
             await loadPolicy()
         }
-        .onChange(of: appModel.trustPolicy) { _, newPolicy in
+        .onChange(of: appModel.engine.trust.policy) { _, newPolicy in
             // Guard mirrors TrainingPermissionsView: a mid-save trustPolicy
             // refresh must not clobber unsaved toggle edits (2026-07-21 audit).
             guard !isSaving else { return }
@@ -547,20 +472,30 @@ struct MacControlPermissionsView: View {
             AliveEyebrow("Mac control")
             // The presets are cards themselves, so they sit above the group
             // card rather than inside it — a card in a card is a plate.
-            LazyVGrid(columns: [GridItem(.adaptive(minimum: 145), spacing: 10, alignment: .top)], spacing: 10) {
-                MacIntegrationPresetButton(preset: .off, active: activePreset == .off, disabled: isSaving) {
-                    Task { await applyIntegrationPreset(.off) }
+            // The Mac's own radio group (User 09-27: all controls native).
+            Picker("Mac control", selection: Binding<MacIntegrationPreset?>(
+                get: { activePreset },
+                set: { preset in
+                    guard let preset else { return }
+                    if preset == .full { showFullMacConfirm = true }
+                    else { Task { await applyIntegrationPreset(preset) } }
                 }
-                MacIntegrationPresetButton(preset: .watch, active: activePreset == .watch, disabled: isSaving) {
-                    Task { await applyIntegrationPreset(.watch) }
-                }
-                MacIntegrationPresetButton(preset: .assistant, active: activePreset == .assistant, disabled: isSaving) {
-                    Task { await applyIntegrationPreset(.assistant) }
-                }
-                MacIntegrationPresetButton(preset: .full, active: activePreset == .full, disabled: isSaving) {
-                    showFullMacConfirm = true
+            )) {
+                ForEach([MacIntegrationPreset.off, .watch, .assistant, .full]) { preset in
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(preset.title)
+                        Text(preset.subtitle)
+                            .font(ShellType.label)
+                            .foregroundStyle(NativeAgentShell.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .padding(.vertical, 3)
+                    .tag(Optional(preset))
                 }
             }
+            .pickerStyle(.radioGroup)
+            .labelsHidden()
+            .disabled(isSaving)
             .padding(.bottom, 2)
 
             AliveGroupCard {
@@ -881,7 +816,7 @@ struct MacControlPermissionsView: View {
         }
         do {
             let result = try await appModel
-                .saveMacIntegrationPreset(preset.rawValue, currentPolicy: appModel.trustPolicy)
+                .saveMacIntegrationPreset(preset.rawValue, currentPolicy: appModel.engine.trust.policy)
             appModel.applySavedTrustPolicy(result, status: "Applied \(preset.title).")
             if let mp = result.macControlPolicy {
                 policy = mp
@@ -950,14 +885,14 @@ struct MacControlPermissionsView: View {
     }
 
     /// PATCH-2026-05-07: macctl-policy-fetch The earlier version only read
-    /// from `appModel.trustPolicy` and bailed if nil. If this view loaded
+    /// from `appModel.engine.trust.policy` and bailed if nil. If this view loaded
     /// before any other surface had populated trustPolicy, the user saw
     /// every toggle as off (default) and any save would commit those
     /// defaults. Now we explicitly fetch /v1/trust on appear and seed
     /// AppModel so subsequent reads are correct too.
     private func loadPolicy() async {
         // Use cache if available
-        if let mp = appModel.trustPolicy?.macControlPolicy {
+        if let mp = appModel.engine.trust.policy?.macControlPolicy {
             policy = mp
             savedPolicy = mp
             policyReadState = .available
@@ -965,8 +900,8 @@ struct MacControlPermissionsView: View {
         }
         // Fetch fresh from daemon
         do {
-            let tp = try await appModel.getTrustPolicy()
-            await MainActor.run { appModel.trustPolicy = tp }
+            let tp = try await appModel.engine.trust.load()
+            await MainActor.run { appModel.engine.trust.policy = tp }
             if let mp = tp.macControlPolicy {
                 policy = mp
                 savedPolicy = mp
@@ -1021,7 +956,7 @@ struct MacControlPermissionsView: View {
     private func loadAudit() async {
         isLoadingAudit = true
         auditReadProblem = nil
-        let dataDir = appModel.health?.dataDir ?? ""
+        let dataDir = appModel.engine.doctor.health?.dataDir ?? ""
         let path = URL(fileURLWithPath: dataDir).appendingPathComponent("mac_control_audit.jsonl")
         // Read + parse the (potentially large, unbounded) audit file off the
         // MainActor; awaited so ordering vs. isLoadingAudit is preserved.
@@ -1139,55 +1074,6 @@ private struct MacControlUnavailableCategoryRow: View {
     }
 }
 
-/// One Mac integration preset as a selectable card, the same shape as Trust's
-/// four presets: a quiet card, and a ring in the haze on the chosen one.
-private struct MacIntegrationPresetButton: View {
-    var preset: MacIntegrationPreset
-    var active: Bool
-    var disabled: Bool
-    var action: () -> Void
-    @AppStorage(HazeColor.key) private var colorRaw = HazeColor.defaultValue.rawValue
-
-    var body: some View {
-        let haze = HazeColor(stored: colorRaw).base
-        let shape = RoundedRectangle(cornerRadius: AliveMetrics.cardRadius, style: .continuous)
-        Button(action: action) {
-            VStack(alignment: .leading, spacing: 4) {
-                HStack(spacing: 6) {
-                    Text(preset.title)
-                        .font(.system(size: 14, weight: .medium))
-                        .foregroundStyle(NativeAgentShell.text)
-                    Spacer(minLength: 4)
-                    // Not colour alone: the chosen one also carries a mark.
-                    if active {
-                        Image(systemName: "checkmark.circle.fill")
-                            .font(.system(size: 13))
-                            .foregroundStyle(haze)
-                            .accessibilityHidden(true)
-                    }
-                }
-                Text(preset.subtitle)
-                    .font(.system(size: 12))
-                    .foregroundStyle(NativeAgentShell.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 12)
-            .frame(maxWidth: .infinity, minHeight: 64, alignment: .topLeading)
-            .aliveCard()
-            .overlay {
-                if active {
-                    shape.strokeBorder(haze, lineWidth: 2)
-                }
-            }
-            .contentShape(shape)
-        }
-        .buttonStyle(.naFeel)
-        .disabled(disabled)
-        .opacity(disabled ? 0.6 : 1)
-        .accessibilityAddTraits(active ? [.isSelected] : [])
-    }
-}
 
 // MARK: - Audit Sheet
 

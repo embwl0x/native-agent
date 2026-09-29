@@ -1,3 +1,4 @@
+import NativeAgentCore
 import Foundation
 import GRDB
 import PersistenceCore
@@ -140,6 +141,20 @@ public actor CognitiveSQLiteStore {
         self.dbQueue = try DatabaseQueue(path: databaseURL.path, configuration: config)
         try Self.migrator.migrate(dbQueue)
         try Self.drainRetiredCognitionArtifacts(dbQueue)
+    }
+
+    /// Consistent online snapshot through the mounted writer before Doctor restores.
+    public func backupForDoctor() throws -> URL {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let name = "cognition.sqlite.doctor-bak-\(formatter.string(from: Date()).replacingOccurrences(of: ":", with: ""))-\(UUID().uuidString)"
+        let destination = databaseURL.deletingLastPathComponent().appendingPathComponent(name)
+        let backup = try DatabaseQueue(path: destination.path)
+        try dbQueue.backup(to: backup)
+        let result = try backup.read { db in try String.fetchOne(db, sql: "PRAGMA quick_check") }
+        guard result == "ok" else { throw CognitivePersistenceError.storeUnavailable }
+        try backup.close()
+        return destination
     }
 
     /// One-way drain of retired cognition machinery. Runs unconditionally at

@@ -138,7 +138,7 @@ extension MacAppleScriptBridge {
 
     private static func mailManage(input: [String: JSONValue], action: String, single: Bool, body: String) async -> JSONValue {
         let exact = mailExactLocator(input)
-        if input["message_id"] != nil && exact == nil { return failedEnvelope(integration: "mail", reason: "invalid_message_locator") }
+        if (input["message_id"] != nil || input["expected_message_id"] != nil) && exact == nil { return failedEnvelope(integration: "mail", reason: "invalid_message_locator") }
         let subject = inputString(input["subject"]) ?? ""
         guard exact != nil || !subject.isEmpty else { return failedEnvelope(integration: "mail", reason: "missing_subject") }
         let whereClause = exact.map { "id is \($0.id)" }
@@ -200,7 +200,7 @@ extension MacAppleScriptBridge {
     /// Returns: {status, action: "sent_reply", subject}.
     public static func mailReply(input: [String: JSONValue]) async throws -> JSONValue {
         let exact = mailExactLocator(input)
-        if input["message_id"] != nil && exact == nil { return failedEnvelope(integration: "mail", reason: "invalid_message_locator") }
+        if (input["message_id"] != nil || input["expected_message_id"] != nil) && exact == nil { return failedEnvelope(integration: "mail", reason: "invalid_message_locator") }
         let subject = inputString(input["subject"]) ?? ""
         guard exact != nil || !subject.isEmpty else {
             return failedEnvelope(integration: "mail", reason: "missing_subject")

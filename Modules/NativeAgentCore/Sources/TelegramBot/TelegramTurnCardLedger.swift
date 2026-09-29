@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import TurnTrace
 
 struct TelegramPersistedTurnCard: Sendable, Codable, Equatable {
     let turnId: UUID

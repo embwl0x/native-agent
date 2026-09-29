@@ -49,14 +49,6 @@ Mac app derives them from the paired iOS token registration (`bundleId` and
 APNS environment). `team_id`, `key_id`, and `key_path` remain required APNS
 provider credentials.
 
-Live verification is intentionally opt-in because it sends a real notification:
-
-```bash
-NATIVE_AGENT_DATA_ROOT="$PWD/data" \
-NATIVE_AGENT_LIVE_MOBILE_NOTIFY_TEST=1 \
-swift test --filter liveMobileNotify_optInOnly
-```
-
 Successful sends append Swift-native receipts to
 `data/mobile_push/receipts.jsonl` with `httpStatus: 200`. Notification titles
 default to the onboarded agent display name from `data/memory/profile.json`.

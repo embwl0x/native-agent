@@ -43,12 +43,9 @@ extension SwiftNativeResearchClient {
             return false
         }
         do {
-            let (status, body, _) = try await http.get(url: url, timeout: 6)
-            if status != 200 { return false }
-            // Python reads up to 512_000 bytes then json.loads — Swift parses the whole body
-            // (the test stub honors a small-body contract; production responses are bounded
-            // by URLSession's transport buffer + SearXNG's own response size).
-            let parsed = try JSONValue.parse(body)
+            let response = try await http.getBounded(url: url, timeout: 6, maxBytes: 512_000)
+            guard response.status == 200, !response.truncated else { return false }
+            let parsed = try JSONValue.parse(response.body)
             guard case .object(let obj) = parsed else { return false }
             return obj["results"] != nil
         } catch {
@@ -105,7 +102,7 @@ extension SwiftNativeResearchClient {
     /// sibling convention from PersistenceCore+FileLock.swift.
     private func persistSearXNGBaseURL(_ base: String) async throws {
         let work: @Sendable () async throws -> Void = { [persistence, configPath] in
-            let raw = await persistence.readJSON(configPath, defaultValue: .object([:]))
+            let raw = try await persistence.readJSON(configPath, ifMissing: .object([:]))
             var obj: [String: JSONValue]
             if case .object(let existing) = raw {
                 obj = existing

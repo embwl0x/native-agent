@@ -31,6 +31,8 @@ struct QueuedChatSend: Identifiable, Codable {
 
 @MainActor
 final class ChatStore: ObservableObject {
+    /// The scene and cold App Intents must settle the same durable exchanges.
+    static let shared = ChatStore()
     struct CachedTranscript: Codable {
         let schemaVersion: Int
         let sessionID: String?
@@ -77,8 +79,12 @@ final class ChatStore: ObservableObject {
         didSet { persistPendingExchanges() }
     }
     static let pendingExchangesKey = "NativeAgentMobile.chatPendingExchanges.v1"
+    var sharedInboxControls: ChatRuntimeControls?
     @Published var queuedSends: [QueuedChatSend] = [] {
-        didSet { persistQueuedSends() }
+        didSet {
+            persistQueuedSends()
+            if queuedSends.count < oldValue.count { scheduleSharedInboxRetry() }
+        }
     }
     /// Persist every accepted send. Admission is bounded per session; a global
     /// persistence cap would silently discard other sessions' paused queues.
@@ -167,8 +173,10 @@ final class ChatStore: ObservableObject {
             defaults.removeObject(forKey: Self.mainSessionIDKey)
             defaults.set(true, forKey: "NativeAgent.unifiedSession.v1")
         }
-        let savedSelected = Self.cleanSessionID(defaults.string(forKey: Self.selectedSessionIDKey))
-        let savedMain = Self.cleanSessionID(defaults.string(forKey: Self.mainSessionIDKey)) ?? savedSelected
+        let savedMain = Self.cleanSessionID(defaults.string(forKey: Self.mainSessionIDKey))
+        // A launch opens main. History is only selected by an explicit action
+        // in this launch, never by restoring yesterday's open history thread.
+        let savedSelected = savedMain
         let savedLocal = Self.cleanSessionID(defaults.string(forKey: Self.locallyCreatedSessionIDKey))
         selectedSessionID = savedSelected
         mainSessionID = savedMain

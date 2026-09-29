@@ -1,9 +1,18 @@
 import Foundation
+import Security
+import CloudKit
 #if canImport(Darwin)
 import Darwin
 #endif
 import NativeAgentCore
+import NativeAgentShared
 import PersistenceCore
+import DeviceSyncState
+import Desk
+import GitHubConnector
+import XConnector
+import SlackConnector
+import ProviderRouting
 import PersonaEngine
 // M5: MemoryStoreCheck validates the REAL knowledge-graph store (memory.sqlite
 // kg_entities/kg_relationships) through the reader the app already uses.
@@ -31,25 +40,52 @@ import MemoryV2
 ///   {"id", "title", "status", "detail", "repair"}.
 /// status is one of "ok" | "warn" | "fail". `repair` is the optional
 /// remediation hint.
-public struct CheckResult: Sendable, Codable, Equatable {
+public struct CheckResult: Sendable, Codable, Equatable, Identifiable {
     public let id: String
     public let title: String
     public let status: String
     public let detail: String
+    /// Executable repair instruction in reports; legacy core checks are
+    /// normalized by DoctorActionRuntime before they reach consumers.
     public let repair: String?
+    public let receipt: String?
+    public let human_action: String?
+    /// Live handler availability observed by DoctorActionRuntime, not inferred
+    /// from human instructions or completion receipts. Nil in older reports.
+    public let repair_available: Bool?
 
     public init(
         id: String,
         title: String,
         status: String,
         detail: String,
-        repair: String? = nil
+        repair: String? = nil,
+        receipt: String? = nil,
+        human_action: String? = nil,
+        repair_available: Bool? = nil
     ) {
         self.id = id
         self.title = title
         self.status = status
         self.detail = detail
         self.repair = repair
+        self.receipt = receipt
+        self.human_action = human_action
+        self.repair_available = repair_available
+    }
+
+    /// Reports must leave an adverse row with an executable repair or a human
+    /// next step, including older cached rows with only legacy repair copy.
+    public func recoveryAction(repairAvailable: Bool) -> String? {
+        if let action = human_action?.trimmingCharacters(in: .whitespacesAndNewlines), !action.isEmpty {
+            return action
+        }
+        guard !repairAvailable, DoctorSafeRepairPolicy.isAdverse(status) else { return nil }
+        if let action = repair?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !action.isEmpty, !action.lowercased().hasPrefix("run repair safe issues") {
+            return action
+        }
+        return "Open Diagnostics → Doctor and copy the \(title) detail into a support request. This check has no automatic repair."
     }
 }
 
@@ -86,16 +122,23 @@ public extension DoctorCheck {
 
 /// Which check ids an unattended sweep must leave alone.
 ///
-/// Derived from the real default check list rather than restated, so the flag
-/// on the check and the set the heartbeat filters by CANNOT drift apart. A
-/// reader that only has a persisted `doctor/latest.json` (the heartbeat, the
-/// self-heal hook) has no check instances to ask, so it asks this.
+/// Core ids derive from the default check list so heartbeat policy follows
+/// their flags. App-mounted live ids have no DoctorCheck instances and are
+/// listed here for persisted-report readers such as heartbeat and self-heal.
 public enum DoctorHeartbeatPolicy {
     public static let ineligibleCheckIDs: Set<String> = Set(
         SwiftNativeDoctorChecks.defaultChecks
             .filter { !$0.heartbeatEligible }
             .map(\.id)
-    )
+    ).union([
+        // App-mounted Cognition checks include historical receipts and
+        // operator-only readings. They belong in Doctor, not phone alerts.
+        "live.cognition.runtime", "live.cognition.persistence",
+        "live.cognition.receipts", "live.cognition.readouts",
+        "live.cognition.body", "live.cognition.welfare",
+        "live.cognition.capacity", "live.cognition.associations",
+        "live.cognition.context_flow", "live.cognition.phone_pairing",
+    ])
 
     /// True when an unattended sweep may judge this id.
     public static func isEligible(_ id: String) -> Bool {
@@ -116,6 +159,11 @@ public extension RepairingDoctorCheck {
     }
 }
 
+/// File repair entry point available without an explicit Repair button.
+public protocol CreateMissingDoctorCheck: RepairingDoctorCheck {
+    func createMissing() async -> CheckResult
+}
+
 // MARK: - DoctorChecksProtocol
 
 /// SwiftNative impl never throws (the actor catches everything and reflects
@@ -130,7 +178,7 @@ public extension RepairingDoctorCheck {
 /// pass it, and do not read it as permission to make a network call.
 public protocol DoctorChecksProtocol: Sendable {
     func runAll(repair: Bool, checkLLM: Bool) async throws -> [CheckResult]
-    func runCheck(id: String, repair: Bool) async throws -> CheckResult?
+    func runCheck(id: String, repair: Bool, scope: DoctorRepairScope) async throws -> CheckResult?
 }
 
 // MARK: - Errors
@@ -171,7 +219,7 @@ private struct DoctorJSONStoreSpec: Sendable {
     }
 }
 
-private enum DoctorFileRepair {
+public enum DoctorFileRepair {
     static func timestamp() -> String {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
@@ -180,7 +228,7 @@ private enum DoctorFileRepair {
             .replacingOccurrences(of: ".", with: "")
     }
 
-    static func backupExistingFile(_ url: URL) throws -> URL? {
+    public static func backupExistingFile(_ url: URL) throws -> URL? {
         guard FileManager.default.fileExists(atPath: url.path) else { return nil }
         var isDir: ObjCBool = false
         guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), !isDir.boolValue else {
@@ -196,12 +244,18 @@ private enum DoctorFileRepair {
         try await SwiftNativePersistenceCore().writeJSON(value, to: url)
     }
 
+    static func createJSON(_ value: JSONValue, at url: URL) throws {
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        // Exclusive creation also protects files/symlinks appearing after the check.
+        try value.serializedData(pretty: true).write(to: url, options: [.withoutOverwriting])
+    }
+
     static func parseJSONFile(_ url: URL) throws -> JSONValue {
         let data = try Data(contentsOf: url)
         return try JSONValue.parse(data)
     }
 
-    static func value(_ value: JSONValue, matches shape: DoctorJSONShape) -> Bool {
+    fileprivate static func value(_ value: JSONValue, matches shape: DoctorJSONShape) -> Bool {
         switch (shape, value) {
         case (.object, .object): return true
         case (.array, .array): return true
@@ -552,9 +606,9 @@ public struct PersonaEngineCheck: RepairingDoctorCheck {
 
 // MARK: - RuntimeJSONStoresCheck
 
-/// Verifies the app-owned JSON files that route core runtime behavior. Repair
-/// only writes safe empty/default shapes and backs up malformed existing files.
-public struct RuntimeJSONStoresCheck: RepairingDoctorCheck {
+/// Verifies the app-owned JSON files that route core runtime behavior.
+/// Creation never overwrites; the full button repair backs up existing files.
+public struct RuntimeJSONStoresCheck: CreateMissingDoctorCheck {
     public let id: String = "runtime_json_stores"
     public let title: String = "Runtime JSON Stores"
     private let root: URL
@@ -571,6 +625,14 @@ public struct RuntimeJSONStoresCheck: RepairingDoctorCheck {
     }
 
     public func run(repair: Bool) async -> CheckResult {
+        await run(repair: repair, replaceExisting: repair)
+    }
+
+    public func createMissing() async -> CheckResult {
+        await run(repair: true, replaceExisting: false)
+    }
+
+    private func run(repair: Bool, replaceExisting: Bool) async -> CheckResult {
         var missing: [String] = []
         var malformed: [String] = []
         var wrongShape: [String] = []
@@ -585,7 +647,7 @@ public struct RuntimeJSONStoresCheck: RepairingDoctorCheck {
                 missing.append(spec.relativePath)
                 if repair {
                     do {
-                        try await DoctorFileRepair.writeJSON(spec.defaultValue, to: path)
+                        try DoctorFileRepair.createJSON(spec.defaultValue, at: path)
                         repaired.append("created \(spec.relativePath)")
                     } catch {
                         unrepaired.append("\(spec.relativePath): \(error.localizedDescription)")
@@ -608,7 +670,7 @@ public struct RuntimeJSONStoresCheck: RepairingDoctorCheck {
                 let value = try DoctorFileRepair.parseJSONFile(path)
                 if !DoctorFileRepair.value(value, matches: spec.shape) {
                     wrongShape.append(spec.relativePath)
-                    if repair {
+                    if replaceExisting {
                         do {
                             _ = try DoctorFileRepair.backupExistingFile(path)
                             try await DoctorFileRepair.writeJSON(spec.defaultValue, to: path)
@@ -620,7 +682,7 @@ public struct RuntimeJSONStoresCheck: RepairingDoctorCheck {
                 }
             } catch {
                 malformed.append(spec.relativePath)
-                if repair {
+                if replaceExisting {
                     do {
                         _ = try DoctorFileRepair.backupExistingFile(path)
                         try await DoctorFileRepair.writeJSON(spec.defaultValue, to: path)
@@ -644,7 +706,8 @@ public struct RuntimeJSONStoresCheck: RepairingDoctorCheck {
         // "valid after repair" may only be claimed when NOTHING is left
         // broken — every wrongShape/malformed entry must have been reset (or
         // recorded in `unrepaired`, which already returned "fail" above).
-        if repair, !repaired.isEmpty, unrepaired.isEmpty {
+        if repair, !repaired.isEmpty, unrepaired.isEmpty,
+           replaceExisting || (malformed.isEmpty && wrongShape.isEmpty) {
             return CheckResult(
                 id: id,
                 title: title,
@@ -660,7 +723,9 @@ public struct RuntimeJSONStoresCheck: RepairingDoctorCheck {
                 title: title,
                 status: "fail",
                 detail: "\(issueCount) runtime JSON store(s) are malformed or wrong-shaped: \((malformed + wrongShape).prefix(8).joined(separator: ", "))",
-                repair: "Run Repair Safe Issues to back up and reset malformed app-owned JSON stores."
+                repair: "Run Repair Safe Issues to back up and reset malformed app-owned JSON stores.",
+                receipt: repaired.isEmpty ? nil : "Completed: \(repaired.joined(separator: "; ")).",
+                human_action: "Open Diagnostics → Doctor and press Repair to back up and reset malformed app-owned JSON stores. Onboarding and automatic repairs leave existing files unchanged."
             )
         }
         if !missing.isEmpty {
@@ -771,7 +836,7 @@ actor ChatMessagesScanCache {
     func count() -> Int { entries.count }
 }
 
-public struct ChatMessagesIntegrityCheck: RepairingDoctorCheck {
+public struct ChatMessagesIntegrityCheck: CreateMissingDoctorCheck {
     public let id: String = "chat_messages"
     public let title: String = "Chat Message Logs"
     private let root: URL
@@ -812,6 +877,14 @@ public struct ChatMessagesIntegrityCheck: RepairingDoctorCheck {
     }
 
     public func run(repair: Bool) async -> CheckResult {
+        await run(repair: repair, replaceExisting: repair)
+    }
+
+    public func createMissing() async -> CheckResult {
+        await run(repair: true, replaceExisting: false)
+    }
+
+    private func run(repair: Bool, replaceExisting: Bool) async -> CheckResult {
         let dir = root
             .appendingPathComponent("chat", isDirectory: true)
             .appendingPathComponent("messages", isDirectory: true)
@@ -859,7 +932,7 @@ public struct ChatMessagesIntegrityCheck: RepairingDoctorCheck {
         // A1/FIX-1b: the (mtime,size) memo is consulted only on the read-only
         // path. Repair mode rewrites files, so it always re-parses and lets the
         // rewritten fingerprint invalidate the old memo naturally.
-        let useCache = !repair
+        let useCache = !replaceExisting
         var scannedPaths: Set<String> = []
 
         for file in files {
@@ -912,7 +985,7 @@ public struct ChatMessagesIntegrityCheck: RepairingDoctorCheck {
             if fileMalformed > 0 {
                 malformedLines += fileMalformed
                 malformedFiles.append(file)
-                if repair {
+                if replaceExisting {
                     do {
                         _ = try DoctorFileRepair.backupExistingFile(file)
                         let repairedText = validLines.isEmpty ? "" : validLines.joined(separator: "\n") + "\n"
@@ -952,7 +1025,8 @@ public struct ChatMessagesIntegrityCheck: RepairingDoctorCheck {
                 title: title,
                 status: "fail",
                 detail: "\(malformedLines) malformed chat JSONL row(s) across \(malformedFiles.count) file(s).",
-                repair: "Run Repair Safe Issues to back up malformed JSONL files and keep valid rows."
+                repair: "Run Repair Safe Issues to back up malformed JSONL files and keep valid rows.",
+                human_action: "Open Diagnostics → Doctor and press Repair to back up malformed chat logs and keep valid rows. Onboarding and automatic repairs leave existing logs unchanged."
             )
         }
         return CheckResult(
@@ -1058,35 +1132,16 @@ public struct MemoryStoreCheck: DoctorCheck {
 
 // MARK: - ICloudBridgeStateCheck
 
-public struct ICloudBridgeStateCheck: RepairingDoctorCheck {
+public struct ICloudBridgeStateCheck: CreateMissingDoctorCheck {
     public let id: String = "icloud_bridge_state"
     public let title: String = "iCloud Bridge State"
-    private let docsURLProvider: @Sendable () -> URL?
-    /// Whether THIS build actually ships iCloud (a real container id is
-    /// configured, not the standalone "com.example" sentinel). The public
-    /// no-iCloud DMG ships without iCloud on purpose, so an unavailable
-    /// container there is EXPECTED, not a problem to warn about (User,
-    /// 2026-07-04). Only a build that genuinely configures iCloud should nag to
-    /// sign in.
-    private let iCloudConfigured: Bool
     /// Local (non-iCloud) sync bookkeeping root. Sweep R4 items 1 + 2 record
     /// their durable failure state here, and this row is where it surfaces —
     /// reusing the existing iCloud bridge row rather than opening a second
     /// reporting lane for the same subsystem.
     private let dataRoot: URL
 
-    public init(
-        docsURLProvider: @escaping @Sendable () -> URL? = {
-            let containerID = ICloudBridgeStateCheck.resolvedContainerID()
-            return FileManager.default
-                .url(forUbiquityContainerIdentifier: containerID)?
-                .appendingPathComponent("Documents", isDirectory: true)
-        },
-        iCloudConfigured: Bool = ICloudBridgeStateCheck.buildConfiguresICloud(),
-        dataRoot: URL = PersistenceCore.defaultDataRoot()
-    ) {
-        self.docsURLProvider = docsURLProvider
-        self.iCloudConfigured = iCloudConfigured
+    public init(dataRoot: URL = PersistenceCore.defaultDataRoot()) {
         self.dataRoot = dataRoot
     }
 
@@ -1123,7 +1178,7 @@ public struct ICloudBridgeStateCheck: RepairingDoctorCheck {
         return warnings
     }
 
-    /// Folds local sync-state warnings into a bridge-directory verdict without
+    /// Folds local sync-state warnings into the active transport verdict without
     /// downgrading a harder existing status.
     private func merging(_ result: CheckResult) -> CheckResult {
         let warnings = Self.localSyncStateWarnings(dataRoot: dataRoot)
@@ -1138,44 +1193,54 @@ public struct ICloudBridgeStateCheck: RepairingDoctorCheck {
         )
     }
 
-    /// The configured container id, or the standalone "com.example" sentinel.
-    public static func resolvedContainerID() -> String {
-        let envContainerID = ProcessInfo.processInfo.environment["NATIVEAGENT_ICLOUD_CONTAINER_ID"]
-        let infoContainerID = Bundle.main.object(forInfoDictionaryKey: "NativeAgentICloudContainerID") as? String
-        let configured = (envContainerID ?? infoContainerID)?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        if let configured, !configured.isEmpty, !configured.contains("$(") {
-            return configured
-        }
-        return "iCloud.io.github.embwl0x.nativeagent"
+    public func createMissing() async -> CheckResult {
+        await run(repair: true)
     }
 
-    /// True only when a REAL (non-placeholder) iCloud container is configured.
-    public static func buildConfiguresICloud() -> Bool {
-        let id = resolvedContainerID()
-        return !id.contains("com.example")
+    private static func entitlementValues(_ key: String) -> [String] {
+        guard let task = SecTaskCreateFromSelf(nil),
+              let raw = SecTaskCopyValueForEntitlement(task, key as CFString, nil) else { return [] }
+        if let values = raw as? [String] { return values }
+        if let value = raw as? String { return [value] }
+        return []
     }
 
     public func run(repair: Bool) async -> CheckResult {
-        guard let docsURL = docsURLProvider() else {
-            // Public no-iCloud build: iCloud isn't part of it, so an
-            // unavailable container is expected — report OK, not a warning.
-            if !iCloudConfigured {
-                // Even a no-iCloud build runs the CloudKit projection lane, so
-                // its local sync bookkeeping still matters here.
-                return merging(CheckResult(
-                    id: id,
-                    title: title,
-                    status: "ok",
-                    detail: "iCloud sync isn't part of this build (no iCloud container configured)."
-                ))
-            }
+        let services = Self.entitlementValues(DeviceCloudKitPreflight.iCloudServicesEntitlementKey)
+        guard let snapshot = await ICloudBridgeHealthReader.snapshot(dataRoot: dataRoot) else {
             return merging(CheckResult(
-                id: id,
-                title: title,
-                status: "warn",
-                detail: "iCloud container is unavailable to this process.",
-                repair: "Run Doctor from the signed Mac app after signing into iCloud; CLI builds may not have the iCloud entitlement."
+                id: id, title: title, status: "ok",
+                detail: "iCloud transport health is unmeasured; the app's bridge has not started."
+            ))
+        }
+        let containerID = NativeAgentICloudBridgeConstants.containerID
+        let cloudKit = snapshot.transport == .cloudKit
+        let service = cloudKit ? "CloudKit" : "CloudDocuments"
+        let containerKey = cloudKit ? DeviceCloudKitPreflight.iCloudContainersEntitlementKey
+            : "com.apple.developer.ubiquity-container-identifiers"
+        guard services.contains(service), Self.entitlementValues(containerKey).contains(containerID) else {
+            return merging(CheckResult(
+                id: id, title: title, status: "warn",
+                detail: "The active \(cloudKit ? "CloudKit" : "iCloud Drive") transport lacks its signed \(service) service or container entitlement.",
+                repair: "Install a signed NativeAgent build granting \(service) and container \(containerID)."
+            ))
+        }
+        if cloudKit {
+            return merging(cloudKitResult(snapshot.health))
+        }
+        if case .unmeasured = snapshot.health {
+            return merging(CheckResult(
+                id: id, title: title, status: "ok", detail: "iCloud Drive is starting; transport health is not measured yet."
+            ))
+        }
+        guard case .available = snapshot.health, let docsURL = snapshot.documentsURL else {
+            let signedIn = FileManager.default.ubiquityIdentityToken != nil
+            return merging(CheckResult(
+                id: id, title: title, status: "warn",
+                detail: signedIn ? "The active iCloud Drive container is unavailable." : "The active iCloud Drive transport has no signed-in iCloud account.",
+                repair: signedIn
+                    ? "Open System Settings → Apple Account → iCloud → Drive and turn on Sync this Mac; allow NativeAgent under Apps Syncing to iCloud Drive."
+                    : "Open System Settings → Apple Account and sign in to iCloud."
             ))
         }
         let bridgeDirs = [
@@ -1238,6 +1303,43 @@ public struct ICloudBridgeStateCheck: RepairingDoctorCheck {
             detail: "iCloud/APNS bridge directories are present."
         ))
     }
+
+    private func cloudKitResult(_ health: ICloudBridgeHealthSnapshot.Health) -> CheckResult {
+        var status = "warn"
+        let detail: String
+        var action: String?
+        switch health {
+        case .unmeasured:
+            status = "ok"
+            detail = "CloudKit is active; transport health is not measured yet. iCloud Drive is not required."
+        case .available:
+            status = "ok"
+            detail = "CloudKit is active and its last receive completed successfully. iCloud Drive is not required."
+        case .signedOut:
+            detail = "The active CloudKit transport has no authenticated iCloud account."
+            action = "Open System Settings → Apple Account and sign in to iCloud."
+        case .notEntitled:
+            detail = "The active CloudKit transport is not configured with its required entitlements."
+            action = "Install a signed NativeAgent build granting CloudKit and container \(NativeAgentICloudBridgeConstants.containerID)."
+        case .quotaExceeded:
+            detail = "The active CloudKit transport cannot receive because iCloud storage is full."
+            action = "Open System Settings → Apple Account → iCloud → Manage and free iCloud storage."
+        case .accountFailure(let code, let reason):
+            detail = "The active CloudKit transport was rejected: \(reason)"
+            switch CKError.Code(rawValue: code) {
+            case .notAuthenticated:
+                action = "Open System Settings → Apple Account and complete iCloud sign-in."
+            case .missingEntitlement:
+                action = "Install a signed NativeAgent build granting CloudKit and container \(NativeAgentICloudBridgeConstants.containerID)."
+            case .managedAccountRestricted:
+                action = "Ask your Apple Account administrator to allow CloudKit for NativeAgent."
+            default: break
+            }
+        case .unavailable(let reason):
+            detail = "The active CloudKit transport's last receive failed: \(reason)"
+        }
+        return CheckResult(id: id, title: title, status: status, detail: detail, repair: action)
+    }
 }
 
 // MARK: - SwiftNative impl
@@ -1272,13 +1374,24 @@ public struct CoreMLEmbedderCheck: RepairingDoctorCheck {
     public var title: String { "Core ML Embedder (\(Self.resolvedModelID))" }
 
     private static var resolvedModelID: String {
-        CoreMLEmbeddingProvider.installedExtrasModel(root: defaultDataRoot())?.modelID
+        (try? CoreMLEmbeddingProvider.installedExtrasModel(root: defaultDataRoot()))?.modelID
             ?? CoreMLEmbeddingProvider.bundledModelID
     }
 
     public init() {}
 
     public func run(repair: Bool) async -> CheckResult {
+        // An installed model whose manifest is unusable fails here by name —
+        // it is never reported as the MiniLM floor loading (S12, 2026-09-26).
+        do {
+            _ = try CoreMLEmbeddingProvider.installedExtrasModel(root: defaultDataRoot())
+        } catch {
+            return CheckResult(
+                id: id, title: "Core ML Embedder (installed model)", status: "fail",
+                detail: "\(error.localizedDescription). Semantic recall is off until the installed model is fixed or removed.",
+                repair: repair ? "Cannot repair: the installed model's files need fixing, not cached state." : nil
+            )
+        }
         guard CoreMLEmbeddingProvider.bundledResourcesAvailable(extrasRoot: defaultDataRoot()) else {
             return CheckResult(
                 id: id, title: title, status: "fail",
@@ -1418,195 +1531,187 @@ public struct OpLogHealthCheck: DoctorCheck {
 
 // MARK: - OAuthTokenExpiryCheck
 
-/// C9-3 (upgrade sweep 2026-08-28). Two OAuth credentials in the live data
-/// root had been expired for weeks with nothing anywhere reporting it — the
-/// `x` connector (expired 2026-06-20) and the `xai_oauth_direct` provider
-/// (expired 2026-07-10). Both still hold a refresh token, so the failure is
-/// invisible until a call fails somewhere far from the cause. Doctor now says
-/// it out loud.
-///
-/// STRICTLY READ-ONLY, and deliberately so: this check never writes, never
-/// refreshes, never deletes a credential, and never reads a secret field. It
-/// reads `expires_at`, the file name, and whether a nonempty refresh credential
-/// is present. Credential material is never copied into the result, so a Doctor
-/// report can never carry it.
-///
-/// FIX-5a (2026-09-01): because the refresh is never probed, "a refresh token
-/// is on file" is evidence about a string, not about recovery. An expired
-/// access token therefore WARNS whether or not a refresh token sits beside it,
-/// and every credential Doctor could not judge (unparseable, or carrying no
-/// `expires_at`) is named as unchecked AND warns — an unjudged credential
-/// behind a green row is the same silence, one level up.
-public struct OAuthTokenExpiryCheck: DoctorCheck {
-    public let id: String = "oauth_token_expiry"
-    public let title: String = "OAuth Token Expiry"
+/// Expiry repair delegates to the credential's runtime owner. Inspection never
+/// exchanges tokens; safe repair refreshes only expired, refreshable credentials.
+public struct OAuthTokenExpiryCheck: RepairingDoctorCheck {
+    public let id = "oauth_token_expiry"
+    public let title = "OAuth Token Expiry"
     private let root: URL
-    private let now: Date
+    private let now: Date?
 
-    /// Inside this window a still-valid token is reported as expiring soon, so
-    /// a credential is surfaced before the first failed call, not after.
-    static let expiringSoonWindow: TimeInterval = 7 * 24 * 60 * 60
-
-    public init(root: URL = defaultDataRoot(), now: Date = Date()) {
+    public init(root: URL = defaultDataRoot(), now: Date? = nil) {
         self.root = root
         self.now = now
     }
 
-    /// The live stores disagree on shape: `oauth_tokens/x.json` writes epoch
-    /// seconds as a STRING ("1781971620.402659") while
-    /// `providers/xai_oauth_direct.json` writes ISO-8601 ("2026-07-10T16:05:22Z").
-    /// A credential store that stops being read because its stamp is spelled
-    /// differently is exactly the silence this check exists to break, so both
-    /// spellings (plus a bare number) resolve here.
-    static func parseExpiry(_ value: JSONValue?) -> Date? {
-        let raw: String
-        switch value {
-        case .string(let s): raw = s.trimmingCharacters(in: .whitespaces)
-        case .int(let i): return Date(timeIntervalSince1970: TimeInterval(i))
-        case .double(let d): return Date(timeIntervalSince1970: d)
-        default: return nil
+    private struct Credential {
+        let owner: String
+        let name: String
+        let path: URL
+
+        var signIn: String {
+            let section = owner.hasSuffix("_oauth_direct") ? "Providers" : "Connectors"
+            return "Open Settings → \(section) → \(name) and sign in again."
         }
-        if raw.isEmpty { return nil }
-        if let seconds = Double(raw) {
-            // Guard against a millisecond stamp being read as year ~57000.
-            return Date(timeIntervalSince1970: seconds > 100_000_000_000 ? seconds / 1000 : seconds)
-        }
-        let withFractional = ISO8601DateFormatter()
-        withFractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let date = withFractional.date(from: raw) { return date }
-        return ISO8601DateFormatter().date(from: raw)
     }
 
-    /// Every credential file Doctor inspects, as (label, url). Both stores are
-    /// named explicitly: a glob over `providers/` would sweep in model caches
-    /// and provider config that carry no expiry at all.
-    static func credentialFiles(root: URL) -> [(String, URL)] {
-        let fm = FileManager.default
-        var found: [(String, URL)] = []
-        let tokensDir = root.appendingPathComponent("oauth_tokens", isDirectory: true)
-        for url in ((try? fm.contentsOfDirectory(at: tokensDir, includingPropertiesForKeys: nil)) ?? [])
-        where url.pathExtension == "json" {
-            found.append((url.deletingPathExtension().lastPathComponent, url))
+    private func credentials() -> [Credential] {
+        let entries = [
+            Credential(owner: "x", name: "X", path: root.appendingPathComponent("oauth_tokens/x.json")),
+            Credential(owner: "gmail", name: "Gmail", path: root.appendingPathComponent("connectors/gmail/auth.json")),
+            Credential(owner: "calendar", name: "Google Calendar", path: root.appendingPathComponent("connectors/calendar/auth.json")),
+            Credential(owner: "github", name: "GitHub", path: root.appendingPathComponent("connectors/github/auth.json")),
+            Credential(owner: "slack", name: "Slack", path: root.appendingPathComponent("oauth_tokens/slack.json")),
+        ] + [
+            ("xai_oauth_direct", "xAI"), ("anthropic_oauth_direct", "Anthropic"),
+            ("openai_oauth_direct", "ChatGPT"),
+        ].map { owner, name in
+            Credential(owner: owner, name: name,
+                       path: ProviderOAuthCredentialMaintenance.credentialPath(provider: owner, root: root))
         }
-        let providersDir = root.appendingPathComponent("providers", isDirectory: true)
-        for url in ((try? fm.contentsOfDirectory(at: providersDir, includingPropertiesForKeys: nil)) ?? [])
-        where url.pathExtension == "json" && url.deletingPathExtension().lastPathComponent.hasSuffix("_oauth_direct") {
-            found.append((url.deletingPathExtension().lastPathComponent, url))
+        return entries.filter { credential in
+            let fm = FileManager.default
+            if credential.owner == "github" {
+                return GitHubCredentialStore.metadataPaths(dataRoot: root).contains { fm.fileExists(atPath: $0.path) }
+            }
+            if credential.owner == "slack" {
+                return fm.fileExists(atPath: credential.path.path)
+                    || fm.fileExists(atPath: root.appendingPathComponent("connectors/slack/auth.json").path)
+            }
+            guard fm.fileExists(atPath: credential.path.path) else { return false }
+            if credential.owner.hasSuffix("_oauth_direct"),
+               let data = try? Data(contentsOf: credential.path),
+               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                // A provider settings file with no credential is not a failed sign-in.
+                return object["access_token"] != nil || object["refresh_token"] != nil || object["tokens"] != nil
+            }
+            return true
         }
-        return found.sorted { $0.0 < $1.0 }
     }
 
-    public func run() async -> CheckResult {
-        var expired: [String] = []
-        var expiringSoon: [String] = []
-        var refreshableExpired: [String] = []
-        var checked = 0
-        var unreadable: [String] = []
-        var noExpiry: [String] = []
-
-        for (label, url) in Self.credentialFiles(root: root) {
-            guard FileManager.default.fileExists(atPath: url.path) else { continue }
-            guard let parsed = try? DoctorFileRepair.parseJSONFile(url), case .object(let object) = parsed else {
-                unreadable.append(label)
-                continue
-            }
-            guard let expiry = Self.parseExpiry(object["expires_at"]) else {
-                // FIX-5a: a credential with no `expires_at` was NOT checked.
-                // Skipping it silently made "\(checked) credentials … none is
-                // expired" read as coverage it never had.
-                noExpiry.append(label)
-                continue
-            }
-            checked += 1
-            let stamp = ISO8601DateFormatter().string(from: expiry)
-            let refreshToken: String? = {
-                if case .string(let value)? = object["refresh_token"] { return value }
-                if case .object(let tokens)? = object["tokens"],
-                   case .string(let value)? = tokens["refresh_token"] { return value }
-                return nil
-            }()
-            let canRefresh = refreshToken?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
-            if expiry <= now {
-                let days = Int(now.timeIntervalSince(expiry) / 86_400)
-                if canRefresh {
-                    refreshableExpired.append("\(label) access expired \(days)d ago; refresh untested")
-                } else {
-                    expired.append("\(label) expired \(stamp) (\(days)d ago)")
-                }
-            } else if expiry.timeIntervalSince(now) <= Self.expiringSoonWindow {
-                if !canRefresh {
-                    expiringSoon.append("\(label) expires \(stamp)")
-                }
-            }
+    private func status(_ credential: Credential, afterRefresh: Bool = false) async throws -> OAuthCredentialHealth {
+        switch credential.owner {
+        case "gmail", "calendar":
+            return try GoogleOAuthCredentials.credentialStatus(path: credential.path)
+        case "x":
+            let state = try XConnectorActions.credentialStatus(dataRoot: root)
+            return OAuthCredentialHealth(configured: state.configured, expiresAt: state.expiresAt, canRefresh: state.canRefresh)
+        case "github":
+            let state = try await GitHubCredentialStore.shared.credentialStatus(dataRoot: root, requiringOAuth: afterRefresh)
+            return OAuthCredentialHealth(configured: state.configured, expiresAt: state.expiresAt, canRefresh: state.canRefresh)
+        case "slack":
+            try SlackConnectorActions.requireConfiguredToken(dataRoot: root)
+            return OAuthCredentialHealth(configured: true, expiresAt: nil, canRefresh: false)
+        default:
+            return try ProviderOAuthCredentialMaintenance.status(provider: credential.owner, root: root)
         }
+    }
 
-        let repair = "Re-authorize the named integration from Settings → Connectors / Providers. "
-            + "Doctor never touches credential files: it reads `expires_at` only."
-
-        // FIX-5a: every unchecked file is named, on every path. An unparseable
-        // credential and one with no `expires_at` are both "Doctor knows
-        // nothing about this one", which is not the same as healthy.
-        var unchecked = ""
-        if !unreadable.isEmpty {
-            unchecked += " Unchecked (unparseable): \(unreadable.joined(separator: ", "))."
+    private func refresh(_ credential: Credential) async throws {
+        switch credential.owner {
+        case "gmail", "calendar":
+            _ = try await GoogleOAuthCredentials.refresh(path: credential.path)
+        case "x":
+            try await XConnectorActions.refreshCredential(dataRoot: root)
+        case "github":
+            try await GitHubCredentialStore.shared.refreshCredential(dataRoot: root)
+        default:
+            try await ProviderOAuthCredentialMaintenance.refresh(provider: credential.owner, root: root)
         }
-        if !noExpiry.isEmpty {
-            unchecked += " Unchecked (no expires_at, so Doctor cannot judge them):"
-                + " \(noExpiry.joined(separator: ", "))."
-        }
+    }
 
+    private func requiresSignIn(_ error: Error, credential: Credential) -> Bool {
+        switch credential.owner {
+        case "gmail", "calendar":
+            return (error as? GoogleOAuthCredentials.RefreshError)?.requiresReauthentication == true
+        case "x":
+            return XConnectorActions.refreshRequiresSignIn(error)
+        case "github":
+            if case .refreshRejected = error as? GitHubOAuthDeviceFlow.FlowError { return true }
+            return false
+        default:
+            return ProviderOAuthCredentialMaintenance.requiresSignIn(error)
+        }
+    }
+
+    public func run() async -> CheckResult { await run(repair: false) }
+
+    public func run(repair: Bool) async -> CheckResult {
+        let now = self.now ?? Date()
         var findings: [String] = []
-        if !expired.isEmpty {
-            findings.append("Expired OAuth credential(s): \(expired.joined(separator: "; ")).")
-        }
-        // FIX-5a: this used to fall through to `ok` with "refresh is
-        // available" — a claim inferred from a nonempty refresh_token string
-        // that Doctor has never probed. An expired access token is a real
-        // finding until something actually refreshes it.
-        if !refreshableExpired.isEmpty {
-            findings.append(
-                "Expired OAuth access token(s) with a refresh token on file:"
-                    + " \(refreshableExpired.joined(separator: "; "))."
-                    + " Doctor never attempts a refresh, so recovery is unproven."
-            )
-        }
-        if !findings.isEmpty {
-            if !expiringSoon.isEmpty {
-                findings.append("Expiring soon: \(expiringSoon.joined(separator: "; ")).")
+        var asks: [String] = []
+        var repaired: [String] = []
+        var noExpiry: [String] = []
+        var refreshable = false
+        var checked = 0
+        for credential in credentials() {
+            do {
+                var state = try await status(credential)
+                checked += 1
+                guard state.configured else {
+                    findings.append("\(credential.name) has no usable saved credential.")
+                    asks.append(credential.signIn)
+                    continue
+                }
+                if state.expiresAt == nil && !state.requiresRefresh {
+                    noExpiry.append(credential.name)
+                    continue
+                }
+                if !state.requiresRefresh, let expiry = state.expiresAt, expiry > now {
+                    if !state.canRefresh && expiry.timeIntervalSince(now) <= 7 * 24 * 60 * 60 {
+                        findings.append("\(credential.name) access expires within 7 days and no refresh credential is available.")
+                        asks.append(credential.signIn)
+                    }
+                    continue
+                }
+                let reason = state.requiresRefresh ? "authorization needs renewal" : "access expired"
+                guard state.canRefresh else {
+                    findings.append("\(credential.name) \(reason) and no refresh credential is available.")
+                    asks.append(credential.signIn)
+                    continue
+                }
+                guard repair else {
+                    findings.append("\(credential.name) \(reason); its credential owner can attempt a refresh.")
+                    refreshable = true
+                    continue
+                }
+                do {
+                    try Task.checkCancellation()
+                    try await refresh(credential)
+                    state = try await status(credential, afterRefresh: true)
+                    if state.configured && !state.requiresRefresh && (state.expiresAt.map { $0 > Date() } ?? true) {
+                        repaired.append(credential.name)
+                        if state.expiresAt == nil { noExpiry.append(credential.name) }
+                    } else {
+                        findings.append("\(credential.name) still has no current access credential after refresh.")
+                        if !state.configured || !state.canRefresh { asks.append(credential.signIn) }
+                        else { refreshable = true }
+                    }
+                } catch {
+                    if requiresSignIn(error, credential: credential) {
+                        findings.append("\(credential.name) rejected the saved refresh authorization.")
+                        asks.append(credential.signIn)
+                    } else {
+                        // Provider bodies and credential material never enter Doctor reports.
+                        findings.append("\(credential.name) refresh could not complete. Retry Repair Safe Issues when the provider is available.")
+                        refreshable = true
+                    }
+                }
+            } catch {
+                findings.append("\(credential.name) credential state is unavailable from its owner.")
             }
-            return CheckResult(
-                id: id, title: title, status: "warn",
-                detail: findings.joined(separator: " ") + unchecked,
-                repair: repair
-            )
         }
-        if !expiringSoon.isEmpty {
-            return CheckResult(
-                id: id, title: title, status: "warn",
-                detail: "OAuth credential(s) expiring within 7 days: \(expiringSoon.joined(separator: "; "))."
-                    + unchecked,
-                repair: repair
-            )
+        var detail = "\(checked) credential(s) inspected through their owners."
+        if !noExpiry.isEmpty {
+            detail += " No scheduled expiry: \(noExpiry.joined(separator: ", "))."
         }
-        // FIX-5a (gpt review 2026-09-01): naming the unchecked files was only
-        // half the fix — returning "ok" alongside them still hid an unjudged
-        // credential behind green, which is the exact silence this check
-        // exists to break. Doctor knowing nothing about a credential is a
-        // finding about Doctor's coverage, so it warns and says which ones.
-        if !unchecked.isEmpty {
-            let count = unreadable.count + noExpiry.count
-            return CheckResult(
-                id: id, title: title, status: "warn",
-                detail: "\(checked) OAuth credential(s) carry an expiry and none is expired,"
-                    + " but \(count) could not be judged at all." + unchecked,
-                repair: "Confirm each unchecked credential from Settings → Connectors / Providers."
-                    + " A credential Doctor cannot read an expiry from is unverified, not healthy."
-            )
-        }
-        return CheckResult(
-            id: id, title: title, status: "ok",
-            detail: "\(checked) OAuth credential(s) carry an expiry and none is expired."
-        )
+        if !repaired.isEmpty { detail += " Refreshed: \(repaired.joined(separator: ", "))." }
+        if !findings.isEmpty { detail += " " + findings.joined(separator: " ") }
+        return CheckResult(id: id, title: title, status: findings.isEmpty ? "ok" : "warn",
+                           detail: detail,
+                           repair: refreshable ? DoctorSafeRepairPolicy.oauthRefreshInstruction : nil,
+                           receipt: repaired.isEmpty ? nil : "Repaired: refreshed \(repaired.joined(separator: ", ")).",
+                           human_action: asks.isEmpty ? nil : asks.joined(separator: " "))
     }
 }
 
@@ -1620,6 +1725,8 @@ public actor SwiftNativeDoctorChecks: DoctorChecksProtocol {
     public static let defaultChecks: [DoctorCheck] = [
         StorageCheck(),
         RuntimeJSONStoresCheck(),
+        RunLedgerIntegrityCheck(),
+        TurnTraceIntegrityCheck(),
         ChatSessionsCheck(),
         // One-thread-many-surfaces Phase 0: hot session count, 24h mints BY
         // MINT SITE, and the source-flapping detector. Read-only.
@@ -1677,10 +1784,10 @@ public actor SwiftNativeDoctorChecks: DoctorChecksProtocol {
     public func runAll(repair: Bool, checkLLM: Bool) async throws -> [CheckResult] {
         // Note: checkLLM intentionally unused — see class docstring.
         //
-        // A1/FIX-1c: REPAIR stays strictly sequential. Repairing checks mutate
-        // app-owned state (create directories, back up and rewrite files) and
-        // their ordering is part of the contract, so nothing about that path
-        // changes. The repair:false path is read-only — every check only stats,
+        // Bulk repairs have no button authority: only create missing files
+        // or refresh OAuth through its owner, sequentially. File replacement
+        // requires runCheck with explicit button scope.
+        // The repair:false path is read-only — every check only stats,
         // reads and parses its own subtree — so the checks are independent and
         // run concurrently. Results are re-sorted back into declaration order,
         // so the emitted array (and therefore the rollup, the wire shape, and
@@ -1690,10 +1797,8 @@ public actor SwiftNativeDoctorChecks: DoctorChecksProtocol {
             var results: [CheckResult] = []
             results.reserveCapacity(checks.count)
             for check in checks {
-                if let repairable = check as? any RepairingDoctorCheck {
-                    results.append(await repairable.run(repair: true))
-                } else {
-                    results.append(await check.run())
+                if let result = try await runCheck(id: check.id, repair: true, scope: .automatic) {
+                    results.append(result)
                 }
             }
             return results
@@ -1730,8 +1835,18 @@ public actor SwiftNativeDoctorChecks: DoctorChecksProtocol {
         return ordered.sorted { $0.0 < $1.0 }.map(\.1)
     }
 
-    public func runCheck(id: String, repair: Bool) async throws -> CheckResult? {
+    public func runCheck(id: String, repair: Bool, scope: DoctorRepairScope) async throws -> CheckResult? {
         for check in checks where check.id == id {
+            if repair, scope != .button {
+                if let oauth = check as? OAuthTokenExpiryCheck {
+                    return await oauth.run(repair: true)
+                }
+                if DoctorSafeRepairPolicy.automaticCoreIDs.contains(id),
+                   let creator = check as? any CreateMissingDoctorCheck {
+                    return await creator.createMissing()
+                }
+                return await check.run()
+            }
             if let repairable = check as? any RepairingDoctorCheck {
                 return await repairable.run(repair: repair)
             }

@@ -60,7 +60,7 @@ public enum OpenRouterModelCatalog {
         case available
         /// A recent live-backed cache does not contain the exact id.
         case unavailable
-        /// No recent live-backed catalog exists; offline fallback/stale bytes
+        /// No recent live-backed catalog exists; stale bytes or no list at all
         /// are insufficient evidence to reject a user pin.
         case unknown
     }
@@ -77,8 +77,7 @@ public enum OpenRouterModelCatalog {
         // Both doors are the same fetch; `fetchLiveComplete` is the one that
         // carries the completeness verdict (User, 2026-09-06).
         fetchLive: { try await fetchLiveModels(dataRoot: $0, session: $1).models },
-        fetchLiveComplete: { try await fetchLiveModels(dataRoot: $0, session: $1) },
-        fallback: { fallbackModels() }
+        fetchLiveComplete: { try await fetchLiveModels(dataRoot: $0, session: $1) }
     )
 
     public static func models(
@@ -89,7 +88,8 @@ public enum OpenRouterModelCatalog {
         await ttlCache.models(dataRoot: dataRoot, session: session, refresh: refresh)
     }
 
-    /// The same read, saying whether it reached OpenRouter (User, 2026-09-06).
+    /// The same read, saying whether it reached OpenRouter (User, 2026-09-06)
+    /// and, if not, why.
     public static func modelsWithFreshness(
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
         session: URLSession = .shared,
@@ -161,34 +161,6 @@ public enum OpenRouterModelCatalog {
         let wanted = modelID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !wanted.isEmpty else { return nil }
         return readCache(dataRoot: dataRoot)?.first { $0.id == wanted }
-    }
-
-    /// Served only when both the on-disk cache and a live fetch are
-    /// unavailable. Ids must exist on OpenRouter TODAY — a retired id here
-    /// turns the no-network first-run picker into a 404 factory. Verified
-    /// against the live /api/v1/models response 2026-08-07 (the previous
-    /// entry `anthropic/claude-3.5-sonnet` had been delisted).
-    public static func fallbackModels() -> [ProviderModelDescriptor] {
-        sortModels([
-            ProviderModelDescriptor(
-                id: "meta-llama/llama-3.3-70b-instruct",
-                name: "Llama 3.3 70B (OpenRouter)",
-                contextLength: 131_072,
-                supportsStreaming: true,
-                supportsVision: false,
-                supportsTools: false,
-                supportsJSONMode: false
-            ),
-            ProviderModelDescriptor(
-                id: "anthropic/claude-sonnet-5",
-                name: "Claude Sonnet 5 (OpenRouter)",
-                contextLength: 1_000_000,
-                supportsStreaming: true,
-                supportsVision: false,
-                supportsTools: false,
-                supportsJSONMode: false
-            ),
-        ])
     }
 
     static func parseModelsResponse(_ data: Data) throws -> [ProviderModelDescriptor] {
@@ -267,11 +239,8 @@ public enum OpenRouterModelCatalog {
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.setValue("NativeAgent", forHTTPHeaderField: "X-Title")
         if let key = LLMCredentialResolver.resolveAPIKey(
-            envVar: "OPENROUTER_API_KEY",
             providerConfigFile: "openrouter.json",
-            dataRoot: dataRoot,
-            includeEnvironment: dataRoot.standardizedFileURL
-                == PersistenceCore.defaultDataRoot().standardizedFileURL
+            dataRoot: dataRoot
         ) {
             request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
         }

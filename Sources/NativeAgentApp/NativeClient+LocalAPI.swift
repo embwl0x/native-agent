@@ -12,6 +12,7 @@ import ToolRegistry
 import KnowledgeGraph
 import XConnector
 import SlackConnector
+import SlackBot
 import GitHubConnector
 import ProviderRouting
 import BackgroundLoops
@@ -48,147 +49,31 @@ extension NativeClient {
     /// that used to hit a daemon GET route for a JSON file now reads the same
     /// file (or its sibling on the new schema) directly off disk.
     static func readLocalJSON<T: Decodable>(_ url: URL, fallbackJSON: String) throws -> T {
-        let data: Data
-        if FileManager.default.fileExists(atPath: url.path),
-           let read = try? Data(contentsOf: url) {
-            data = read
-        } else {
-            data = Data(fallbackJSON.utf8)
-        }
-        return try JSONDecoder.nativeAgent.decode(T.self, from: data)
+        try RuntimeReadProjection.readLocalJSON(url, fallbackJSON: fallbackJSON)
     }
 
     static func readJSONObject(at path: URL) -> [String: Any] {
-        guard let data = try? Data(contentsOf: path),
-              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-        else { return [:] }
-        return object
+        ProvidersFacade.readJSONObject(at: path)
     }
 
     static func readAutoDoctorConfig(dataRoot: URL) -> AutoDoctorConfig {
-        let path = dataRoot
-            .appendingPathComponent("auto_doctor", isDirectory: true)
-            .appendingPathComponent("config.json")
-        let object = readJSONObject(at: path)
-        var config = AutoDoctorConfig()
-        config.enabled = boolValue(object["enabled"])
-        config.runOnStartup = boolValue(object["run_on_startup"])
-        config.intervalSeconds = intValue(object["interval_seconds"])
-        config.usesModelCalls = boolValue(object["uses_model_calls"])
-        config.checkLLM = boolValue(object["check_llm"])
-        return config
+        DoctorStatusProjection.readAutoDoctorConfig(dataRoot: dataRoot)
     }
 
     static func readModelRoutingConfig(dataRoot: URL) -> ModelRoutingConfig {
-        // The default IS Chat's saved choice, resolved below; there is no model
-        // named in code here any more (2026-09-13).
-        var defaultModel = ""
-        let providersDir = dataRoot.appendingPathComponent("providers", isDirectory: true)
-        let surfaces = readJSONObject(at: providersDir.appendingPathComponent("surfaces.json"))
-        let activeRaw = readJSONObject(at: providersDir.appendingPathComponent("active.json"))
-        var active: [String: String] = [:]
-        for (surface, value) in activeRaw {
-            if let provider = stringValue(value)?.trimmingCharacters(in: .whitespacesAndNewlines),
-               !provider.isEmpty {
-                active[surface] = provider
-            }
-        }
-
-        // 2026-09-13 review: resolve CHAT first. This legacy projection used to
-        // build the Telegram/iOS rows while `defaultModel` was still empty, so a
-        // surface with no saved key of its own reported nothing instead of the
-        // Chat choice it actually runs on.
-        func savedModel(_ surface: String) -> String? {
-            let raw = surfaces[surface]
-            let value = (raw as? [String: Any]).map { stringValue($0["model"]) } ?? stringValue(raw)
-            let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines)
-            return (trimmed?.isEmpty == false) ? trimmed : nil
-        }
-        defaultModel = savedModel("chat") ?? ""
-
-        var surfacePrefs: [String: ModelSurfacePreference] = [:]
-        for surface in Set(surfaces.keys).union(active.keys).sorted() {
-            let raw = surfaces[surface]
-            var model: String?
-            var effort: String?
-            var serviceTier: String?
-            if let entry = raw as? [String: Any] {
-                model = stringValue(entry["model"])
-                effort = stringValue(entry["reasoningEffort"]) ?? stringValue(entry["reasoning_effort"])
-                serviceTier = stringValue(entry["serviceTier"]) ?? stringValue(entry["service_tier"])
-            } else {
-                model = stringValue(raw)
-            }
-            let trimmedModel = model?.trimmingCharacters(in: .whitespacesAndNewlines)
-            let trimmedEffort = effort?.trimmingCharacters(in: .whitespacesAndNewlines)
-            let resolvedModel = (trimmedModel?.isEmpty == false) ? trimmedModel! : defaultModel
-            let resolvedEffort = (trimmedEffort?.isEmpty == false) ? trimmedEffort! : "medium"
-            surfacePrefs[surface] = ModelSurfacePreference(
-                surface: surface,
-                model: resolvedModel,
-                reasoningEffort: resolvedEffort,
-                serviceTier: serviceTier == "priority" ? "priority" : "default",
-                source: active[surface],
-                modelKnown: nil
-            )
-        }
-
-        func pref(_ surface: String) -> ModelSurfacePreference {
-            surfacePrefs[surface] ?? ModelSurfacePreference(
-                surface: surface,
-                model: defaultModel,
-                reasoningEffort: "medium",
-                serviceTier: "default",
-                source: active[surface],
-                modelKnown: nil
-            )
-        }
-        let efforts = defaultReasoningEffortOptions
-        let current = ModelRoutingCurrent(
-            chat: pref("chat"),
-            telegram: pref("telegram"),
-            // An absent row means "follows Chat", so say Chat's answer rather
-            // than nothing: these are the rows the phone and Telegram read.
-            ios: surfacePrefs["ios"] ?? pref("ios"),
-            executions: ProviderRoutingSurfaceLookup.value(surfacePrefs, WorkshopSurfaceVocabulary.canonical),
-            autonomy: surfacePrefs["autonomy"],
-            swarms: surfacePrefs["swarms"],
-            dream: surfacePrefs["dream"],
-            training: surfacePrefs["training"]
-        )
-        return ModelRoutingConfig(
-            status: "ok",
-            defaultModel: defaultModel,
-            fallbackModels: [],
-            reasoningEfforts: efforts,
-            current: current
-        )
+        ProvidersFacade.readModelRoutingConfig(dataRoot: dataRoot)
     }
 
     static func stringValue(_ value: Any?) -> String? {
-        if let string = value as? String { return string }
-        if let number = value as? NSNumber { return number.stringValue }
-        return nil
+        ProvidersFacade.stringValue(value)
     }
 
     static func boolValue(_ value: Any?) -> Bool? {
-        if let bool = value as? Bool { return bool }
-        if let number = value as? NSNumber { return number.boolValue }
-        if let string = value as? String {
-            switch string.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-            case "true", "1", "yes", "on": return true
-            case "false", "0", "no", "off": return false
-            default: return nil
-            }
-        }
-        return nil
+        DoctorStatusProjection.boolValue(value)
     }
 
     static func intValue(_ value: Any?) -> Int? {
-        if let int = value as? Int { return int }
-        if let number = value as? NSNumber { return number.intValue }
-        if let string = value as? String { return Int(string.trimmingCharacters(in: .whitespacesAndNewlines)) }
-        return nil
+        DoctorStatusProjection.intValue(value)
     }
 
     /// Blank-slate connector catalog seeded into an EMPTY registry so a fresh
@@ -258,429 +143,60 @@ extension NativeClient {
         return catalog
     }
 
-    /// Seed the default catalog ONLY when the registry has zero rows (fresh
-    /// install, or a deleted registry). Idempotent — never clobbers an existing
-    /// registry, so a real user's connected state is preserved.
+    /// Only an absent registry bootstraps. Even an empty saved catalog belongs
+    /// to the operator; damaged content is reported by the checked reader.
     static func seedDefaultConnectorsIfEmpty(root: URL) async {
         let path = connectorRegistryPath(root: root)
         let persistence = SwiftNativePersistenceCore()
         _ = try? await persistence.withFileLock(path) {
-            let current = await persistence.readJSON(path, defaultValue: .array([]))
-            // Use connectorRows so an older OBJECT-shaped registry (also valid)
-            // isn't mistaken for empty and clobbered — only a truly empty
-            // registry gets seeded.
-            if !connectorRows(from: current).isEmpty { return }
+            do {
+                _ = try FileManager.default.attributesOfItem(atPath: path.path)
+                return
+            } catch CocoaError.fileReadNoSuchFile {
+                // Missing is the sole bootstrap case.
+            }
             let catalog = JSONValue.array(defaultConnectorCatalog().map { .object($0) })
-            try? await persistence.writeJSON(catalog, to: path)
+            try await persistence.writeJSON(catalog, to: path)
         }
     }
 
     static func readConnectorRecords(root: URL) async throws -> [ConnectorRecord] {
-        // Fresh install shows the blank-slate catalog instead of "0 connectors".
-        await seedDefaultConnectorsIfEmpty(root: root)
-        let path = connectorRegistryPath(root: root)
-        let persistence = SwiftNativePersistenceCore()
-        let current = try await persistence.withFileLock(path) {
-            await persistence.readJSON(path, defaultValue: .array([]))
-        }
-        // Fable 5.1 item 49 — health DECAYS. The overlay below derives "ok" from
-        // credential PRESENCE (a token file, a saved config), which proves a
-        // sign-in once completed, not that the integration works now. This
-        // layer asks the connector-action receipt ledger whether a real,
-        // non-dry-run call has succeeded lately and downgrades an unproven
-        // green to "unverified" — a clock, never a probe. Only rows the overlay
-        // stamped as credential-proved are eligible: a local readiness claim
-        // (Telegram's configured bot, EventKit's granted calendar permission)
-        // has no receipt stream that could ever refresh it, so decaying it
-        // would swap one lie for another. It is applied HERE,
-        // on the list read that feeds both the Connectors view and the phone
-        // projection, and deliberately NOT on the mutation path's readiness
-        // gate (NativeClient+RegistryMutations), which asks a different
-        // question: may this connector be enabled at all.
-        let proof = ConnectorProofLedger.lastSuccessByConnector(root: root)
-        let decayNow = Date()
-        let rows = connectorRows(from: current)
-            .map { connectorRowWithRuntimeOverlay($0, root: root) }
-            .map { row -> [String: JSONValue] in
-                let family = ConnectorProofLedger.canonicalID(connectorString(row["id"]) ?? "")
-                return ConnectorHealthDecay.apply(
-                    to: row,
-                    lastSuccessAt: proof[family],
-                    now: decayNow
-                )
-            }
-        let data = try JSONValue.array(rows.map { .object($0) }).serializedData(pretty: false)
-        return try decodeLossyArray(data, context: "getConnectors(swift registry)")
+        try await ConnectorStatusProjection.readConnectorRecords(root: root, platform: NativeClientStatusPlatform(), seedDefaults: { await Self.seedDefaultConnectorsIfEmpty(root: root) })
     }
 
     static func readConnectorRegistryEntry(
         root: URL,
         provider: String
     ) async throws -> [String: JSONValue]? {
-        let providerID = normalizedConnectorID(provider)
-        guard !providerID.isEmpty else { return nil }
-        let path = connectorRegistryPath(root: root)
-        let persistence = SwiftNativePersistenceCore()
-        let current = try await persistence.withFileLock(path) {
-            await persistence.readJSON(path, defaultValue: .array([]))
-        }
-        return connectorRows(from: current)
-            .first { connectorRow($0, matches: providerID) }
+        try await ConnectorOAuthRegistry.readConnectorRegistryEntry(root: root, provider: provider)
     }
 
     static func mutateConnectorRegistryEntry(
-        root: URL,
-        provider: String,
-        createIfMissing: Bool,
+        root: URL, provider: String, createIfMissing: Bool,
         mutate: @escaping @Sendable (inout [String: JSONValue]) -> Void
     ) async throws -> [String: JSONValue] {
-        let providerID = normalizedConnectorID(provider)
-        guard !providerID.isEmpty else {
-            throw NSError(domain: "NativeAgentSwiftOnly", code: -400, userInfo: [
-                NSLocalizedDescriptionKey: "Connector provider id is empty"
-            ])
-        }
-        let path = connectorRegistryPath(root: root)
-        let persistence = SwiftNativePersistenceCore()
-        return try await persistence.withFileLock(path) {
-            let current = await persistence.readJSON(path, defaultValue: .array([]))
-            switch current {
-            case .array(var rows):
-                for idx in rows.indices {
-                    guard case .object(var entry) = rows[idx],
-                          connectorRow(entry, matches: providerID)
-                    else { continue }
-                    entry["id"] = .string(providerID)
-                    mutate(&entry)
-                    rows[idx] = .object(entry)
-                    try await persistence.writeJSON(.array(rows), to: path)
-                    return entry
-                }
-                guard createIfMissing else {
-                    throw NSError(domain: "NativeAgentSwiftOnly", code: -404, userInfo: [
-                        NSLocalizedDescriptionKey: "Connector \(providerID) not found in \(path.path)"
-                    ])
-                }
-                var entry: [String: JSONValue] = ["id": .string(providerID)]
-                mutate(&entry)
-                rows.append(.object(entry))
-                try await persistence.writeJSON(.array(rows), to: path)
-                return entry
-            case .object(var object):
-                var entry: [String: JSONValue]
-                if case .object(let existing)? = object[providerID] {
-                    entry = existing
-                } else if let matchedKey = object.keys.first(where: { $0.lowercased() == providerID }),
-                          case .object(let existing)? = object[matchedKey] {
-                    entry = existing
-                    object.removeValue(forKey: matchedKey)
-                } else {
-                    guard createIfMissing else {
-                        throw NSError(domain: "NativeAgentSwiftOnly", code: -404, userInfo: [
-                            NSLocalizedDescriptionKey: "Connector \(providerID) not found in \(path.path)"
-                        ])
-                    }
-                    entry = [:]
-                }
-                entry["id"] = .string(providerID)
-                mutate(&entry)
-                object[providerID] = .object(entry)
-                try await persistence.writeJSON(.object(object), to: path)
-                return entry
-            default:
-                guard createIfMissing else {
-                    throw NSError(domain: "NativeAgentSwiftOnly", code: -404, userInfo: [
-                        NSLocalizedDescriptionKey: "Connector \(providerID) not found in \(path.path)"
-                    ])
-                }
-                var entry: [String: JSONValue] = ["id": .string(providerID)]
-                mutate(&entry)
-                try await persistence.writeJSON(.array([.object(entry)]), to: path)
-                return entry
-            }
-        }
+        try await ConnectorOAuthRegistry.mutateConnectorRegistryEntry(
+            root: root, provider: provider, createIfMissing: createIfMissing, mutate: mutate
+        )
     }
 
     static func connectorRowWithRuntimeOverlay(
         _ row: [String: JSONValue],
         root: URL
     ) -> [String: JSONValue] {
-        guard let id = connectorString(row["id"]).map(normalizedConnectorID), !id.isEmpty else {
-            return row
-        }
-        var out = row
-        out["id"] = .string(id)
-        // Health decay eligibility is DERIVED here, never carried in from the
-        // registry file: a hand-edited row must not be able to claim (or
-        // disclaim) credential proof. Cleared first, stamped below only on the
-        // branches whose green comes from a token/credential being present.
-        out.removeValue(forKey: ConnectorHealthDecay.proofSourceKey)
-        if connectorString(out["name"])?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false {
-            out["name"] = .string(defaultConnectorName(id))
-        }
-        if connectorString(out["kind"])?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false {
-            out["kind"] = .string("connector")
-        }
-        if connectorString(out["description"]) == nil {
-            out["description"] = .string("")
-        }
-
-        // NO credential-proof stamp below: Telegram's green is a LOCAL
-        // readiness claim (a configured bot the poll loop owns), and it never
-        // emits a connector-action receipt, so decay could only ever downgrade
-        // it and never restore it. Same for the EventKit calendar branch.
-        if id == "telegram" {
-            if let cfg = TelegramBot.TelegramConfig.loadFromDisk(dataRoot: root), !cfg.botToken.isEmpty {
-                out["enabled"] = .bool(cfg.enabled)
-                out["authState"] = .string("configured")
-                out["healthStatus"] = .string(cfg.enabled ? "ok" : "disabled")
-            } else {
-                out["enabled"] = .bool(false)
-                out["authState"] = .string("not_connected")
-                out["healthStatus"] = .string("needs_auth")
-            }
-            return out
-        }
-
-        if id == "searxng" {
-            if !searxngBaseURL(root: root).isEmpty {
-                if connectorBool(out["enabled"]) == nil { out["enabled"] = .bool(true) }
-                out["authState"] = .string("not_required")
-                out["healthStatus"] = .string("ready")
-            } else {
-                out["enabled"] = .bool(false)
-                out["authState"] = .string("not_required")
-                out["healthStatus"] = .string("needs_config")
-            }
-            return out
-        }
-
-        if id == "calendar" {
-            switch calendarEventKitReadState() {
-            case "ready":
-                out["enabled"] = .bool(true)
-                out["authState"] = .string("connected")
-                out["healthStatus"] = .string("ok")
-            case "probe_needed":
-                out["enabled"] = .bool(false)
-                out["authState"] = .string("not_required")
-                out["healthStatus"] = .string("probe_needed")
-            case "needs_permission":
-                out["enabled"] = .bool(false)
-                out["authState"] = .string("not_required")
-                out["healthStatus"] = .string("needs_permission")
-            default:
-                out["enabled"] = .bool(false)
-                out["authState"] = .string("not_required")
-                out["healthStatus"] = .string("unknown")
-            }
-            return out
-        }
-
-        if id == "shortcuts" {
-            out["enabled"] = .bool(true)
-            out["authState"] = .string("not_required")
-            out["healthStatus"] = .string("ready")
-            return out
-        }
-
-        if id == "browser" {
-            out["enabled"] = .bool(true)
-            out["authState"] = .string("not_required")
-            out["healthStatus"] = .string("ready")
-            if connectorString(out["kind"])?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false {
-                out["kind"] = .string("browser")
-            }
-            if connectorString(out["description"])?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false {
-                out["description"] = .string("Visible browser research and inspection with receipts.")
-            }
-            return out
-        }
-
-        // GitHub's secret is Keychain-backed. The paired auth metadata is
-        // created only after a Keychain write-and-read verification and is
-        // removed during revoke, so it is the synchronous presentation proof
-        // used by this overlay. Actual GitHub actions still resolve the secret
-        // from Keychain and fail closed if it was removed externally.
-        if id == "github" {
-            let metadataExists = GitHubCredentialStore.metadataPaths(dataRoot: root)
-                .contains { path in
-                    guard let data = try? Data(contentsOf: path),
-                          case .object(let metadata) = try? JSONValue.parse(data),
-                          connectorString(metadata["credential_store"]) == "macos_keychain"
-                    else {
-                        return false
-                    }
-                    return true
-                }
-            if metadataExists {
-                out["authState"] = .string("connected")
-                out["healthStatus"] = .string("ok")
-                markCredentialProof(&out)
-            } else {
-                out["enabled"] = .bool(false)
-                out["authState"] = .string("not_connected")
-                out["healthStatus"] = .string("needs_auth")
-            }
-            return out
-        }
-
-        if id == "notion" {
-            out["description"] = .string(
-                "Search and read pages shared with a validated Notion integration."
-            )
-            if Self.oauthConnectorTokenExists(oauthId: "notion", root: root) {
-                out["enabled"] = .bool(true)
-                out["authState"] = .string("connected")
-                out["healthStatus"] = .string("ok")
-                markCredentialProof(&out)
-            } else {
-                out["enabled"] = .bool(false)
-                out["authState"] = .string("not_connected")
-                out["healthStatus"] = .string("needs_auth")
-            }
-            return out
-        }
-
-        // OAuth PKCE connectors (Google / X). Their registry ids (gmail/gcal/x)
-        // map to the OAuth flow's canonical ids (gmail/calendar/x) — the SAME
-        // aliases ConnectorWizardSetupRoute uses. The overlay MUST key
-        // connected-detection by these registry ids: previously the connected
-        // branch keyed on "calendar" and the token set on "email", so registry
-        // rows "gcal"/"gmail" could NEVER reflect a completed sign-in
-        // (A2.3 id-mismatch, W1#8). Order: a real token wins; else an explicit
-        // honest-disconnected freeze is preserved; else present needs_auth so
-        // the public wizard can collect an operator-owned OAuth app.
-        if let oauth = Self.pkceOAuthConnectors[id] {
-            out["description"] = .string(oauth.setupNote)
-            if Self.oauthConnectorTokenExists(oauthId: oauth.oauthId, root: root) {
-                out["enabled"] = .bool(true)
-                out["authState"] = .string("connected")
-                out["healthStatus"] = .string("ok")
-                markCredentialProof(&out)
-                return out
-            }
-            let existingAuth = connectorString(out["authState"])?.lowercased()
-            let existingHealth = connectorString(out["healthStatus"])?.lowercased()
-            if existingAuth == "connected_unverified" || existingHealth == "needs_probe" {
-                return out
-            }
-            if !Self.oauthConnectorAppExists(
-                oauthId: oauth.oauthId,
-                clientIdEnv: oauth.clientIdEnv,
-                root: root
-            ) {
-                out["enabled"] = .bool(false)
-                out["authState"] = .string("not_connected")
-                out["healthStatus"] = .string("needs_auth")
-                return out
-            }
-            out["enabled"] = .bool(false)
-            out["authState"] = .string("not_connected")
-            out["healthStatus"] = .string("needs_auth")
-            return out
-        }
-
-        let tokenBacked: Set<String> = ["email", "slack"]
-        if tokenBacked.contains(id) {
-            let existingAuth = connectorString(out["authState"])?.lowercased()
-            let existingHealth = connectorString(out["healthStatus"])?.lowercased()
-            let token = root.appendingPathComponent("oauth_tokens", isDirectory: true)
-                .appendingPathComponent("\(id).json")
-            if FileManager.default.fileExists(atPath: token.path) {
-                // A token on disk is hard proof of a real connection;
-                // promote regardless of a stale needs_probe / unverified flag.
-                out["authState"] = .string("connected")
-                out["healthStatus"] = .string("ok")
-                markCredentialProof(&out)
-            } else {
-                // No token: honor the honest-disconnected freeze if set.
-                if existingAuth == "connected_unverified" || existingHealth == "needs_probe" {
-                    // Slack's credential state remains frozen, but its
-                    // separately-owned Socket Mode feed still has to be
-                    // surfaced below. Other token-backed connectors have no
-                    // such runtime feed.
-                    if id != "slack" { return out }
-                }
-                if existingAuth != "connected_unverified" && existingHealth != "needs_probe" {
-                    out["authState"] = .string("not_connected")
-                    if existingHealth == nil || existingHealth == "ok" || existingHealth == "ready" || existingHealth == "connected" {
-                        out["healthStatus"] = .string("needs_auth")
-                    }
-                }
-            }
-        }
-        if id == "slack" {
-            applySlackRuntimeStateFeed(to: &out, root: root)
-        }
-        return out
+        ConnectorStatusProjection.connectorRowWithRuntimeOverlay(row, root: root, platform: NativeClientStatusPlatform())
     }
 
     /// Stamp the decay-eligibility bit on a row whose green was just derived
     /// from a token/credential being present on disk. `ConnectorHealthDecay`
     /// decays exactly these rows and leaves every other green alone.
-    private static func markCredentialProof(_ row: inout [String: JSONValue]) {
-        row[ConnectorHealthDecay.proofSourceKey] =
-            .string(ConnectorHealthDecay.credentialProofSource)
-    }
+
 
     /// Keep credential readiness and Socket Mode evidence separate. Slack can
     /// post with a valid bot token while inbound Socket Mode has not started;
     /// conversely, a stale runtime feed must be displayed as stale rather than
     /// silently changing the credential claim to disconnected.
-    private static func applySlackRuntimeStateFeed(
-        to row: inout [String: JSONValue],
-        root: URL
-    ) {
-        switch SlackRuntimeStateFeed.read(dataRoot: root) {
-        case .absent:
-            row["runtimeStatus"] = .string("unobserved")
-            row["runtimeDetail"] = .string("Socket Mode has not produced runtime state yet.")
-            row["runtimeUpdatedAt"] = .null
-        case .current(let snapshot):
-            row["runtimeUpdatedAt"] = .string(snapshot.updatedAt)
-            if snapshot.hasReportedError {
-                row["runtimeStatus"] = .string("degraded")
-                row["runtimeDetail"] = .string("Socket Mode reported a runtime error.")
-            } else if snapshot.connected {
-                row["runtimeStatus"] = .string("connected")
-                row["runtimeDetail"] = .string("Socket Mode heartbeat is current.")
-            } else {
-                row["runtimeStatus"] = .string("disconnected")
-                row["runtimeDetail"] = .string("Socket Mode last reported a disconnected state.")
-            }
-        case .stale(let snapshot):
-            row["runtimeStatus"] = .string("stale")
-            row["runtimeDetail"] = .string("Socket Mode state has not refreshed within its heartbeat window.")
-            row["runtimeUpdatedAt"] = .string(snapshot.updatedAt)
-        case .unavailable:
-            row["runtimeStatus"] = .string("unavailable")
-            row["runtimeDetail"] = .string("Socket Mode runtime state could not be read safely.")
-            row["runtimeUpdatedAt"] = .null
-        }
-        do {
-            if let recovery = try SlackInboundDeliveryJournal.recoverySummary(dataRoot: root),
-               recovery.hasQuarantinedEvidence {
-                row["runtimeStatus"] = .string("recovery_quarantined")
-                row["runtimeDetail"] = .string("A damaged Slack delivery journal was moved aside (.stale-<ts>) and a fresh one started; intake is running again. Accepted-but-undelivered replies may only exist in that file — ask \(AgentVoice.live.subject) to inspect it before any manual retry.")
-            } else if let recovery = try SlackInboundDeliveryJournal.recoverySummary(dataRoot: root),
-                      recovery.pendingCount > 0 {
-                if recovery.isAtCapacity {
-                    row["runtimeStatus"] = .string("intake_paused")
-                    row["runtimeDetail"] = .string("\(recovery.pendingCount) pending replies; new message intake is paused. \(recovery.unknownCount) need recovery. Ask \(AgentVoice.live.subject) to inspect Slack delivery recovery before any manual retry; nothing is automatically discarded or resent.")
-                } else if recovery.unknownCount > 0 {
-                    row["runtimeStatus"] = .string("recovery_required")
-                    row["runtimeDetail"] = .string("\(recovery.unknownCount) replies have an unknown outcome (\(recovery.pendingCount) pending). Ask \(AgentVoice.live.subject) to inspect Slack delivery recovery before any manual retry; automatic resend is paused.")
-                } else {
-                    let detail = connectorString(row["runtimeDetail"]) ?? ""
-                    row["runtimeDetail"] = .string("\(detail) \(recovery.pendingCount) accepted replies are pending delivery.")
-                }
-            }
-        } catch {
-            row["runtimeStatus"] = .string("recovery_unavailable")
-            row["runtimeDetail"] = .string("Slack delivery recovery state cannot be read safely. New message intake may be paused; ask \(AgentVoice.live.subject) to inspect it before retrying.")
-        }
-    }
+
 
     /// Registry connector id → (client-id env var, OAuth-flow canonical id,
     /// setup note). The `oauthId` matches `connectorTokenPath`'s
@@ -688,15 +204,7 @@ extension NativeClient {
     /// `ConnectorWizardSetupRoute` mapping, so the overlay, the OAuth flow, and
     /// the wizard all agree on one id per connector. Client ids may come from
     /// the environment or the public connector wizard's owner-only local file.
-    static let pkceOAuthConnectors:
-        [String: (clientIdEnv: String, oauthId: String, setupNote: String)] = [
-        "gmail": ("NATIVE_AGENT_GMAIL_CLIENT_ID", "gmail",
-                  "Search and read Gmail through an operator-configured Google OAuth app."),
-        "gcal": ("NATIVE_AGENT_CALENDAR_CLIENT_ID", "calendar",
-                 "Read Google Calendar through an operator-configured Google OAuth app."),
-        "x": ("NATIVE_AGENT_X_CLIENT_ID", "x",
-              "Use the X tools through an operator-configured X OAuth app."),
-    ]
+    static let pkceOAuthConnectors = ConnectorStatusProjection.pkceOAuthConnectors
 
     /// True when a completed OAuth token exists for `oauthId`, at EITHER the
     /// PKCE flow's write path (`connectors/<oauthId>/auth.json`) or the legacy/
@@ -704,23 +212,7 @@ extension NativeClient {
     /// A non-empty access token is required; an empty or malformed file cannot
     /// impersonate a connected account.
     static func oauthConnectorTokenExists(oauthId: String, root: URL) -> Bool {
-        let pkce = root
-            .appendingPathComponent("connectors", isDirectory: true)
-            .appendingPathComponent(oauthId, isDirectory: true)
-            .appendingPathComponent("auth.json")
-        let mirror = root
-            .appendingPathComponent("oauth_tokens", isDirectory: true)
-            .appendingPathComponent("\(oauthId).json")
-        return [pkce, mirror].contains { path in
-            guard let data = try? Data(contentsOf: path),
-                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                return false
-            }
-            return ["access_token", "oauth_token", "token"].contains { key in
-                guard let value = object[key] as? String else { return false }
-                return !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            }
-        }
+        ConnectorStatusProjection.oauthConnectorTokenExists(oauthId: oauthId, root: root)
     }
 
     static func oauthConnectorAppExists(
@@ -728,20 +220,7 @@ extension NativeClient {
         clientIdEnv: String,
         root: URL
     ) -> Bool {
-        if let value = ProcessInfo.processInfo.environment[clientIdEnv],
-           !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return true
-        }
-        let path = root
-            .appendingPathComponent("connectors", isDirectory: true)
-            .appendingPathComponent(oauthId, isDirectory: true)
-            .appendingPathComponent("oauth_app.json")
-        guard let data = try? Data(contentsOf: path),
-              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let clientId = object["client_id"] as? String else {
-            return false
-        }
-        return !clientId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        ConnectorStatusProjection.oauthConnectorAppExists(oauthId: oauthId, clientIdEnv: clientIdEnv, root: root)
     }
 
     static func calendarEventKitReadState() -> String {
@@ -758,73 +237,34 @@ extension NativeClient {
     }
 
     static func connectorRegistryPath(root: URL) -> URL {
-        root.appendingPathComponent("connectors", isDirectory: true)
-            .appendingPathComponent("registry.json")
+        ConnectorOAuthRegistry.connectorRegistryPath(root: root)
     }
 
     static func connectorRows(from value: JSONValue) -> [[String: JSONValue]] {
-        switch value {
-        case .array(let rows):
-            return rows.compactMap {
-                guard case .object(let object) = $0 else { return nil }
-                return object
-            }
-        case .object(let object):
-            return object.keys.sorted().compactMap { key in
-                guard case .object(var entry)? = object[key] else { return nil }
-                if connectorString(entry["id"]) == nil {
-                    entry["id"] = .string(normalizedConnectorID(key))
-                }
-                return entry
-            }
-        default:
-            return []
-        }
+        ConnectorStatusProjection.connectorRows(from: value)
     }
 
     static func connectorRow(_ row: [String: JSONValue], matches providerID: String) -> Bool {
-        guard let id = connectorString(row["id"]) else { return false }
-        return normalizedConnectorID(id) == providerID
+        ConnectorOAuthRegistry.connectorRow(row, matches: providerID)
     }
 
     static func normalizedConnectorID(_ raw: String) -> String {
-        raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        ConnectorOAuthRegistry.normalizedConnectorID(raw)
     }
 
     static func connectorString(_ value: JSONValue?) -> String? {
-        guard let value else { return nil }
-        if case .string(let string) = value { return string }
-        return nil
+        ConnectorOAuthRegistry.connectorString(value)
     }
 
     static func connectorBool(_ value: JSONValue?) -> Bool? {
-        guard let value else { return nil }
-        if case .bool(let bool) = value { return bool }
-        return nil
+        ConnectorStatusProjection.connectorBool(value)
     }
 
     static func searxngBaseURL(root: URL) -> String {
-        let path = root.appendingPathComponent("research", isDirectory: true)
-            .appendingPathComponent("config.json")
-        guard let data = try? Data(contentsOf: path),
-              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let raw = object["searxng_base_url"] as? String
-        else { return "" }
-        return raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        ConnectorStatusProjection.searxngBaseURL(root: root)
     }
 
     static func defaultConnectorName(_ id: String) -> String {
-        switch id {
-        case "searxng": return "SearXNG"
-        case "local_files": return "Local File Workspaces"
-        case "github": return "GitHub"
-        case "x": return "X"
-        case "agentmail": return "AgentMail"
-        default:
-            return id
-                .split(separator: "_")
-                .map { part in part.prefix(1).uppercased() + part.dropFirst() }
-                .joined(separator: " ")
-        }
+        ConnectorStatusProjection.defaultConnectorName(id)
     }
 }

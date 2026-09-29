@@ -6,8 +6,6 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$ROOT/script/lib/provisioning_profile_contract.sh"
 # shellcheck source=lib/development_bundle_signing.sh
 source "$ROOT/script/lib/development_bundle_signing.sh"
-# shellcheck source=lib/chrome_payload.sh
-source "$ROOT/script/lib/chrome_payload.sh"
 APP_NAME="NativeAgent"
 PRODUCT="NativeAgentApp"
 APP_LOG="$ROOT/.runtime/nativeagent-app.log"
@@ -75,6 +73,12 @@ if [[ "${CODEX_SHELL:-0}" == "1" && "$MODE" != "--build-only" ]]; then
   exit 2
 fi
 
+if ! command -v xcodegen >/dev/null 2>&1; then
+  echo "[build_and_run.sh] ERROR: xcodegen is required; install it with: brew install xcodegen" >&2
+  exit 1
+fi
+xcodegen --spec "$ROOT/project.yml"
+
 LOCAL_ENV="$ROOT/local/nativeagent.local.env"
 if [[ -f "$LOCAL_ENV" ]]; then
   # Local Apple/iCloud identifiers are intentionally gitignored.
@@ -87,95 +91,78 @@ NATIVEAGENT_MOBILE_SOURCE_KEY="${NATIVEAGENT_MOBILE_SOURCE_KEY:-mobile_app}"
 NATIVEAGENT_BACKGROUND_TASK_PREFIX="${NATIVEAGENT_BACKGROUND_TASK_PREFIX:-io.github.embwl0x.nativeagent}"
 NATIVEAGENT_DEVICE_SYNC="${NATIVEAGENT_DEVICE_SYNC:-cloudkit}"
 NATIVEAGENT_RELEASE_PAGE_URL="${NATIVE_AGENT_RELEASE_PAGE_URL:-${NATIVEAGENT_RELEASE_PAGE_URL:-https://github.com/embwl0x/native-agent/releases}}"
-NATIVEAGENT_BUILD_VERSION="$(tr -d '[:space:]' < "$ROOT/VERSION" 2>/dev/null || true)"
-NATIVEAGENT_BUILD_VERSION="${NATIVEAGENT_BUILD_VERSION:-0.0.0-dev}"
-NATIVEAGENT_SOURCE_REVISION="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || true)"
-NATIVEAGENT_SOURCE_REVISION="${NATIVEAGENT_SOURCE_REVISION:-unknown}"
-if [[ -n "$(git -C "$ROOT" status --porcelain --untracked-files=normal 2>/dev/null || true)" ]]; then
-  NATIVEAGENT_SOURCE_DIRTY=true
-else
-  NATIVEAGENT_SOURCE_DIRTY=false
+
+mkdir -p "$ROOT/.runtime" "$ROOT/dist"
+
+# Large embedding model (2026-09-05). The bundled MiniLM is the floor; a
+# stronger model is too big for git, so the build copies it from
+# extras/embedding/ in the checkout (gitignored; embedding.json + the model +
+# vocab it names) into Contents/Resources/embedding/. The runtime prefers it
+# over MiniLM and re-embeds the store on first launch.
+EMBEDDING_MODEL_DIR="${NATIVEAGENT_EMBEDDING_MODEL_DIR:-$ROOT/extras/embedding}"
+# This dev bundle's data root is $ROOT/data (REPO_PATH stamp). A model already
+# installed there (data/extras/coreml) outranks any bundle copy at runtime, so
+# a second 600+ MB copy in the bundle would never load: leave it out. Same
+# manifest as the one the bundle would carry = the runtime validates both
+# alike, so the copy could never win. (A launch with NATIVE_AGENT_DATA_ROOT
+# elsewhere reads that root's extras.)
+DATA_MODEL_DIR="$ROOT/data/extras/coreml"
+data_model_file() { plutil -extract "$1" raw -o - "$DATA_MODEL_DIR/embedding.json" 2>/dev/null; }
+if [[ -z "${NATIVEAGENT_EMBEDDING_MODEL_DIR:-}" ]] &&
+   cmp -s "$DATA_MODEL_DIR/embedding.json" "$EMBEDDING_MODEL_DIR/embedding.json" &&
+   model_file="$(data_model_file model)" && vocab_file="$(data_model_file vocab)" &&
+   [[ -n "$model_file" && -e "$DATA_MODEL_DIR/$model_file" && ! -L "$DATA_MODEL_DIR/$model_file" &&
+      -n "$vocab_file" && -f "$DATA_MODEL_DIR/$vocab_file" && ! -L "$DATA_MODEL_DIR/$vocab_file" ]]; then
+  echo "[embedding] data/extras/coreml holds the model this install loads; not copying it into the bundle"
+  EMBEDDING_MODEL_DIR=/dev/null
+# First build on a fresh checkout: fetch the model from the repository's model
+# release unless told not to. A failed fetch is not fatal; MiniLM remains.
+elif [[ ! -f "$EMBEDDING_MODEL_DIR/embedding.json" && "${NATIVEAGENT_SKIP_EMBEDDING_FETCH:-0}" != "1" ]]; then
+  "$ROOT/script/fetch_embedding_model.sh" || echo "[embedding] fetch failed; building with the bundled MiniLM"
 fi
 
-# internal-build-seat-hygiene item 1 (2026-08-21): an internal build must never
-# be mistakable for the published release. Aug 19 a locally built 0.4.1 was
-# scp-installed onto the VM seat, carried no updater config, and still said
-# "0.4.1" — the seat silently left the update train while looking identical to
-# the shipped DMG. The HUMAN-visible string now carries the build identity;
-# CFBundleVersion stays bare because that is Sparkle's comparison key.
-# Kept textually identical in install_app.sh and release.sh (guard-tested).
-nativeagent_internal_version_suffix() { # $1 = repo root; echoes "-dev.<sha8>[.dirty]"
-  local root="$1" sha dirty=""
-  sha="$(git -C "$root" rev-parse --short=8 HEAD 2>/dev/null || true)"
-  [[ "$sha" =~ ^[0-9a-f]{8}$ ]] || sha="nogit"
-  if [[ -n "$(git -C "$root" status --porcelain --untracked-files=normal 2>/dev/null || true)" ]]; then
-    dirty=".dirty"
-  fi
-  printf '%s' "-dev.${sha}${dirty}"
-}
-# build_and_run.sh has no publish lane: every bundle it produces is internal.
-NATIVEAGENT_BUILD_SHORT_VERSION="$NATIVEAGENT_BUILD_VERSION$(nativeagent_internal_version_suffix "$ROOT")"
-export NATIVEAGENT_MAC_BUNDLE_ID
-export NATIVEAGENT_ICLOUD_CONTAINER_ID
-export NATIVEAGENT_MOBILE_SOURCE_KEY
-export NATIVEAGENT_BACKGROUND_TASK_PREFIX
-export NATIVEAGENT_DEVICE_SYNC
-
-# shellcheck source=lib/build_source_inventory.sh
-source "$ROOT/script/lib/build_source_inventory.sh"
-
-mkdir -p "$ROOT/.runtime" "$ROOT/dist/$APP_NAME.app/Contents/MacOS"
-export CLANG_MODULE_CACHE_PATH="$ROOT/.runtime/clang-module-cache"
-export SWIFT_MODULE_CACHE_PATH="$ROOT/.runtime/swift-module-cache"
-mkdir -p "$CLANG_MODULE_CACHE_PATH" "$SWIFT_MODULE_CACHE_PATH"
-
-# SPM stale-build-plan refresh (vault: 04_tooling/spm_local_dep_stale_build_plan.md):
-# a new source file added to a local package dep (Modules/NativeAgentCore) is
-# invisible to the ROOT build until the PARENT manifest mtime changes — the
-# cached .build/debug.yaml keeps the dep's old source list and the build fails
-# with "cannot find <NewType> in scope". Re-plan only when the deterministic
-# source/resource PATH inventory changes; ordinary content edits remain owned
-# by SwiftPM and no longer force an otherwise-cached plan on every build.
-if nativeagent_refresh_swiftpm_plan_if_inventory_changed "$ROOT"; then
-  echo "[swiftpm-plan] source/resource inventory changed; refreshed build plan"
-else
-  echo "[swiftpm-plan] source/resource inventory unchanged; keeping cached plan"
-fi
-
-# DOWNTIME GUARD 2026-07-02: the running app used to be pkill'd HERE, before
-# `swift build` — so a compile failure (e.g. the stale-plan case above) left
-# NativeAgent dead with nothing relaunched. The kill now happens at the
-# POINT OF NO RETURN below, after the staged bundle is signed and verified.
-SWIFTPM_SANDBOX_FLAG=()
-if [[ "${NATIVE_AGENT_SWIFTPM_DISABLE_SANDBOX:-0}" == "1" ]]; then
-  SWIFTPM_SANDBOX_FLAG=(--disable-sandbox)
-fi
 # NATIVEAGENT_BUILD_CONFIG=release installs an optimized binary (the speed of the
 # DMG) for day-to-day use on a development install; default stays debug.
-BUILD_CONFIG_FLAG=(-c "${NATIVEAGENT_BUILD_CONFIG:-debug}")
+case "${NATIVEAGENT_BUILD_CONFIG:-debug}" in
+  debug) XCODE_CONFIG=Debug ;;
+  release) XCODE_CONFIG=Release ;;
+  *)
+    echo "[build_and_run.sh] ERROR: NATIVEAGENT_BUILD_CONFIG must be debug or release" >&2
+    exit 2
+    ;;
+esac
 
-# Development builds/installations consume the reviewed dependency pins. A
-# manifest originHash refresh must not silently resolve a newer compatible
-# release; deliberate updates belong in an explicit package-update workflow.
-swift build --disable-keychain ${SWIFTPM_SANDBOX_FLAG[@]+"${SWIFTPM_SANDBOX_FLAG[@]}"} "${BUILD_CONFIG_FLAG[@]}" \
-  --force-resolved-versions --skip-update --package-path "$ROOT"
+# S13b: the bundle is Xcode's (project.yml): Info.plist, resources, the Chrome
+# payload, helpers in Contents/MacOS, Sparkle in Contents/Frameworks and the
+# generated Metadata.appintents. Its stamp phase writes VERSION, the source
+# identity and, for this dev path only, REPO_PATH. The local identity
+# overrides reach it as build settings (they outrank the xcconfig defaults).
+# Xcode does not sign here: nativeagent_sign_development_bundle below is the
+# one signing owner, so local/NativeAgent.xcconfig signing settings and
+# NATIVE_AGENT_ADHOC cannot disagree with it.
+# Development builds consume the reviewed dependency pins; deliberate updates
+# belong in an explicit package-update workflow. The running app is not
+# touched until the POINT OF NO RETURN below (DOWNTIME GUARD 2026-07-02).
+DERIVED_DATA="$ROOT/DerivedData"
+xcodebuild -quiet \
+  -project "$ROOT/$APP_NAME.xcodeproj" -scheme "$APP_NAME" -configuration "$XCODE_CONFIG" \
+  -destination "platform=macOS,arch=$(uname -m)" -derivedDataPath "$DERIVED_DATA" \
+  -onlyUsePackageVersionsFromResolvedFile -skipPackageUpdates \
+  ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO \
+  NATIVEAGENT_MAC_BUNDLE_ID="$NATIVEAGENT_MAC_BUNDLE_ID" \
+  NATIVEAGENT_ICLOUD_CONTAINER_ID="$NATIVEAGENT_ICLOUD_CONTAINER_ID" \
+  NATIVEAGENT_MOBILE_SOURCE_KEY="$NATIVEAGENT_MOBILE_SOURCE_KEY" \
+  NATIVEAGENT_BACKGROUND_TASK_PREFIX="$NATIVEAGENT_BACKGROUND_TASK_PREFIX" \
+  NATIVEAGENT_DEVICE_SYNC="$NATIVEAGENT_DEVICE_SYNC" \
+  NATIVEAGENT_RELEASE_PAGE_URL="$NATIVEAGENT_RELEASE_PAGE_URL" \
+  NATIVEAGENT_EMBEDDING_MODEL_DIR="$EMBEDDING_MODEL_DIR" \
+  NATIVEAGENT_STAMP_REPO_PATH=YES \
+  build
+BUILT_APP="$DERIVED_DATA/Build/Products/$XCODE_CONFIG/$APP_NAME.app"
 
-BIN_DIR="$(swift build --disable-keychain ${SWIFTPM_SANDBOX_FLAG[@]+"${SWIFTPM_SANDBOX_FLAG[@]}"} "${BUILD_CONFIG_FLAG[@]}" \
-  --force-resolved-versions --skip-update --package-path "$ROOT" --show-bin-path)"
-BIN="$BIN_DIR/$PRODUCT"
-CHROME_RELAY_BIN="$BIN_DIR/NativeAgentChromeRelay"
-AGENT_LINK_BIN="$BIN_DIR/nativeagent-link"
-[[ -x "$AGENT_LINK_BIN" ]] || {
-  echo "[agent-link] ERROR: expected executable missing: $AGENT_LINK_BIN" >&2
-  exit 1
-}
-[[ -x "$CHROME_RELAY_BIN" ]] || {
-  echo "[chrome-relay] ERROR: expected executable missing: $CHROME_RELAY_BIN" >&2
-  exit 1
-}
 # Stage + sign into a TEMP bundle and only swap it into dist/NativeAgent.app
-# after the shared signing owner passes deep verification. Every fallible step (resource staging,
-# provisioning checks, codesign, verification) therefore runs while the
+# after the shared signing owner passes deep verification. Every fallible step
+# (provisioning checks, codesign, verification) therefore runs while the
 # previous dist bundle — and the running app — are still intact; a failure
 # anywhere exits nonzero with nothing killed and nothing half-replaced.
 BUNDLE_FINAL="$ROOT/dist/$APP_NAME.app"
@@ -185,54 +172,8 @@ rm -rf "$BUNDLE"
 # mv lands, $BUNDLE is reassigned to the final path — this trap must be gone
 # by then or it would delete the freshly installed bundle).
 trap 'rm -rf "$ROOT/dist/.$APP_NAME.app.staging.$$"' EXIT
-mkdir -p "$BUNDLE/Contents/MacOS" "$BUNDLE/Contents/Resources"
-cp "$BIN" "$BUNDLE/Contents/MacOS/$PRODUCT"
-cp "$AGENT_LINK_BIN" "$BUNDLE/Contents/MacOS/nativeagent-link"
-stage_chrome_payload "$ROOT" "$BUNDLE" "$CHROME_RELAY_BIN"
-if [[ -f "$ROOT/VERSION" ]]; then
-  cp "$ROOT/VERSION" "$BUNDLE/Contents/Resources/VERSION"
-fi
-printf '%s\n' "$NATIVEAGENT_SOURCE_REVISION" > "$BUNDLE/Contents/Resources/VERSION_SHA"
-
-# 2026-06-07 task #88: stage SPM-generated resource bundles into
-# Contents/Resources/. Without this, the bundled MiniLM mlpackage is
-# unreachable in any install where `.build/` doesn't exist next to the
-# binary (i.e. anyone but the developer who built it).
-#
-# We stage UNDER Contents/Resources/ ONLY. Putting `.bundle` dirs at the
-# .app top level breaks codesign (strict bundle-layout check). The
-# SPM-synthesized `Bundle.module` resolver looks at the .app top level
-# first, so the Swift-side `CoreMLEmbeddingProvider.bundled()` factory
-# adds an explicit Bundle.main fallback to Contents/Resources/<name>.bundle
-# in the installed-app shape.
-SPM_BIN_DIR_FOR_RES="$(dirname "$BIN")"
-shopt -s nullglob
-for spm_bundle in "$SPM_BIN_DIR_FOR_RES"/*.bundle; do
-  bundle_basename="$(basename "$spm_bundle")"
-  rm -rf "$BUNDLE/Contents/Resources/$bundle_basename"
-  cp -R "$spm_bundle" "$BUNDLE/Contents/Resources/$bundle_basename"
-  echo "[spm-resources] staged $bundle_basename"
-done
-shopt -u nullglob
-
-# gRPC products link into the executable; privacy resource bundles above and
-# these source-license notices are sealed by the existing app signature.
-cp "$ROOT/docs/licenses/A2A-gRPC-NOTICES.txt" "$BUNDLE/Contents/Resources/A2A-gRPC-NOTICES.txt"
-
-# Large embedding model for release builds (2026-09-05). The bundled MiniLM is
-# the floor; a stronger model is too big for git, so a DMG ships it from
-# extras/embedding/ in the checkout (gitignored; embedding.json + the model +
-# vocab it names) into Contents/Resources/embedding/. The runtime prefers it
-# over MiniLM and re-embeds the store on first launch.
-EMBEDDING_MODEL_DIR="${NATIVEAGENT_EMBEDDING_MODEL_DIR:-$ROOT/extras/embedding}"
-# First build on a fresh checkout: fetch the model from the repository's model
-# release unless told not to. A failed fetch is not fatal; MiniLM remains.
-if [[ ! -f "$EMBEDDING_MODEL_DIR/embedding.json" && "${NATIVEAGENT_SKIP_EMBEDDING_FETCH:-0}" != "1" ]]; then
-  "$ROOT/script/fetch_embedding_model.sh" || echo "[embedding] fetch failed; building with the bundled MiniLM"
-fi
-if [[ -f "$EMBEDDING_MODEL_DIR/embedding.json" ]]; then
-  rm -rf "$BUNDLE/Contents/Resources/embedding"
-  cp -R "$EMBEDDING_MODEL_DIR" "$BUNDLE/Contents/Resources/embedding"
+ditto "$BUILT_APP" "$BUNDLE"
+if [[ -d "$BUNDLE/Contents/Resources/embedding" ]]; then
   echo "[embedding] staged $(basename "$EMBEDDING_MODEL_DIR") ($(du -sh "$BUNDLE/Contents/Resources/embedding" | cut -f1))"
 fi
 
@@ -250,123 +191,8 @@ assert_no_python_artifacts() {
   fi
 }
 
-# Copy Sparkle.framework to the standard app bundle framework location and
-# make the executable's rpath explicit. This avoids the startup updater warning
-# caused by dyld being unable to resolve @rpath/Sparkle.framework in installed
-# bundles.
-SPM_BIN_DIR="$(dirname "$BIN")"
-if [[ -d "$SPM_BIN_DIR/Sparkle.framework" ]]; then
-  mkdir -p "$BUNDLE/Contents/Frameworks"
-  rm -rf "$BUNDLE/Contents/Frameworks/Sparkle.framework" "$BUNDLE/Contents/MacOS/Sparkle.framework"
-  cp -R "$SPM_BIN_DIR/Sparkle.framework" "$BUNDLE/Contents/Frameworks/Sparkle.framework"
-  if ! otool -l "$BUNDLE/Contents/MacOS/$PRODUCT" 2>/dev/null | grep -q '@executable_path/../Frameworks'; then
-    install_name_tool -add_rpath "@executable_path/../Frameworks" "$BUNDLE/Contents/MacOS/$PRODUCT" 2>/dev/null || true
-  fi
-fi
-if [[ -f "$ROOT/Resources/AppIcon.icns" ]]; then
-  cp "$ROOT/Resources/AppIcon.icns" "$BUNDLE/Contents/Resources/AppIcon.icns"
-fi
-
-cat > "$BUNDLE/Contents/Info.plist" <<PLIST
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>CFBundleExecutable</key>
-  <string>$PRODUCT</string>
-  <key>CFBundleIdentifier</key>
-  <string>$NATIVEAGENT_MAC_BUNDLE_ID</string>
-  <key>CFBundleName</key>
-  <string>$APP_NAME</string>
-  <key>CFBundleVersion</key>
-  <string>$NATIVEAGENT_BUILD_VERSION</string>
-  <key>CFBundleShortVersionString</key>
-  <string>$NATIVEAGENT_BUILD_SHORT_VERSION</string>
-  <key>NativeAgentSourceRevision</key>
-  <string>$NATIVEAGENT_SOURCE_REVISION</string>
-  <key>NativeAgentSourceDirty</key>
-  <$NATIVEAGENT_SOURCE_DIRTY/>
-  <key>NativeAgentMacBundleID</key>
-  <string>$NATIVEAGENT_MAC_BUNDLE_ID</string>
-  <key>NativeAgentICloudContainerID</key>
-  <string>$NATIVEAGENT_ICLOUD_CONTAINER_ID</string>
-  <key>NativeAgentMobileSourceKey</key>
-  <string>$NATIVEAGENT_MOBILE_SOURCE_KEY</string>
-  <key>NativeAgentBackgroundTaskIDPrefix</key>
-  <string>$NATIVEAGENT_BACKGROUND_TASK_PREFIX</string>
-  <key>NativeAgentDeviceSync</key>
-  <string>$NATIVEAGENT_DEVICE_SYNC</string>
-  <key>NativeAgentReleasePageURL</key>
-  <string>$NATIVEAGENT_RELEASE_PAGE_URL</string>
-  <key>CFBundleIconFile</key>
-  <string>AppIcon</string>
-  <key>CFBundleIconName</key>
-  <string>AppIcon</string>
-  <key>CFBundlePackageType</key>
-  <string>APPL</string>
-  <key>UTExportedTypeDeclarations</key>
-  <array>
-    <dict>
-      <key>UTTypeConformsTo</key>
-      <array>
-        <string>public.data</string>
-      </array>
-      <key>UTTypeDescription</key>
-      <string>NativeAgent Chat Session</string>
-      <key>UTTypeIdentifier</key>
-      <string>com.nativeagent.chat-session</string>
-    </dict>
-  </array>
-  <key>CFBundleURLTypes</key>
-  <array>
-    <dict>
-      <key>CFBundleURLName</key>
-      <string>$NATIVEAGENT_MAC_BUNDLE_ID.oauth</string>
-      <key>CFBundleURLSchemes</key>
-      <array>
-        <string>nativeagent</string>
-      </array>
-    </dict>
-  </array>
-  <key>LSMinimumSystemVersion</key>
-  <string>26.0</string>
-  <key>NSPrincipalClass</key>
-  <string>NSApplication</string>
-  <key>NSAppleEventsUsageDescription</key>
-  <string>NativeAgent uses Apple Events to coordinate with system applications.</string>
-  <key>NSCalendarsUsageDescription</key>
-  <string>NativeAgent uses calendar access for assistant briefings and user-approved watch jobs.</string>
-  <key>NSCalendarsFullAccessUsageDescription</key>
-  <string>NativeAgent uses full calendar access to read upcoming events for assistant briefings and user-approved watch jobs.</string>
-  <key>NSCalendarsWriteOnlyAccessUsageDescription</key>
-  <string>NativeAgent uses write-only calendar access to create events only when the user enables Calendar write access.</string>
-  <key>NSRemindersUsageDescription</key>
-  <string>NativeAgent uses reminders access for assistant briefings and user-approved watch jobs.</string>
-  <key>NSRemindersFullAccessUsageDescription</key>
-  <string>NativeAgent uses reminders access to read due reminders for assistant briefings and user-approved watch jobs.</string>
-  <!-- Contacts framework access for assistant-requested people lookup. -->
-  <key>NSContactsUsageDescription</key>
-  <string>NativeAgent uses Contacts so the assistant can look up people you ask about and (with the Contacts write toggle on) create or update contacts on your behalf.</string>
-  <!-- PATCH-2026-05-06: multimodal-ui Sprint 3.1 — voice input usage descriptions -->
-  <key>NSMicrophoneUsageDescription</key>
-  <string>NativeAgent uses your microphone for voice input.</string>
-  <key>NSSpeechRecognitionUsageDescription</key>
-  <string>NativeAgent uses speech recognition to transcribe your voice.</string>
-  <key>NSLocalNetworkUsageDescription</key>
-  <string>NativeAgent uses the local network to connect the Mac app and trusted companion devices.</string>
-</dict>
-</plist>
-PLIST
-
-# Stamp REPO_PATH in dev bundles so Swift-native data-root resolution can keep
-# using the repo-owned data/ tree during local development.
-printf '%s\n' "$ROOT" > "$BUNDLE/Contents/Resources/REPO_PATH"
-
 xattr -dr com.apple.quarantine "$BUNDLE" 2>/dev/null || true
 
-# Belt-and-suspenders: stale runtime artifacts under Contents/ make codesign
-# reject the bundle, so strip them before signing.
-rm -rf "$BUNDLE/Contents/.runtime" "$BUNDLE/Contents/.build"
 assert_no_python_artifacts "$BUNDLE"
 
 # Mac app signing. One shared owner keeps build and install on the exact same

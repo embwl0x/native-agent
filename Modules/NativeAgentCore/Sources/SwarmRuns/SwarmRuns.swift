@@ -27,7 +27,7 @@
 // to Swift-native in production additionally requires the cross-process file
 // lock to wrap every
 // Python write of swarms/runs.json, because run_agent_swarm mutates the same
-// file the daemon process owns. See CUTOVER_PLAN.md §6.55.
+// file the daemon process owns.
 
 import Foundation
 import PersistenceCore

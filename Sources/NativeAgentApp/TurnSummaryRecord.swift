@@ -1,5 +1,6 @@
 import Foundation
 import PersistenceCore
+import TurnTrace
 
 // MARK: - Turn Inspector W4 — per-turn SUMMARY records for the iCloud snapshot lane
 //

@@ -723,27 +723,6 @@ still truncate toward zero; nonfinite or out-of-range values use the existing
 defaults. An unrepresentable explicit path paired with a mark refuses as an
 ambiguous target instead of trapping during path comparison.
 
-Marked `mac_click` input re-resolves the captured app/window and element before
-posting each move or mouse-down, using the live frame. Mouse-up finishes the
-accepted press at its last posted position: the press itself may change or
-remove the target. Each subsequent click still requires a fresh target check.
-Missing, ambiguous, inferred-label,
-unfocused, or drifted targets refuse with `mark_drifted`; a fresh view or an
-unambiguous semantic target is required. A held button is released at the last
-posted position on refusal.
-Live value labels use the reader's AX string conversion and the mark selector's
-whitespace trimming, including numeric and Boolean values.
-Marked actions search the live captured window for a unique role/label identity;
-child-index changes do not retarget an action. If the window walk exceeds 4,096
-elements or pending children, it refuses (2026-09-06). Captured ancestor indices
-are not identity evidence after relayout and cannot establish whole-window
-uniqueness. Duplicate identities and AX read failures also refuse.
-Marked `mac_ax_act` uses the same app/window and identity checks, then passes
-that exact resolved target to the actuator; it never reinterprets the mark's
-path in another frontmost window.
-Click/drag execution checks task cancellation before each event and exits on a
-cancelled drag delay. Cancellation releases a held button at the last posted
-position and returns `cancelled`; remaining motion is never accelerated or replayed.
 Approval creation and match-or-create share the 300-row terminal-first cap:
 pending requests are never evicted. A new distinct request is refused before
 writing when all 300 rows are pending; touching an existing pending request
@@ -1791,14 +1770,5 @@ or unreadable files retain their distinct evidence/availability semantics.
 iOS snapshot download waits suspend with cancellation-aware sleep before bounded
 coordinated reads on a dedicated I/O queue. Timeout or cancellation returns no
 replacement value, preserving the existing last-good publication rules.
-# Release-gate execution (2026-09-07)
-
-`script/test.sh --require-ios` collects every test-shard failure before refusing
-release proof. `script/lib/test_gate.sh` owns bounded shell/Core process pools,
-isolated fallback data roots, retained logs, counts and wall-time summaries.
-Core builds its test bundle once; safe Swift Testing shards load that bundle
-through Xcode's SwiftPM testing helper, avoiding SwiftPM's execution-time build
-lock. ChatOrchestration, ProviderRouting and SelfImprovement remain serial.
-StandingBots is explicitly included. Failed iOS runs retain their xcresult counts.
 The engine's existing `providerRecoverySleep` seam still owns all three retry
 waits; production timing, attempt budgets and cancellation boundaries do not change.

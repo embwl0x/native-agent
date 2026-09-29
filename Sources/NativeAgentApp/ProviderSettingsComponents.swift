@@ -543,7 +543,7 @@ struct ProviderConfigSheet: View {
             if savedAuthMode == "api_key", apiKey == savedInput {
                 apiKey = ""
             }
-            let refreshed = try await appModel.listProviders()
+            let refreshed = try await appModel.engine.providers.list()
             if let current = refreshed.first(where: { $0.provider_id == provider.provider_id }) {
                 availableModels = current.models
             }

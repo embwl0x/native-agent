@@ -425,6 +425,18 @@ public enum GitHubConnectorActions {
         token explicitToken: String? = nil,
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) async throws -> Any {
+        try await callWithResponse(path: path, params: params, method: method, body: body,
+                                   token: explicitToken, dataRoot: dataRoot).value
+    }
+
+    static func callWithResponse(
+        path: String,
+        params: [String: String] = [:],
+        method: String = "GET",
+        body: [String: Any]? = nil,
+        token explicitToken: String? = nil,
+        dataRoot: URL = PersistenceCore.defaultDataRoot()
+    ) async throws -> (value: Any, response: HTTPURLResponse) {
         let token = try await requestToken(explicitToken: explicitToken, dataRoot: dataRoot)
         // Closed back-off window: fail locally instead of adding load to a
         // throttle we already provoked (secondary-rate circuit breaker).
@@ -447,12 +459,20 @@ public enum GitHubConnectorActions {
             throw GitHubConnectorError.invalidResponse("missing HTTP response")
         }
         // A stored OAuth sign-in that GitHub rejects gets one refresh and one retry.
-        if http.statusCode == 401, explicitToken == nil,
-           // A failed refresh leaves GitHub's own 401 as the answer.
-           let fresh = (try? await GitHubCredentialStore.shared.refreshAfterRejection(token, dataRoot: dataRoot)) ?? nil,
-           fresh != token {
-            return try await call(path: path, params: params, method: method, body: body,
-                                  token: fresh, dataRoot: dataRoot)
+        if http.statusCode == 401, explicitToken == nil {
+            let fresh: String?
+            do {
+                fresh = try await GitHubCredentialStore.shared.refreshAfterRejection(token, dataRoot: dataRoot)
+            } catch GitHubCredentialVaultError.accountChanged {
+                throw GitHubCredentialVaultError.accountChanged
+            } catch {
+                // Other refresh failures leave GitHub's own 401 as the answer.
+                fresh = nil
+            }
+            if let fresh, fresh != token {
+                return try await callWithResponse(path: path, params: params, method: method, body: body,
+                                      token: fresh, dataRoot: dataRoot)
+            }
         }
         guard http.statusCode < 400 else {
             let message: String
@@ -486,7 +506,7 @@ public enum GitHubConnectorActions {
                 rateLimitReset: reset
             )
         }
-        return parsed
+        return (parsed, http)
     }
 
     static func requireRateLimitAdmission() async throws {

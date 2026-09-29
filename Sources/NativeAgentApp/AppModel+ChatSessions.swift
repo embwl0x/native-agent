@@ -1,3 +1,5 @@
+import AppToolRuntime
+import TurnTrace
 import Foundation
 import Observation
 import Darwin
@@ -6,6 +8,7 @@ import AppKit
 import SwiftUI
 import NativeAgentShared
 import PersistenceCore
+import Transcripts
 import NativeAgentCore
 import MemoryV2
 import ToolRegistry
@@ -40,27 +43,7 @@ import WorkflowOrchestration
 import Skills
 import Connectors
 import Browser
-
-/// Serializes durable session-index mutations without holding an actor across
-/// a re-entrant await. A newer rename intent can supersede a queued older one;
-/// once a write has started, the next intent waits and writes last.
-actor ChatRenameMutationGate {
-    private var held = false
-    private var waiters: [CheckedContinuation<Void, Never>] = []
-
-    func acquire() async {
-        guard held else { held = true; return }
-        await withCheckedContinuation { waiters.append($0) }
-    }
-
-    func release() {
-        if waiters.isEmpty {
-            held = false
-        } else {
-            waiters.removeFirst().resume()
-        }
-    }
-}
+import DeviceSync
 
 /// Whether the human has explicitly picked a chat session since this launch.
 ///
@@ -122,7 +105,7 @@ extension AppModel {
     // drop empty drafts immediately, and cap to 50 most-recently-used entries.
     @MainActor
     private func pruneChatDrafts() {
-        let activeIds = Set(chatSessions.map(\.id))
+        let activeIds = Set(engine.transcripts.sessions.map(\.id))
         // Drop sessions that no longer exist
         chatDrafts = chatDrafts.filter { activeIds.contains($0.key) }
         chatPendingAttachments = chatPendingAttachments.filter { activeIds.contains($0.key) }
@@ -189,6 +172,11 @@ extension AppModel {
     @discardableResult
     func refreshForSidebarItem(_ item: SidebarItem) async -> PanelRefreshStatus {
         let api = client
+        let memory = engine.memory
+        let approvalStore = engine.approvals
+        let inbox = engine.inbox
+        let toolStore = engine.tools
+        let desk = engine.desk
         var failedEndpoints: [String] = []
         // Sol P1, 2026-09-13: what this call ANNOUNCES must come from what this
         // call actually did. Two branches below do no read at all, and the one
@@ -219,7 +207,7 @@ extension AppModel {
         switch item {
         case .chat:
             if !(await loadProvidersForChat()) { failedEndpoints.append("providers") }
-            modelCatalog = fresh("model catalog", try? await api.getModelCatalog(refresh: false))
+            engine.providers.catalog = fresh("model catalog", try? await engine.providers.modelCatalog(refresh: false))
             await loadChatState(api: api)
             if chatStateLoadFailed { failedEndpoints.append("chat messages") }
             compiledPersonality = fresh("personality", try? await api.getCompiledPersonality(surface: "chat"))
@@ -237,17 +225,13 @@ extension AppModel {
         case .legacyWorkshop:
             // 2026-06-06 sidebar-fix v3: removed the approvals side-effect
             // refresh. It was causing the sidebar to scroll on Executions click:
-            // updating BOTH appModel.executions AND appModel.approvals in the
+            // updating BOTH appModel.executions AND the approvals in the
             // same render cycle changed TWO sidebar badge counts at once
             // (Executions running-count + Activity pending-count), triggering
             // a double re-layout that shifted the scroll position. Approvals
             // have their own refresh in the .activity case and the sidebar's
             // own 30s poll; they don't need to ride along with the execution lane.
-            async let nextExecutions = try? api.getWorkshopExecutions()
-            async let nextRuns = try? api.getRuns()
-            let (executionRows, runRows) = await (nextExecutions, nextRuns)
-            executions = fresh("missions", executionRows) ?? executions
-            runs = fresh("runs", runRows) ?? runs
+            runs = fresh("runs", try? await api.getRuns()) ?? runs
         case .desk, .workshop, .work, .command, .bots:
             // Nothing is read here, so nothing is said about freshness below.
             performedRead = false
@@ -256,15 +240,15 @@ extension AppModel {
             // 2026-07-23); its old command-summary fetch went with the view.
             break
         case .memory, .memories, .knowledge:
-            async let nextMemories = try? api.getMemories()
-            async let nextMemoryProposals = try? api.getMemoryProposals()
+            async let nextMemories = try? memory.activeMemories()
+            async let nextMemoryProposals = try? memory.proposals(status: "pending")
             async let nextVectorStatus = try? api.getMemoryVectorStatus()
             async let nextMemoryV2Status = try? api.getMemoryV2Status()
             async let nextAgentGraph = try? api.getAgentGraph()
             async let nextGraphEntities = try? api.getGraphEntities()
             async let nextGraphStatus = try? api.getGraphStatus()
             async let nextPersonality = try? api.getPersonality()
-            async let nextTrustPolicy = try? api.getTrustPolicy()
+            async let nextTrustPolicy = try? engine.trust.load()
             let (memoryRows, proposalRows, vectorRow, memoryV2Row, agentGraphRow, graphRows, graphStatusRow, personalityRow, trustRow) = await (
                 nextMemories,
                 nextMemoryProposals,
@@ -276,13 +260,13 @@ extension AppModel {
                 nextPersonality,
                 nextTrustPolicy
             )
-            memories = fresh("memories", memoryRows) ?? memories
-            if memoryRows != nil, let query = memorySearchResultQuery, query.count >= 3 {
+            memory.memories = fresh("memories", memoryRows) ?? memory.memories
+            if memoryRows != nil, let query = memory.searchResultQuery, query.count >= 3 {
                 // Even an unchanged newest-200 list can hide a changed older
                 // search hit. Begin a new generation on every successful read.
-                await runMemorySemanticSearch(query: query)
+                await memory.search(query: query)
             }
-            memoryProposals = fresh("memory proposals", proposalRows) ?? memoryProposals
+            memory.proposals = fresh("memory proposals", proposalRows) ?? memory.proposals
             memoryVectorStatus = fresh("vector status", vectorRow) ?? memoryVectorStatus
             memoryV2Status = fresh("memory v2 status", memoryV2Row) ?? memoryV2Status
             agentGraph = fresh("agent graph", agentGraphRow) ?? agentGraph
@@ -290,11 +274,11 @@ extension AppModel {
             graphStatus = fresh("graph status", graphStatusRow) ?? graphStatus
             personality = fresh("personality", personalityRow) ?? personality
             teachMemoryHygieneName()
-            trustPolicy = fresh("trust policy", trustRow) ?? trustPolicy
+            engine.trust.policy = fresh("trust policy", trustRow) ?? engine.trust.policy
         case .settingsHub, .settings, .connectors, .providers, .telegram, .inboxPolicy, .macIntegration:
             async let nextConfig = try? api.getConfig()
             async let nextPrivacyMap = try? api.getPrivacyMap()
-            async let nextTelegramStatus = try? api.getTelegramStatus()
+            async let nextTelegramStatus = try? engine.telegram.load(manager: api.backgroundLoopsManager.coreManager)
             async let nextConnectors = try? api.getConnectors()
             let (configRow, privacyRow, telegramRow, connectorRows) = await (
                 nextConfig,
@@ -303,19 +287,19 @@ extension AppModel {
                 nextConnectors
             )
             if let config = fresh("config", configRow) {
-                codexAuthStatus = config.codexAuth
+                engine.providers.codexAuth = config.codexAuth
                 _ = applyRefreshedSearXNGBaseURL(config.searxngBaseURL)
             }
             privacyMap = fresh("privacy map", privacyRow) ?? privacyMap
-            telegramStatus = fresh("telegram status", telegramRow) ?? telegramStatus
+            engine.telegram.status = fresh("telegram status", telegramRow) ?? engine.telegram.status
             connectors = fresh("connectors", connectorRows) ?? connectors
             if item == .connectors {
                 workspaces = fresh("shared folders", try? await api.getWorkspaces()) ?? workspaces
             }
         case .approvals, .activity:
-            async let nextApprovals = try? api.getApprovals()
-            async let nextInbox = try? api.getInboxItems(unreadOnly: false)
-            async let nextMemoryProposals = try? api.getMemoryProposals()
+            async let nextApprovals = try? approvalStore.list()
+            async let nextInbox = try? inbox.list()
+            async let nextMemoryProposals = try? memory.proposals(status: "pending")
             async let nextImprovementSummary = try? api.getImprovementSummary()
             async let nextTrainingProposals = try? api.getTrainingProposals()
             async let nextPromotionCandidates = try? api.getPromotionCandidates()
@@ -329,25 +313,25 @@ extension AppModel {
                 nextPromotionCandidates,
                 nextPromotionPending
             )
-            approvals = fresh("approvals", approvalRows) ?? approvals
-            inboxItems = fresh("inbox", inboxRows) ?? inboxItems
-            memoryProposals = fresh("memory proposals", proposalRows) ?? memoryProposals
+            approvalStore.records = fresh("approvals", approvalRows) ?? approvalStore.records
+            inbox.items = fresh("inbox", inboxRows) ?? inbox.items
+            memory.proposals = fresh("memory proposals", proposalRows) ?? memory.proposals
             improvementSummary = fresh("improvement summary", improvementRow) ?? improvementSummary
             trainingProposals = fresh("training proposals", trainingRows) ?? trainingProposals
             promotionCandidates = fresh("promotion candidates", promotionRows) ?? promotionCandidates
             promotionPending = fresh("promotion pending", pendingRows) ?? promotionPending
         case .capabilities:
             async let nextSkills = try? api.getSkills()
-            async let nextTools = try? api.getTools()
-            async let nextCapabilitySummary = try? api.getCapabilities()
-            async let nextApprovals = try? api.getApprovals()
+            async let nextTools = try? toolStore.listAuthored()
+            async let nextCapabilitySummary = try? engine.trust.loadCapabilities()
+            async let nextApprovals = try? approvalStore.list()
             async let nextWorkflows = try? api.getWorkflows()
             async let nextMCPServers = try? api.getMCPServers()
             // The compact MCP Builder is mounted in Capabilities too. Its
             // server controls render live session and consent evidence, so
             // refresh all three authorities together rather than leaving
             // those rows stale/empty until someone opens the separate MCP tab.
-            async let nextMCPSessions = try? api.getMCPSessions()
+            async let nextMCPSessions = try? engine.tools.listMCPSessions()
             async let nextMCPConsent = try? api.getMCPConsent()
             // Native macOS Power is part of the Capabilities hardening view.
             // Refresh each live tile and action registry here so that view
@@ -362,7 +346,7 @@ extension AppModel {
             async let nextCatalog = try? api.getCapabilityCatalog()
             async let nextCatalogSources = try? api.getCapabilityCatalogSources()
             async let nextPackInstalls = try? api.getCapabilityPackInstalls()
-            async let nextCapabilityTrust = try? api.getCapabilityTrust()
+            async let nextCapabilityTrust = try? engine.trust.loadCapabilityNetwork()
             async let nextSummary = try? api.getNextGenSummary()
             async let nextPhases = try? api.getNextGenPhases()
             async let nextReceipts = try? api.getNextGenReceipts()
@@ -423,12 +407,12 @@ extension AppModel {
                 nextGraphStatus
             )
             skills = fresh("skills", skillRows) ?? skills
-            tools = fresh("tools", toolRows) ?? tools
-            capabilitySummary = fresh("capability summary", capabilityRow) ?? capabilitySummary
-            approvals = fresh("approvals", approvalRows) ?? approvals
+            toolStore.authored = fresh("tools", toolRows) ?? toolStore.authored
+            engine.trust.capabilitySummary = fresh("capability summary", capabilityRow) ?? engine.trust.capabilitySummary
+            approvalStore.records = fresh("approvals", approvalRows) ?? approvalStore.records
             workflows = fresh("workflows", workflowRows) ?? workflows
             mcpServers = fresh("mcp servers", mcpRows) ?? mcpServers
-            mcpSessions = fresh("mcp sessions", mcpSessionRows) ?? mcpSessions
+            engine.tools.mcpSessions = fresh("mcp sessions", mcpSessionRows) ?? engine.tools.mcpSessions
             mcpConsent = fresh("mcp consent", mcpConsentRows) ?? mcpConsent
             notificationStatus = fresh("notification status", notificationStatusRow) ?? notificationStatus
             browserRuntimeStatus = fresh("browser status", browserRuntimeStatusRow) ?? browserRuntimeStatus
@@ -453,7 +437,7 @@ extension AppModel {
             capabilityCatalog = fresh("capability catalog", catalogRows) ?? capabilityCatalog
             capabilityCatalogSources = fresh("catalog sources", sourceRows) ?? capabilityCatalogSources
             capabilityPackInstalls = fresh("pack installs", installRows) ?? capabilityPackInstalls
-            capabilityTrust = fresh("capability trust", trustRow) ?? capabilityTrust
+            engine.trust.capabilityNetwork = fresh("capability trust", trustRow) ?? engine.trust.capabilityNetwork
             nextGenSummary = fresh("nextgen summary", summaryRow) ?? nextGenSummary
             agentGraph = fresh("skill memory graph", agentGraphRow) ?? agentGraph
             graphEntities = fresh("skill memory graph entities", graphRows) ?? graphEntities
@@ -471,7 +455,7 @@ extension AppModel {
             await loadAllSelfImprovement()
             async let nextImprovementSummary = try? api.getImprovementSummary()
             async let nextImprovements = try? api.getImprovements()
-            async let nextJobs = try? api.getJobs()
+            async let nextJobs = try? desk.listJobs()
             async let nextTrainingArtifacts = try? api.getTrainingArtifacts()
             let (improvementRow, improvementRows, jobRows, artifactRows) = await (
                 nextImprovementSummary,
@@ -481,13 +465,13 @@ extension AppModel {
             )
             improvementSummary = fresh("improvement summary", improvementRow) ?? improvementSummary
             improvements = fresh("improvements", improvementRows) ?? improvements
-            jobs = fresh("jobs", jobRows) ?? jobs
+            desk.jobs = fresh("jobs", jobRows) ?? desk.jobs
             trainingArtifacts = fresh("training artifacts", artifactRows) ?? trainingArtifacts
         case .dreams:
             // The Dreams tab fetches its diary itself; refresh the trust policy
             // here so the REM toggle (trainingPolicy.rem_cycle_enabled) reflects
             // current state on tab entry.
-            trustPolicy = fresh("trust policy", try? await api.getTrustPolicy()) ?? trustPolicy
+            engine.trust.policy = fresh("trust policy", try? await engine.trust.load()) ?? engine.trust.policy
         case .cognition:
             performedRead = false
         case .skills, .skillLifecycle:
@@ -507,27 +491,24 @@ extension AppModel {
             // consumer is starved. See prerelease-upgrade-campaign.md B2.1 [W7#1].
             async let nextActivity = try? api.getActivity()
             async let nextRuns = api.getRunsStrict()
-            async let nextWatchdog = try? api.getWatchdog()
+            async let nextWatchdog = engine.doctor.readWatchdog(manager: api.backgroundLoopsManager.coreManager)
             // Health used to be fetched unconditionally for every page above;
-            // Status is the page that actually reads it, so it fetches it here
-            // now — in parallel with its three siblings rather than ahead of
-            // them.
-            async let nextHealth = try? api.getHealth()
-            let (activityRows, runRows, watchdogRow, healthRow) = await (
+            // Status is the page that actually reads it, so it reads it here.
+            let healthRow: RuntimeHealth? = engine.doctor.readHealth()
+            let (activityRows, runRows, watchdogRow) = await (
                 nextActivity,
                 nextRuns,
-                nextWatchdog,
-                nextHealth
+                nextWatchdog
             )
             activityEvents = fresh("activity", activityRows) ?? activityEvents
             runs = fresh("runs", runRows) ?? runs
-            watchdogStatus = fresh("watchdog", watchdogRow) ?? watchdogStatus
+            engine.doctor.watchdog = fresh("watchdog", watchdogRow) ?? engine.doctor.watchdog
             healthProbeFailed = healthRow == nil
             // The probe's outcome outlives this call: the Diagnostics
             // projection reads `health` long after, and a cached row must not
             // be read there as a reading that came back.
-            self.healthProbeFailed = healthProbeFailed
-            health = fresh("health", healthRow) ?? health
+            engine.doctor.healthProbeFailed = healthProbeFailed
+            engine.doctor.health = fresh("health", healthRow) ?? engine.doctor.health
         case .personality:
             async let nextPersonality = try? api.getPersonality()
             async let nextDocs = try? api.getPersonalityDocs()
@@ -547,11 +528,11 @@ extension AppModel {
             compiledPersonality = fresh("compiled personality", compiledRow) ?? compiledPersonality
             personalityGrowth = fresh("personality growth", growthRow) ?? personalityGrowth
         case .trust:
-            async let nextTrust = try? api.getTrustPolicy()
+            async let nextTrust = try? engine.trust.load()
             async let nextPrivacy = try? api.getPrivacyMap()
             async let nextConnectors = try? api.getConnectors()
             async let nextWorkspaces = try? api.getWorkspaces()
-            async let nextBackups = try? api.getBackups()
+            async let nextBackups = try? engine.trust.listBackups()
             let (trustRow, privacyRow, connectorRows, workspaceRows, backupRows) = await (
                 nextTrust,
                 nextPrivacy,
@@ -559,45 +540,45 @@ extension AppModel {
                 nextWorkspaces,
                 nextBackups
             )
-            trustPolicy = fresh("trust policy", trustRow) ?? trustPolicy
+            engine.trust.policy = fresh("trust policy", trustRow) ?? engine.trust.policy
             privacyMap = fresh("privacy map", privacyRow) ?? privacyMap
             connectors = fresh("connectors", connectorRows) ?? connectors
             workspaces = fresh("workspaces", workspaceRows) ?? workspaces
-            backups = fresh("backups", backupRows) ?? backups
+            engine.trust.backups = fresh("backups", backupRows) ?? engine.trust.backups
         case .panels:
             async let nextSkills = try? api.getSkills()
-            async let nextTools = try? api.getTools()
+            async let nextTools = try? toolStore.listAuthored()
             let (skillRows, toolRows) = await (nextSkills, nextTools)
             skills = fresh("skills", skillRows) ?? skills
-            tools = fresh("tools", toolRows) ?? tools
+            toolStore.authored = fresh("tools", toolRows) ?? toolStore.authored
         case .tools:
-            async let nextTools = try? api.getTools()
+            async let nextTools = try? toolStore.listAuthored()
             async let nextConnectorActions = try? api.getConnectorActions()
             async let nextMCPServers = try? api.getMCPServers()
             // Tools renders the current catalog *and* its Full Mac lifecycle
             // explanation. Refresh the Trust policy in the same pass so an
             // expired/unreadable window is never flattened into "off".
-            async let nextTrustPolicy = try? api.getTrustPolicy()
+            async let nextTrustPolicy = try? engine.trust.load()
             let (toolRows, connectorRows, mcpRows, trustPolicyRow) = await (
                 nextTools,
                 nextConnectorActions,
                 nextMCPServers,
                 nextTrustPolicy
             )
-            tools = fresh("tools", toolRows) ?? tools
+            toolStore.authored = fresh("tools", toolRows) ?? toolStore.authored
             connectorActionRegistry = fresh("connector actions", connectorRows) ?? connectorActionRegistry
             mcpServers = fresh("mcp servers", mcpRows) ?? mcpServers
-            trustPolicy = fresh("trust policy", trustPolicyRow) ?? trustPolicy
-            if !(await refreshChatToolCatalog()) {
+            engine.trust.policy = fresh("trust policy", trustPolicyRow) ?? engine.trust.policy
+            if !(await toolStore.refreshCatalog()) {
                 failedEndpoints.append("tool catalog")
             }
         case .mcp:
             async let nextMCPServers = try? api.getMCPServers()
-            async let nextMCPSessions = try? api.getMCPSessions()
+            async let nextMCPSessions = try? engine.tools.listMCPSessions()
             async let nextMCPConsent = try? api.getMCPConsent()
             let (mcpRows, sessionRows, consentRows) = await (nextMCPServers, nextMCPSessions, nextMCPConsent)
             mcpServers = fresh("mcp servers", mcpRows) ?? mcpServers
-            mcpSessions = fresh("mcp sessions", sessionRows) ?? mcpSessions
+            engine.tools.mcpSessions = fresh("mcp sessions", sessionRows) ?? engine.tools.mcpSessions
             mcpConsent = fresh("mcp consent", consentRows) ?? mcpConsent
             // gpt-5.5 review: clear stale inventories when selection becomes
             // invalid OR the server list is empty. Without this, the UI shows
@@ -693,7 +674,7 @@ extension AppModel {
         if item.normalized == .diagnostics {
             statusText = healthProbeFailed
                 ? "Health check failed"
-                : (health?.ok == true ? "I'm online" : "I'm unavailable")
+                : (engine.doctor.health?.ok == true ? "I'm online" : "I'm unavailable")
         } else if !performedRead {
             statusText = "\(item.normalized.rawValue) opened"
         } else if receipt.failedEndpoints.isEmpty {
@@ -812,10 +793,12 @@ extension AppModel {
     @MainActor
     @discardableResult
     func refreshSidebarActivityBadge() async -> PanelRefreshStatus {
-        let api = client
-        async let nextApprovals = try? api.getApprovals()
-        async let nextInbox = try? api.getInboxItems(unreadOnly: false)
-        async let nextMemoryProposals = try? api.getMemoryProposals()
+        let approvalStore = engine.approvals
+        let inbox = engine.inbox
+        let memory = engine.memory
+        async let nextApprovals = try? approvalStore.list()
+        async let nextInbox = try? inbox.list()
+        async let nextMemoryProposals = try? memory.proposals(status: "pending")
         let (approvalRows, inboxRows, proposalRows) = await (
             nextApprovals,
             nextInbox,
@@ -829,12 +812,12 @@ extension AppModel {
         // these collections). Observation fires on write, not on change, so
         // gate every one: an unchanged badge refresh now performs zero writes
         // and triggers zero render passes.
-        let nextApprovalRows = Self.keepingLastGood(approvals, fetched: approvalRows)
-        if approvals != nextApprovalRows { approvals = nextApprovalRows }
-        let nextInboxRows = Self.keepingLastGood(inboxItems, fetched: inboxRows)
-        if inboxItems != nextInboxRows { inboxItems = nextInboxRows }
-        let nextProposalRows = Self.keepingLastGood(memoryProposals, fetched: proposalRows)
-        if memoryProposals != nextProposalRows { memoryProposals = nextProposalRows }
+        let nextApprovalRows = Self.keepingLastGood(approvalStore.records, fetched: approvalRows)
+        if approvalStore.records != nextApprovalRows { approvalStore.records = nextApprovalRows }
+        let nextInboxRows = Self.keepingLastGood(inbox.items, fetched: inboxRows)
+        if inbox.items != nextInboxRows { inbox.items = nextInboxRows }
+        let nextProposalRows = Self.keepingLastGood(memory.proposals, fetched: proposalRows)
+        if memory.proposals != nextProposalRows { memory.proposals = nextProposalRows }
         var failed: [String] = []
         if approvalRows == nil { failed.append("approvals") }
         if inboxRows == nil { failed.append("inbox") }
@@ -852,6 +835,7 @@ extension AppModel {
         ) {
             sidebarActivityRefreshStatus = nextStatus
         }
+        if #available(macOS 27, *) { await publishWidgetStatus() }
         return receipt
     }
 
@@ -990,8 +974,8 @@ extension AppModel {
     /// receipt; those retain their existing owners.
     @MainActor
     func refreshChatSessionIndex() async {
-        await refreshChatSessionIndex { [client] in
-            try await client.getChatSessions()
+        await refreshChatSessionIndex { [transcripts = engine.transcripts] in
+            try await transcripts.list()
         }
     }
 
@@ -1015,8 +999,8 @@ extension AppModel {
                     await self.readCanonicalChatTurnTerminalProof(identity: identity)
                 }
             }
-            guard refreshed != chatSessions else { return }
-            chatSessions = refreshed
+            guard refreshed != engine.transcripts.sessions else { return }
+            engine.transcripts.sessions = refreshed
             pruneChatDrafts()
             pruneStaleSessionChatState(knownSessionIds: knownSessionIds)
             if !activeChatSessionId.isEmpty, !knownSessionIds.contains(activeChatSessionId) {
@@ -1039,52 +1023,47 @@ extension AppModel {
         let activeAtStart = activeChatSessionId
         let selectionGenerationAtStart = chatSelectionGeneration
         do {
-            if health?.ok != true {
-                for _ in 0..<8 {
-                    if let fresh = try? await api.getHealth(), fresh.ok {
-                        health = fresh
-                        break
-                    }
-                    try? await Task.sleep(for: .milliseconds(350))
-                }
+            if engine.doctor.health?.ok != true {
+                engine.doctor.health = engine.doctor.readHealth()
             }
-            if let policy = try? await api.getTrustPolicy() {
-                trustPolicy = policy
+            if let policy = try? await engine.trust.load() {
+                engine.trust.policy = policy
             }
-            let fetchedSessions = try await api.getChatSessions()
+            let fetchedSessions = try await engine.transcripts.list()
             chatSessionIndexRefreshFailed = false
-            chatSessions = fetchedSessions
-            // Default to the conversation anchor — but only until the human
+            engine.transcripts.sessions = fetchedSessions
+            // Simple owns its current thread. Advanced may default to the
+            // remote conversation anchor — but only until the human
             // picks something. `shouldAdoptAnchor` owns that rule and also
             // refuses an anchor that names no live session, so a stale pin can
             // never blank the window. Surface-agnostic: nothing here knows or
             // cares which adapter published the anchor.
-            if ConversationAnchor.shouldAdoptAnchor(
+            if !SimpleViewMode.isShowing, ConversationAnchor.shouldAdoptAnchor(
                 anchorSessionId: ConversationAnchor.currentSessionId(),
                 currentSelection: activeChatSessionId,
                 userChoseThisLaunch: MacChatSelectionIntent.userChoseThisLaunch,
-                liveSessionIds: Set(chatSessions.filter { $0.archived != true }.map(\.id))
+                liveSessionIds: Set(engine.transcripts.sessions.filter { $0.archived != true }.map(\.id))
             ), let anchorId = ConversationAnchor.currentSessionId() {
                 activeChatSessionId = anchorId
                 persistActiveChatSessionID(activeChatSessionId)
             }
-            if activeChatSessionId.isEmpty || !chatSessions.contains(where: { $0.id == activeChatSessionId }) {
+            if activeChatSessionId.isEmpty || !engine.transcripts.sessions.contains(where: { $0.id == activeChatSessionId }) {
                 if !activeAtStart.isEmpty,
                    (activeChatSessionId != activeAtStart || chatSelectionGeneration != selectionGenerationAtStart) {
                     return
                 }
-                if let unified = chatSessions.first(where: { isMainAppSourceKey($0.sourceKey) && $0.archived != true }) {
+                if let unified = chatSessionTransactions.existingMainSession(in: engine.transcripts.sessions) {
                     activeChatSessionId = unified.id
                 } else {
-                    let session = try await api.createChatSession(title: "New Chat", sourceKey: "app")
+                    let session = try await chatSessionTransactions.create(store: engine.transcripts)
                     activeChatSessionId = session.id
-                    chatSessions = [session]
-                    MacSyncEngine.shared.requestChatSnapshotPublication(includeTranscripts: false)
+                    engine.transcripts.sessions = [session]
+                    NativeAgentEngine.liveDeviceSync.engine.requestChatSnapshotPublication(includeTranscripts: false)
                 }
                 UserDefaults.standard.set(activeChatSessionId, forKey: "activeChatSessionId")
             }
             migrateEmptySessionChatState(to: activeChatSessionId)
-            let knownSessionIds = Set(chatSessions.map(\.id))
+            let knownSessionIds = Set(engine.transcripts.sessions.map(\.id))
             await repairChatTurnLifecyclesIfNeeded(
                 knownSessionIds: knownSessionIds
             ) { identity in
@@ -1096,13 +1075,13 @@ extension AppModel {
             // prune above, same low-frequency hook.
             pruneStaleSessionChatState(knownSessionIds: knownSessionIds)
             let targetSessionId = activeChatSessionId
-            let lifecycleAtLoadStart = chatTurnLifecycle(for: targetSessionId)
-            let messages = try await api.getChatMessages(sessionId: targetSessionId)
+            let lifecycleAtLoadStart = engine.turns.lifecycle(for: targetSessionId)
+            let messages = try await engine.transcripts.loadMessages(sessionId: targetSessionId, cached: true)
             let receipt = try? await api.getLatestContextReceipt(sessionId: targetSessionId)
             guard activeChatSessionId == targetSessionId else { return }
-            guard !streamingSessions.contains(targetSessionId),
-                  chatTurnLifecycle(for: targetSessionId) == lifecycleAtLoadStart,
-                  activeChatTurnLifecycleIDsBySession[targetSessionId] == nil else {
+            guard !engine.turns.streamingSessions.contains(targetSessionId),
+                  engine.turns.lifecycle(for: targetSessionId) == lifecycleAtLoadStart,
+                  engine.turns.activeTurnIDsBySession[targetSessionId] == nil else {
                 // A live turn owns this slot. Disk is necessarily behind its
                 // optimistic bubble/deltas, so a full Chat reload must not
                 // replace the stream's exact message identity mid-turn.
@@ -1143,11 +1122,11 @@ extension AppModel {
     @MainActor
     func refreshChatMessagesAfterTurn(sessionId: String, messagesAlreadyRefreshed: Bool = false) async {
         guard !sessionId.isEmpty, activeChatSessionId == sessionId else { return }
-        let lifecycleAtLoadStart = chatTurnLifecycle(for: sessionId)
+        let lifecycleAtLoadStart = engine.turns.lifecycle(for: sessionId)
         var messages: [ChatMessage]? = nil
         if !messagesAlreadyRefreshed {
             do {
-                messages = try await client.getChatMessages(sessionId: sessionId)
+                messages = try await engine.transcripts.loadMessages(sessionId: sessionId, cached: true)
             } catch {
                 // Don't swallow this. A failed post-turn refresh leaves optimistic
                 // bubble ids on screen; saying nothing is the same lie M12 is about.
@@ -1158,15 +1137,15 @@ extension AppModel {
         let receipt = try? await client.getLatestContextReceipt(sessionId: sessionId)
         // The active session can change while those awaits are in flight.
         guard activeChatSessionId == sessionId,
-              !streamingSessions.contains(sessionId),
-              chatTurnLifecycle(for: sessionId) == lifecycleAtLoadStart else { return }
+              !engine.turns.streamingSessions.contains(sessionId),
+              engine.turns.lifecycle(for: sessionId) == lifecycleAtLoadStart else { return }
         if let messages {
             // A NEW turn may have started on this session while we were fetching
             // (the user sent again immediately). That turn owns the slot and its
             // optimistic bubbles are fresher than this disk snapshot — mirrors
             // selectChatSession's streaming guard. The finished turn's rows are
             // already in memory, so nothing is lost by skipping the swap.
-            guard !streamingSessions.contains(sessionId) else { return }
+            guard !engine.turns.streamingSessions.contains(sessionId) else { return }
             applyLoadedChatMessages(messages, for: sessionId)
         }
         if let receipt {
@@ -1184,13 +1163,13 @@ extension AppModel {
     ) async {
         guard !sessionId.isEmpty,
               DetachedChatWindowController.shared.isDetached(sessionId),
-              !streamingSessions.contains(sessionId)
+              !engine.turns.streamingSessions.contains(sessionId)
         else { return }
-        let lifecycleAtLoadStart = chatTurnLifecycle(for: sessionId)
+        let lifecycleAtLoadStart = engine.turns.lifecycle(for: sessionId)
         var messages: [ChatMessage]?
         if !messagesAlreadyRefreshed {
             do {
-                messages = try await client.getChatMessages(sessionId: sessionId)
+                messages = try await engine.transcripts.loadMessages(sessionId: sessionId, cached: true)
             } catch {
                 detachedChatRefreshStatus[sessionId] = Self.nextRefreshStatus(
                     previous: detachedChatRefreshStatus[sessionId],
@@ -1202,8 +1181,8 @@ extension AppModel {
         }
         let receipt = try? await client.getLatestContextReceipt(sessionId: sessionId)
         guard DetachedChatWindowController.shared.isDetached(sessionId),
-              chatTurnLifecycle(for: sessionId) == lifecycleAtLoadStart,
-              !streamingSessions.contains(sessionId)
+              engine.turns.lifecycle(for: sessionId) == lifecycleAtLoadStart,
+              !engine.turns.streamingSessions.contains(sessionId)
         else { return }
         if let messages {
             applyLoadedChatMessages(messages, for: sessionId)
@@ -1239,13 +1218,13 @@ extension AppModel {
     /// notice). (gpt-5.5 review of fix Z, point b.)
     ///
     /// H4: skip the write entirely when the result is identical to what's
-    /// already in the slot. `chatMessagesBySession` is observed by the message
+    /// already in the slot. `engine.transcripts.messagesBySession` is observed by the message
     /// list, the sidebar badges and the scroll coordinator; an equal-value
     /// write still invalidates all of them.
     @MainActor
     func applyLoadedChatMessages(_ disk: [ChatMessage], for sessionId: String) {
         var loaded = disk
-        if let local = chatMessagesBySession[sessionId],
+        if let local = engine.transcripts.messagesBySession[sessionId],
            let tail = local.last,
            tail.id.hasPrefix(Self.syntheticErrorIDPrefix),
            !disk.contains(where: { $0.id == tail.id }) {
@@ -1265,8 +1244,8 @@ extension AppModel {
                 loaded.append(tail)
             }
         }
-        guard chatMessagesBySession[sessionId] != loaded else { return }
-        chatMessagesBySession[sessionId] = loaded
+        guard engine.transcripts.messagesBySession[sessionId] != loaded else { return }
+        engine.transcripts.messagesBySession[sessionId] = loaded
     }
 
     struct ChatSessionLoadSnapshot {
@@ -1276,8 +1255,8 @@ extension AppModel {
 
     @MainActor
     func selectChatSession(_ session: ChatSession) async {
-        await selectChatSession(session, persistSelection: true) { [client] requestedId in
-            let messages = try await client.getChatMessages(sessionId: requestedId)
+        await selectChatSession(session, persistSelection: true) { [client, transcripts = engine.transcripts] requestedId in
+            let messages = try await transcripts.loadMessages(sessionId: requestedId, cached: true)
             let receipt = try? await client.getLatestContextReceipt(sessionId: requestedId)
             return ChatSessionLoadSnapshot(messages: messages, receipt: receipt)
         }
@@ -1292,52 +1271,13 @@ extension AppModel {
         persistSelection: Bool,
         load: (String) async throws -> ChatSessionLoadSnapshot
     ) async {
-        let requestedId = session.id
-        guard !requestedId.isEmpty else { return }
-        // The human has picked a session. From here on this launch the main
-        // window stops defaulting to the conversation anchor — never yank
-        // someone off a session they chose.
-        MacChatSelectionIntent.noteUserChoice()
-        chatSelectionGeneration += 1
-        let generation = chatSelectionGeneration
-        let hasCachedTranscript = chatMessagesBySession[requestedId] != nil
-        let lifecycleAtLoadStart = chatTurnLifecycle(for: requestedId)
-
-        if hasCachedTranscript {
-            commitChatSessionSelection(
-                requestedId,
-                snapshot: nil,
-                persistSelection: persistSelection
-            )
-        }
-
-        do {
-            let snapshot = try await load(requestedId)
-            guard chatSelectionGeneration == generation,
-                  chatSessions.contains(where: { $0.id == requestedId }) else { return }
-            if hasCachedTranscript {
-                guard activeChatSessionId == requestedId else { return }
-            }
-            // A turn can start AND settle during this load, leaving no active
-            // stream for commitChatSessionSelection's guard to see. Its retained
-            // lifecycle is the existing evidence that the local rows/receipt
-            // advanced. Still honor selection, but do not roll those rows back.
-            let currentLifecycle = chatTurnLifecycle(for: requestedId)
-            let turnAdvanced = currentLifecycle != nil && currentLifecycle != lifecycleAtLoadStart
-            commitChatSessionSelection(
-                requestedId,
-                snapshot: turnAdvanced ? nil : snapshot,
-                persistSelection: persistSelection
-            )
-        } catch {
-            if chatSelectionGeneration == generation {
-                statusText = "Chat session load failed: \(error.localizedDescription)"
-            }
-        }
+        await chatSessionTransactions.select(
+            session.id, persistSelection: persistSelection, port: self, load: load
+        )
     }
 
     @MainActor
-    private func commitChatSessionSelection(
+    func commitChatSessionSelection(
         _ requestedId: String,
         snapshot: ChatSessionLoadSnapshot?,
         persistSelection: Bool
@@ -1345,8 +1285,8 @@ extension AppModel {
         if let snapshot {
             // A live stream owns its populated slot. An empty slot may still be
             // seeded from disk, then the optimistic rows are re-injected below.
-            let isStreamingThisSession = streamingSessions.contains(requestedId)
-            let inMemoryEmpty = (chatMessagesBySession[requestedId] ?? []).isEmpty
+            let isStreamingThisSession = engine.turns.streamingSessions.contains(requestedId)
+            let inMemoryEmpty = (engine.transcripts.messagesBySession[requestedId] ?? []).isEmpty
             if !isStreamingThisSession || inMemoryEmpty {
                 applyLoadedChatMessages(snapshot.messages, for: requestedId)
             }
@@ -1363,17 +1303,17 @@ extension AppModel {
 
         // PATCH-2026-05-13: parallel-sessions — if this session is still
         // streaming, restore the optimistic user turn and live assistant row.
-        if streamingSessions.contains(requestedId) {
-            if let userTurnId = streamingUserTurnIds[requestedId],
-               !chatMessages(for: requestedId).contains(where: { $0.id == userTurnId }) {
-                let userText = streamingUserTurnTexts[requestedId] ?? ""
+        if engine.turns.streamingSessions.contains(requestedId) {
+            if let userTurnId = engine.turns.streamingUserTurnIds[requestedId],
+               !engine.transcripts.messages(for: requestedId).contains(where: { $0.id == userTurnId }) {
+                let userText = engine.turns.streamingUserTurnTexts[requestedId] ?? ""
                 var userBubble = ChatMessage(sessionId: requestedId, role: "user", content: userText)
                 userBubble.id = userTurnId
                 appendChatMessage(userBubble, to: requestedId)
             }
-            if let bubbleId = streamingBubbleIds[requestedId],
-               !chatMessages(for: requestedId).contains(where: { $0.id == bubbleId }) {
-                let liveText = streamingTexts[requestedId] ?? ""
+            if let bubbleId = engine.turns.streamingBubbleIds[requestedId],
+               !engine.transcripts.messages(for: requestedId).contains(where: { $0.id == bubbleId }) {
+                let liveText = engine.turns.streamingTexts[requestedId] ?? ""
                 var liveBubble = ChatMessage(sessionId: requestedId, role: "assistant", content: liveText)
                 liveBubble.id = bubbleId
                 appendChatMessage(liveBubble, to: requestedId)
@@ -1384,22 +1324,22 @@ extension AppModel {
     @MainActor
     func newChatSession() async {
         do {
-            let session = try await client.createChatSession(title: "New Chat", sourceKey: "app", forceNew: true)
+            let session = try await chatSessionTransactions.create(store: engine.transcripts)
             MacChatSelectionIntent.noteUserChoice()
             chatSelectionGeneration += 1
             // Seed before publishing the session: the next await lets its
             // composer start a turn, which must retain ownership of these rows.
-            setChatMessages([], for: session.id)
+            engine.transcripts.setMessages([], for: session.id)
             setLatestContextReceipt(nil, for: session.id)
             activeChatSessionId = session.id
             persistActiveChatSessionID(activeChatSessionId)
-            chatSessions = try await client.getChatSessions()
+            engine.transcripts.sessions = try await engine.transcripts.list()
             migrateEmptySessionChatState(to: activeChatSessionId)
             pruneChatDrafts()
             // 2026-07-21 audit fix: prune per-session message/receipt caches
             // for sessions the list no longer reports — mirrors the stale-draft
             // prune above, same low-frequency hook.
-            pruneStaleSessionChatState(knownSessionIds: Set(chatSessions.map(\.id)))
+            pruneStaleSessionChatState(knownSessionIds: Set(engine.transcripts.sessions.map(\.id)))
             statusText = "New chat session ready"
             publishChatSnapshot()
         } catch {
@@ -1409,38 +1349,14 @@ extension AppModel {
 
     @MainActor
     func renameChatSession(id sessionId: String, title: String) async {
-        let cleanTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !sessionId.isEmpty, !cleanTitle.isEmpty else { return }
-        let intent = (chatRenameIntentGeneration[sessionId] ?? 0) &+ 1
-        chatRenameIntentGeneration[sessionId] = intent
-        await chatRenameMutationGate.acquire()
-        defer { Task { await chatRenameMutationGate.release() } }
-        // A newer request arrived while this one was waiting. Do not write an
-        // obsolete title; the newest queued intent owns the durable index.
-        guard chatRenameIntentGeneration[sessionId] == intent else { return }
-        // Both visible rename controls already prevent an unchanged commit, but
-        // keep that no-write guarantee at their shared durable owner too. A
-        // recycled/focus-lost editor must not needlessly touch the session
-        // index or publish a snapshot.
-        if chatSessions.first(where: { $0.id == sessionId })?.title == cleanTitle {
-            return
-        }
-        do {
-            let updated = try await client.updateChatSession(id: sessionId, title: cleanTitle, archived: nil)
-            if let refreshed = try? await client.getChatSessions() {
-                chatSessions = refreshed
-            } else if let index = chatSessions.firstIndex(where: { $0.id == sessionId }) {
-                chatSessions[index] = updated
-            }
-            statusText = "Renamed chat session"
-            publishChatSnapshot()
-        } catch {
-            statusText = "Rename failed: \(error.localizedDescription)"
+        await chatSessionTransactions.rename(id: sessionId, title: title, store: engine.transcripts) { [self] status, publish in
+            statusText = status
+            if publish { publishChatSnapshot() }
         }
     }
 
     // PATCH-2026-05-13: settings-toggle-2 — AppModel wrappers for the
-    // embeddings-backend toggle. SlimSettingsView's
-    // EmbeddingsSettingsSection consumes these (can't reach `client`
-    // directly because it's private).
+    // embeddings-backend toggle. The Settings page's memory rows
+    // (SetupFeatureRows) consume these (can't reach `client` directly
+    // because it's private).
 }

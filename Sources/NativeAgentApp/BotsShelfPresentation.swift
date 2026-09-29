@@ -1,16 +1,9 @@
+import AppToolRuntime
+import NativeAgentCore
 import Foundation
 import PersistenceCore
 import StandingBots
 import ChatOrchestration
-
-/// Defaults-backed design experiment, following NativeAgentShellPreference.
-enum BotsShelfPreference {
-    static let key = "uiBotsShelfPreview"
-    /// On unless the person switched it off (User: fresh installs turn everything on).
-    static func isEnabled(_ defaults: UserDefaults = .standard) -> Bool {
-        defaults.object(forKey: key) == nil ? true : defaults.bool(forKey: key)
-    }
-}
 
 /// Option B groups, preserving callers' filtered destinations and the Bots gate.
 enum BotsShelfRailProposal {

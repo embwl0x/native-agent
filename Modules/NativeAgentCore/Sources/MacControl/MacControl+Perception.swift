@@ -1,6 +1,8 @@
 import Foundation
+import CryptoKit
 import NativeAgentCore
 import PersistenceCore
+import TrustCenter
 #if canImport(AppKit)
 import AppKit
 #endif
@@ -185,7 +187,7 @@ extension SwiftNativeMacControl {
     }
 
     /// Read AXDocument from the exact retained window, not another focus query.
-    private func documentPath(window: MacAXElementRef, pid: Int32) -> String? {
+    func documentPath(window: MacAXElementRef, pid: Int32) -> String? {
         #if canImport(ApplicationServices) && os(macOS)
         if let source = accessibilitySource as? SystemMacAXElementSource {
             guard pid != getpid(), source.isTrusted(), let element = source.element(window),
@@ -200,6 +202,37 @@ extension SwiftNativeMacControl {
         let path = accessibilitySource.frontmostDocumentPath(pid: pid)
         guard accessibilitySource.windowRoot(pid: pid) == window else { return nil }
         return path
+    }
+
+    /// Read complete bytes from the retained editor, including an empty value.
+    private func craftEditorValue(_ node: MacAXNode) -> String? {
+        #if canImport(ApplicationServices) && os(macOS)
+        guard let source = accessibilitySource as? SystemMacAXElementSource,
+              let ref = node.element, let element = source.element(ref),
+              let raw = MacAXAttributeRead.copyRaw(element, kAXValueAttribute),
+              CFGetTypeID(raw) == CFStringGetTypeID() else { return nil }
+        let value = raw as! CFString as String
+        return value.utf8.count <= 4096 ? value : nil
+        #else
+        return nil
+        #endif
+    }
+
+    /// Recheck the object at the effect boundary, including menu actions that
+    /// otherwise address an app rather than a particular document window.
+    func craftDocumentMatches(pid: Int32) -> Bool {
+        guard let expected = MacCraftReplacement.documentPath else { return true }
+        guard accessibilitySource.appInfo(pid: pid)?.bundleIdentifier == "com.apple.TextEdit",
+              let root = accessibilitySource.windowRoot(pid: pid),
+              let path = documentPath(window: root, pid: pid),
+              Data(path.utf8) == Data(expected.utf8) else { return false }
+        let snapshot = MacAccessibilityReader.walk(source: accessibilitySource, root: root, limits: .init())
+        guard !snapshot.truncated,
+              !snapshot.nodes.contains(where: { ["AXSheet", "AXDialog"].contains($0.attributes.role) }) else { return false }
+        let editors = snapshot.nodes.filter { $0.attributes.role == "AXTextArea" && $0.attributes.enabled }
+        guard editors.count == 1, let editor = editors.first,
+              let value = craftEditorValue(editor) else { return false }
+        return SHA256.hash(data: Data(value.utf8)).map { String(format: "%02x", $0) }.joined() == MacCraftReplacement.editorDigest
     }
 
     /// The file-policy clearance an AX-INFERRED document path must pass before
@@ -756,6 +789,7 @@ extension SwiftNativeMacControl {
         var seam: [String: JSONValue] = [:]
         let chromiumFamily = MacChromiumAccessibility.looksChromium(
             bundleId: windowRead.app?.bundleIdentifier,
+            pid: windowRead.app?.processIdentifier,
             snapshot: windowRead.snapshot
         ) || MacChromiumAccessibility.hasWebArea(windowRead.snapshot)
         guard scope != .chrome, chromiumFamily else {
@@ -765,7 +799,9 @@ extension SwiftNativeMacControl {
             }
             return (windowRead, seam)
         }
-        let search = MacAccessibilityReader.findFirst(
+        // Prefer the first web area with content; any web area otherwise.
+        let populated = populatedWebArea(under: windowRead.root)
+        let search = populated.hit != nil ? populated : MacAccessibilityReader.findFirst(
             role: "AXWebArea",
             source: accessibilitySource,
             root: windowRead.root
@@ -807,11 +843,25 @@ extension SwiftNativeMacControl {
             )
             return (windowRead, seam)
         }
-        let pageWalk = MacAccessibilityReader.walk(
+        var pageWalk = MacAccessibilityReader.walk(
             source: accessibilitySource,
             root: web.ref,
             limits: limits
         )
+        // A page the ordinary budget had to cut is walked once more on the
+        // deeper page budget, so a pane buried under unnamed groups is in the
+        // percept instead of silently missing. A caller that LOWERED the
+        // limits keeps them.
+        // Only a SIZE cut earns the second walk; an unreadable element does not.
+        if pageWalk.truncationReasons.contains(where: { $0 == "node_cap" || $0 == "depth_cap" }),
+           limits == MacAXLimits() {
+            pageWalk = MacAccessibilityReader.walk(
+                source: accessibilitySource,
+                root: web.ref,
+                limits: .deepPage
+            )
+            seam["deep_page_walk"] = .bool(true)
+        }
         // Re-base every path onto the web area's own path from the window root.
         let rebased = MacAXTreeSnapshot(
             nodes: pageWalk.nodes.map { MacAXNode(attributes: $0.attributes, path: web.path + $0.path) },
@@ -847,6 +897,139 @@ extension SwiftNativeMacControl {
             ),
             seam
         )
+    }
+
+    /// The first `AXWebArea` with content under it. A web area with (almost)
+    /// nothing below it is an overlay or a page still loading, not the page:
+    /// Claude.app lists an empty one first (the page-first walk read its two
+    /// nodes), and after the enhanced-AX flag it shows a hollow web area ~2 s
+    /// before the content lands. Live, bounded, read-only probe.
+    func populatedWebArea(under root: MacAXElementRef) -> MacAccessibilityReader.FindFirstResult {
+        let source = accessibilitySource
+        return MacAccessibilityReader.findFirst(
+            source: source,
+            root: root,
+            maxDepth: MacAccessibilityReader.findFirstMaxDepth,
+            nodeBudget: MacAccessibilityReader.findFirstNodeBudget
+        ) { ref, attributes in
+            attributes.role == "AXWebArea"
+                && MacAccessibilityReader.walk(
+                    source: source, root: ref, limits: MacAXLimits(maxNodes: 3, maxDepth: 4)
+                ).nodes.count >= 3
+        }
+    }
+
+    /// Find a control by NAME past the ordinary walk's caps.
+    ///
+    /// Web pages bury their controls under hundreds of unnamed groups: Claude's
+    /// "Attach simulator" button sits 26 levels below the window and ~470th in
+    /// document order, so a 12-level / 400-node walk never reaches it and the
+    /// act said no_match (2026-09-25). When the walk has nothing answering to
+    /// `seek`, one bounded breadth-first search of the live tree looks for it
+    /// (same seam, read-only), and the percept is re-rooted at a close ancestor
+    /// so the control and its neighbours are in the frame — paths re-based onto
+    /// the window, exactly as the page-first walk does.
+    func seekScoped(
+        _ read: MacAXRead,
+        seek: String,
+        limits: MacAXLimits
+    ) -> (read: MacAXRead, seam: [String: JSONValue]) {
+        func normalized(_ raw: String?) -> String {
+            (raw ?? "").lowercased().split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        }
+        // Deep descent is for pages that bury their controls: a web read, or a
+        // walk the caps cut. A miss in an ordinary native window stays cheap.
+        guard MacChromiumAccessibility.hasWebArea(read.snapshot) || read.snapshot.truncated else {
+            return (read, [:])
+        }
+        // "the Attach simulator button" names the control "Attach simulator",
+        // and the kind word stays a requirement: a "Save" link is not the
+        // "Save button".
+        var words = normalized(seek).split(separator: " ").map(String.init)
+        if words.first == "the" { words.removeFirst() }
+        let kindRoles: [String: Set<String>] = [
+            "button": ["AXButton", "AXMenuButton", "AXPopUpButton"],
+            "link": ["AXLink"],
+            "tab": ["AXRadioButton", "AXTab"],
+            "field": ["AXTextField", "AXSecureTextField", "AXTextArea", "AXComboBox", "AXSearchField"],
+            "checkbox": ["AXCheckBox"],
+            "menu": ["AXMenuButton", "AXPopUpButton", "AXMenuItem"],
+            "icon": [],
+        ]
+        var kindWord: Set<String>?
+        if words.count > 1, let kind = kindRoles[words.last ?? ""] {
+            words.removeLast()
+            kindWord = kind.isEmpty ? nil : kind
+        }
+        let roles = kindWord
+        let wanted = words.joined(separator: " ")
+        // Only an actionable control of the requested kind counts, both for
+        // "the walk already has it" and for the deep hit: a static text or a
+        // field value carrying the same words must not hide the button.
+        func names(_ attributes: MacAXAttributes) -> Bool {
+            (normalized(attributes.title) == wanted || normalized(attributes.value) == wanted)
+                && MacPerceptionCompiler.isInteractive(attributes)
+                && roles.map { $0.contains(attributes.role) } ?? true
+        }
+        guard !wanted.isEmpty else { return (read, [:]) }
+        // Skip only when the control will actually be in the percept: a deep
+        // page walk can READ it and the affordance cap still drop it.
+        let kept = MacPerceptionCompiler.compile(
+            snapshot: read.snapshot, app: read.app, windowTitle: read.rootTitle, focusPath: read.focusPath
+        ).affordances
+        if kept.contains(where: { normalized($0.label) == wanted && (roles?.contains($0.role) ?? true) }) {
+            return (read, [:])
+        }
+        // The root's own path from the window: [] for a window walk, the web
+        // area's path for a page walk.
+        let rootPath = read.snapshot.nodes.first?.path ?? []
+        let hitPath: [Int]
+        if let known = read.snapshot.nodes.first(where: { names($0.attributes) }),
+           known.path.starts(with: rootPath) {
+            hitPath = Array(known.path.dropFirst(rootPath.count))
+        } else if let hit = MacAccessibilityReader.findFirst(
+            source: accessibilitySource,
+            root: read.root,
+            maxDepth: MacAXLimits.deepPageMaxDepth,
+            nodeBudget: MacAXLimits.deepPageMaxNodes
+        ) { _, attributes in names(attributes) }.hit {
+            hitPath = hit.path
+        } else {
+            return (read, ["seek": .string(seek), "seek_found": .bool(false)])
+        }
+        for up in [3, 1, 0] where up <= hitPath.count {
+            let prefix = Array(hitPath.dropLast(up))
+            var ancestor: MacAXElementRef? = read.root
+            for index in prefix {
+                ancestor = ancestor.flatMap {
+                    let children = accessibilitySource.children(of: $0, limit: index + 1)
+                    return children.count > index ? children[index] : nil
+                }
+            }
+            guard let ancestor else { break }
+            let walk = MacAccessibilityReader.walk(source: accessibilitySource, root: ancestor, limits: limits)
+            let targetPath = Array(hitPath.suffix(up))
+            guard walk.nodes.contains(where: { $0.path == targetPath }) else { continue }
+            let base = rootPath + prefix
+            return (
+                MacAXRead(
+                    snapshot: MacAXTreeSnapshot(
+                        nodes: walk.nodes.map { MacAXNode(attributes: $0.attributes, path: base + $0.path) },
+                        truncated: walk.truncated,
+                        truncationReasons: walk.truncationReasons,
+                        skippedAtLeast: walk.skippedAtLeast
+                    ),
+                    app: read.app,
+                    rootTitle: read.rootTitle,
+                    focusPath: accessibilitySource.focusedElementPath(relativeTo: ancestor).map { base + $0 },
+                    root: ancestor,
+                    windowIdentity: read.windowIdentity
+                ),
+                ["seek": .string(seek), "seek_found": .bool(true),
+                 "seek_path": .array((rootPath + hitPath).map { .int(Int64($0)) })]
+            )
+        }
+        return (read, ["seek": .string(seek), "seek_found": .bool(false)])
     }
 
     private static func axTruncationJSON(_ snapshot: MacAXTreeSnapshot, limits: MacAXLimits) -> [String: JSONValue] {
@@ -919,8 +1102,8 @@ extension SwiftNativeMacControl {
     ///   2. if the frontmost app looks Chromium-family (known bundle id, or a
     ///      web-less shell-sized window), set both enhanced-AX flags on the APP
     ///      element and read them back;
-    ///   3. if the first walk found no `AXWebArea`, poll every 500 ms for up to
-    ///      4 s and re-walk EXACTLY ONCE more.
+    ///   3. if the first walk is not populated (no `AXWebArea`, or only a hollow
+    ///      one), poll every 500 ms for up to 6 s and re-walk EXACTLY ONCE more.
     ///
     /// The flag is left set (see `MacChromiumAccessibility` for the lifetime
     /// rule) and cleared lazily here when the frontmost app changed or the last
@@ -995,15 +1178,30 @@ extension SwiftNativeMacControl {
         // moment the frontmost app changes or the frame dies.
         let previous = await MacChromiumAccessibilityState.shared.current()
         let frameExpired = await lookFrameStore.isExpired(now: now())
-        if let previous, previous != pid || frameExpired {
-            SystemMacAXElementSource.setEnhancedAccessibility(pid: previous, enabled: false)
-            await MacChromiumAccessibilityState.shared.note(pid: nil)
-            seam["enhanced_ax_cleared_pid"] = .int(Int64(previous))
+        for (previousPID, flags) in previous where previousPID != pid || frameExpired {
+            let readsBack = SystemMacAXElementSource.setEnhancedAccessibility(
+                pid: previousPID, flags: flags, enabled: false
+            )
+            let remaining = flags.filter { readsBack[$0] != false }
+            await MacChromiumAccessibilityState.shared.note(pid: previousPID, flags: remaining)
+            if remaining.isEmpty {
+                seam["enhanced_ax_cleared_pid"] = .int(Int64(previousPID))
+            }
+        }
+
+        // A minimized window can expose only an empty shell. Report that state
+        // after owned-flag cleanup, before Chromium wake/scoping.
+        if let read, let source = accessibilitySource as? SystemMacAXElementSource,
+           let window = source.element(read.root),
+           MacAXAttributeRead.copyBool(window, kAXMinimizedAttribute) == true {
+            seam["window_minimized"] = .bool(true)
+            return (read, seam, nil)
         }
 
         guard let pid,
               MacChromiumAccessibility.looksChromium(
                 bundleId: read?.app?.bundleIdentifier,
+                pid: read?.app?.processIdentifier,
                 snapshot: read?.snapshot
               )
         else { return scoped((read, seam)) }
@@ -1014,22 +1212,38 @@ extension SwiftNativeMacControl {
         // evidence. A false read-back is reported, not treated as fatal.
         // Her-screen Phase 4 — ours to clear only if WE set it: a flag already
         // on (a screen reader, the app itself) is left exactly as found.
-        let ours = await MacChromiumAccessibilityState.shared.current() == pid
-        let preexisting = !ours && SystemMacAXElementSource.enhancedAccessibilityIsOn(pid: pid)
-        let readsBack = preexisting
-            || SystemMacAXElementSource.setEnhancedAccessibility(pid: pid, enabled: true)
-        seam["enhanced_ax_set"] = .bool(readsBack)
-        seam["enhanced_ax_preexisting"] = .bool(preexisting)
-        if !preexisting { await MacChromiumAccessibilityState.shared.note(pid: pid) }
+        let owned = await MacChromiumAccessibilityState.shared.current()
+        let ours = owned[pid] ?? []
+        let before = SystemMacAXElementSource.enhancedAccessibilityFlags(pid: pid)
+        let alreadyOn = Set(before.filter(\.value).keys)
+        let flags = MacChromiumAccessibility.Flag.allCases
+        let missing = Set(flags).subtracting(alreadyOn)
+        let readsBack = missing.isEmpty ? before
+            : SystemMacAXElementSource.setEnhancedAccessibility(pid: pid, flags: missing, enabled: true)
+        // Chrome wakes on one flag and Electron on the other, so either on is set.
+        seam["enhanced_ax_set"] = .bool(flags.contains { readsBack[$0] == true })
+        let unverified = flags.filter { readsBack[$0] == nil }
+        if !unverified.isEmpty {
+            seam["enhanced_ax_unverified"] = .array(unverified.map { .string($0.rawValue) })
+        }
+        seam["enhanced_ax_preexisting"] = .bool(!alreadyOn.subtracting(ours).isEmpty)
+        // Ours to restore: a flag not on before our write that is not
+        // confirmed off after it (on, or unknown until cleanup reads it off).
+        await MacChromiumAccessibilityState.shared.note(
+            pid: pid, flags: ours.union(missing.filter { readsBack[$0] != false })
+        )
 
-        if !MacChromiumAccessibility.hasWebArea(read?.snapshot) {
+        func populated(_ candidate: MacAXRead?) -> Bool {
+            candidate.map { populatedWebArea(under: $0.root).hit != nil } ?? false
+        }
+        if !populated(read) {
             let deadline = now().addingTimeInterval(MacChromiumAccessibility.settleSeconds)
             while now() < deadline {
                 try? await Task.sleep(
                     nanoseconds: UInt64(MacChromiumAccessibility.pollSeconds * 1_000_000_000)
                 )
                 if case .read(let candidate) = anchoredRead(),
-                   MacChromiumAccessibility.hasWebArea(candidate.snapshot) {
+                   populated(candidate) {
                     read = candidate
                     seam["rewalked"] = .bool(true)
                     break
@@ -1043,7 +1257,7 @@ extension SwiftNativeMacControl {
                     read = candidate
                 }
                 seam["rewalked"] = .bool(true)
-                seam["web_area_after_settle"] = .bool(MacChromiumAccessibility.hasWebArea(read?.snapshot))
+                seam["web_area_after_settle"] = .bool(populated(read))
             }
         }
         #endif
@@ -1133,11 +1347,15 @@ extension SwiftNativeMacControl {
             var stillOn = false
             #if canImport(ApplicationServices) && os(macOS)
             if let pid = anchorPid, accessibilitySource is SystemMacAXElementSource,
-               await MacChromiumAccessibilityState.shared.current() == pid {
-                // The read-back is the evidence. Still on ⇒ keep the ownership
-                // record so the next release (or the lazy clear) tries again.
-                stillOn = SystemMacAXElementSource.setEnhancedAccessibility(pid: pid, enabled: false)
-                if !stillOn { await MacChromiumAccessibilityState.shared.note(pid: nil) }
+               let owned = await MacChromiumAccessibilityState.shared.current()[pid] {
+                // Only a confirmed off read clears ownership. On or unknown
+                // keeps the record for the next release or lazy clear.
+                let readsBack = SystemMacAXElementSource.setEnhancedAccessibility(
+                    pid: pid, flags: owned, enabled: false
+                )
+                let remaining = owned.filter { readsBack[$0] != false }
+                stillOn = !remaining.isEmpty
+                await MacChromiumAccessibilityState.shared.note(pid: pid, flags: remaining)
                 released = !stillOn
             }
             #endif
@@ -1185,15 +1403,37 @@ extension SwiftNativeMacControl {
             )
         }
         let limits = Self.axLimits(from: body)
-        let (read, seam, anchor) = await lookSnapshot(
+        let snapshotted = await lookSnapshot(
             limits: limits,
             scope: scope,
             anchorPid: anchorPid
         )
+        var read = snapshotted.read
+        var seam = snapshotted.seam
+        let anchor = snapshotted.anchor
         if case .selfProcess? = anchor {
             return selfInspectionResult(action: "look", started: started)
         }
-        guard let read else {
+        let minimized = seam["window_minimized"] == .bool(true)
+        if !minimized, let seek = body.stringValue("seek"), let current = read {
+            let found = seekScoped(current, seek: seek, limits: limits)
+            read = found.read
+            for (key, item) in found.seam { seam[key] = item }
+        }
+        // Her-screen Phase 4 — for an anchored look, WHO is in front (pid) and
+        // its key window, so an act that brings its app forward can put exactly that back —
+        // with or without a window to read.
+        // Never an AX read of our own process.
+        let frontmostAppJSON: JSONValue = {
+            guard anchoredApp != nil, let front = accessibilitySource.frontmostApp(),
+                  case .object(var object) = front.toJSON() else { return .null }
+            if front.processIdentifier != getpid(),
+               let window = accessibilityActSource.focusedWindow(pid: front.processIdentifier) {
+                object["window"] = window.identity.toJSON()
+            }
+            return .object(object)
+        }()
+        guard let read, !minimized else {
             // An anchored read that found nothing is a DIFFERENT fact from "no
             // frontmost window": the app is running but has no readable window
             // (minimized, or all windows closed). Saying the frontmost thing
@@ -1202,6 +1442,7 @@ extension SwiftNativeMacControl {
             // not "minimized or closed".
             let locked = MacScreenLock.isLocked()
             let status = locked ? "mac_locked"
+                : minimized ? "window_minimized"
                 : anchoredApp == nil ? "no_frontmost_window" : "no_window_in_app"
             var output: [String: JSONValue] = [
                 "trusted": .bool(true),
@@ -1211,11 +1452,26 @@ extension SwiftNativeMacControl {
             ]
             if locked {
                 output["message"] = .string(MacScreenLock.reply)
+            } else if minimized {
+                let name = anchoredApp?.name ?? read?.app?.name ?? "The app"
+                output["requested_app"] = .string(name)
+                output["frontmost_app"] = frontmostAppJSON
+                output["message"] = .string(
+                    "\(name)'s window is minimized. go name:\"\(name)\" brings it back. "
+                    + "Its menu bar still works: act app:\"\(name)\" target:\"File > New\" makes a new window."
+                )
+            } else if anchoredApp == nil, let front = accessibilitySource.frontmostApp(),
+                      front.processIdentifier != getpid() {
+                // The windowless front app still takes keys: say which one it is.
+                output["frontmost_app"] = front.toJSON()
             } else if let anchoredApp {
                 output["requested_app"] = .string(anchoredApp.name)
+                output["frontmost_app"] = frontmostAppJSON
                 output["message"] = .string(
                     "\(anchoredApp.name) is running but has no window I can read right now "
-                    + "(it may be minimized or have every window closed)."
+                    + "(it may be minimized or have every window closed). Its menu bar still works: "
+                    + "act app:\"\(anchoredApp.name)\" target:\"File > New\" makes a new window, "
+                    + "and go name:\"\(anchoredApp.name)\" brings one back."
                 )
             }
             return MacControlResult(
@@ -1253,18 +1509,6 @@ extension SwiftNativeMacControl {
         // rows, so it mints every affordance and says how many are addressable.
         let capturedAt = now()
         let frameId = UUID().uuidString
-        // Her-screen Phase 4 — for an anchored look, WHO is in front (pid) and
-        // its key window, so a `front:true` act can put exactly that back.
-        // Never an AX read of our own process.
-        let frontmostAppJSON: JSONValue = {
-            guard anchoredApp != nil, let front = accessibilitySource.frontmostApp(),
-                  case .object(var object) = front.toJSON() else { return .null }
-            if front.processIdentifier != getpid(),
-               let window = accessibilityActSource.focusedWindow(pid: front.processIdentifier) {
-                object["window"] = window.identity.toJSON()
-            }
-            return .object(object)
-        }()
 
         /// Everything except the byte accounting, so the S5 loop below can
         /// serialize the COMPLETE object — envelope, `how_to_read` and all —
@@ -1314,6 +1558,22 @@ extension SwiftNativeMacControl {
                 output["window_frame"] = windowFrame.toJSON()
             }
             if let windowKind { output["window_kind"] = .string(windowKind) }
+            // Exact object and complete editor bytes for the TextEdit method.
+            if fourVerbs, read.app?.bundleIdentifier == "com.apple.TextEdit",
+               !read.snapshot.truncated,
+               !read.snapshot.nodes.contains(where: { ["AXSheet", "AXDialog"].contains($0.attributes.role) }),
+               let pid = read.app?.processIdentifier,
+               let path = documentPath(window: read.root, pid: pid) {
+                let editors = percept.affordances.filter { $0.role == "AXTextArea" && $0.enabled && !$0.secret }
+                if editors.count == 1, let editor = editors.first,
+                   let node = read.snapshot.nodes.first(where: { $0.path == editor.path }),
+                   let value = craftEditorValue(node) {
+                    output["craft_document"] = .object([
+                        "path": .string(path), "handle": .string(editor.handle),
+                        "editor_sha256": .string(SHA256.hash(data: Data(value.utf8)).map { String(format: "%02x", $0) }.joined()),
+                    ])
+                }
+            }
             if grade == "glance" {
                 output["glance"] = .string(percept.glanceLine())
                 output["addressable_handles"] = .int(Int64(percept.affordances.count))
@@ -1917,9 +2177,8 @@ extension SwiftNativeMacControl {
             + "beside it, and one with label_source \"none\" has no name the app publishes."
         )
         output["how_to_act"] = .string(
-            "Act by NUMBER, not by coordinate: mac_ax_act {mark: N, view: \"\(viewId)\"} presses "
-            + "the element the app's own way, mac_click {mark: N, view: \"\(viewId)\"} clicks its "
-            + "centre. Coordinates are for the parts of the picture "
+            "Act by name with act {verb: \"click\", target: \"<the element's name>\"}; it "
+            + "presses the element the app's own way. Coordinates are for the parts of the picture "
             + "with no marks (canvas, game, video). Marks are only valid for THIS view."
         )
         let viewFinishedNs = DispatchTime.now().uptimeNanoseconds

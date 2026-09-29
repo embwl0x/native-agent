@@ -184,6 +184,8 @@ extension CognitiveSubstrate {
                     nextPresentationState.soundRutLastSurfacedAt = expectedPresentationState.soundRutLastSurfacedAt
                     nextPresentationState.soundRutTurnsSinceSurfaced =
                         expectedPresentationState.soundRutTurnsSinceSurfaced
+                    nextPresentationState.soundRutEarlyRepeatSpent =
+                        expectedPresentationState.soundRutEarlyRepeatSpent
                 }
             }
             // Same rule for the Inner ledger: a line clipped out of the capsule
@@ -430,7 +432,8 @@ extension CognitiveSubstrate {
             signature: echo.wornSignature,
             at: now,
             dynamics: dyn,
-            presentationState: &presentationState
+            presentationState: &presentationState,
+            fedAgain: echo.rutFedAgain
         )
         if let echoLine = echo.line {
             tailLines.append(echoLine)
@@ -695,6 +698,7 @@ extension CognitiveSubstrate {
         settlingRun = next.settlingRun
         soundRutSignature = next.soundRutSignature
         soundRutLastSurfacedAt = next.soundRutLastSurfacedAt
+        soundRutEarlyRepeatSpent = next.soundRutEarlyRepeatSpent
         // Only a nudge that actually SPOKE resets the counter; otherwise the
         // free-running live value stands.
         if next.soundRutTurnsSinceSurfaced == 0 { soundRutTurnsSinceSurfaced = 0 }
@@ -750,6 +754,9 @@ extension CognitiveSubstrate {
         if let surfacedAt = soundRutLastSurfacedAt {
             object["soundRutLastSurfacedAt"] = .double(surfacedAt.timeIntervalSince1970)
         }
+        if soundRutEarlyRepeatSpent {
+            object["soundRutEarlyRepeatSpent"] = .bool(true)
+        }
         return .object(object)
     }
 
@@ -779,6 +786,8 @@ extension CognitiveSubstrate {
         soundRutSignature = stringValue(object["soundRutSignature"])
             .flatMap { $0.contains(":") ? $0 : nil }
         soundRutLastSurfacedAt = dateValue(object["soundRutLastSurfacedAt"])
+        soundRutEarlyRepeatSpent = object["soundRutEarlyRepeatSpent"] == .bool(true)
+            && soundRutSignature != nil
         soundRutTurnsSinceSurfaced = min(
             max(0, Int(exactly: (doubleValue(object["soundRutTurnsSinceSurfaced"]) ?? 0).rounded(.towardZero)) ?? 0),
             Self.soundRutTurnCounterCap

@@ -1,6 +1,7 @@
 import Foundation
 import os
 import PersistenceCore
+import TurnTrace
 
 /// 2026-09-23 (turn 4976a970): Agent streamed 97k chars for 404s until
 /// max_tokens, and the whole reply was replaced by the length notice. This

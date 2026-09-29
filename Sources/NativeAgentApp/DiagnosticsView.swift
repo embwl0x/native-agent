@@ -50,7 +50,7 @@ struct DiagnosticsView: View {
     /// Diagnostics (fence-A routing) by opening on their own segment:
     /// `DiagnosticsView(initialMode: .cognition)` / `.inspector`.
     /// Off when a rail page owns the tabs (DiagnosticsRailPage) and hands the
-    /// mode in; on for the classic shell, which has no tab row.
+    /// mode in; on where no tab row does.
     var showsModePicker: Bool = true
 
     init(initialMode: DiagnosticsMode = .doctor, showsModePicker: Bool = true) {
@@ -124,7 +124,11 @@ struct DiagnosticsView: View {
                         refreshAction: { await refreshSnapshot() }
                     )
                 case .cognition:
-                    CognitionObservatoryView(dependencies: .live(appModel: appModel))
+                    if let runtime = appModel.engine.cognitionView.runtime {
+                        CognitionObservatoryView(cognition: appModel.engine.cognitionView, runtime: runtime, dependencies: .live(appModel: appModel))
+                    } else {
+                        Text("Unavailable").foregroundStyle(.secondary)
+                    }
                 case .inspector: InspectorView()
                 }
             }
@@ -150,7 +154,7 @@ struct DiagnosticsView: View {
     /// has run: the frame keeps its plain subtitle rather than guess.
     @MainActor
     static func headerLine(_ appModel: AppModel) -> String? {
-        guard let report = appModel.doctorReport else { return nil }
+        guard let report = appModel.engine.doctor.report else { return nil }
         let summary = DoctorPlainCopy.summarize(report.checks)
         let total = summary.total
         guard total > 0 else { return nil }

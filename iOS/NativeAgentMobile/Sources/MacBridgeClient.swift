@@ -99,6 +99,7 @@ enum BridgeStatus: Equatable {
     /// E8: this phone has no usable network path. Distinct from every other
     /// case, all of which blame the Mac or iCloud for a local outage.
     case deviceOffline
+    case iCloudAccountAttention
     case stale(minutesAgo: Int)
     case connecting
 
@@ -116,6 +117,8 @@ enum BridgeStatus: Equatable {
             return "Mac unavailable"
         case .deviceOffline:
             return "iPhone offline"
+        case .iCloudAccountAttention:
+            return DeviceSyncAccountFailure.phoneMessage
         case .stale(let minutesAgo):
             return "Last seen \(minutesAgo)m ago"
         case .connecting:
@@ -127,7 +130,7 @@ enum BridgeStatus: Equatable {
         switch self {
         case .online:
             return .green
-        case .offline, .macUnreachable, .deviceOffline:
+        case .offline, .macUnreachable, .deviceOffline, .iCloudAccountAttention:
             return .red
         case .awaitingMacActivity, .stale, .connecting:
             return .orange
@@ -239,7 +242,7 @@ final class MacBridgeClient: ObservableObject {
 
     init(bridge: iCloudBridge = .shared) {
         self.bridge = bridge
-        bridgeAvailabilityCancellable = bridge.$available
+        bridgeAvailabilityCancellable = bridge.$available.combineLatest(bridge.$accountFailure)
             .sink { [weak self] _ in
                 Task { @MainActor in self?.refreshBridgeStatus() }
             }
@@ -460,6 +463,7 @@ final class MacBridgeClient: ObservableObject {
         // E8: a phone with no network path must say so rather than blaming the
         // Mac. Only an observed outage overrides; an unknown path does not.
         if deviceIsOffline == true { return .deviceOffline }
+        if bridge.accountFailure != nil { return .iCloudAccountAttention }
         return Self.bridgeStatusDecision(
             bridgeAvailable: bridgeAvailable,
             lastSeenAt: lastSeenAt,

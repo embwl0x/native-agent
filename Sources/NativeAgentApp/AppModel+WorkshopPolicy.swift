@@ -1,4 +1,5 @@
 import Foundation
+import SchedulerExecution
 import Observation
 import Darwin
 import AppKit
@@ -19,6 +20,7 @@ import MCPDispatcher
 import ToolExecution
 import PersonaEngine
 import ChatOrchestration
+import ChromeControl
 import TrustCenter
 import DreamREMCycle
 import DoctorChecks
@@ -105,14 +107,14 @@ extension AppModel {
     @MainActor
     @discardableResult
     func refreshSchedulerJobs() async -> SchedulerJobsRefreshResult {
-        let feed = await client.schedulerJobsFeed()
+        let feed = await engine.desk.jobsFeed()
         let result = SchedulerJobsRefreshResult.make(from: feed)
         switch feed {
         case .current(let rows):
-            jobs = rows
+            engine.desk.jobs = rows
             return result
         case .partial(let rows, _):
-            jobs = rows
+            engine.desk.jobs = rows
             statusText = result.failureDetail ?? "Schedule is partially unavailable."
             return result
         case .sourceAbsent:
@@ -145,9 +147,9 @@ extension AppModel {
     @MainActor
     func createDreamJob() async -> NightlyReflectionJobOutcome {
         do {
-            let before: SchedulerJob?
+            let before: ScheduledJob?
             do {
-                before = try await client.getJobs().first {
+                before = try await engine.desk.listJobs().first {
                     $0.id == "nativeagent-nightly-dream"
                 }
             } catch SchedulerJobsFeedError.sourceAbsent {
@@ -175,8 +177,8 @@ extension AppModel {
                 reactivateCancelled: true
             )
 
-            let refreshed = try await client.getJobs()
-            jobs = refreshed
+            let refreshed = try await engine.desk.listJobs()
+            engine.desk.jobs = refreshed
             guard let after = refreshed.first(where: {
                 $0.id == "nativeagent-nightly-dream"
             }) else {
@@ -223,7 +225,7 @@ extension AppModel {
 
     @MainActor
     func saveWorkshopPolicyToggle(enabled: Bool, showTimeline: Bool) async {
-        guard let policy = trustPolicy else { return }
+        guard let policy = engine.trust.policy else { return }
         do {
             let savedPolicy = try await client.saveTrustPolicy(
                 permissionLevel: policy.permissionLevel,
@@ -288,7 +290,7 @@ extension AppModel {
             // A failed canonical write can mean the underlying policy bytes
             // became unreadable between the UI read and this mutation. Do not
             // leave a stale OpenAI-voice grant available to playback.
-            trustPolicy = nil
+            engine.trust.policy = nil
             recordTrustActionFailure("Multimodal policy save failed: \(error.localizedDescription)")
             return false
         }
@@ -302,12 +304,12 @@ extension AppModel {
     @discardableResult
     func refreshVoiceOutputPolicy() async -> Bool {
         do {
-            trustPolicy = try await client.getTrustPolicy()
+            engine.trust.policy = try await engine.trust.load()
             return true
         } catch {
             // Trust policy is a hard output-route authority. Its previous
             // snapshot cannot stand in for a failed canonical reload.
-            trustPolicy = nil
+            engine.trust.policy = nil
             statusText = "Voice output policy unavailable: \(error.localizedDescription)"
             return false
         }
@@ -356,7 +358,7 @@ extension AppModel {
                 savedPolicy,
                 status: enabled ? "Chrome control enabled" : "Chrome control disabled"
             )
-            await ChromeControlRuntime.shared.reconcilePolicy()
+            await NativeAgentEngine.live.chrome.reconcilePolicy()
         } catch {
             recordTrustActionFailure("Chrome control save failed: \(error.localizedDescription)")
         }
@@ -378,7 +380,7 @@ extension AppModel {
     @discardableResult
     func saveAgentAccessMode(_ mode: String, developerMode: Bool? = nil) async -> Bool {
         do {
-            let savedPolicy = try await client.saveAgentAccessMode(mode, currentPolicy: trustPolicy, developerMode: developerMode)
+            let savedPolicy = try await client.saveAgentAccessMode(mode, currentPolicy: engine.trust.policy, developerMode: developerMode)
             let status = "Agent access saved: \(Self.agentAccessLabel(mode))"
             applySavedTrustPolicy(savedPolicy, status: status)
             chatFileAccess = Self.normalizedAgentAccessMode(mode)
@@ -391,7 +393,7 @@ extension AppModel {
 
     @MainActor
     func applySavedTrustPolicy(_ policy: TrustPolicy, status: String? = nil) {
-        trustPolicy = policy
+        engine.trust.policy = policy
         if let status {
             statusText = status
             trustCenterActionOutcome = .saved(status)
@@ -404,8 +406,7 @@ extension AppModel {
     }
 
     nonisolated static func normalizedAgentAccessMode(_ mode: String) -> String {
-        let value = mode.trimmingCharacters(in: .whitespacesAndNewlines).lowercased().replacingOccurrences(of: "-", with: "_")
-        return ["auto", "read_only", "workspace", "full"].contains(value) ? value : "auto"
+        TrustAccessModeCapabilityCatalog.normalizedMode(mode)
     }
 
     nonisolated static func agentAccessMode(from policy: TrustPolicy, fallback: String = "auto") -> String {
@@ -516,7 +517,7 @@ extension AppModel {
     @MainActor
     private func refreshBackupList(preserving receipt: String) async {
         do {
-            backups = try await client.getBackups()
+            engine.trust.backups = try await engine.trust.listBackups()
             statusText = receipt
         } catch {
             statusText = "\(receipt) Backup list refresh failed: \(error.localizedDescription)"

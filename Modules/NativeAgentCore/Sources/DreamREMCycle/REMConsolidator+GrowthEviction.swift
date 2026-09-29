@@ -152,11 +152,11 @@ extension REMConsolidator {
         // TOGETHER or NEITHER. Previously the KG append was best-effort and the
         // GROWTH splice unconditionally followed, so a missing/malformed KG file
         // could leave the slice gone from GROWTH and never landed in KG —
-        // PERMANENT DATA LOSS. Now `appendKGNode` THROWS on any fail-closed
-        // skip (file missing, wrong top-level shape, broken sub-shape, encode
-        // failure), and we let that throw propagate out of `runWeeklyREM`. The
-        // GROWTH eviction RETRIES on the next REM tick. Worst case: the cap
-        // pressure stays high until the operator fixes the KG file. That is
+        // PERMANENT DATA LOSS. Now `appendKGNode` THROWS on any failure (no
+        // store, unreadable store, write failure), and we let that throw
+        // propagate out of `runWeeklyREM`. The GROWTH eviction RETRIES on the
+        // next REM tick. Worst case: the cap pressure stays high until the
+        // store is healthy again. That is
         // strictly better than silently shredding the user's growth notes.
         try await appendKGNode(kgNode)
 
@@ -345,200 +345,40 @@ extension REMConsolidator {
         return "growth_\(digest)"
     }
 
-    /// Merge a GROWTH-eviction distillation node through the canonical graph
-    /// owner. `memory.sqlite` is authoritative whenever it exists. The JSON
-    /// mutation below is retained only for a true pre-SQLite install/fixture.
-    ///
-    /// LEGACY COMPATIBILITY SHAPE — DO NOT BREAK. The pre-SQLite KG file is a dict:
-    /// ```
-    /// {
-    ///   "_commit_seq": <int>,
-    ///   "version":     <int>,
-    ///   "entities":    { "<id>": { id, name, type, first_seen,
-    ///                              last_seen, mention_count, aliases, summary }, ... },
-    ///   "edges":       [ {...}, ... ]
-    /// }
-    /// ```
-    /// The earlier version of
-    /// this method decoded as `[KGNode]` (a top-level array), defaulted to
-    /// `[]` on any failure, then wrote the array back. The first time REM
-    /// fired a GROWTH eviction it would have silently OVERWRITTEN the
-    /// compatibility file with an array, deleting the user's whole knowledge graph.
-    /// That bug is the entire reason this function looks the way it does now.
-    ///
-    /// FAIL-CLOSED CONTRACT: any unexpected condition (file missing, read
-    /// failure, top-level not a dict, `entities` present but not a dict)
-    /// THROWS and we leave the file untouched. The caller (`runGrowthEviction`)
-    /// must NOT splice the GROWTH.md slice unless this call succeeded —
-    /// otherwise the slice would be gone from both GROWTH and KG.
-    ///
-    /// CROSS-PROCESS LOCK: the whole read → validate → mutate → encode →
-    /// atomic-write sequence runs under `withFileLock` on the KG file path so
-    /// a concurrent writer (daemon merge, manual edit, sibling tool) can't
-    /// race us. The lock matches the convention `PersistenceCore` documents
-    /// for any read-modify-write of a daemon-shared JSON file.
     /// Corroborating identity for a reconciled eviction: the distilled node
-    /// carrying the record's id, looked up the same two ways `appendKGNode`
-    /// writes it (SQLite graph when present, legacy JSON otherwise). Any
-    /// failure reads as "not present" — reconciliation then leaves the row
-    /// pending, which is the safe side.
+    /// carrying the record's id in the graph (memory.sqlite). Any failure
+    /// reads as "not present" — reconciliation then leaves the row pending,
+    /// which is the safe side.
     fileprivate static func growthDistillationNodeExists(id: String, dataRoot: URL) async -> Bool {
-        let kgDir = dataRoot.appendingPathComponent("memory", isDirectory: true)
-        let sqliteURL = kgDir.appendingPathComponent("memory.sqlite")
-        if FileManager.default.fileExists(atPath: sqliteURL.path) {
-            guard let indexer = try? SwiftNativeKnowledgeGraphIndexer(memorySQLitePath: sqliteURL),
-                  let exists = try? await indexer.growthDistillationExists(id: id) else {
-                return false
-            }
-            return exists
+        let sqliteURL = dataRoot
+            .appendingPathComponent("memory", isDirectory: true)
+            .appendingPathComponent("memory.sqlite")
+        guard let indexer = try? SwiftNativeKnowledgeGraphIndexer(memorySQLitePath: sqliteURL),
+              let exists = try? await indexer.growthDistillationExists(id: id) else {
+            return false
         }
-        let kgURL = kgDir.appendingPathComponent("knowledge_graph.json")
-        guard let data = try? Data(contentsOf: kgURL),
-              let graph = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-              let entities = graph["entities"] as? [String: Any] else { return false }
-        return entities[id] != nil
+        return exists
     }
 
+    /// Merge a GROWTH-eviction distillation node into the graph in
+    /// memory.sqlite. THROWS on any failure (no store yet included), and the
+    /// caller (`runGrowthEviction`) must NOT splice the GROWTH.md slice unless
+    /// this call succeeded — otherwise the slice would be gone from both
+    /// GROWTH and the graph.
     private func appendKGNode(_ node: KGNode) async throws {
         let kgDir = dataRoot.appendingPathComponent("memory", isDirectory: true)
-        let kgURL = kgDir.appendingPathComponent("knowledge_graph.json")
-        let sqliteURL = kgDir.appendingPathComponent("memory.sqlite")
-        if FileManager.default.fileExists(atPath: sqliteURL.path) {
-            let indexer = try SwiftNativeKnowledgeGraphIndexer(memorySQLitePath: sqliteURL)
-            try await indexer.upsertGrowthDistillation(
-                id: node.id,
-                summary: node.summary,
-                sourceLines: node.sourceLines,
-                createdAt: node.createdAt,
-                legacyJSONPath: kgURL
-            )
-            return
-        }
-
-        let persistence = SwiftNativePersistenceCore()
-        try await persistence.withFileLock(kgURL) {
-            try Self.mergeKGNodeUnderLock(node, kgURL: kgURL)
-        }
-    }
-
-    /// The locked critical section. Static so it can be passed into the
-    /// `@Sendable` closure of `withFileLock` without capturing actor state.
-    /// Every fail-closed branch throws — the on-disk file is read into memory,
-    /// validated, mutated, encoded, and then atomically rewritten; if any
-    /// step is wrong we bail out BEFORE the write.
-    private static func mergeKGNodeUnderLock(_ node: KGNode, kgURL: URL) throws {
-        let fm = FileManager.default
-        guard fm.fileExists(atPath: kgURL.path) else {
-            throw NSError(
-                domain: "REMConsolidator",
-                code: -201,
-                userInfo: [NSLocalizedDescriptionKey:
-                    "knowledge_graph.json missing at \(kgURL.path); refusing to "
-                    + "create a fresh file because the canonical shape (dict with "
-                    + "entities/edges/version/_commit_seq) must be authored by the "
-                    + "KG owner, not by GROWTH eviction."]
-            )
-        }
-        let data: Data
-        do {
-            data = try Data(contentsOf: kgURL)
-        } catch {
-            throw NSError(
-                domain: "REMConsolidator",
-                code: -202,
-                userInfo: [NSLocalizedDescriptionKey:
-                    "failed to read knowledge_graph.json: \(error)"]
-            )
-        }
-        guard var graph = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
-            throw NSError(
-                domain: "REMConsolidator",
-                code: -203,
-                userInfo: [NSLocalizedDescriptionKey:
-                    "knowledge_graph.json top level is not a dict — refusing to "
-                    + "overwrite. The canonical shape is "
-                    + "{_commit_seq, version, entities:{...}, edges:[...]}."]
-            )
-        }
-
-        // Validate sub-shape BEFORE mutating. `entities` MUST be present and
-        // must be a dict; if it's absent or wrong-typed we refuse rather than
-        // silently default-to-empty and clobber a non-canonical file the user
-        // is mid-migration on. Same for `edges`: if present it must be an
-        // array. Missing edges is tolerated (older variants may omit it) but
-        // we won't overwrite a non-array edges.
-        guard let existingEntities = graph["entities"] as? [String: Any] else {
-            throw NSError(
-                domain: "REMConsolidator",
-                code: -204,
-                userInfo: [NSLocalizedDescriptionKey:
-                    "knowledge_graph.json `entities` field is missing or not a "
-                    + "dict — refusing to overwrite. Live KG has 793 entities "
-                    + "keyed by id; defaulting to empty here would erase them."]
-            )
-        }
-        if let edges = graph["edges"], !(edges is [Any]) {
-            throw NSError(
-                domain: "REMConsolidator",
-                code: -205,
-                userInfo: [NSLocalizedDescriptionKey:
-                    "knowledge_graph.json `edges` field is present but not an "
-                    + "array — refusing to overwrite. Canonical shape is "
-                    + "edges:[...]."]
-            )
-        }
-
-        // Adapter shape: a distilled GROWTH-eviction node lives under entities
-        // as a single record with type="growth_distillation". This keeps the
-        // file's contract (entities is a dict keyed by id) intact and lets
-        // downstream consumers query/render these nodes the same way they do
-        // any other entity. Name = summary truncated; first_seen/last_seen =
-        // createdAt; mention_count = sourceLines.
-        var entities = existingEntities
-        let nameTruncated: String = {
-            let summary = node.summary
-            if summary.count <= 80 { return summary }
-            let idx = summary.index(summary.startIndex, offsetBy: 80)
-            return String(summary[..<idx])
-        }()
-        let entity: [String: Any] = [
-            "id": node.id,
-            "name": nameTruncated,
-            "type": "growth_distillation",
-            "first_seen": node.createdAt,
-            "last_seen": node.createdAt,
-            "mention_count": node.sourceLines,
-            "aliases": [String](),
-            "summary": node.summary,
-        ]
-        entities[node.id] = entity
-        graph["entities"] = entities
-
-        // Bump _commit_seq so any consumer watching for changes sees a fresh
-        // version. Treat the value defensively — older files may carry it as
-        // a NSNumber or be missing entirely.
-        let currentSeq: Int = {
-            if let n = graph["_commit_seq"] as? Int { return n }
-            if let n = graph["_commit_seq"] as? NSNumber { return n.intValue }
-            return 0
-        }()
-        graph["_commit_seq"] = currentSeq + 1
-
-        let out: Data
-        do {
-            out = try JSONSerialization.data(
-                withJSONObject: graph,
-                options: [.prettyPrinted, .sortedKeys]
-            )
-        } catch {
-            throw NSError(
-                domain: "REMConsolidator",
-                code: -206,
-                userInfo: [NSLocalizedDescriptionKey:
-                    "failed to encode merged KG: \(error)"]
-            )
-        }
-        try out.write(to: kgURL, options: .atomic)
+        let indexer = try SwiftNativeKnowledgeGraphIndexer(
+            memorySQLitePath: kgDir.appendingPathComponent("memory.sqlite")
+        )
+        try await indexer.upsertGrowthDistillation(
+            id: node.id,
+            summary: node.summary,
+            sourceLines: node.sourceLines,
+            createdAt: node.createdAt,
+            // The graph's own one-time legacy import source; a no-op once
+            // `.kg_migrated_to_sqlite_v1` stands.
+            legacyJSONPath: kgDir.appendingPathComponent("knowledge_graph.json")
+        )
     }
 
     private func isoNow() -> String {

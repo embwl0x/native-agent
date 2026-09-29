@@ -191,6 +191,11 @@ extension MacFourVerbs {
         if let hit = narrow(targets.filter { normalize($0.label ?? "") == needle && !needle.isEmpty }) {
             return hit
         }
+        // Walk 4 — a field answers to the placeholder a person reads in it
+        // ("Search Maps"), only after every exact label on the screen.
+        if let hit = narrow(targets.filter { !needle.isEmpty && $0.placeholder.map(normalize) == needle }) {
+            return hit
+        }
         // A short or numeric name is exact-only (her-screen 09-23: "7" became
         // row 7 = the Apple menu, "6" became Help). No fuzzy rung, and a bare
         // number is not an ordinal — "row 7" / "button 7" still are.
@@ -240,6 +245,8 @@ extension MacFourVerbs {
         let label = normalize(candidate.label ?? "")
         if asked.isEmpty { return roleHint(in: identity) == candidate.kind }
         if label == asked || label == whole { return true }
+        if let placeholder = candidate.placeholder.map(normalize), !placeholder.isEmpty,
+           placeholder == asked || placeholder == whole { return true }
         // The label must answer the WHOLE request: "Delete" does not answer
         // "Delete selected file" (a label inside a longer request is refused).
         guard !isExactOnlyName(asked) else { return false }
@@ -327,6 +334,39 @@ extension MacFourVerbs {
 
     static let editableKinds: Set<String> = ["text", "text area", "secure text"]
 
+    /// Walk 3 — a bare role phrase names the field itself when nothing carries
+    /// that name: the focused editable field, else the only one. With several
+    /// and none focused there is no hit; the candidates are for the miss to list.
+    static let bareFieldPhrases: Set<String> = [
+        "field", "text field", "textfield", "search field", "search box", "search bar", "search",
+        "path field", "text box", "input", "input field", "entry field", "box",
+    ]
+
+    static func bareField(_ target: String, in seen: Sighting) -> (hit: ActTarget?, candidates: [ActTarget])? {
+        guard bareFieldPhrases.contains(normalize(target)) else { return nil }
+        var handles = Set<String>()
+        let fields = seen.targets.filter { candidate in
+            // A field phrase never names a password field.
+            !candidate.isSupplemental && candidate.enabled && candidate.kind != "secure text"
+                && seen.editableHandles.contains(candidate.handle)
+                && handles.insert(candidate.handle).inserted
+        }
+        if let focused = fields.first(where: {
+            $0.aliases.contains("focused field") || (seen.focusPath != nil && $0.sourceAXPath == seen.focusPath)
+        }) {
+            return (focused, fields)
+        }
+        return (fields.count == 1 ? fields[0] : nil, fields)
+    }
+
+    /// Walk 4 — a field phrase with no editable field on the screen (Freeform's
+    /// canvas text box in edit mode) types where the keyboard focus is, as a
+    /// person would. Never into a password field, or when focus is unknown.
+    static func typesAtFocus(_ target: String, in seen: Sighting) -> Bool {
+        guard let bare = bareField(target, in: seen), bare.candidates.isEmpty else { return false }
+        return seen.focusPath != nil && !seen.focusSecure
+    }
+
     static func focusedEditableAliases(kind: String) -> [String] {
         var aliases = ["focused control", "focused field", "focused text", "focused editable control"]
         aliases.append("focused \(kind)")
@@ -350,8 +390,10 @@ extension MacFourVerbs {
     /// What she DID see, so a miss is a fact she can act on rather than a dead
     /// end. Labels only — an unnamed control is not a suggestion.
     static func nearest(to needle: String, among targets: [ActTarget], limit: Int = 8) -> [String] {
+        let wantsScrollBar = needle.contains("scroll")
         let named = targets.compactMap { candidate -> (String, Int)? in
             guard let label = candidate.label, !label.isEmpty else { return nil }
+            if !wantsScrollBar, isScrollBarPart(candidate) { return nil }
             let normalized = normalize(label)
             var score = 0
             if !needle.isEmpty {
@@ -366,6 +408,16 @@ extension MacFourVerbs {
             .map(\.element.0)
         var seen: Set<String> = []
         return ranked.filter { seen.insert($0).inserted }.prefix(limit).map { $0 }
+    }
+
+    /// Walk 4 — a scroll bar or its thumb, whose "name" is a raw position
+    /// ("0.40120663650075417"): noise in any listing of what she can act on.
+    static func isScrollBarPart(_ candidate: ActTarget) -> Bool {
+        if ["scroll bar", "valueindicator"].contains(candidate.kind) { return true }
+        guard let label = candidate.label?.trimmingCharacters(in: .whitespaces),
+              let value = Double(label), (0...1).contains(value),
+              let dot = label.firstIndex(of: ".") else { return false }
+        return label[label.index(after: dot)...].count >= 4
     }
 
     static func matches(_ needle: String, _ label: String?, kind: String?) -> Bool {

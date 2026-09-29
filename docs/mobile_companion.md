@@ -198,7 +198,7 @@ For source builds:
    requires the CloudKit service grant, deployed private-database schema, and
    any exact query-subscription contracts promoted from Development.
 3. Enable iCloud Drive on the Mac and phone for KVS/Drive mode.
-4. Build the iOS project from
+4. Run `xcodegen --spec iOS/NativeAgentMobile/project.yml`, then build
    `iOS/NativeAgentMobile/NativeAgentMobile.xcodeproj`.
 5. In NativeAgent on the Mac, open the pairing surface and pair the phone. The
    secret is transferred through the configured Apple-native pairing plane.
@@ -207,7 +207,10 @@ For source builds:
 Example simulator build:
 
 ```bash
+command -v xcodegen >/dev/null 2>&1 || { echo 'Install XcodeGen: brew install xcodegen' >&2; exit 1; }
+xcodegen --spec iOS/NativeAgentMobile/project.yml &&
 xcodebuild \
+  -onlyUsePackageVersionsFromResolvedFile -skipPackageUpdates \
   -project iOS/NativeAgentMobile/NativeAgentMobile.xcodeproj \
   -scheme NativeAgentMobile \
   -destination 'platform=iOS Simulator,name=<installed simulator>' \

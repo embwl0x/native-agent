@@ -42,8 +42,10 @@ public extension GitHubConnectorActions {
         } else {
             path = "notifications"
         }
-        let raw = try await call(path: path, params: params, dataRoot: dataRoot)
-        let projection = notificationRows(raw, limit: limit)
+        let response = try await callWithResponse(path: path, params: params, dataRoot: dataRoot)
+        let projection = notificationRows(response.value, limit: limit)
+        let hasMore = response.response.value(forHTTPHeaderField: "Link")?
+            .split(separator: ",").contains { $0.contains("rel=\"next\"") } ?? false
         return GitHubConnectorSecretRedactor.redactValue(.object([
             "actionId": .string("github.list_notifications"),
             "connectorId": .string("github"),
@@ -52,6 +54,9 @@ public extension GitHubConnectorActions {
             "repository": repositoryName.map(JSONValue.string) ?? .null,
             "page": .int(Int64(page)),
             "count": .int(Int64(projection.rows.count)),
+            "total": .null,
+            "has_more": .bool(hasMore),
+            "next_page": hasMore ? .int(Int64(page + 1)) : .null,
             "sourcePageCount": .int(Int64(projection.sourceCount)),
             "resultsTruncated": .bool(projection.truncated),
             "notifications": JSONValue(fromFoundation: projection.rows),

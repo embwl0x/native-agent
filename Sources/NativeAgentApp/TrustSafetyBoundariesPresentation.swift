@@ -1,4 +1,5 @@
 import Foundation
+import TrustCenter
 
 /// Visual severity for a boundary receipt. These values describe the loaded
 /// policy only; they do not authorize an action or replace effect-time gates.

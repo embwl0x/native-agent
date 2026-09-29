@@ -1,4 +1,6 @@
 import SwiftUI
+import NotificationInbox
+import ApprovalInbox
 import AppKit
 import CoreGraphics
 import ScreenCaptureKit
@@ -14,6 +16,7 @@ import CoreSpotlight
 #endif
 #if canImport(CloudKit)
 import CloudKit
+import DeviceSync
 #endif
 
 /// A failed inbox read is a distinct visible state, not an empty inbox. Keep
@@ -44,9 +47,32 @@ struct InboxStripContainer: View {
     // inline error row instead of fabricating an empty strip.
     @State private var loadError: String? = nil
     @State private var reloadGeneration = 0
+    @State private var approvals: [ApprovalRecord] = []
+    @State private var approvalError: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
+        if let approvalError {
+            Text(approvalError).foregroundStyle(.orange)
+        }
+        if !approvals.isEmpty || items.contains(where: { $0.source == InteractionCardDelivery.source }) {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 8) {
+                    ForEach(approvals) { approval in
+                        if ApprovalPayloadPreviewPresentation.canResolve(approval) {
+                            InlineApprovalCard(message: approvalMessage(approval))
+                        } else {
+                            Text(ApprovalPayloadPreviewPresentation.unavailableText)
+                        }
+                    }
+                    ForEach(items.filter { $0.source == InteractionCardDelivery.source }) { item in
+                        InteractionInboxCard(item: item)
+                    }
+                }
+                .padding(.horizontal, 16)
+            }
+            .frame(maxHeight: 260)
+        }
         if let loadError {
             Label("Inbox unavailable: \(loadError)", systemImage: "exclamationmark.triangle")
                 .font(.caption)
@@ -56,7 +82,7 @@ struct InboxStripContainer: View {
                 .accessibilityIdentifier("inbox-strip-load-error")
         }
         InboxStripView(
-            items: items,
+            items: items.filter { $0.source != InteractionCardDelivery.source && !$0.hasLinkedApproval },
             onAction: { id, actionID in
                 try await appModel.inboxAction(id, action: actionID)
                 // Every successful action changes inbox state. Reload now so
@@ -67,7 +93,7 @@ struct InboxStripContainer: View {
                 if let inboxSnapshotWriterOverride = appModel.inboxSnapshotWriterOverride {
                     await inboxSnapshotWriterOverride()
                 } else {
-                    await MacSyncEngine.shared.writeSnapshots()
+                    await NativeAgentEngine.liveDeviceSync.engine.writeSnapshots()
                 }
             }
         )
@@ -83,7 +109,25 @@ struct InboxStripContainer: View {
         .onChange(of: appModel.inboxReloadGeneration) { _, _ in
             Task { await reload() }
         }
+        .task {
+            await ApprovalRequestsLiveRefresh.observe(approvals: appModel.engine.approvals) {
+                do {
+                    approvals = try await appModel.engine.approvals.list().filter { $0.status == "pending" }
+                    approvalError = nil
+                } catch {
+                    approvalError = ApprovalLoadFailurePresentation.banner(error: error, retainedApprovalCount: approvals.count)
+                }
+            }
         }
+        }
+    }
+
+    private func approvalMessage(_ approval: ApprovalRecord) -> ChatMessage {
+        var metadata = ChatMessageMetadata()
+        metadata.kind = ChatMessageMetadata.approvalPendingKind
+        metadata.approvalId = approval.id
+        return ChatMessage(id: approval.id, role: "tool",
+            content: "\(approval.title)\n\(approval.reason)\n\(approval.payloadPreview)", metadata: metadata)
     }
 
     func reload() async {
@@ -91,7 +135,13 @@ struct InboxStripContainer: View {
         let generation = reloadGeneration
         do {
             let next = InboxStripPresentation.loaded(
-                try await appModel.getInboxItems(unreadOnly: true)
+                try await appModel.engine.inbox.list().filter {
+                    // Reading a request is not resolving it. Delivery archives
+                    // its pointer when the originating interaction settles.
+                    $0.source == InteractionCardDelivery.source
+                        ? $0.normalizedStatus != "archived"
+                        : $0.isUnread
+                }
             )
             guard generation == reloadGeneration else { return }
             items = next.items

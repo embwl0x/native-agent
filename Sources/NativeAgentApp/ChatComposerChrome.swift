@@ -103,19 +103,6 @@ struct AttachmentChip: View {
     }
 }
 
-enum ChatEmptyStatePresentation {
-    /// A blank chat is where a first-timer decides what this app is for, so
-    /// each chip names something the agent can really do today. Every one is
-    /// grounded in a shipped tool: mac_calendar_list_upcoming, read_file /
-    /// file_excerpt, commit_memory / recall_memory, and desk_add_item.
-    static let suggestions = [
-        "What's on my calendar today?",
-        "Summarize a file on my Mac",
-        "Remember something about me",
-        "Add a task to my Desk",
-    ]
-}
-
 // D1 (2026-08-28): a blank chat on a machine with no connected provider used
 // to invite a first message ("Say something to …") that could only dead-end in
 // "No reply came back". The blank slate now branches: with a provider, the D6
@@ -183,46 +170,6 @@ enum ChatEmptyStateSuggestionAction {
     }
 }
 
-// PATCH-2026-05-09: chat-ux-polish — Chat empty state with persona name + suggestion chips
-struct ChatEmptyState: View {
-    var personaName: String
-    var onSuggestion: (String) -> Void
-
-    var body: some View {
-        VStack(spacing: NativeAgentSpacing.xl) {
-            NativeEmptyState(
-                title: "Say something to \(personaName)",
-                detail: "Start with a goal, a question, or a task. Each conversation is kept separate and comes back after you quit and reopen the app.",
-                systemImage: "bubble.left.and.bubble.right"
-            )
-
-            // Four chips overflow a narrow chat pane in one fixed row, so they
-            // wrap instead of clipping the last capability off-screen.
-            LazyVGrid(
-                columns: [GridItem(.adaptive(minimum: 170), spacing: NativeAgentSpacing.sm)],
-                spacing: NativeAgentSpacing.sm
-            ) {
-                ForEach(ChatEmptyStatePresentation.suggestions, id: \.self) { suggestion in
-                    Button {
-                        onSuggestion(suggestion)
-                    } label: {
-                        Text(suggestion)
-                            .font(NativeAgentFont.label)
-                            .padding(.horizontal, NativeAgentSpacing.md)
-                            .padding(.vertical, NativeAgentSpacing.sm)
-                            .glassEffect(.regular.interactive(), in: Capsule())  // Liquid Feel W2
-                            .overlay(Capsule().strokeBorder(NativeAgentBrand.accent.opacity(0.25), lineWidth: 0.8))
-                    }
-                    .buttonStyle(.borderless)
-                    .help("Start with: \(suggestion)")
-                }
-            }
-            .frame(maxWidth: 560)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
-}
-
 enum ChatComposerSendAction: Equatable {
     case send
     case queueNext
@@ -286,8 +233,8 @@ struct MacChatComposerControlStrip<InputContent: View>: View {
     /// ui-simplify 2026-09-02 (Lane A). ON: one material, 22pt radius, a single
     /// hairline, a soft shadow, plus and mic on the left and a plain send arrow
     /// on the right — the thing you sit down at. OFF: the previous GlassCard
-    /// strip, unchanged, for the `uiClassicShell` kill switch and the detached
-    /// panels that have not been reshaped yet.
+    /// strip, unchanged, for the detached panels that have not been reshaped
+    /// yet.
     var shell: Bool = false
 
     let isListening: Bool
@@ -524,8 +471,10 @@ struct MacChatComposerControlStrip<InputContent: View>: View {
             HazeBottomGlow(cornerRadius: NativeAgentShellLayout.composerRadius)
             ThinkingGlow(kind: .shimmer, cornerRadius: NativeAgentShellLayout.composerRadius)
         }
+        // The card holds independent controls; interactive glass makes a
+        // click in the field press/dim the entire card on macOS 27.
         .glassEffect(
-            reduceTransparency ? .identity : .regular.interactive(),
+            reduceTransparency ? .identity : ShellSidebarRail.plateGlass,
             in: RoundedRectangle(
                 cornerRadius: NativeAgentShellLayout.composerRadius,
                 style: .continuous
@@ -536,7 +485,7 @@ struct MacChatComposerControlStrip<InputContent: View>: View {
         // transparency already draws this border permanently on its opaque
         // fill, so the focused state stays out of its way there.
         .overlay {
-            if isFocused, !reduceTransparency {
+            if !reduceTransparency {
                 // Agent, 2026-09-03: the hairline only showed on the top rim
                 // over glass; one step of fill reads as "held" all round.
                 RoundedRectangle(
@@ -544,10 +493,12 @@ struct MacChatComposerControlStrip<InputContent: View>: View {
                     style: .continuous
                 )
                 .fill(Color.primary.opacity(0.04))
+                .opacity(isFocused ? 1 : 0)
+                // Animate only the focus wash, never the field's focus layout.
+                .animation(reduceMotion ? nil : NativeAgentMotion.quick, value: isFocused)
                 .allowsHitTesting(false)
             }
         }
-        .animation(reduceMotion ? nil : NativeAgentMotion.quick, value: isFocused)
         // The thinking rim: one arc of light travelling round the edge. Outside
         // the focus animation's scope; it carries its own fade.
         .overlay { ThinkingGlow(kind: .rim, cornerRadius: NativeAgentShellLayout.composerRadius) }

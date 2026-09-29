@@ -1,3 +1,4 @@
+import ChatOrchestration
 import Foundation
 import SwiftUI
 
@@ -106,7 +107,7 @@ extension ChatView {
         Task {
             await voiceOutput.speak(
                 text: text,
-                resolution: VoiceOutputModeSelection.resolve(for: appModel.trustPolicy)
+                trust: appModel.engine.trust
             )
         }
     }
@@ -150,9 +151,9 @@ extension ChatTurnCardInset {
     // because that question has no other home in the transcript.
     var showThinkingRow: Bool {
         MacChatTurnCardProjection.isVisible(
-            appModel.chatTurnLifecycle(for: appModel.activeChatSessionId),
+            appModel.engine.turns.lifecycle(for: appModel.activeChatSessionId),
             sessionId: appModel.activeChatSessionId,
-            approvals: appModel.approvals
+            approvals: appModel.engine.approvals.records
         )
     }
 }

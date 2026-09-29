@@ -4,6 +4,7 @@ import PersistenceCore
 public typealias TelegramChatHandler = @Sendable (_ chatId: Int, _ text: String) async throws -> String
 
 public enum TelegramChatProgressEvent: Sendable, Equatable {
+    case replyTextSettled(Bool)
     case status(text: String)
     case toolUse(name: String, input: JSONValue?)
     case toolResult(name: String, output: JSONValue?)

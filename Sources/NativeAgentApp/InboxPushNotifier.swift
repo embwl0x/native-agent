@@ -1,4 +1,7 @@
+import Privacy
 import Foundation
+import AttentionRouting
+import PersistenceCore
 
 enum InboxPushNotifier {
     static func notifyIfAttentionWorthy(
@@ -15,7 +18,6 @@ enum InboxPushNotifier {
     ) async {
         guard shouldNotify(severity: severity) else { return }
         guard usesLiveAppDataRoot(dataRoot) else { return }
-        guard ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] == nil else { return }
         guard ProcessInfo.processInfo.environment["NATIVE_AGENT_DISABLE_INBOX_PUSH"] != "1" else { return }
 
         do {

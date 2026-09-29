@@ -1,4 +1,5 @@
 import Foundation
+import Cognition
 import Onboarding
 import PersonaEngine
 
@@ -130,8 +131,8 @@ extension NativeClient {
     // SUBSYSTEM #17: retired Swift wrapper checkOnboardingNeeded — startOnboarding() remains live.
 
     func refreshResidentMindAfterOnboardingTransition() async {
-        async let contextFlow: Void = NativeContextFlowRuntime.shared.reloadConfiguration()
-        async let cognition = NativeCognitionRuntime.shared.refreshAfterOnboardingTransition()
+        async let contextFlow: Void = NativeAgentEngine.live.contextFlow.reloadConfiguration()
+        async let cognition = NativeAgentEngine.liveCognition.refreshAfterOnboardingTransition()
         _ = await (contextFlow, cognition)
     }
 }

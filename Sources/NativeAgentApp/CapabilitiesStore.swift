@@ -5,7 +5,7 @@ import PersistenceCore
 // PATCH-Phase6b: CapabilitiesStore — fetches GET /v1/capabilities (dispatcher tool manifest)
 // and caches results for 30 seconds.  Refreshes on view appear, app focus, and manual button.
 //
-// NOTE: This is separate from AppModel.capabilitySummary (which decodes the old
+// NOTE: This is separate from engine.trust.capabilitySummary (which projects the
 //       CapabilitySummaryResponse / capability catalog shape).  This store decodes the
 //       Phase-2 dispatcher manifest: { ok, persona, active_provider, tools: [...], ... }.
 
@@ -104,7 +104,7 @@ final class CapabilitiesStore {
 
     init(
         manifestLoader: @escaping @Sendable () async throws -> JSONValue = {
-            try await makeNativeAgentAppToolDispatchClient().dispatch(
+            try await NativeAgentEngine.live.toolDispatchClient().dispatch(
                 tool: "tool_catalog",
                 input: [:],
                 surface: "chat"

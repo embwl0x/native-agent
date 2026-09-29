@@ -1,4 +1,5 @@
 import Foundation
+import AppIntents
 import Observation
 import Darwin
 import AppKit
@@ -40,6 +41,7 @@ import WorkflowOrchestration
 import Skills
 import Connectors
 import Browser
+import DeviceSync
 
 @MainActor
 @Observable
@@ -47,6 +49,19 @@ final class AppModel {
     /// Global toast/status surface. Views overlay SystemToastBar(center:) and
     /// any code path can call appModel.systemToasts.push(...).
     let systemToasts = SystemToastCenter()
+    private var iCloudAccountToastID: UUID?
+
+    func showICloudAccountFailure(_ failure: DeviceSyncAccountFailure?) {
+        guard failure != nil else {
+            if let id = iCloudAccountToastID { systemToasts.dismiss(id) }
+            iCloudAccountToastID = nil
+            return
+        }
+        guard iCloudAccountToastID == nil else { return }
+        let toast = SystemToast(kind: .error, text: DeviceSyncAccountFailure.macMessage, autoDismissAfter: nil)
+        iCloudAccountToastID = toast.id
+        systemToasts.push(toast)
+    }
     /// Central poll scheduler — replaces per-view sleep-loop `.task` blocks
     /// with one coordinated tick that pauses while chat is streaming or the
     /// app is unfocused. Local-state UI uses owner invalidations instead; see
@@ -55,13 +70,11 @@ final class AppModel {
     private let activeChatSessionIDWriter: @MainActor (String?) -> Void
     private let backgroundLoopsManager: BackgroundLoopsManager
     private let chatSnapshotPublisher: @MainActor () -> Void
-    var approvalResolverOverride: (@MainActor (String, String) async throws -> ApprovalRequest)?
-    var inboxReaderOverride: (@MainActor (Bool) async throws -> [InboxItemRecord])?
+    var approvalResolverOverride: (@MainActor (String, String) async throws -> ApprovalRecord)?
     var inboxActionOverride: (@MainActor (String, String) async throws -> Void)?
     var inboxSnapshotWriterOverride: (@MainActor () async -> Void)?
     var inboxReloadGeneration = 0
-    let chatRenameMutationGate = ChatRenameMutationGate()
-    var chatRenameIntentGeneration: [String: Int] = [:]
+    let chatSessionTransactions = MacChatSessionTransactions()
 
     // PATCH-2026-05-07: model-default-bump. One-time migration for a saved
     // chatModel/telegramModel this build no longer carries.
@@ -224,12 +237,10 @@ final class AppModel {
     var isTestingTelegram = false
     var isClearingTelegramLogs = false
     var telegramClearLogsOutcome: TelegramClearLogsPresentation.Outcome?
-    var telegramStatus: TelegramStatus?
     /// A failed status refresh does not erase the last readable Telegram
     /// receipt snapshot. The settings surface must mark that snapshot stale
     /// instead of presenting it as a current read.
     var telegramStatusRefreshError: String?
-    var chatSessions: [ChatSession] = []
     // PATCH-2026-05-11: unified-session-v1 — on first launch after this change, drop any
     // stale Mac-only session ID so the daemon resolves via the configured mobile source key instead.
     var activeChatSessionId: String = {
@@ -238,126 +249,21 @@ final class AppModel {
             UserDefaults.standard.set(true, forKey: "NativeAgent.unifiedSession.v1")
         }
         return UserDefaults.standard.string(forKey: "activeChatSessionId") ?? ""
-    }()
-    // 2026-06-08 detached-chat-windows W0.2: dict-ified storage for both
-    // chatMessages and latestContextReceipt. The public properties below are
-    // computed reads/writes against the active session's slot, preserving
-    // every existing call site (72 chatMessages reads + 9 receipt reads +
-    // 25+ writes across NativeClient.swift and ChatView.swift). Per-session
-    // accessors `chatMessages(for:)` / `setChatMessages(_:for:)` /
-    // `latestContextReceipt(for:)` / `setLatestContextReceipt(_:for:)` let
-    // detached chat panels (Phase 1) bind to any session without going
-    // through `activeChatSessionId`.
-    //
-    // Why dict + computed property instead of a per-session ViewModel:
-    // PATCH-2026-05-13 (parallel-sessions) already ships `busySessions`,
-    // `streamingSessions`, `chatTasks`, `chatTaskGenerations`,
-    // `streamingTexts`, `streamingBubbleIds`, `streamingUserTurnIds`,
-    // `streamingUserTurnTexts`, `chatDrafts` as
-    // per-session dicts. The ONLY two fields still in the singleton are
-    // `chatMessages` and `latestContextReceipt` — dict-ifying them
-    // completes the per-session migration without inventing a new VM type.
-    // 2026-09-06: the transcript's mutation counter. The message-list grouper
-    // used to detect "same list" with count + tail row + total content bytes;
-    // an interior row replaced with the same byte count, or changed only in
-    // its metadata, passed all three and the view kept stale groups. Every
-    // write to the transcript now goes through the computed
-    // `chatMessagesBySession` below, so the counter cannot be forgotten by a
-    // new writer. `chatMessagesStructureVersion` is the cache key: it skips
-    // the streaming delta, which rewrites only the final row and which the
-    // list patches in place rather than re-walking the whole transcript.
-    /// 2026-09-14 (snappiness): the transcript's rows are no longer an
-    /// observed STORED property. Structure — appends, removals, wholesale
-    /// replaces — publishes through the computed `chatMessagesBySession`
-    /// below, which does the `access`/`withMutation` by hand. The streaming
-    /// delta rewrites the final row's content straight in this storage and
-    /// publishes to that row's own `ChatStreamingTailBox` instead, so a token
-    /// invalidates one leaf bubble rather than every view that reads the
-    /// transcript. Readers still see current bytes on their next read; what
-    /// they no longer get is a re-render 14 times a second.
-    @ObservationIgnored private var chatMessagesStorage: [String: [ChatMessage]] = [:]
-    @ObservationIgnored let convertedChatTranscriptCache = NativeClient.ChatTranscriptCache()
-    @ObservationIgnored private var chatMessagesTailOnlyWrite = false
-    private(set) var chatMessagesStructureVersion: UInt64 = 0
-    var chatMessagesBySession: [String: [ChatMessage]] {
-        get {
-            access(keyPath: \.chatMessagesBySession)
-            return chatMessagesStorage
+    }() {
+        didSet {
+            guard activeChatSessionId != oldValue else { return }
+            persistActiveChatSessionID(activeChatSessionId.isEmpty ? nil : activeChatSessionId)
+            UserDefaults.standard.set(ISO8601DateFormatter().string(from: Date()), forKey: "activeChatSessionUpdatedAt")
+            MacChatUnreadSessions.shared.markRead(activeChatSessionId)
+            NativeAgentEngine.liveDeviceSync.engine.requestChatSnapshotPublication(includeTranscripts: true)
         }
-        set {
-            withMutation(keyPath: \.chatMessagesBySession) {
-                chatMessagesStorage = newValue
-                if !chatMessagesTailOnlyWrite { chatMessagesStructureVersion &+= 1 }
-                chatMessagesTailOnlyWrite = false
-            }
-        }
-    }
-
-    /// The live content of one streaming row, observed by that row's bubble
-    /// and by nothing else.
-    ///
-    /// Boxes are handed out per message id and created on demand, so the
-    /// bubble can take one before the first chunk exists and a placeholder
-    /// that migrates to a confirmed session id keeps the box it already has.
-    @ObservationIgnored private var streamingTailBoxes: [String: ChatStreamingTailBox] = [:]
-    @ObservationIgnored private var streamingTailBoxOrder: [String] = []
-
-    /// The box for `messageId`, created if this is the first ask. Cheap enough
-    /// to call from a view body: one dictionary lookup, no observation.
-    func streamingTailBox(forMessage messageId: String) -> ChatStreamingTailBox {
-        if let existing = streamingTailBoxes[messageId] { return existing }
-        let box = ChatStreamingTailBox()
-        streamingTailBoxes[messageId] = box
-        streamingTailBoxOrder.append(messageId)
-        // A handful of live tails at once (the main window, detached panels,
-        // parallel sessions) is the whole working set; older rows are settled
-        // and render from the transcript.
-        while streamingTailBoxOrder.count > 8 {
-            streamingTailBoxes.removeValue(forKey: streamingTailBoxOrder.removeFirst())
-        }
-        return box
-    }
-    /// Write `messages` knowing that only the FINAL row differs from what is
-    /// there now. The one caller is the streaming delta (2026-09-06).
-    func setChatMessagesTailOnly(_ messages: [ChatMessage], for sessionId: String) {
-        chatMessagesTailOnlyWrite = true
-        chatMessagesBySession[sessionId] = messages
-    }
-
-    /// Rewrite the content of the FINAL row in place, without extracting the
-    /// transcript, searching it, and writing a whole mutated copy back.
-    ///
-    /// 2026-09-13 (snappiness): this is the streaming delta's write — ~14 a
-    /// second for the length of a reply, on the main actor. The old route
-    /// (`chatMessagesBySession[sessionId]` → `firstIndex(where: id ==)` →
-    /// mutate the copy → write the dictionary back) did a linear pass of
-    /// string comparisons over the whole transcript and a dictionary copy per
-    /// chunk, so a long conversation paid for its own length on every chunk.
-    /// Going straight at the storage through the `_modify` accessors is the
-    /// same observation (the property is still observed, the tail-only flag
-    /// still keeps `chatMessagesStructureVersion` still) with none of that.
-    /// Returns false when the tail is not `messageId` — the caller falls back
-    /// to the general path, which is where an interior rewrite belongs.
-    func setTailChatMessageContent(_ content: String, id messageId: String, in sessionId: String) -> Bool {
-        guard let count = chatMessagesStorage[sessionId]?.count, count > 0,
-              chatMessagesStorage[sessionId]?[count - 1].id == messageId
-        else { return false }
-        // Straight at the storage: the computed `chatMessagesBySession` setter
-        // is what bumps `chatMessagesStructureVersion`, and a tail content
-        // rewrite must not bump it (that is exactly what
-        // `setChatMessagesTailOnly` exists to suppress).
-        chatMessagesStorage[sessionId]?[count - 1].content = content
-        // The one publication a streamed chunk makes: the leaf bubble for this
-        // exact row. Nothing else observes it, so the parent list keeps its
-        // structural snapshot and its layout.
-        streamingTailBox(forMessage: messageId).content = content
-        return true
     }
     var latestContextReceiptBySession: [String: ContextReceipt] = [:]
 
+    /// The active session's loaded transcript (`engine.transcripts`).
     var chatMessages: [ChatMessage] {
-        get { chatMessagesBySession[activeChatSessionId] ?? [] }
-        set { chatMessagesBySession[activeChatSessionId] = newValue }
+        get { engine.transcripts.messages(for: activeChatSessionId) }
+        set { engine.transcripts.setMessages(newValue, for: activeChatSessionId) }
     }
     var latestContextReceipt: ContextReceipt? {
         get { latestContextReceiptBySession[activeChatSessionId] }
@@ -369,18 +275,7 @@ final class AppModel {
     // one of those falls back to the previous value and the panel renders
     // last-week's data as if it were fetched a moment ago. Record which
     // endpoints came back nil so the UI can say so instead of lying.
-    struct PanelRefreshStatus: Equatable, Sendable {
-        /// When the panel last attempted a refresh.
-        var lastAttemptAt: Date
-        /// When the panel last completed a refresh with *every* endpoint OK.
-        /// nil means it has never had a fully-successful refresh this run.
-        var lastSuccessAt: Date?
-        /// Endpoints that returned nil on the last attempt. Non-empty means at
-        /// least one value on screen is carried over from an earlier refresh.
-        var failedEndpoints: [String]
-
-        var isStale: Bool { !failedEndpoints.isEmpty }
-    }
+    typealias PanelRefreshStatus = EngineRuntime.PanelRefreshStatus
 
     enum CompactReadPresentationState: Equatable, Sendable {
         case loading, unavailable, stale, empty, content
@@ -450,19 +345,22 @@ final class AppModel {
     /// is loading, unavailable, or failed.
     var supportDiagnosticsLoading = false
     var capabilityCatalogSourceSaveInFlight = false
-    var health: RuntimeHealth?
-    /// The LAST health probe's own outcome, not the row it fell back to. A
-    /// failed read leaves `health` on its cached row, so anything that says
-    /// "online" has to ask this first.
-    var healthProbeFailed = false
     var activityEvents: [ActivityEvent] = []
-    var executions: [WorkshopExecutionRecord] = []
     var runs: [RunRecord] = []
     /// App integration tests use the same native files behind a temporary
     /// root; production leaves this nil and resolves the ordinary data root.
     var dataRootOverride: URL?
-    var memories: [MemoryRecord] = []
-    var personality: PersonalityProfile?
+    /// The engine for this model's root: the live one, or a body-less one
+    /// over an override. The memory pages observe `engine.memory`.
+    @ObservationIgnored let engine: NativeAgentEngine
+    @ObservationIgnored var widgetContainerUnavailableLogged = false
+    var personality: PersonalityProfile? {
+        didSet {
+            if oldValue?.name != personality?.name {
+                NativeAgentShortcuts.updateAppShortcutParameters()
+            }
+        }
+    }
     private var cachedAgentDisplayName = UserDefaults.standard.string(forKey: "cachedAgentDisplayName")
 
     /// Memory hygiene learns the name she goes by, so a fact "about Agent" is
@@ -482,38 +380,20 @@ final class AppModel {
     }
     var personalityDocs: [PersonalityDoc] = []
     var skills: [SkillRecord] = []
-    var tools: [ToolRecord] = []
-    var chatToolCatalog: ChatToolCatalogSnapshot?
-    /// Last authoritative catalog-read failure. Kept beside the last good
-    /// catalog so the Tools surface can say when it is displaying stale data
-    /// instead of presenting an old snapshot as a fresh one.
-    var chatToolCatalogLoadError: String?
-    /// True after a refresh attempt has FAILED (decode error or dispatch
-    /// throw). Lets the UI distinguish "still loading" (catalog == nil &&
-    /// !loadFailed) from an unavailable catalog (catalog == nil &&
-    /// loadFailed), without presenting the latter as an empty result.
-    var chatToolCatalogLoadFailed: Bool = false
     /// Toolbar-specific single-flight state. Navigation may still perform its
     /// own scoped load, but repeated user taps cannot launch concurrent Tools
     /// refreshes that race to overwrite the visible receipt.
     var isRefreshingTools = false
     var toolsRefreshState: ToolsRefreshPresentation.State = .idle
-    var capabilitySummary: CapabilitySummaryResponse?
     var routePlan: IntentRoutePlan?
     var routePresentation: IntentRoutePresentation = .idle
     var workflows: [WorkflowRecord] = []
-    // Render-cost audit F13: `didSet` keeps `pendingActivityCount` derived from
-    // EVERY mutation path, not just the badge refresh — see the invariant note
-    // on `recomputePendingActivityCount()`.
-    var approvals: [ApprovalRequest] = [] {
-        didSet { recomputePendingActivityCount() }
-    }
     /// Shared by every mounted approval surface. This is UI coordination only;
     /// the ApprovalInbox actor remains the durable terminal-decision authority.
     var approvalResolutionInFlightIDs: Set<String> = []
     /// Retains the one resolver task so direct callers (chat cards included)
     /// join an active decision instead of re-entering NativeClient's executor.
-    var approvalResolutionTasks: [String: Task<ApprovalRequest, Error>] = [:]
+    var approvalResolutionTasks: [String: Task<ApprovalRecord, Error>] = [:]
     /// The decision each in-flight resolution is carrying. 2026-09-06: joining
     /// by id alone handed the FIRST decision's result back to a second caller
     /// who asked for the opposite one, so a Deny pressed over a running Approve
@@ -522,11 +402,7 @@ final class AppModel {
     /// Last compact-Capabilities approval action outcome. This is a UI receipt
     /// only; ApprovalInbox remains the terminal-decision authority.
     var capabilitiesApprovalInboxOutcome: CapabilitiesApprovalInboxResolution?
-    var inboxItems: [InboxItemRecord] = [] {
-        didSet { recomputePendingActivityCount() }
-    }
     var mcpServers: [MCPServerRecord] = []
-    var mcpSessions: [MCPSessionStatus] = []
     var mcpConsent: [MCPConsentRecord] = []
     var mcpTools: [MCPToolRecord] = []
     var mcpToolReadState: MCPHubToolReadState = .notLoaded
@@ -535,7 +411,6 @@ final class AppModel {
     var latestMCPCall: MCPCallResult?
     var mcpRecentCallState: MCPHubRecentCallState = .notLoaded
     var selectedMCPServerId: String?
-    var researchLabRuns: [ResearchLabRun] = []
     var traces: [RuntimeTrace] = []
     var capabilityTraceTimeline: CapabilityTraceFeed.State = .sourceAbsent
     var agentGraph: AgentGraph?
@@ -555,7 +430,6 @@ final class AppModel {
     /// mounted control single-flight so a second click cannot race the
     /// signature gate or make two receipts look like one successful install.
     var isInstallingDemoCapabilityPack = false
-    var capabilityTrust: CapabilityTrustNetwork?
     var latestCapabilityTrustEvaluation: CapabilityTrustEvaluation?
     var latestCapabilityUpdateCheck: CapabilityUpdateCheck?
     var nextGenSummary: NextGenSummary?
@@ -586,19 +460,6 @@ final class AppModel {
     /// instead of a fake success toast or a red error. Cleared by the next
     /// successful action on the affected panel.
     var disabledFeature: String?
-    /// F2: semantic recall results for the Memory tab search box. nil means
-    /// "no search active — show appModel.memories". Populated by
-    /// `runMemorySemanticSearch(query:)` via the root-resolved MemoryV2 owner.
-    var memorySearchResults: [MemoryRecord]? = nil
-    var memorySearchError: String? = nil
-    /// Normalized query that produced `memorySearchResults`. Views must compare
-    /// this before rendering a prior asynchronous response under new keystrokes.
-    var memorySearchResultQuery: String? = nil
-    /// A semantic request is in flight for `memorySearchResultQuery`. This is
-    /// distinct from an empty result so the search field never claims "No
-    /// Matches" while the canonical reader is still working.
-    var memorySearchIsLoading = false
-    var memorySearchGate = LatestAsyncRequestGate()
     var connectorActionRegistry: ConnectorActionRegistry?
     var latestConnectorActionReceipt: ConnectorActionReceipt?
     var improvementGauntletStatus: ImprovementGauntletStatus?
@@ -606,15 +467,6 @@ final class AppModel {
     var latestGauntletRun: ImprovementGauntletRun?
     var productionHardening: ProductionHardeningSummary?
     var productionExports: [ProductionExport] = []
-    var trustPolicy: TrustPolicy? {
-        didSet {
-            guard let policy = trustPolicy else { return }
-            let syncedMode = Self.agentAccessMode(from: policy, fallback: chatFileAccess)
-            if chatFileAccess != syncedMode {
-                chatFileAccess = syncedMode
-            }
-        }
-    }
     /// The last action initiated on the Trust surface. Unlike `statusText`, it
     /// cannot be overwritten by refreshes or work from another surface.
     var trustCenterActionOutcome: TrustCenterActionOutcome?
@@ -623,31 +475,15 @@ final class AppModel {
     /// unavailable-policy envelope. Keeping it separate prevents an old
     /// successful verdict from remaining visible after a later failed run.
     var policySimulationFailure: String?
-    var backups: [BackupRecord] = []
     var connectors: [ConnectorRecord] = []
     var workspaces: [WorkspaceRecord] = []
     var workspaceSearchResults: [WorkspaceSearchResult] = []
     var evals: [EvalRun] = []
     var releaseChecklist: ReleaseChecklist?
-    var watchdogStatus: WatchdogStatus?
     var trainingArtifacts: [TrainingArtifact] = []
-    var jobs: [SchedulerJob] = []
     var improvements: [ImprovementRun] = []
     var improvementSummary: ImprovementSummary?
-    var researchResults: [ResearchResult] = []
-    var doctorReport: DoctorReport?
-    // PATCH-2026-05-30: Doctor in-flight flag so the UI can show a spinner
-    // while the 7-15s probe runs (rather than appearing frozen until done).
-    // Mirrors the doctor button click; flipped true at start of runDoctor,
-    // false in the defer block at the end.
-    var doctorRunning: Bool = false
-    var doctorRunStartedAt: Date?
-    // 2026-07-23 B2.6d: when the last full Doctor run completed. Support
-    // Snapshot reuses that fresh result instead of re-running the whole pass.
-    var doctorReportCompletedAt: Date?
-    var codexAuthStatus: CodexAuthStatus?
     var codexDeviceLogin: CodexDeviceLogin?
-    var modelCatalog: ModelCatalogResponse?
     var isSavingChatBrain = false
     /// One captured chat-brain tuple. Picker fields are optimistic UI caches;
     /// this value is updated only from a checked canonical read or a successful
@@ -687,10 +523,9 @@ final class AppModel {
     /// Hermetic seams for concurrency/failure tests. Production leaves both nil.
     @ObservationIgnored var chatBrainWriteOverride: (@MainActor @Sendable (ChatBrainSelection) async throws -> ChatBrainWriteReceipt)?
     @ObservationIgnored var chatBrainReadOverride: (@MainActor @Sendable () async throws -> ChatBrainSelection)?
-    // PATCH-2026-05-07: chat-provider-picker Cache provider list + active
-    // chat provider so the chat screen can render a Provider→Model dual
-    // picker without re-fetching every render.
-    var providersList: [ProviderInfo] = []
+    // PATCH-2026-05-07: chat-provider-picker Cache the active chat provider
+    // so the chat screen can render a Provider→Model dual picker without
+    // re-fetching every render (the list is `engine.providers.connections`).
     // PATCH-2026-05-07: chat-binding-fix Stored property (not computed)
     // so @Observable actually tracks changes. UserDefaults persistence is
     // a side effect of didSet.
@@ -710,22 +545,7 @@ final class AppModel {
     // FIX: last decode/network failure seen during refreshAll, so swallowed
     // section failures are observable instead of silently blanking the UI.
     var lastRefreshError: String? = nil
-    // PATCH-2026-05-13: parallel-sessions — per-session chat state so the user
-    // can work in multiple sessions concurrently. Daemon already supports
-    // parallel sessions (per-session chat_file_lock). The single-flight guard
-    // here in the Mac UI was the only blocker.
-    //
-    // `isBusy` / `isChatStreaming` / `currentChatTaskSessionId` are preserved
-    // as computed back-compat properties that report the ACTIVE session's
-    // state — which is what nearly every ContentView call site actually
-    // wants. The new per-session API is `isSessionBusy(_:)` /
-    // `isSessionStreaming(_:)` for code that needs to inspect non-active
-    // sessions (e.g. running-indicator badges in the sidebar).
-    var busySessions: Set<String> = []
-    /// Synchronous mutex for the one-time first-run welcome greeting: set before
-    /// the provider-refresh await so the .task + two onChange triggers can't
-    /// double-greet. See AppModel+FirstRunWelcome.
-    @ObservationIgnored var firstRunGreetingInFlight = false
+    @ObservationIgnored let firstRunWelcomeTransaction = FirstRunWelcomeTransaction()
     /// Backing cache for `firstConversationReceiptTitle`. The recorded title
     /// never changes once the first conversation has armed its write token, so
     /// a positive answer is cached for the process; a negative one is re-read,
@@ -742,81 +562,26 @@ final class AppModel {
     /// a deferred or rejected first greeting instead of silently dismissing
     /// into Chat as though the kickoff had happened.
     var onboardingWizardCompletionReceipt: OnboardingWizardCompletionReceipt?
-    var streamingSessions: Set<String> = []
-    /// Sessions whose running turn has started to publish reply text. Written
-    /// once when the first non-empty snapshot lands and cleared with the
-    /// turn, never per token — the window haze reads it (WindowHaze.swift).
-    var replyingSessions: Set<String> = []
-    var chatTasks: [String: Task<Void, Never>] = [:]
-    var chatTaskGenerations: [String: Int] = [:]
-    /// The one authoritative Mac presentation lifecycle for the current or
-    /// most-recent accepted turn in each session. Operational events, stop
-    /// requests, and evidence-backed terminals all reduce into this state.
-    var chatTurnLifecycleBySession: [String: MacChatTurnLifecycleState] = [:]
-    /// What the agent is looking at while it drives the Mac, per session. Lives
-    /// and dies with the turn's card: opened by the first Mac verb of a turn,
-    /// cleared when the next turn opens or this one's intake closes. Empty for
-    /// every turn that never touches the Mac.
-    var macScreenPreviewBySession: [String: MacChatScreenPreview] = [:]
-    @ObservationIgnored var activeChatTurnLifecycleIDsBySession: [String: String] = [:]
-    /// When this session's turn last applied a pure stream-progress bump, and
-    /// to which turn. 2026-09-14 (snappiness): see
-    /// `recordChatTurnStreamProgress`.
-    @ObservationIgnored var chatStreamProgressAppliedAt: [String: (turnId: String, at: Date)] = [:]
-    @ObservationIgnored var chatTurnLifecycleStore = MacChatTurnLifecycleStore()
-    @ObservationIgnored var chatTurnTranscriptProofReader: any MacChatTurnTranscriptProofReading =
-        MacChatTurnTranscriptProofReader()
-    @ObservationIgnored var chatTurnLifecycleRepairCompleted = false
+    var chatTurnTranscriptProofReader: any MacChatTurnTranscriptProofReading {
+        get { engine.turns.runtime.chatTurnTranscriptProofReader }
+        set { engine.turns.runtime.chatTurnTranscriptProofReader = newValue }
+    }
+    var chatTurnLifecycleRepairCompleted: Bool {
+        get { engine.turns.runtime.chatTurnLifecycleRepairCompleted }
+        set { engine.turns.runtime.chatTurnLifecycleRepairCompleted = newValue }
+    }
     /// User, 2026-09-06: a profile repair that landed while a turn was running.
     /// The resident refresh stops and restarts Context Flow and reloads
     /// cognition, so it waits for the last active turn to close rather than
     /// pulling the ground out from under a turn in flight.
     @ObservationIgnored var residentRefreshPendingAfterActiveTurns = false
-    /// User-authored turns waiting behind the active turn, keyed by canonical
-    /// session id. They stay outside the transcript/provider path until they
-    /// become active, so queued text cannot race or duplicate the running turn.
-    var queuedChatTurnsBySession: [String: [QueuedChatTurn]] = [:]
-    /// A manual Stop pauses automatic queue drain for that session. Natural
-    /// completion drains immediately; Steer explicitly unpauses and promotes.
-    var pausedChatQueueSessions: Set<String> = []
-    /// 2026-09-06: why the queue paused, when it paused because a queued turn
-    /// FAILED to start. The drain used to discard the typed rejection's
-    /// message, so the strip read "Paused" and the person was never told what
-    /// went wrong. Absent for an ordinary Stop-pause, which needs no reason.
-    var chatQueuePauseReasons: [String: String] = [:]
     /// Hermetic queue-drain seam. Production leaves this nil and starts the
     /// real chat turn; tests can prove FIFO/promotion without touching a
     /// provider, transcript, or the user's runtime root.
-    @ObservationIgnored var queuedChatTurnStartOverride: (@MainActor @Sendable (QueuedChatTurn, String) async -> ChatTurnAcceptance)?
-    @ObservationIgnored var drainingChatQueueSessions: Set<String> = []
-    // 2026-06-10 audit FIX 4: stopChatStream's cancelled.flag write used to be
-    // fire-and-forget — Stop then a quick re-Send raced the new turn's
-    // flag-clear, so the stale write could land mid-turn and kill the NEW
-    // turn. Track the in-flight write per session; turn starts await it via
-    // awaitPendingCancelFlagWrite(for:) so the write is ordered BEFORE the
-    // turn-start clear. Entries self-remove when the latest write completes
-    // (generation-guarded, all on MainActor).
-    var pendingCancelFlagWrites: [String: Task<Void, Never>] = [:]
-    var pendingCancelFlagWriteGenerations: [String: Int] = [:]
-    // PATCH-2026-05-13: parallel-sessions — when a session is streaming but
-    // not active, we still need to know (a) the live delta-buffer and (b)
-    // the in-flight bubble id so that switching back to the session can
-    // restore the live-text bubble without waiting for the next refresh.
-    // 2026-09-13 (performance pass 3): this buffer is written on EVERY delta —
-    // the only uncoalesced per-token write in the turn — and it is read only by
-    // `selectChatSession`'s restore path, never by a view. Keeping it out of
-    // observation means a token costs a dictionary store and nothing else; the
-    // one write the UI reacts to stays the coalesced
-    // `updateChatMessageContent` below it.
-    @ObservationIgnored var streamingTexts: [String: String] = [:]
-    var streamingBubbleIds: [String: String] = [:]
-    // PATCH-2026-05-13: parallel-sessions — also stash the optimistic user
-    // turn (id + content) for each in-flight session. If the user switches
-    // away/back before the daemon has persisted the user message, we
-    // re-inject it so the visible session shows both the prompt and the
-    // streaming reply, not just the reply.
-    var streamingUserTurnIds: [String: String] = [:]
-    var streamingUserTurnTexts: [String: String] = [:]
+    var queuedChatTurnStartOverride: (@MainActor @Sendable (QueuedChatTurn, String) async -> ChatTurnAcceptance)? {
+        get { engine.turns.runtime.queuedChatTurnStartOverride }
+        set { engine.turns.runtime.queuedChatTurnStartOverride = newValue }
+    }
     var chatSelectionGeneration = 0
 
     /// Clear the per-session streaming-bubble state for `sessionId` BEFORE
@@ -837,7 +602,7 @@ final class AppModel {
             }
             UserDefaults.standard.set(normalized, forKey: "chatPersona")
             Task {
-                await NativeContextFlowRuntime.shared.personaPickerDidChange()
+                await NativeAgentEngine.live.contextFlow.personaPickerDidChange()
             }
         }
     }
@@ -882,19 +647,11 @@ final class AppModel {
     // from selfImprovementError so a dream/REM failure doesn't bleed into the
     // Self-Improvement view's banner).
     var dreamError: String?
-    // PATCH-2026-05-07: living-memory Memory proposals state
-    var memoryProposals: [MemoryProposalRecord] = [] {
-        didSet {
-            recomputePendingActivityCount()
-            MemoryReviewReminder.consider(pending: pendingMemoryProposalsCount, agentName: agentDisplayName)
-        }
-    }
     var pendingMemoryProposalsCount: Int {
-        memoryProposals.filter { $0.status == "pending" }.count
+        engine.memory.proposals.filter { $0.status == "pending" }.count
     }
 
     // PATCH-2026-05-08: wave3 Feature A/B state
-    var healthCard: HealthCard?
     @ObservationIgnored var healthCardRefreshGate = LatestSnapshotRefreshGate()
 
     @MainActor
@@ -925,7 +682,7 @@ final class AppModel {
     }
 
     var pendingApprovalsCount: Int {
-        approvals.filter { $0.status.lowercased() == "pending" }.count
+        engine.approvals.records.filter { $0.status.lowercased() == "pending" }.count
     }
 
     /// W6/G12: the badge counts the "For you" lane ONLY.
@@ -937,7 +694,7 @@ final class AppModel {
     /// means "you are needed". Lane membership is defined once on
     /// `InboxItemRecord` (`InboxView.swift`) and read here and by the list.
     var pendingInboxCount: Int {
-        inboxItems.filter { $0.isActivityPending && $0.isForYouLane }.count
+        engine.inbox.items.filter { $0.isActivityPending && $0.isForYouLane }.count
     }
 
     var pendingTrainingProposalCount: Int {
@@ -955,7 +712,7 @@ final class AppModel {
     /// Render-cost audit F13 — the root `ContentView` observes ONE scalar.
     ///
     /// This used to be a computed property fanning out to five stored
-    /// collections (`approvals`, `inboxItems`, `memoryProposals`,
+    /// collections (`engine.approvals.records`, `engine.inbox.items`, `engine.memory.proposals`,
     /// `trainingProposals`, `promotionCandidates`). Reading it inside
     /// `ContentView.body` (`ContentView.swift:372`, the sidebar badge)
     /// registered an Observation dependency on all five, so ANY write to ANY
@@ -988,11 +745,11 @@ final class AppModel {
     }
 
     /// PATCH-2026-06-06: activity-flatten — when Cmd+Shift+A / Cmd+Shift+I
-    /// fires from a tab other than Activity, ActivityView is not yet mounted
-    /// and its `.onReceive(.openActivitySectionRequest)` cannot observe the
+    /// fires from another page, Today is not yet mounted and its
+    /// `.onReceive(.openActivitySectionRequest)` cannot observe the
     /// notification. ContentView stashes the target section here before
-    /// switching tabs; ActivityView consumes + clears it on `.task`. The
-    /// notification path still works when Activity is already the active tab.
+    /// switching pages; Today consumes + clears it on appear. The
+    /// notification path still works when Today is already in front.
     var pendingActivitySectionRaw: String? = nil
 
     static func isHumanActionableTrainingProposal(_ proposal: TrainingProposalSummary) -> Bool {
@@ -1020,7 +777,7 @@ final class AppModel {
             else { UserDefaults.standard.removeObject(forKey: "activeChatSessionId") }
         },
         chatSnapshotPublisher: @escaping @MainActor () -> Void = {
-            MacSyncEngine.shared.requestChatSnapshotPublication(includeTranscripts: false)
+            NativeAgentEngine.liveDeviceSync.engine.requestChatSnapshotPublication(includeTranscripts: false)
         }
     ) {
         // Earlier builds mirrored the secure-field draft into UserDefaults.
@@ -1028,9 +785,33 @@ final class AppModel {
         // discard that legacy plaintext draft on the first current launch.
         UserDefaults.standard.removeObject(forKey: "telegramToken")
         self.dataRootOverride = dataRootOverride
+        self.engine = dataRootOverride.map { NativeAgentEngine(dataRoot: $0, ports: .app(dataRoot: $0), hasBody: false) } ?? .live
         self.backgroundLoopsManager = backgroundLoopsManager
         self.activeChatSessionIDWriter = activeChatSessionIDWriter
         self.chatSnapshotPublisher = chatSnapshotPublisher
+        // Render-cost audit F13: these hooks keep `pendingActivityCount`
+        // derived from EVERY mutation path, not just the badge refresh — see
+        // the invariant note on `recomputePendingActivityCount()`.
+        engine.approvals.recordsDidChange = { [weak self] in self?.recomputePendingActivityCount() }
+        engine.inbox.itemsDidChange = { [weak self] in self?.recomputePendingActivityCount() }
+        engine.turns.activityDidChange = { [weak self] in
+            if #available(macOS 27, *) {
+                Task { [weak self] in await self?.publishWidgetStatus() }
+            }
+        }
+        // Every policy read or write re-syncs the chat's access mode.
+        engine.trust.policyDidChange = { [weak self] in
+            guard let self, let policy = engine.trust.policy else { return }
+            let syncedMode = Self.agentAccessMode(from: policy, fallback: chatFileAccess)
+            if chatFileAccess != syncedMode {
+                chatFileAccess = syncedMode
+            }
+        }
+        engine.memory.proposalsDidChange = { [weak self] in
+            guard let self else { return }
+            recomputePendingActivityCount()
+            MemoryReviewReminder.consider(pending: pendingMemoryProposalsCount, agentName: agentDisplayName)
+        }
         guard startBackgroundTasks else { return }
         Task { @MainActor in await self.refreshSurfacePickerCache() }
         pollScheduler.bind(to: self)
@@ -1040,7 +821,6 @@ final class AppModel {
         NativeClient(
             baseURL: nativeBaseURL,
             dataRootOverride: dataRootOverride,
-            chatTranscriptCache: convertedChatTranscriptCache,
             backgroundLoopsManager: backgroundLoopsManager
         )
     }

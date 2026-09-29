@@ -41,6 +41,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import Studio
 
 /// What the encounter lane decided, and why. Returned rather than logged so the
 /// kill criterion ("if seeds mint and she doesn't file them") can be measured

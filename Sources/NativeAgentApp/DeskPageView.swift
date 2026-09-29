@@ -21,8 +21,8 @@
 //
 // Every row reads from the SAME stores the classic Desk reads, in the same
 // order, with the same failure honesty — literally the same function, now that
-// the read lives in `DeskBoardRead` (DeskBoardRead.swift) and both pages call
-// it. An unreadable lane says so instead of rendering as calm:
+// the read lives in `engine.desk.loadBoard` (EngineDesk.swift) and both pages
+// call it. An unreadable lane says so instead of rendering as calm:
 //
 //   desk items          SwiftNativeDeskStore.liveState()
 //   in progress         DeskProgramFamilyPresentation.families + the workshop
@@ -33,11 +33,11 @@
 //   watching / stale    DeskBoardLayout.watches + DeskItemPresentation.staleThresholdDays
 //   GitHub Watcher      GitHubCommandStore.liveState().items, bucketed by
 //                       DeskGitHubBucket
-//   schedule            AppModel.jobs (AppModel.refreshSchedulerJobs)
+//   schedule            engine.desk.jobs (AppModel.refreshSchedulerJobs)
 //
-// NOTHING is deleted from the classic Desk: DeskHubView still renders the old
-// page in the classic shell, and this page opens it in a sheet for every action
-// that has no home here yet.
+// NOTHING is deleted from the classic Desk: this page opens it in a sheet for
+// every action that has no home here yet, and its New task button opens the
+// same New Desk Task sheet the classic toolbar did.
 //
 // Alive glass (User approved the mockup, 2026-09-23): the same lanes, drawn from
 // AlivePageKit — a serif "Desk" with one counts sentence, what's waiting in one
@@ -48,7 +48,10 @@
 import SwiftUI
 import AppKit
 import PersistenceCore
+import Desk
+import GitHubConnector
 import SelfImprovement
+import TriggerScheduler
 import WorkshopExecution
 
 // MARK: - Words
@@ -141,13 +144,13 @@ struct DeskPageSnapshot: Sendable {
 
     static let empty = DeskPageSnapshot()
 
-    /// The SAME store read the classic Desk performs (`DeskBoardRead`), minus
+    /// The SAME store read the classic Desk performs (`engine.desk.loadBoard`), minus
     /// the parts only the classic Desk renders — the sequencing plan and alias
     /// map it does not ask for, and her hour, which the classic page reads on
     /// the main actor. Same stores, same order, same failure classification,
     /// because it is the same function.
-    static func load(root: URL) async -> DeskPageSnapshot {
-        let read = await DeskBoardRead.load(root: root)
+    static func load(desk: DeskFacade) async -> DeskPageSnapshot {
+        let read = await desk.loadBoard()
         var snapshot = DeskPageSnapshot()
         snapshot.loaded = true
         snapshot.items = read.items
@@ -363,7 +366,7 @@ enum DeskPageContent {
     /// A missed occurrence is neither running nor paused, so it is counted on
     /// its own: nothing ran, and the page says so instead of staying silent.
     /// `bots` is the unpaused bots on a schedule; each one runs on a timer too.
-    static func scheduleHeadline(_ jobs: [SchedulerJob], missed: Int = 0, bots: Int = 0) -> String {
+    static func scheduleHeadline(_ jobs: [ScheduledJob], missed: Int = 0, bots: Int = 0) -> String {
         let paused = jobs.count - jobs.filter(\.enabled).count
         let running = jobs.count - paused + bots
         var tail = paused > 0 ? ", \(DeskPageWords.spelledLower(paused)) paused" : ""
@@ -376,7 +379,7 @@ enum DeskPageContent {
             + "\(DeskPageWords.plural(running, "thing runs", "things run")) on a timer" + tail
     }
 
-    static func scheduleLine(_ job: SchedulerJob) -> String {
+    static func scheduleLine(_ job: ScheduledJob) -> String {
         guard job.enabled else { return "Paused." }
         guard let seconds = job.intervalSeconds, seconds > 0 else { return "On its own schedule." }
         if seconds % 86_400 == 0 {
@@ -434,6 +437,18 @@ struct DeskPageView: View {
                 HStack(alignment: .firstTextBaseline) {
                     AlivePageHeader(title: "Desk", line: headerLine)
                     Spacer(minLength: 12)
+                    // ContentView owns the New Task sheet (a sheet attached
+                    // here presents only once on macOS); the page posts.
+                    Button {
+                        NotificationCenter.default.post(name: .newWorkshopTaskRequest, object: nil)
+                    } label: {
+                        Label("New task", systemImage: "plus")
+                            .font(.system(size: 13))
+                            .foregroundStyle(NativeAgentShell.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.trailing, 8)
+                    .accessibilityIdentifier("desk.new-task")
                     Button { sheet = .research } label: {
                         Label("Look something up", systemImage: "magnifyingglass")
                             .font(.system(size: 13))
@@ -527,7 +542,7 @@ struct DeskPageView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         // A route to the Desk is a route to its ROOT: the folds close, the
-        // stores are re-read. Same contract DeskHubView keeps for its modes.
+        // stores are re-read.
         // This is also first paint — one task, owned by the view, instead of a
         // detached `Task {}` from onChange that outlived it.
         .liveTask(id: rootRouteVersion) {
@@ -565,6 +580,9 @@ struct DeskPageView: View {
                 sheet = nil
                 Task { await reload() }
             }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .deskTaskCreated)) { _ in
+            Task { await reload() }
         }
         // A click on a Desk reminder banner while this page is already up.
         .onChange(of: appModel.pendingDeskHandle) { openPendingDeskItem(scroller) }
@@ -831,7 +849,7 @@ struct DeskPageView: View {
     private var staleItems: [DeskItem] { DeskPageContent.staleWatches(items, now: now) }
 
     private var boardIsEmpty: Bool {
-        blockedItems.isEmpty && watchItems.isEmpty && githubItems.isEmpty && appModel.jobs.isEmpty
+        blockedItems.isEmpty && watchItems.isEmpty && githubItems.isEmpty && appModel.engine.desk.jobs.isEmpty
     }
 
     // MARK: finished work
@@ -938,7 +956,7 @@ struct DeskPageView: View {
                 label: "\(count) \(noun)",
                 title: DeskPageContent.githubHeadline(githubItems)))
         }
-        let jobs = appModel.jobs
+        let jobs = appModel.engine.desk.jobs
         let running = jobs.filter(\.enabled).count + timedBots.count
         var timer = running == 0 ? "nothing on a timer" : "\(running) on a timer"
         if !missedBots.isEmpty {
@@ -1173,7 +1191,7 @@ struct DeskPageView: View {
                 line: bot.line,
                 meta: BotsShelfRecord.shortDate(bot.dueAt))
         }
-        ForEach(appModel.jobs) { job in
+        ForEach(appModel.engine.desk.jobs) { job in
             DeskPageDetailRow(
                 title: TodayWords.line(job.name, limit: 110),
                 line: DeskPageContent.scheduleLine(job),
@@ -1313,8 +1331,10 @@ struct DeskPageView: View {
         // publishes nothing at all, rather than half-replacing the board.
         let token = loadGate.begin()
         _ = await appModel.refreshSchedulerJobs()
+        // The page's own root, the one its actions and bot reads use.
+        let desk = DeskFacade(dataRoot: PersistenceCore.defaultDataRoot())
         let loaded = await Task.detached(priority: .userInitiated) {
-            await DeskPageSnapshot.load(root: PersistenceCore.defaultDataRoot())
+            await DeskPageSnapshot.load(desk: desk)
         }.value
         let missed = await Task.detached(priority: .userInitiated) {
             DeskMissedBot.load(root: PersistenceCore.defaultDataRoot())
@@ -1379,6 +1399,25 @@ private struct DeskPageSheetHost: View {
     }
 
     var body: some View {
+        PageSheetHost(title: title, onDone: onDone) {
+            switch sheet {
+            case .classicDesk: DeskView()
+            case .schedule: SchedulerView()
+            case .research: ResearchView()
+            }
+        }
+    }
+}
+
+/// A full surface a page folds to but does not re-implement, in a sheet: its
+/// title and Done, then the surface itself. The Desk and Today both open
+/// theirs this way.
+struct PageSheetHost<Content: View>: View {
+    let title: String
+    let onDone: () -> Void
+    @ViewBuilder let content: () -> Content
+
+    var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack {
                 Text(title)
@@ -1390,14 +1429,8 @@ private struct DeskPageSheetHost: View {
             .padding(.horizontal, 16)
             .padding(.vertical, 12)
             Divider()
-            Group {
-                switch sheet {
-                case .classicDesk: DeskView()
-                case .schedule: SchedulerView()
-                case .research: ResearchView()
-                }
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            content()
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .frame(minWidth: 720, idealWidth: 900, minHeight: 520, idealHeight: 700)
     }
@@ -1548,38 +1581,24 @@ struct DeskPageFoldRow<Content: View>: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        // The Mac's own disclosure (User 09-27: all controls native).
+        DisclosureGroup(isExpanded: $isOpen) {
+            VStack(alignment: .leading, spacing: 10) {
+                content()
+            }
+            .padding(.top, 12)
+        } label: {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
                 Text(title)
                     .font(.system(size: DeskPageMetrics.titleSize, weight: .semibold))
                     .foregroundStyle(NativeAgentShell.text)
                     .fixedSize(horizontal: false, vertical: true)
-                Image(systemName: "chevron.right")
-                    .font(ShellType.captionSemibold)
-                    .foregroundStyle(NativeAgentShell.tertiary)
-                    .rotationEffect(.degrees(isOpen ? 90 : 0))
                 Spacer(minLength: 8)
                 if let meta, !meta.isEmpty {
                     Text(meta)
                         .font(.system(size: DeskPageMetrics.metaSize))
                         .foregroundStyle(NativeAgentShell.tertiary)
                 }
-            }
-            // The gesture belongs to the HEADER, not the card: with sixty rows
-            // open, a click anywhere would otherwise fold them away again.
-            .contentShape(Rectangle())
-            .onTapGesture {
-                withAnimation(NativeAgentMotion.respecting(
-                    NativeAgentMotion.quick, reduceMotion: reduceMotion
-                )) { isOpen.toggle() }
-            }
-            .accessibilityAddTraits(.isButton)
-            if isOpen {
-                VStack(alignment: .leading, spacing: 10) {
-                    content()
-                }
-                .padding(.top, 2)
-                .transition(NativeAgentMotion.reveal(reduceMotion: reduceMotion))
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)

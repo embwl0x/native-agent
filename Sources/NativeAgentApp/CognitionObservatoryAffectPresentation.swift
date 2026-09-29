@@ -1,4 +1,5 @@
 import Foundation
+import Cognition
 import CognitiveSubstrate
 
 /// Read-only presentation contract for the Observatory's Affect Signals panel.

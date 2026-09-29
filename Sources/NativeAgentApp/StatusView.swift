@@ -73,15 +73,18 @@ struct StatusView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
+                // The living status card — posture, body, behaviour, and the
+                // Desk, approvals and dream it reads — first, above the app's.
+                LivingStatusPanel()
                 NativePanel(title: "The app", systemImage: "server.rack") {
-                    Label(appModel.statusText, systemImage: appModel.health?.ok == true ? "checkmark.circle.fill" : "xmark.octagon")
-                        .foregroundStyle(appModel.health?.ok == true ? .green : .red)
-                    if let health = appModel.health {
+                    Label(appModel.statusText, systemImage: appModel.engine.doctor.health?.ok == true ? "checkmark.circle.fill" : "xmark.octagon")
+                        .foregroundStyle(appModel.engine.doctor.health?.ok == true ? .green : .red)
+                    if let health = appModel.engine.doctor.health {
                         LazyVGrid(columns: [GridItem(.adaptive(minimum: 150), spacing: 10)], spacing: 10) {
                             MetricTile(title: "Version", value: health.version, systemImage: "number")
                             MetricTile(title: "Uptime", value: "\(Int(health.uptimeSeconds))s", systemImage: "timer")
                             MetricTile(title: "Runs", value: "\(appModel.runs.count)", systemImage: "play.rectangle")
-                            MetricTile(title: "Sessions", value: "\(appModel.chatSessions.count)", systemImage: "bubble.left.and.bubble.right")
+                            MetricTile(title: "Sessions", value: "\(appModel.engine.transcripts.sessions.count)", systemImage: "bubble.left.and.bubble.right")
                         }
                         Text(UserDisplayFormatters.tildifyPath(health.dataDir))
                             .font(NativeAgentFont.mono)
@@ -92,7 +95,7 @@ struct StatusView: View {
                     }
                 }
 
-                if let watchdog = appModel.watchdogStatus {
+                if let watchdog = appModel.engine.doctor.watchdog {
                     NativePanel(title: "Background work", systemImage: "waveform.path.ecg") {
                         HStack {
                             StatusBadge(text: watchdog.runtimeBadgeText, status: watchdog.runtimeBadgeStatus)
@@ -101,11 +104,11 @@ struct StatusView: View {
                                 .foregroundStyle(.secondary)
                             Spacer()
                         }
-                        Text("Status: \(watchdog.runtimeLifecycleStatus) · Desk tasks running \(watchdog.runningExecutions) · improvements \(watchdog.runningImprovements)")
+                        Text("Status: \(watchdog.runtimeLifecycleStatus) · Desk tasks running \(watchdog.runningExecutions ?? 0) · improvements \(watchdog.runningImprovements ?? 0)")
                             .font(.caption)
                             .foregroundStyle(.secondary)
-                        if !watchdog.launchAgentStatus.isEmpty {
-                            Text("Old startup helper: \(watchdog.launchAgentStatus) · \(watchdog.launchAgentDetail)")
+                        if let launchAgentStatus = watchdog.launchAgentStatus, !launchAgentStatus.isEmpty {
+                            Text("Old startup helper: \(launchAgentStatus) · \(watchdog.launchAgentDetail ?? "")")
                                 .font(.caption2)
                                 .foregroundStyle(NativeAgentShell.secondary)
                         }

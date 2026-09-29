@@ -3,13 +3,39 @@ import NativeAgentCore
 import PersistenceCore
 import ProviderRouting
 
+private actor TelegramTypingHeartbeat {
+    let start: @Sendable () -> Task<Void, Never>
+    private var task: Task<Void, Never>?
+    private var stopped = false
+
+    init(start: @escaping @Sendable () -> Task<Void, Never>) { self.start = start }
+
+    func setSettled(_ settled: Bool) {
+        guard !stopped else { return }
+        if settled {
+            task?.cancel()
+            task = nil
+        } else if task == nil {
+            task = start()
+        }
+    }
+
+    func stop() async {
+        stopped = true
+        let pending = task
+        task = nil
+        pending?.cancel()
+        await pending?.value
+    }
+}
+
 extension TelegramPollLoop {
-    func startTypingHeartbeat(destination: TelegramDestination) async -> Task<Void, Never>? {
+    private func startTypingHeartbeat(destination: TelegramDestination) async -> TelegramTypingHeartbeat {
         let token = self.token
         let sendChatAction = self.sendChatAction
         let delay = typingRefreshNanoseconds
         // Presence must never delay starting the actual conversation.
-        return Task {
+        let heartbeat = TelegramTypingHeartbeat { Task {
             while !Task.isCancelled {
                 do {
                     try await sendChatAction(token, destination, "typing")
@@ -23,7 +49,9 @@ extension TelegramPollLoop {
                 do { try await Task.sleep(nanoseconds: delay) }
                 catch { break }
             }
-        }
+        } }
+        await heartbeat.setSettled(false)
+        return heartbeat
     }
 
     func makeTurnProgressCard(
@@ -93,8 +121,11 @@ extension TelegramPollLoop {
             turnId: turnId,
             ordinary: ordinary,
             sendOrdinary: sendMessage,
-            sendRichDraft: sendRichMessageDraft,
-            sendRichFinal: sendRichMessage,
+            // User 09-27: one real message that grows in place. The rich draft
+            // is a 30-second preview, so its final had to arrive as a second
+            // message and read as a rewrite. Restore these two to go back.
+            sendRichDraft: nil,
+            sendRichFinal: nil,
             richDraftInterval: draftEditIntervalSeconds,
             recordFailure: { redactedError in
                 await recordError(
@@ -172,6 +203,8 @@ extension TelegramPollLoop {
 
     static func progressMessage(for event: TelegramChatProgressEvent) -> String? {
         switch event {
+        case .replyTextSettled:
+            return nil
         case .status(let text):
             let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
             return trimmed.isEmpty ? nil : trimmed
@@ -244,24 +277,30 @@ extension TelegramPollLoop {
         suppressUserAppend: Bool = false,
         sessionId: String? = nil
     ) async throws -> String {
-        let typingTask = await startTypingHeartbeat(destination: destination)
+        let typing = await startTypingHeartbeat(destination: destination)
+        let displayProgress: TelegramChatProgressSink = { event in
+            if case .replyTextSettled(let settled) = event {
+                await typing.setSettled(settled)
+            } else {
+                await typing.setSettled(false)
+            }
+            await progress(event)
+        }
         return try await withTaskCancellationHandler {
             do {
                 let reply = try await runChatHandlerAttempts(
                     destination: destination, text: text, attachments: attachments,
-                    progress: progress, replyTo: replyTo, fromUserId: fromUserId,
+                    progress: displayProgress, replyTo: replyTo, fromUserId: fromUserId,
                     suppressUserAppend: suppressUserAppend, sessionId: sessionId
                 )
-                typingTask?.cancel()
-                await typingTask?.value
+                await typing.stop()
                 return reply
             } catch {
-                typingTask?.cancel()
-                await typingTask?.value
+                await typing.stop()
                 throw error
             }
         } onCancel: {
-            typingTask?.cancel()
+            Task { await typing.stop() }
         }
     }
 

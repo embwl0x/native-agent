@@ -1,5 +1,4 @@
 import Foundation
-import MCPDispatcher
 import NativeAgentCore
 import PersistenceCore
 
@@ -29,9 +28,9 @@ import PersistenceCore
 
 // MARK: - Wire types
 //
-// Shape matches Sources/NativeAgentApp/Models.swift:1593-1636 exactly.
+// The app renders these directly (Capabilities, engine.trust).
 
-public struct CapabilityTrustRoot: Sendable, Codable, Equatable {
+public struct CapabilityTrustRoot: Sendable, Codable, Hashable, Identifiable {
     public var id: String
     public var name: String
     public var kind: String?
@@ -50,7 +49,7 @@ public struct CapabilityTrustRoot: Sendable, Codable, Equatable {
     }
 }
 
-public struct CapabilityCatalogSource: Sendable, Codable, Equatable {
+public struct CapabilityCatalogSource: Sendable, Codable, Hashable, Identifiable {
     public var id: String
     public var name: String
     public var kind: String?
@@ -73,7 +72,7 @@ public struct CapabilityCatalogSource: Sendable, Codable, Equatable {
     }
 }
 
-public struct CapabilityTrustRecord: Sendable, Codable, Equatable {
+public struct CapabilityTrustRecord: Sendable, Codable, Hashable, Identifiable {
     public var id: String
     public var name: String?
     public var kind: String?
@@ -94,7 +93,7 @@ public struct CapabilityTrustRecord: Sendable, Codable, Equatable {
     }
 }
 
-public struct CapabilityTrustSummary: Sendable, Codable, Equatable {
+public struct CapabilityTrustSummary: Sendable, Codable, Hashable {
     public var trusted: Int
     public var review: Int
     public var untrusted: Int
@@ -104,7 +103,7 @@ public struct CapabilityTrustSummary: Sendable, Codable, Equatable {
     }
 }
 
-public struct CapabilityTrustNetwork: Sendable, Codable, Equatable {
+public struct CapabilityTrustNetwork: Sendable, Codable, Hashable {
     public var status: String
     public var roots: [CapabilityTrustRoot]
     public var sources: [CapabilityCatalogSource]
@@ -122,7 +121,7 @@ public struct CapabilityTrustNetwork: Sendable, Codable, Equatable {
     }
 }
 
-public struct CapabilityTrustEvaluation: Sendable, Codable, Equatable {
+public struct CapabilityTrustEvaluation: Sendable, Codable, Hashable {
     public var id: String
     public var name: String?
     public var trustScore: Double
@@ -242,7 +241,7 @@ public func capabilityTrustTier(forScore score: Double) -> String {
 
 // MARK: - Static capability record (manifest-derived subset)
 
-public struct CapabilityRecord: Codable, Sendable, Equatable {
+public struct CapabilityRecord: Codable, Sendable, Hashable, Identifiable {
     public var id: String
     public var sourceId: String?
     public var name: String?
@@ -270,6 +269,65 @@ public struct CapabilityRecord: Codable, Sendable, Equatable {
         self.riskClass = riskClass; self.autoload = autoload
         self.useCount = useCount; self.lastUsedAt = lastUsedAt
         self.updatedAt = updatedAt
+    }
+
+    /// Typed read of the dynamic catalog/intent row, without a JSON byte round-trip.
+    /// The mounted catalog requires both identity and kind; malformed optional
+    /// fields reject the row just as its former Codable projection did.
+    public init(catalogRow row: [String: JSONValue]) throws {
+        struct Key: CodingKey {
+            let stringValue: String
+            var intValue: Int? { nil }
+            init(stringValue: String) { self.stringValue = stringValue }
+            init?(intValue: Int) { return nil }
+        }
+        func value<T>(_ key: String, _ read: (JSONValue) -> T?) throws -> T? {
+            guard let raw = row[key], raw != .null else { return nil }
+            guard let result = read(raw) else {
+                throw DecodingError.typeMismatch(T.self,
+                    .init(codingPath: [Key(stringValue: key)], debugDescription: "Invalid capability field: \(key)"))
+            }
+            return result
+        }
+        func string(_ key: String) throws -> String? {
+            try value(key) { if case .string(let s) = $0 { return s }; return nil }
+        }
+        func requiredString(_ key: String) throws -> String {
+            let codingKey = Key(stringValue: key)
+            guard row[key] != nil else {
+                throw DecodingError.keyNotFound(codingKey,
+                    .init(codingPath: [], debugDescription: "Missing capability field: \(key)"))
+            }
+            guard let result = try string(key) else {
+                throw DecodingError.valueNotFound(String.self,
+                    .init(codingPath: [codingKey], debugDescription: "Null capability field: \(key)"))
+            }
+            return result
+        }
+        func strings(_ key: String) throws -> [String]? {
+            try value(key) { raw in
+                guard case .array(let values) = raw else { return nil }
+                let strings = values.compactMap { if case .string(let s) = $0 { return s }; return nil }
+                return strings.count == values.count ? strings : nil
+            }
+        }
+        let id = try requiredString("id")
+        let kind = try requiredString("kind")
+        self.init(
+            id: id, sourceId: try string("sourceId"), name: try string("name"),
+            kind: kind, status: try string("status"), description: try string("description"),
+            triggers: try strings("triggers"), permissions: try strings("permissions"),
+            riskClass: try string("riskClass"),
+            autoload: try value("autoload") { if case .bool(let b) = $0 { return b }; return nil },
+            useCount: try value("useCount") {
+                switch $0 {
+                case .int(let i): return Int(exactly: i)
+                case .double(let d): return Int(exactly: d)
+                default: return nil
+                }
+            },
+            lastUsedAt: try string("lastUsedAt"), updatedAt: try string("updatedAt")
+        )
     }
 }
 
@@ -345,14 +403,15 @@ public actor SwiftNativeCapabilityTrust: CapabilityTrustProtocol {
     private let clock: @Sendable () -> Date
     private let catalogSourcesActor: SwiftNativeCatalogSources
     private let trustRootsActor: SwiftNativeCapabilityTrustRoots
-    private let mcpDispatcher: SwiftNativeMCPDispatcher?
+    /// The MCP owner's server listing, handed in: TrustCenter imports no executor.
+    private let mcpServers: @Sendable () async -> [[String: JSONValue]]
 
     public init(
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
         personaRoot: URL? = nil,
         persistence: any PersistenceCoreProtocol = SwiftNativePersistenceCore(),
         clock: @escaping @Sendable () -> Date = { Date() },
-        mcpDispatcher: SwiftNativeMCPDispatcher? = nil
+        mcpServers: @escaping @Sendable () async -> [[String: JSONValue]]
     ) {
         self.dataRoot = dataRoot
         self.personaRoot = personaRoot
@@ -364,18 +423,18 @@ public actor SwiftNativeCapabilityTrust: CapabilityTrustProtocol {
         self.trustRootsActor = SwiftNativeCapabilityTrustRoots(
             dataRoot: dataRoot, persistence: persistence, clock: clock
         )
-        self.mcpDispatcher = mcpDispatcher
+        self.mcpServers = mcpServers
     }
 
     /// Byte-for-byte port of the retired daemon capability_trust_network().
     public func network() async throws -> CapabilityTrustNetwork {
         let nowISO = SwiftNativeManifestSigner.isoTimestamp(clock())
-        let allRecords = await capabilityRecordsFull(
+        let allRecords = try await capabilityRecordsFull(
             dataRoot: dataRoot,
             personaRoot: personaRoot,
             nowISO: nowISO,
             persistence: persistence,
-            mcpDispatcher: mcpDispatcher
+            mcpServers: mcpServers
         )
         let sliced = Array(allRecords.prefix(200))
         var records: [CapabilityTrustRecord] = []
@@ -423,12 +482,12 @@ public actor SwiftNativeCapabilityTrust: CapabilityTrustProtocol {
     /// the daemon's route still performs the audit write when the flag is OFF.
     public func evaluate(capabilityId: String) async throws -> CapabilityTrustEvaluation {
         let nowISO = SwiftNativeManifestSigner.isoTimestamp(clock())
-        let records = await capabilityRecordsFull(
+        let records = try await capabilityRecordsFull(
             dataRoot: dataRoot,
             personaRoot: personaRoot,
             nowISO: nowISO,
             persistence: persistence,
-            mcpDispatcher: mcpDispatcher
+            mcpServers: mcpServers
         )
         let match = records.first { rec in
             let id = jsonOptionalStringField(rec, "id") ?? ""
@@ -491,6 +550,8 @@ private func decodeCatalogSource(_ dict: [String: JSONValue]) -> CapabilityCatal
 /// flow through the two on-disk-merge actors with symmetric flock against
 /// the Python side. The Python-backed impl stays available as the rollback
 /// when `capabilityTrust` is absent from `NATIVE_AGENT_SWIFT_SUBSYSTEMS`.
-public func makeCapabilityTrust() -> any CapabilityTrustProtocol {
-    return SwiftNativeCapabilityTrust()
+public func makeCapabilityTrust(
+    mcpServers: @escaping @Sendable () async -> [[String: JSONValue]]
+) -> any CapabilityTrustProtocol {
+    return SwiftNativeCapabilityTrust(mcpServers: mcpServers)
 }

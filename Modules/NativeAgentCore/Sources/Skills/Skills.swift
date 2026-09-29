@@ -1,3 +1,4 @@
+import Privacy
 import Foundation
 import CryptoKit
 import NativeAgentCore
@@ -145,7 +146,7 @@ public final class SwiftNativeSkillsClient: SkillsClient {
     }
 
     public func listSkills() async throws -> [JSONValue] {
-        let raw = await persistence.readJSON(registryPath, defaultValue: .array([]))
+        let raw = try await persistence.readJSON(registryPath, ifMissing: .array([]))
         let registry: [JSONValue]
         if case .array(let arr) = raw {
             registry = arr.compactMap { entry in
@@ -264,8 +265,8 @@ public final class SwiftNativeSkillsClient: SkillsClient {
         // the daemon's read_json(path, {"schemaVersion":1,"skills":{}}) +
         // `if not isinstance(data.get("skills"), dict): continue`).
         let defaultDoc: JSONValue = .object(["schemaVersion": .int(1), "skills": .object([:])])
-        let legacyRaw = await persistence.readJSON(legacyManifestPath, defaultValue: defaultDoc)
-        let dataRootRaw = await persistence.readJSON(dataRootManifestPath, defaultValue: defaultDoc)
+        let legacyRaw = try await persistence.readJSON(legacyManifestPath, ifMissing: defaultDoc)
+        let dataRootRaw = try await persistence.readJSON(dataRootManifestPath, ifMissing: defaultDoc)
         let merged = SkillManifestRegistry.merge(entries: [
             (raw: legacyRaw,
              parentPath: legacyManifestPath.deletingLastPathComponent().path,
@@ -296,10 +297,10 @@ public final class SwiftNativeSkillsClient: SkillsClient {
     /// dict back to the data-root file, exactly as the route does (this
     /// collapses the legacy file's entries into the data-root file; preserved
     /// for behavior parity, NOT corrected here).
-    private func manifestRegisteredSkillsObject() async -> JSONValue {
+    private func manifestRegisteredSkillsObject() async throws -> JSONValue {
         let defaultDoc: JSONValue = .object(["schemaVersion": .int(1), "skills": .object([:])])
-        let legacyRaw = await persistence.readJSON(legacyManifestPath, defaultValue: defaultDoc)
-        let dataRootRaw = await persistence.readJSON(dataRootManifestPath, defaultValue: defaultDoc)
+        let legacyRaw = try await persistence.readJSON(legacyManifestPath, ifMissing: defaultDoc)
+        let dataRootRaw = try await persistence.readJSON(dataRootManifestPath, ifMissing: defaultDoc)
         var skillsByName: [String: JSONValue] = [:]
         for (raw, path) in [(legacyRaw, legacyManifestPath), (dataRootRaw, dataRootManifestPath)] {
             guard case .object(let root) = raw,
@@ -393,7 +394,7 @@ public final class SwiftNativeSkillsClient: SkillsClient {
         // Manifest fallback (route L52412-52421): pop from the merged registry,
         // write the merged dict back to the data-root manifest file.
         return try await withManifestLock { () throws -> JSONValue in
-            var mreg = await self.manifestRegisteredSkillsObject()
+            var mreg = try await self.manifestRegisteredSkillsObject()
             guard case .object(var mregObj) = mreg, case .object(var skills)? = mregObj["skills"],
                   let entry = skills[skillId] else {
                 throw SkillsError.unknownSkill(skillId)
@@ -439,7 +440,7 @@ public final class SwiftNativeSkillsClient: SkillsClient {
         } catch SkillsError.unknownSkill {
             // Manifest fallback.
             return try await withManifestLock { () throws -> JSONValue in
-                var mreg = await self.manifestRegisteredSkillsObject()
+                var mreg = try await self.manifestRegisteredSkillsObject()
                 guard case .object(var mregObj) = mreg, case .object(var skills)? = mregObj["skills"] else {
                     throw SkillsError.unknownSkill(name)
                 }

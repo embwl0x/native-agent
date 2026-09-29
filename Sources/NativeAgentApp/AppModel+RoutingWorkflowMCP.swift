@@ -77,7 +77,7 @@ enum WorkflowBuilderError: LocalizedError, Equatable {
 @MainActor
 extension AppModel {
     @MainActor
-    func search(_ query: String) async -> Result<[ResearchResult], ResearchSearchFailure> {
+    func search(_ query: String) async -> Result<[ResearchSearchResult], ResearchSearchFailure> {
         let configuredBaseURL = searxngBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
         return await search(query) { [client] trimmed in
             if !configuredBaseURL.isEmpty {
@@ -90,14 +90,12 @@ extension AppModel {
     @MainActor
     func search(
         _ query: String,
-        using operation: (String) async throws -> [ResearchResult]
-    ) async -> Result<[ResearchResult], ResearchSearchFailure> {
+        using operation: (String) async throws -> [ResearchSearchResult]
+    ) async -> Result<[ResearchSearchResult], ResearchSearchFailure> {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return .failure(.blankQuery) }
         do {
-            let results = try await operation(trimmed)
-            researchResults = results
-            return .success(results)
+            return .success(try await operation(trimmed))
         } catch {
             statusText = "Research failed: \(error.localizedDescription)"
             return .failure(.requestFailed(error.localizedDescription))
@@ -196,7 +194,7 @@ extension AppModel {
     }
 
     @MainActor
-    func resolveApproval(_ approval: ApprovalRequest, decision: String) async {
+    func resolveApproval(_ approval: ApprovalRecord, decision: String) async {
         let result = await resolveApprovalOnce(id: approval.id, decision: decision)
         switch result {
         case .applied:
@@ -213,7 +211,7 @@ extension AppModel {
     /// The compact Capabilities panel keeps its own visible receipt rather
     /// than implying an outcome from the list refresh or global status text.
     @MainActor
-    func resolveCapabilitiesApprovalInbox(_ approval: ApprovalRequest, decision: String) async {
+    func resolveCapabilitiesApprovalInbox(_ approval: ApprovalRecord, decision: String) async {
         capabilitiesApprovalInboxOutcome = nil
         let result = await resolveApprovalOnce(id: approval.id, decision: decision)
         capabilitiesApprovalInboxOutcome = result
@@ -299,7 +297,7 @@ extension AppModel {
         do {
             selectedMCPServerId = pendingId
             _ = try await client.warmMCPServer(serverId: pendingId)
-            let fetchedSessions = (try? await client.getMCPSessions())
+            let fetchedSessions = (try? await engine.tools.listMCPSessions())
             mcpToolReadState = .loading
             let fetchedTools: [MCPToolRecord]?
             do {
@@ -322,7 +320,7 @@ extension AppModel {
                 }
             }
             // Sessions are server-list-wide, safe to apply unconditionally.
-            if let s = fetchedSessions { mcpSessions = s }
+            if let s = fetchedSessions { engine.tools.mcpSessions = s }
             // Tools / resources are server-scoped — guard on still-selected.
             if selectedMCPServerId == pendingId {
                 if let t = fetchedTools { mcpTools = t }
@@ -354,7 +352,7 @@ extension AppModel {
         do {
             selectedMCPServerId = pendingId
             _ = try await client.restartMCPServer(serverId: pendingId)
-            mcpSessions = (try? await client.getMCPSessions()) ?? mcpSessions
+            engine.tools.mcpSessions = (try? await engine.tools.listMCPSessions()) ?? engine.tools.mcpSessions
             // Restart replaces the live child. Refresh the selected inventory
             // through the same owner before declaring completion; otherwise
             // the Hub can show tools/resources from the pre-restart session.
@@ -377,7 +375,7 @@ extension AppModel {
         do {
             selectedMCPServerId = server.id
             _ = try await client.refreshMCPCache(serverId: server.id)
-            mcpSessions = (try? await client.getMCPSessions()) ?? mcpSessions
+            engine.tools.mcpSessions = (try? await engine.tools.listMCPSessions()) ?? engine.tools.mcpSessions
             disabledFeature = nil
             statusText = "MCP cache refreshed: \(server.name)"
         } catch let err as NSError where AppModel.isNotImplemented(err) {

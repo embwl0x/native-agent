@@ -1,7 +1,11 @@
 import Foundation
+import ApprovalInbox
+import Cognition
 import CognitiveSubstrate
 import NativeAgentShared
 import PersistenceCore
+import Desk
+import DeviceSync
 
 /// The mounted Living Status refresh owns a complete snapshot: mixing one
 /// fresh endpoint with guessed zeroes from another would fabricate a calm
@@ -32,9 +36,11 @@ struct LivingStatusRefreshOperation {
     static func run(
         appModel: AppModel,
         dataRoot: URL,
-        approvalsOverride: (() async throws -> [ApprovalRequest])? = nil
+        approvalsOverride: (() async throws -> [ApprovalRecord])? = nil
     ) async -> Outcome {
-        let organism = await NativeCognitionRuntime.shared.organismSnapshot()
+        guard let organism = await appModel.engine.cognitionView.organismSnapshot() else {
+            return Outcome(snapshot: nil, failedEndpoints: ["Cognition"])
+        }
         var failedEndpoints: [String] = []
         let deskItems: [DeskItem]
         do {
@@ -51,12 +57,12 @@ struct LivingStatusRefreshOperation {
         if dreamDiary == nil { failedEndpoints.append("Dream diary") }
         let latestDream = dreamDiary?.entries.first
 
-        let approvalRows: [ApprovalRequest]
+        let approvalRows: [ApprovalRecord]
         do {
             if let approvalsOverride {
                 approvalRows = try await approvalsOverride()
             } else {
-                approvalRows = try await appModel.getApprovals()
+                approvalRows = try await appModel.engine.approvals.list()
             }
         } catch {
             approvalRows = []

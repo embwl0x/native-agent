@@ -1,3 +1,4 @@
+import AppToolRuntime
 import SwiftUI
 import PersistenceCore
 
@@ -7,89 +8,40 @@ import PersistenceCore
 // agent. Advanced is the full app, unchanged. The whole feature lives in the
 // Simple*.swift files; the shared views carry one hook each.
 
-/// "simple", "advanced" or "agent", in `nativeagent.viewMode` (the agent can
-/// switch it: `settings.view_mode` in QuietSelfAdminSettings). Agent is User's
-/// window into hers (AgentScreenView.swift) and never the unset default.
-enum SimpleViewMode {
-    static let key = "nativeagent.viewMode"
-    static let simple = "simple"
-    static let advanced = "advanced"
-    static let agent = "agent"
-    static let choices = [simple, advanced, agent]
-
-    /// With the key unset: Simple on a fresh install, Advanced where chats
-    /// already exist, so nobody who knows the full app loses it on update.
-    /// Read once per launch.
-    static let unsetDefault: String = hasExistingChats(PersistenceCore.defaultDataRoot()) ? advanced : simple
-
-    static func resolved(_ raw: String) -> String { choices.contains(raw) ? raw : unsetDefault }
-
-    /// What the window shows now: Simple has no pages to send anyone to.
-    static var isShowing: Bool {
-        let defaults = UserDefaults.standard
-        return !defaults.bool(forKey: NativeAgentShellPreference.classicShellKey)
-            && resolved(defaults.string(forKey: key) ?? "") == simple
-    }
-    static let noPagesNote = "No pages in Simple view; raise request_interaction for setup."
-
-    /// Write the first-launch answer down, so the chats a new install goes on
-    /// to make never flip it to Advanced later.
-    static func settle(_ defaults: UserDefaults = .standard) {
-        if defaults.string(forKey: key) == nil { defaults.set(unsetDefault, forKey: key) }
-    }
-
-    private static func hasExistingChats(_ root: URL) -> Bool {
-        let messages = root.appendingPathComponent("chat/messages", isDirectory: true)
-        let names = (try? FileManager.default.contentsOfDirectory(atPath: messages.path)) ?? []
-        return names.contains { $0.hasSuffix(".jsonl") }
-    }
-}
-
 /// Simple | Advanced | Agent: a small glass segmented control in the title strip,
 /// clear of the traffic lights. A pill is right here — it IS a segmented
 /// control (house rule 2).
 struct ViewModeSwitch: View {
     @AppStorage(SimpleViewMode.key) private var raw = ""
-    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
     var body: some View {
-        let current = SimpleViewMode.resolved(raw)
-        HStack(spacing: 2) {
+        // The Mac's own segmented control (User 09-27: all controls native).
+        Picker("View", selection: Binding(
+            get: { SimpleViewMode.resolved(raw) },
+            set: { raw = $0 }
+        )) {
             ForEach(SimpleViewMode.choices, id: \.self) { mode in
-                let selected = current == mode
-                Button { raw = mode } label: {
-                    Text(mode.capitalized)
-                        .font(ShellType.captionMedium)
-                        .foregroundStyle(selected ? NativeAgentShell.text : NativeAgentShell.secondary)
-                        .padding(.horizontal, 10)
-                        .frame(height: 20)
-                        .background { if selected { Capsule().fill(NativeAgentShell.softFill) } }
-                        .contentShape(Capsule())
-                }
-                .buttonStyle(.plain)
-                .accessibilityAddTraits(selected ? [.isButton, .isSelected] : .isButton)
+                Text(mode.capitalized).tag(mode)
             }
         }
-        .padding(2)
-        .glassEffect(reduceTransparency ? .identity : .regular, in: Capsule())
-        .accessibilityElement(children: .contain)
-        .accessibilityLabel("View")
+        .pickerStyle(.segmented)
+        .labelsHidden()
+        .controlSize(.small)
+        .fixedSize()
     }
 }
 
 extension View {
     /// The switch at the window's top right, and the first-launch default.
-    func viewModeSwitch(hidden: Bool) -> some View {
+    func viewModeSwitch() -> some View {
         overlay {
-            if !hidden {
-                VStack {
-                    HStack { Spacer(); ViewModeSwitch() }
-                    Spacer()
-                }
-                .padding(.top, 3)
-                .padding(.trailing, 10)
-                .ignoresSafeArea(edges: .top)
+            VStack {
+                HStack { Spacer(); ViewModeSwitch() }
+                Spacer()
             }
+            .padding(.top, 3)
+            .padding(.trailing, 10)
+            .ignoresSafeArea(edges: .top)
         }
         .onAppear { SimpleViewMode.settle() }
     }

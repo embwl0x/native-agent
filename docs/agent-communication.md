@@ -251,6 +251,10 @@ contact, `provenInboundAt` and `provenOutboundAt`, written only by
 `AgentPeerStore.recordProof` — `upsert` preserves them exactly as it preserves
 the person's elevation grant, so no configure can claim a round trip or erase
 one. `agent_contacts` surfaces them as `last_reply_in` and `last_message_out`.
+For command-line hosts, `last_reply_in` includes the newer bound command-line
+round-trip proof, without changing the separate inbound MCP proof. Built-in
+Codex, Claude and OMP lanes report `connected` or `unavailable` from local
+helper/runtime/CLI and reply-path readiness; sign-in is checked on execution.
 
 Connect proves the round trip where that is possible. For a host whose row has a
 command line, once the entry is written and approved, that command is run once

@@ -52,7 +52,7 @@ import PersistenceCore
 public protocol BrowserStatusReader: Sendable {
     /// GET /v1/browser/status — the full status envelope, or nil when native
     /// status is unavailable.
-    func browserStatus() async -> JSONValue?
+    func browserStatus() async throws -> JSONValue?
 }
 
 // MARK: - SwiftNative impl
@@ -123,9 +123,9 @@ public struct SwiftNativeBrowserClient: BrowserStatusReader {
         )
     }
 
-    public func browserStatus() async -> JSONValue? {
+    public func browserStatus() async throws -> JSONValue? {
         // runs = read_json(self.browser_runs_path, [])  (default [] on missing/torn)
-        let runsRaw = await persistence.readJSON(runsPath, defaultValue: .array([]))
+        let runsRaw = try await persistence.readJSON(runsPath, ifMissing: .array([]))
         let runs: [JSONValue]
         if case .array(let arr) = runsRaw { runs = arr } else { runs = [] }
 
@@ -151,7 +151,7 @@ public struct SwiftNativeBrowserClient: BrowserStatusReader {
         var receipts: [JSONValue] = (try? await persistence.tailJSONL(receiptsPath, limit: 20, maxBytes: 1_048_576)) ?? []
         receipts.reverse()
 
-        let approved = await approvedBrowserDomains()
+        let approved = try await approvedBrowserDomains()
 
         // browser_status() emits createdAt = now_iso() (response timestamp).
         return .object([
@@ -179,9 +179,9 @@ public struct SwiftNativeBrowserClient: BrowserStatusReader {
     /// policy) because `approved_browser_domains` only consults the saved
     /// `browserPolicy.approvedDomains` key with a fixed fallback list — it does
     /// NOT depend on any normalization the daemon applies elsewhere.
-    func approvedBrowserDomains() async -> [String] {
+    func approvedBrowserDomains() async throws -> [String] {
         let defaultDomains = ["example.com", "openai.com", "github.com", "linear.app", "localhost", "127.0.0.1"]
-        let raw = await persistence.readJSON(trustPolicyPath, defaultValue: .object([:]))
+        let raw = try await persistence.readJSON(trustPolicyPath, ifMissing: .object([:]))
         var configured: [String]? = nil
         if case .object(let policy) = raw,
            case .object(let browserPolicy)? = policy["browserPolicy"],

@@ -2,6 +2,7 @@ import ApprovalInbox
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import Procedures
 
 /// Event-driven qualification of the one native procedure implementation that
 /// currently exists. It reads canonical Workshop records plus the existing

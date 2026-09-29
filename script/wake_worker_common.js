@@ -343,6 +343,80 @@ function postWakeCompletion(transport, requestOptions, token, body, sessionId, s
     });
 }
 
+/// Live progress for one wake, into the app's shared update stream
+/// (`POST /<lane>/live`, keyed by the accepted message id): started, the reply
+/// text so far (coalesced to one POST per interval), tool/progress notes, and
+/// finished. Display only: it never gates the run, the completion POST, or a
+/// receipt, and every failure is ignored. Off unless the app launched this
+/// helper (NATIVE_AGENT_WAKE_LIVE=1), so tests and manual runs stay quiet.
+function createWakeLivePoster({ url, tokenPath, messageIds, intervalMs = 400 }) {
+  const noop = { started() {}, partial() {}, note() {}, activity() {}, finished() { return Promise.resolve(); } };
+  const ids = (Array.isArray(messageIds) ? messageIds : [messageIds]).filter((id) => typeof id === "string" && id);
+  if (process.env.NATIVE_AGENT_WAKE_LIVE !== "1" || !url || ids.length === 0) return noop;
+  let target;
+  let token;
+  try {
+    target = new URL(url);
+    token = require("fs").readFileSync(tokenPath, "utf8").trim();
+  } catch { return noop; }
+  if (!token || !["http:", "https:"].includes(target.protocol)) return noop;
+  const transport = target.protocol === "https:" ? require("https") : require("http");
+  let chain = Promise.resolve();
+  let pendingText = null;
+  let timer = null;
+  let lastActivity = 0;
+  const post = (fields) => new Promise((resolve) => {
+    const body = JSON.stringify(fields);
+    const req = transport.request({
+      hostname: target.hostname, port: target.port, path: `${target.pathname}${target.search}`,
+      method: "POST", timeout: 2000,
+      headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) },
+    }, (res) => { res.resume(); res.on("end", resolve); res.on("error", resolve); });
+    req.on("timeout", () => { req.destroy(); resolve(); });
+    req.on("error", resolve);
+    req.end(body);
+  });
+  // One ordered queue: a later partial never lands before an earlier one.
+  const send = (event, fields = {}) => {
+    for (const id of ids) chain = chain.then(() => post({ message_id: id, event, ...fields })).catch(() => {});
+    return chain;
+  };
+  const flushText = () => {
+    if (timer) { clearTimeout(timer); timer = null; }
+    if (pendingText === null) return;
+    const text = pendingText;
+    pendingText = null;
+    send("partial", { text: text.length > 65536 ? text.slice(-32768) : text });
+  };
+  return {
+    started(fields = {}) { send("started", fields); },
+    /// The whole reply text so far (replacement, not a delta).
+    partial(text) {
+      if (typeof text !== "string" || !text) return;
+      pendingText = text;
+      if (!timer) {
+        timer = setTimeout(flushText, intervalMs);
+        if (timer.unref) timer.unref();
+      }
+    },
+    note(text) {
+      if (typeof text !== "string" || !text.trim()) return;
+      flushText();
+      send("note", { note: text.trim().slice(0, 300) });
+    },
+    /// A sign of life with nothing to show; at most one POST per 5s.
+    activity() {
+      if (Date.now() - lastActivity < 5000) return;
+      lastActivity = Date.now();
+      send("activity");
+    },
+    finished(note) {
+      flushText();
+      return send("finished", note ? { note: `Run ended: ${String(note).slice(0, 200)}` } : {});
+    },
+  };
+}
+
 function missingWakeCompletionOrigin(sessionId, agentName) {
   if (typeof sessionId === "string" && sessionId.trim()) return null;
   return {
@@ -357,5 +431,5 @@ module.exports = {
   createProcessStartIdentityReader, postBridgeRequest, postWakeCompletion, writeSyncedAndClose,
   copyWakeProducerIdentity, copyWakeCompletionOrigin, claimWakeJob, readWakeJSON, missingWakeCompletionOrigin,
   appendSyncedWakeLine, createWakeEventWaiter, readWakeJSONLines, sleep,
-  readWakeBridgeToken, processTreeOrder,
+  readWakeBridgeToken, processTreeOrder, createWakeLivePoster,
 };

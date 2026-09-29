@@ -1,3 +1,4 @@
+import Cognition
 import CognitiveSubstrate
 import Foundation
 
@@ -15,7 +16,7 @@ enum CognitionObservatoryActions {
     /// receipt lane from one that was unavailable while the rest of the
     /// Observatory projection was collected.
     static func refreshRead(
-        runtime: NativeCognitionRuntime = .shared
+        runtime: NativeCognitionRuntime = NativeAgentEngine.liveCognition
     ) async -> CognitiveObservatoryDetailRead {
         await runtime.observatoryDetailRead()
     }
@@ -23,42 +24,42 @@ enum CognitionObservatoryActions {
     /// Compatibility projection for action helpers that only need to redraw
     /// their non-receipt fields. New observational consumers must use
     /// `refreshRead` and preserve its explicit evidence state.
-    static func refresh(runtime: NativeCognitionRuntime = .shared) async -> CognitiveObservatoryDetail {
+    static func refresh(runtime: NativeCognitionRuntime = NativeAgentEngine.liveCognition) async -> CognitiveObservatoryDetail {
         await refreshRead(runtime: runtime).detail
     }
 
     /// The control receives the runtime's one typed terminal outcome. It never
     /// infers success from whichever receipt happened to arrive during a refresh.
     static func reflectWithOutcome(
-        runtime: NativeCognitionRuntime = .shared
+        runtime: NativeCognitionRuntime = NativeAgentEngine.liveCognition
     ) async -> ReflectionOutcome {
         let status = await runtime.runManualReflection()
         let detail = await refresh(runtime: runtime)
         return ReflectionOutcome(status: status, detail: detail)
     }
 
-    static func settleBody(runtime: NativeCognitionRuntime = .shared) async -> CognitiveObservatoryDetail {
+    static func settleBody(runtime: NativeCognitionRuntime = NativeAgentEngine.liveCognition) async -> CognitiveObservatoryDetail {
         _ = await runtime.settleOrganismContinuity()
         return await refresh(runtime: runtime)
     }
 
-    static func settleBodyChecked(runtime: NativeCognitionRuntime = .shared) async -> (outcome: OrganismContinuityApplyOutcome, detail: CognitiveObservatoryDetail) {
+    static func settleBodyChecked(runtime: NativeCognitionRuntime = NativeAgentEngine.liveCognition) async -> (outcome: OrganismContinuityApplyOutcome, detail: CognitiveObservatoryDetail) {
         let outcome = await runtime.settleOrganismContinuityChecked()
         return (outcome, await refresh(runtime: runtime))
     }
 
-    static func resetBody(runtime: NativeCognitionRuntime = .shared) async -> CognitiveObservatoryDetail {
+    static func resetBody(runtime: NativeCognitionRuntime = NativeAgentEngine.liveCognition) async -> CognitiveObservatoryDetail {
         _ = await runtime.resetOrganismContinuity()
         return await refresh(runtime: runtime)
     }
 
-    static func resetBodyChecked(runtime: NativeCognitionRuntime = .shared) async -> (outcome: OrganismContinuityApplyOutcome, detail: CognitiveObservatoryDetail) {
+    static func resetBodyChecked(runtime: NativeCognitionRuntime = NativeAgentEngine.liveCognition) async -> (outcome: OrganismContinuityApplyOutcome, detail: CognitiveObservatoryDetail) {
         let outcome = await runtime.resetOrganismContinuityChecked()
         return (outcome, await refresh(runtime: runtime))
     }
 
     static func reviewReflex(
-        runtime: NativeCognitionRuntime = .shared,
+        runtime: NativeCognitionRuntime = NativeAgentEngine.liveCognition,
         id: String,
         decision: OrganismReflexReviewDecision,
         note: String,
@@ -96,7 +97,7 @@ enum CognitionProposalActions {
     }
 
     static func resolve(
-        runtime: NativeCognitionRuntime = .shared,
+        runtime: NativeCognitionRuntime = NativeAgentEngine.liveCognition,
         id: UUID,
         approved: Bool
     ) async -> CognitiveObservatoryDetail {
@@ -107,7 +108,7 @@ enum CognitionProposalActions {
     /// Recheck the candidate at the mutation boundary and report a maintenance
     /// race or a second click explicitly.
     static func resolveWithOutcome(
-        runtime: NativeCognitionRuntime = .shared,
+        runtime: NativeCognitionRuntime = NativeAgentEngine.liveCognition,
         id: UUID,
         approved: Bool
     ) async -> ResolveOutcome {
@@ -142,7 +143,7 @@ enum CognitionProposalActions {
     /// recheck at the mutation boundary, so a second click or a maintenance
     /// race reports itself instead of looking like a success.
     static func retireWithOutcome(
-        runtime: NativeCognitionRuntime = .shared,
+        runtime: NativeCognitionRuntime = NativeAgentEngine.liveCognition,
         id: UUID
     ) async -> ResolveOutcome {
         let before = await runtime.observatoryDetail()

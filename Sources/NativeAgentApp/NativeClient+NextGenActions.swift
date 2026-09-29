@@ -1,4 +1,5 @@
 import Foundation
+import BackgroundLoops
 import NativeAgentShared
 import PersistenceCore
 import MemoryV2
@@ -142,9 +143,15 @@ extension NativeClient {
         case "ops.health.snapshot":
             var output: [String: JSONValue] = [
                 "actionId": .string(id),
-                "health": try JSONValue.fromEncodable(try await getHealth()),
+                "health": try JSONValue.fromEncodable(
+                    DoctorFacade(dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()).readHealth()
+                ),
             ]
-            if let watchdog = try? await getWatchdog() {
+            do {
+                var watchdog = await DoctorFacade(dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()).readWatchdog(manager: backgroundLoopsManager.coreManager)
+                // The per-loop rows are not part of this snapshot; it has
+                // always carried the ten named watchdog fields only.
+                watchdog.extras = nil
                 output["watchdog"] = try? JSONValue.fromEncodable(watchdog)
             }
             if let card = try? await getHealthCard() {
@@ -167,8 +174,8 @@ extension NativeClient {
             ])
 
         case "tool.lazy.index":
-            let tools = try await getTools()
-            let capabilities = try await getCapabilities()
+            let tools = try await ToolsFacade(dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()).listAuthored()
+            let capabilities = try await TrustFacade(dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()).loadCapabilities()
             return .object([
                 "actionId": .string(id),
                 "toolCount": .int(Int64(tools.count)),
@@ -176,7 +183,7 @@ extension NativeClient {
                     .object([
                         "id": .string(tool.id),
                         "name": .string(tool.name),
-                        "status": .string(tool.status ?? tool.phase ?? "unknown"),
+                        "status": .string(tool.status),
                         "language": tool.language.map(JSONValue.string) ?? .null,
                     ])
                 }),
@@ -208,7 +215,7 @@ extension NativeClient {
         case "truth.audit", "privacy.trust.audit", "mac.control.policy.audit":
             return .object([
                 "actionId": .string(id),
-                "trustPolicy": try JSONValue.fromEncodable(try await getTrustPolicy()),
+                "trustPolicy": try JSONValue.fromEncodable(try await TrustFacade(dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()).load()),
             ])
 
         case "personality.drift.audit":
@@ -226,7 +233,7 @@ extension NativeClient {
         case "execution.durable.checkpoint":
             return .object([
                 "actionId": .string(id),
-                "missions": try JSONValue.fromEncodable(try await getWorkshopExecutions()),
+                "missions": try JSONValue.fromEncodable(try await DeskFacade(dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()).taskRows()),
             ])
 
         case "trace.failure.rootcause", "traces.grade":

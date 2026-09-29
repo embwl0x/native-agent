@@ -1,3 +1,5 @@
+import ChatOrchestration
+import AppToolRuntime
 import Foundation
 import NativeAgentCore
 import PersistenceCore

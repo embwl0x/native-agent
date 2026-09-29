@@ -1,5 +1,6 @@
 import Foundation
 import BackgroundLoops
+import DoctorChecks
 import PersistenceCore
 
 // Doctor visibility for background loops. Motivated by 2026-07-12→16:
@@ -106,6 +107,35 @@ struct LoopHealthVerdict: Equatable, Identifiable, Sendable {
 }
 
 enum DoctorLoopHealth {
+    /// A skip whose reason starts with this is a lane that cannot run on this
+    /// Mac (iCloud Drive off): it is shown as a WARN row with the reason rather
+    /// than folded into "nothing was due".
+    static let unavailableSkipPrefix = "unavailable: "
+
+    static let iCloudDriveStep = "Open System Settings → Apple Account → iCloud → Drive and turn on Sync this Mac."
+
+    /// Restart scheduling of the loops already registered with Core's manager.
+    /// Never reassembles loops, forces a workload, or resets a due clock.
+    static func safeRepair(
+        manager: BackgroundLoops.BackgroundLoopsManager
+    ) async -> DoctorExecutableRepair? {
+        let statuses = await manager.status()
+        guard statuses.contains(where: {
+            !$0.running || ($0.lastError != nil && !$0.executing && $0.name != "telegram_poll")
+        }) else { return nil }
+        return DoctorExecutableRepair(checkID: doctorCheckID) {
+            let wasRunning = await manager.isRunning()
+            _ = await manager.start()
+            let after = await manager.status()
+            guard !after.isEmpty, after.allSatisfy(\.running) else {
+                return .unverified("Repair attempted: background scheduling did not restart.")
+            }
+            return wasRunning
+                ? .unverified("Repair attempted: reconciled background scheduling through its owner; failed work retains its normal retry cadence.")
+                : .completed("Completed: restarted background scheduling through its owner; due times and execution gates were preserved.")
+        }
+    }
+
     /// Receipts inside the grace window needed to call a failure persistent
     /// rather than a blip. At the common 5-minute tick interval the 30-minute
     /// floor holds up to 6 ticks, so 3 = half the window solidly failing.
@@ -348,6 +378,11 @@ enum DoctorLoopHealth {
             if observation.lastRun == nil {
                 return verdict(.ok, "First check in \(describeAge(-overdueBy)).")
             }
+            if lastOutcomeWasLegitimateSkip(observation),
+               let reason = observation.lastResult?.dropFirst("skipped: ".count),
+               reason.hasPrefix(unavailableSkipPrefix) {
+                return verdict(.warn, "Unavailable: \(reason.dropFirst(unavailableSkipPrefix.count)).")
+            }
             if lastOutcomeWasLegitimateSkip(observation) {
                 return verdict(.ok, "Ticking; nothing was due on the last check.")
             }
@@ -446,18 +481,18 @@ enum DoctorLoopHealth {
         observations: [LoopHealthObservation],
         recentFailureDates: [String: [Date]],
         now: Date
-    ) -> DoctorCheck {
+    ) -> CheckResult {
         // Absence of loops is no signal, never health: the app registers its
         // fleet at launch, so an empty status list means the scheduler has not
         // come up (or has gone away) rather than that everything is fine.
         guard !observations.isEmpty else {
-            return DoctorCheck(
+            return CheckResult(
                 id: doctorCheckID,
                 title: "Background Loops",
                 status: "warn",
                 detail: "No background loops are registered, so there is nothing to report on. "
                     + "That is a missing signal, not a clean bill of health.",
-                repair: nil
+                human_action: "Quit and reopen NativeAgent to start background scheduling, then run Doctor again."
             )
         }
         let verdicts = evaluate(
@@ -503,12 +538,17 @@ enum DoctorLoopHealth {
         } else {
             status = "warn"
         }
-        return DoctorCheck(
+        return CheckResult(
             id: doctorCheckID,
             title: "Background Loops",
             status: status,
             detail: detail,
-            repair: status == "ok" ? nil : "Open Doctor → background loops for the per-loop verdicts."
+            human_action: status == "ok" ? nil : (
+                observations.first { $0.loopId == verdicts.first?.loopId }?
+                    .lastResult?.localizedCaseInsensitiveContains("unavailable: iCloud Drive") == true
+                    ? iCloudDriveStep
+                    : "Open Doctor → background loops for the named loop's current failure."
+            )
         )
     }
 
@@ -516,7 +556,7 @@ enum DoctorLoopHealth {
     static func doctorCheck(
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
         now: Date = Date()
-    ) async -> DoctorCheck {
+    ) async -> CheckResult {
         let statuses = await BackgroundLoops.BackgroundLoopsManager.shared.status()
         let receipts = recentFailureDates(
             receiptsFile: dataRoot.appendingPathComponent("logs/background_loop_failures.jsonl")

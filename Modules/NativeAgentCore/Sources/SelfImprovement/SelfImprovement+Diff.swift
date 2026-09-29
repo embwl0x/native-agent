@@ -44,7 +44,7 @@ import PersistenceCore
 // so the seam can flip Mac-only without an iOS pin holding the route live.
 //
 // DISPOSITION: Swift-native local port. The app reads this in-process; no
-// daemon route or HTTP fallback remains. See CUTOVER_PLAN §6.96.
+// daemon route or HTTP fallback remains.
 
 /// One changed-file entry in an improvement diff — mirrors the daemon dict
 /// `{"path","status","additions","deletions"}`.
@@ -245,8 +245,8 @@ extension SwiftNativeSelfImprovement {
         // PersistenceCore.readJSON is the same atomic-read the daemon's
         // read_json mirrors (tmp+os.replace on the write side guarantees the
         // reader never sees a torn file — no flock needed for this pure read).
-        let raw = await trainingPromotionPersistence()
-            .readJSON(improvementsRunsPath(), defaultValue: .array([]))
+        let raw = try await trainingPromotionPersistence()
+            .readJSON(improvementsRunsPath(), ifMissing: .array([]))
         let runs: [JSONValue]
         if case .array(let arr) = raw {
             runs = arr

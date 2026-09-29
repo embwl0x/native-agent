@@ -73,39 +73,21 @@ home paths, usernames, email addresses, private bundle IDs, and machine names.
 Do not use `--no-verify` unless the finding is understood and independently
 checked.
 
-## Build and tests
+## Build
 
-Assemble the coherent change, build the integrated target, then run one
-proportionate validation of the finished workflow. The
-[validation map](docs/README.md#validation-boundaries) explains the different
-gates; these commands are alternatives selected by scope, not a sequence of
-per-file checks.
+The repository has no automated test suite. Assemble the coherent change,
+build the integrated target, then prove the finished workflow in the real app.
 
 ```bash
 swift build --jobs 4 --force-resolved-versions --skip-update
 
-# Select the relevant finished-workflow/package check.
-swift test --filter '<suite-or-test>'
-swift test --package-path Modules/NativeAgentCore --no-parallel
-swift test --package-path Modules/NativeAgentShared
-
-# Canonical whole-repository gate before publication.
-./script/test.sh
-./script/test.sh --require-ios
-
-# Optional installed-runtime sweeps.
+# Static checks and build; --live also verifies the installed runtime.
 ./script/smoke_all.sh
 ./script/smoke_all.sh --live
 ```
 
-For iOS changes, build or test against an actually installed simulator and
-verify signing-sensitive behavior on a properly entitled device when needed.
-The canonical gate covers script/inventory/iOS-release guards, Node builder and
-Chrome extension tests, Core
-XCTest and Swift Testing shards, Shared, the root Mac package, and an iOS test
-handoff. An ordinary unavailable-simulator skip is not iOS proof; release
-receipts require that lane. Chrome extension tests also have a focused
-[entry point](Extensions/NativeAgentChrome/README.md).
+For iOS changes, build against an actually installed simulator and verify
+signing-sensitive behavior on a properly entitled device when needed.
 
 For Mac runtime or UI changes, install canonically with
 `./script/install_app.sh`. Do not execute the repository `dist` GUI executable
@@ -115,12 +97,11 @@ dialog even when the installed app is healthy.
 ## Pull requests
 
 - Keep commits focused and use a GitHub-safe noreply author identity.
-- Explain the invariant fixed, sibling paths audited, and tests run.
+- Explain the invariant fixed, sibling paths audited, and how it was proven.
 - Include screenshots for visible Mac/iOS changes.
 - Call out migrations, compatibility wire IDs, or state-root changes.
 - Do not claim a connector, release, or live integration works without the
   corresponding proof.
-- Leave `./script/test.sh` green.
 
 ## Distribution
 

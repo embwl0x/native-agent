@@ -47,6 +47,16 @@ enum TurnInspectorPresentation {
         "Showing \(visibleCount) of \(totalCount) turns (oldest dropped for sync size)."
     }
 
+    /// How long, the way a person says it: "under a second", "8 seconds",
+    /// "2 minutes". Nil when unknown.
+    static func plainDuration(wallMs: Int) -> String? {
+        guard wallMs >= 0 else { return nil }
+        let seconds = Int((Double(wallMs) / 1000).rounded())
+        if wallMs < 1000 { return "under a second" }
+        if seconds < 90 { return AliveWords.count(seconds, "second") }
+        return AliveWords.count(Int((Double(seconds) / 60).rounded()), "minute")
+    }
+
     static func durationText(wallMs: Int) -> String {
         guard wallMs >= 0 else { return "Unknown" }
         let seconds = Double(wallMs) / 1000.0
@@ -82,62 +92,39 @@ enum TurnInspectorPresentation {
 
 }
 
+
 struct TurnInspectorView: View {
     @StateObject private var store = TurnInspectorStore()
     @ObservedObject private var sync = iCloudSyncEngine.shared
 
     var body: some View {
-        List {
+        AlivePage(title: "Turns", line: "How my recent replies went.", freshnessGroup: "turn_summaries") {
             switch TurnInspectorPresentation.contentState(for: store.file) {
             case .content(let truncated, let visibleCount, let totalCount):
-                if truncated {
-                    Section {
-                        Text(TurnInspectorPresentation.truncationNotice(
-                            visibleCount: visibleCount,
-                            totalCount: totalCount
-                        ))
-                            .font(.callout)
-                            .foregroundStyle(.secondary)
-                            .listRowSeparator(.hidden)
-                    }
-                }
-                Section {
-                    ForEach(store.file?.summaries ?? []) { summary in
+                AliveSection(
+                    "Newest first",
+                    footer: truncated
+                        ? TurnInspectorPresentation.truncationNotice(visibleCount: visibleCount, totalCount: totalCount)
+                        : nil
+                ) {
+                    ForEach(Array((store.file?.summaries ?? []).enumerated()), id: \.element.id) { index, summary in
+                        if index > 0 { AliveDivider() }
                         TurnSummaryRow(summary: summary)
                     }
-                } header: {
-                    Label("Turns", systemImage: "list.bullet.rectangle")
-                        .font(.headline)
                 }
             case .unpublished:
-                MobileReadingEmptyState(
-                    title: "Turn summaries unavailable",
-                    systemImage: "waveform.path.ecg",
-                    kind: .unavailable,
-                    description: "The Mac has not published a turn-summary snapshot yet."
+                AliveCalmState(
+                    title: "No turns here yet",
+                    line: "The Mac hasn’t published a turn summary to this iPhone yet."
                 )
-                .listRowBackground(Color.clear)
-                .listRowSeparator(.hidden)
             case .emptyPublished:
-                MobileReadingEmptyState(
+                AliveCalmState(
                     title: "No turns yet",
-                    systemImage: "waveform.path.ecg",
-                    kind: .empty,
-                    description: "The latest published snapshot contains no turns."
+                    line: "The latest summary from the Mac has no turns in it."
                 )
-                .listRowBackground(Color.clear)
-                .listRowSeparator(.hidden)
             }
         }
-        .mobileReadingScreen()
-        .navigationTitle("Turn Inspector")
         .macSyncErrorBanner()
-        // E6: freshness of the Mac snapshot behind these turns.
-        .macSnapshotFreshnessBadge(group: "turn_summaries")
-        .navigationBarTitleDisplayMode(.inline)
-        .safeAreaInset(edge: .top, spacing: 0) {
-                MacStatusChip().frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 16)
-            }
         .onAppear { Task { await store.refresh() } }
         .refreshable { await store.refresh() }
         .onChange(of: sync.turnSummaries) { _, file in
@@ -151,43 +138,65 @@ struct TurnInspectorView: View {
 private struct TurnSummaryRow: View {
     let summary: TurnSummaryRecord
 
-    private var kindsText: String {
-        TurnInspectorPresentation.kindsText(summary.kinds)
+    /// What happened and how long, in plain words: "Replied in 8 seconds,
+    /// using two tools."
+    private var plainLine: String {
+        let took = TurnInspectorPresentation.plainDuration(wallMs: summary.wallMs)
+        // Kinds arrive as "reply" or "chat.reply", "tool" or "tool.call".
+        let replied = summary.kinds.contains { $0.key.contains("reply") && $0.value > 0 }
+        let tools = summary.kinds.filter { $0.key.hasPrefix("tool") }.values.reduce(0, +)
+        var line = took.map { replied ? "Replied in \($0)" : "Took \($0)" } ?? (replied ? "Replied" : "Worked")
+        if tools > 0 {
+            line += ", using \(AliveWords.count(tools, "tool", spelled: true))"
+        }
+        return line + "."
+    }
+
+    /// The numbers, second: tokens, time to the first word, the event mix.
+    private var measures: String {
+        var parts: [String] = []
+        if let tokens = summary.llmTokens, tokens >= 0 {
+            parts.append(AliveWords.count(tokens, "token"))
+        }
+        if let ttft = summary.ttftMs, ttft >= 0 {
+            parts.append("first word in \(ttft) ms")
+        }
+        parts.append(eventsLine)
+        return parts.joined(separator: " · ")
+    }
+
+    /// "12 events: 2 tools, 1 reply".
+    private var eventsLine: String {
+        let count = summary.eventCount >= 0 ? AliveWords.count(summary.eventCount, "event") : "Events unknown"
+        guard !summary.kinds.isEmpty else { return count }
+        let ordered = summary.kinds.sorted { $0.value != $1.value ? $0.value > $1.value : $0.key < $1.key }
+        let visible = ordered.prefix(6).map { AliveWords.count($0.value, AliveWords.humanized($0.key).lowercased()) }
+        let more = ordered.count > 6 ? ", +\(ordered.count - 6) more" : ""
+        return "\(count): " + visible.joined(separator: ", ") + more
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            MobileAdaptiveRow {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(alignment: .firstTextBaseline) {
+                Text(summary.surface.flatMap { $0.isEmpty ? nil : $0 } ?? "Turn")
+                    .font(.body)
+                    .foregroundStyle(AlivePalette.text)
+                Spacer(minLength: 8)
                 Text(summary.startedAt, style: .time)
-                    .font(.callout)
-                Spacer()
-                if let surface = summary.surface, !surface.isEmpty {
-                    Text(surface)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
+                    .font(.subheadline)
+                    .foregroundStyle(AlivePalette.secondary)
             }
-            MobileAdaptiveRow(spacing: 12) {
-                ForEach(TurnInspectorPresentation.metrics(for: summary), id: \.label) { metric in
-                    self.metric(metric.value, metric.label)
-                }
-            }
-            if !summary.kinds.isEmpty {
-                Text(kindsText)
-                    .font(.system(.caption, design: .monospaced))
-                    .foregroundStyle(.tertiary)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .accessibilityLabel("Event kinds: \(kindsText)")
-            }
+            Text(plainLine)
+                .font(.subheadline)
+                .foregroundStyle(AlivePalette.text)
+                .fixedSize(horizontal: false, vertical: true)
+            Text(measures)
+                .font(.footnote)
+                .foregroundStyle(AlivePalette.secondary)
+                .fixedSize(horizontal: false, vertical: true)
         }
-        .padding(.vertical, 2)
-    }
-
-    private func metric(_ value: String, _ label: String) -> some View {
-        VStack(alignment: .leading, spacing: 1) {
-            Text(value).font(.callout)
-            Text(label).font(.caption).foregroundStyle(.secondary)
-        }
+        .aliveRow()
+        .accessibilityElement(children: .combine)
     }
 }
 
@@ -201,14 +210,24 @@ final class TurnInspectorStore: ObservableObject {
         #if DEBUG
         if MobileDesignSamples.screen != nil {
             file = try! JSONDecoder().decode(TurnSummaryFile.self, from: Data("{}".utf8))
-            file?.summaries = MobileDesignSamples.rows([TurnSummaryRecord]())
-            file?.totalTurnsSeen = 1
+            file?.summaries = MobileDesignSamples.rows([TurnSummaryRecord]()) + Self.moreDesignTurns
+            file?.totalTurnsSeen = file?.summaries.count ?? 0
             return
         }
         #endif
         await iCloudSyncEngine.shared.refreshTurnSummariesSnapshot()
         file = iCloudSyncEngine.shared.turnSummaries
     }
+
+    #if DEBUG
+    private static let moreDesignTurns: [TurnSummaryRecord] = try! JSONDecoder().decode(
+        [TurnSummaryRecord].self,
+        from: Data(#"""
+        [{"id":"design-turn-2","surface":"Mac chat","startedAt":809998200,"lastAt":809998224,"eventCount":31,"wallMs":24100,"llmTokens":5820,"ttftMs":610,"kinds":{"reply":1,"tool":9,"thinking":3}},
+         {"id":"design-turn-3","surface":"Desk task","startedAt":809994600,"lastAt":809994603,"eventCount":5,"wallMs":2900,"llmTokens":380,"ttftMs":290,"kinds":{"reply":1}}]
+        """#.utf8)
+    )
+    #endif
 
     func applySyncedFile(_ next: TurnSummaryFile?) {
         file = next

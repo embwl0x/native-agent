@@ -171,7 +171,16 @@ async function navigateLeasedTab(payload, actionId) {
     }
   }
   try {
-    const updated = await chrome.tabs.update(lease.tabId, { url: payload.url });
+    // "back" / "forward": the tab's own history, as a person's Back button.
+    const history = payload.url === "back" ? (id) => chrome.tabs.goBack(id)
+      : payload.url === "forward" ? (id) => chrome.tabs.goForward(id) : null;
+    const updated = history
+      ? await history(lease.tabId).catch(() => {
+        requireCurrentNavigation(); // a newer navigation owns the tab now: step nothing
+        return pageHistoryStep(lease.tabId, payload.url === "back" ? -1 : 1);
+      })
+        .then(() => chrome.tabs.get(lease.tabId))
+      : await chrome.tabs.update(lease.tabId, { url: payload.url });
     requireCurrentNavigation();
     if (updated?.active === true && lease.originalTab.active !== true) {
       await leaseManager.yieldForTab(lease.tabId, "tab_activated_during_navigation");
@@ -814,6 +823,33 @@ function invalidateFrameSnapshots(tabId, frameId, localSnapshotIds, retainedNavi
       else snapshot.routes.delete(nodeId);
     }
     if (!retained) snapshotRoutes.delete(snapshotId);
+  }
+}
+
+// Walk 3 (09-25): her clicks are script clicks with no user activation, so
+// Chrome marks the page she clicked away from "skippable" and tabs.goBack finds
+// nothing ("Cannot find a next page in history." — Chrome's text for both
+// directions). The page's own history.go is not subject to that skip, so it
+// steps instead; resolves once the top frame has moved, rejects if it never does.
+async function pageHistoryStep(tabId, delta) {
+  const events = [chrome.webNavigation.onCommitted, chrome.webNavigation.onHistoryStateUpdated,
+    chrome.webNavigation.onReferenceFragmentUpdated];
+  let done;
+  const moved = new Promise((resolve) => {
+    const timer = setTimeout(() => done(false), 3_000);
+    const listener = (details) => { if (details.tabId === tabId && details.frameId === 0) done(true); };
+    done = (result) => {
+      clearTimeout(timer);
+      for (const event of events) event.removeListener(listener);
+      resolve(result);
+    };
+    for (const event of events) event.addListener(listener);
+  });
+  try {
+    await sendPageMessage(tabId, { type: "nativeagent.page.history", delta }, { frameId: 0 });
+  } catch (error) { done(false); throw error; }
+  if (!(await moved)) {
+    throw new ProtocolError("no_history", `This tab has no page to go ${delta < 0 ? "back" : "forward"} to.`);
   }
 }
 

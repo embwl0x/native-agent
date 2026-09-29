@@ -1,4 +1,5 @@
 import Foundation
+import Agents
 import ChatOrchestration
 import GRPCCore
 import GRPCProtobuf

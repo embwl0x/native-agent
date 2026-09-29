@@ -1,107 +1,26 @@
+import EngineRuntime
+import KnowledgeGraph
 import Foundation
 import Observation
 import NativeAgentShared
 import PersistenceCore
 
-struct ResearchLabRun: Identifiable, Codable, Hashable {
-    var id: String
-    var objective: String
-    var status: String
-    var query: String?
-    var sources: [ResearchResult]
-    var brief: String?
-    var connector: String?
-    var error: String?
-    var createdAt: String?
-}
+typealias RuntimeTrace = EngineRuntime.RuntimeTrace
 
-struct RuntimeTrace: Identifiable, Codable, Hashable {
-    var id: String
-    var kind: String
-    var title: String
-    var status: String?
-    var createdAt: String?
-}
+typealias AgentGraphNode = KnowledgeGraph.AgentGraphNode
 
-struct AgentGraphNode: Identifiable, Codable, Hashable {
-    var id: String
-    var label: String?
-    var kind: String?
-    var status: String?
-}
+typealias AgentGraphEdge = KnowledgeGraph.AgentGraphEdge
 
-struct AgentGraphEdge: Identifiable, Codable, Hashable {
-    var id: String
-    var fromNode: String
-    var toNode: String
-    var label: String?
+typealias AgentGraphCounts = KnowledgeGraph.AgentGraphCounts
 
-    enum CodingKeys: String, CodingKey {
-        case id
-        case fromNode = "from"
-        case toNode = "to"
-        case label
-    }
-}
+typealias AgentGraph = KnowledgeGraph.AgentGraph
 
-struct AgentGraphCounts: Codable, Hashable {
-    var nodes: Int
-    var edges: Int
-    var executions: Int?
-    var capabilities: Int?
+typealias GraphSearchResult = KnowledgeGraph.GraphSearchResult
 
-    enum CodingKeys: String, CodingKey {
-        case nodes, edges, capabilities
-        case executions = "missions" // compatibility wire ID (persisted graphs/index.json)
-    }
-}
+typealias GraphSearchCounts = KnowledgeGraph.GraphSearchCounts
 
-struct AgentGraph: Codable, Hashable {
-    var nodes: [AgentGraphNode]
-    var edges: [AgentGraphEdge]
-    var summary: AgentGraphCounts
-    var createdAt: String?
-}
+typealias GraphSearchResponse = KnowledgeGraph.GraphSearchResponse
 
-struct GraphSearchResult: Identifiable, Codable, Hashable {
-    var id: String
-    var node: AgentGraphNode
-    var score: Double
-    var matchedTerms: [String]?
-    var matchedEntities: [String]?
-    var relatedEdges: [AgentGraphEdge]?
-    var explanation: String?
-}
+typealias GraphEntity = KnowledgeGraph.GraphEntity
 
-struct GraphSearchCounts: Codable, Hashable {
-    var resultCount: Int
-    var nodeCount: Int?
-    var edgeCount: Int?
-}
-
-struct GraphSearchResponse: Codable, Hashable {
-    var query: String
-    var results: [GraphSearchResult]
-    var summary: GraphSearchCounts?
-    var createdAt: String?
-}
-
-struct GraphEntity: Identifiable, Codable, Hashable {
-    var id: String
-    var name: String
-    var aliases: [String]?
-    var kind: String?
-    var confidence: Double?
-    var mentions: Int?
-    var sourceNodeIds: [String]?
-    var updatedAt: String?
-}
-
-struct GraphIndexStatus: Codable, Hashable {
-    var status: String
-    var embeddingModel: String?
-    var dimensions: Int?
-    var nodeCount: Int?
-    var entityCount: Int?
-    var updatedAt: String?
-}
+typealias GraphIndexStatus = KnowledgeGraph.GraphIndexStatus

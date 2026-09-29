@@ -636,9 +636,12 @@ function sanitizePayload(raw) {
   if (typeof payload.inboxPath === "string" && payload.inboxPath) clean.inboxPath = payload.inboxPath;
   if (typeof payload.sessionId === "string" && payload.sessionId) clean.sessionId = payload.sessionId;
   if (typeof payload.cwd === "string" && payload.cwd) clean.cwd = payload.cwd;
+  if (typeof payload.defaultCwd === "string" && payload.defaultCwd) clean.defaultCwd = payload.defaultCwd;
   copyWakeProducerIdentity(payload, clean);
   if (payload.pairReviewer === true) clean.pairReviewer = true;
   if (payload.requireExistingConversation === true) clean.requireExistingConversation = true;
+  // Only an explicit false marks an FYI; absent means a reply is expected.
+  if (payload.expectsReply === false) clean.expectsReply = false;
   if (typeof payload.deskHandle === "string" && /^desk_[A-Za-z0-9-]+$/.test(payload.deskHandle)) {
     clean.deskHandle = payload.deskHandle;
   }

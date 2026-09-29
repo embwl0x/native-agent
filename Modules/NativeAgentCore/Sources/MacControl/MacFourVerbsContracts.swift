@@ -157,17 +157,23 @@ public struct SystemMacFourVerbsClock: MacFourVerbsClock {
     }
 }
 
+public enum MacTypeMode: String, Sendable {
+    case replace, append
+}
+
 /// Her-screen Phase 5 — one step of a batched `act`: a semantic or key verb,
-/// a name, and text for `type`. No repeat, hold or button inside a step.
+/// a name, and text/mode for `type`. No repeat, hold or button inside a step.
 public struct MacActStep: Sendable, Equatable {
     public let verb: String
     public let target: String
     public let text: String?
+    public let mode: MacTypeMode
 
-    public init(verb: String, target: String, text: String? = nil) {
+    public init(verb: String, target: String, text: String? = nil, mode: MacTypeMode = .replace) {
         self.verb = verb
         self.target = target
         self.text = text
+        self.mode = mode
     }
 }
 

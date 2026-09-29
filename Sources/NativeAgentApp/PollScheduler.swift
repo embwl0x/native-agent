@@ -53,7 +53,7 @@ final class PollScheduler: ObservableObject {
             try await Task.sleep(for: .seconds(delay))
         },
         isStreaming: @escaping @MainActor (AppModel?) -> Bool = { model in
-            model?.anySessionStreaming == true
+            model?.engine.turns.anyStreaming == true
         },
         isAppActive: @escaping @MainActor () -> Bool = { NSApp.isActive }
     ) {
@@ -88,14 +88,14 @@ final class PollScheduler: ObservableObject {
 
     private func shouldFire(_ job: PollJob, now: Date) -> Bool {
         if let last = lastTick[job.id], now.timeIntervalSince(last) < job.interval { return false }
-        // `anySessionStreaming` already subsumes `isChatStreaming`. (Review #10.)
+        // `engine.turns.anyStreaming` already subsumes `isChatStreaming`. (Review #10.)
         if job.pauseWhenStreaming, isStreaming(appModel) { return false }
         if job.pauseWhenUnfocused, !isAppActive() { return false }
         return true
     }
 
     private func isPaused(_ job: PollJob) -> Bool {
-        // `anySessionStreaming` already subsumes `isChatStreaming`. (Review #10.)
+        // `engine.turns.anyStreaming` already subsumes `isChatStreaming`. (Review #10.)
         if job.pauseWhenStreaming, isStreaming(appModel) { return true }
         if job.pauseWhenUnfocused, !isAppActive() { return true }
         return false

@@ -52,11 +52,9 @@ public enum LLMCallContext {
     /// byte-identical to before.
     @TaskLocal public static var systemSegments: SystemPromptSegments?
     /// Test-hermeticity seam (2026-06-11). The vision `attachment_unsupported`
-    /// tripwire is emitted from a STATIC method on the `LLMAdapter` default
-    /// `completeMessages` flatten — the adapters that actually hit it
-    /// (Codex / OpenRouter / non-vision stubs) do NOT carry an instance-level
-    /// `telemetryDataRootOverride` (only the four vision-capable adapters do,
-    /// and those override `completeMessages` and never reach the tripwire). So
+    /// tripwire is emitted from a STATIC method on Codex's text-only
+    /// `completeMessages` flatten, and Codex does NOT carry an instance-level
+    /// `telemetryDataRootOverride`. So
     /// the tripwire's destination is threaded the same way the rest of the
     /// per-call context is: a task-local override that propagates into the
     /// inner stream `Task {}`. Unbound (nil) → the trace resolves through
@@ -81,6 +79,10 @@ public enum LLMCallContext {
     /// the current turn so first-call schemas and dispatch agree without
     /// growing the session's durable active-tool file.
     @TaskLocal public static var turnActiveTools: Set<String>?
+
+    /// A turn-only loadout that replaces session tool state without reading,
+    /// promoting, evicting, or recording usage in the persisted loadout.
+    @TaskLocal public static var transientToolLoadout: Set<String>?
 }
 
 // MARK: - Provider lifecycle evidence
@@ -335,9 +337,22 @@ public protocol LLMClient: Sendable {
         surface: String,
         tools: [LLMToolSchema]?
     ) -> AsyncThrowingStream<LLMMessageStreamEvent, Error>
+
+    /// The provider a `streamMessages` call for `model` on `surface` would be
+    /// served by right now, under the caller's bound `LLMCallContext` — the
+    /// same resolution the call runs, so a caller choosing how to talk to the
+    /// adapter reads its answer instead of guessing from a model prefix. Nil
+    /// when the client does not route (test doubles) or the call would fail
+    /// before reaching any adapter.
+    func servingProviderID(model: String?, surface: String) async -> String?
 }
 
 extension LLMClient {
+    /// Clients that do not route to provider adapters serve no provider.
+    public func servingProviderID(model: String?, surface: String) async -> String? {
+        nil
+    }
+
     /// Surface-aware variant. Non-chat callers (executions, dream, REM,
     /// telegram) pass their own surface so the dispatch layer's active.json
     /// provider selection honors the right surface. Default implementation
@@ -490,6 +505,8 @@ public struct LLMStreamToolCall: Sendable, Equatable {
 public enum LLMMessageStreamEvent: Sendable, Equatable {
     case textDelta(String)
     case toolCall(LLMStreamToolCall)
+    /// Presentation only: the message ended, but the response remains open.
+    case replyTextSettled(Bool)
     /// Liveness signal: the provider is producing NON-user-visible output (an
     /// extended-thinking phase, or tool-argument accumulation) — real activity,
     /// but not reply content. `ProviderStreamGuard` counts it as a yield so its
@@ -692,8 +709,7 @@ extension LLMClient {
 
 // Streaming sibling of LLMClient. Lives in NativeAgentCore (same reasoning as
 // LLMClient) so ProviderRouting can declare conformance without taking a
-// circular dep on ChatOrchestration. ChatOrchestration adds the higher-level
-// streamTurn engine that consumes this in TurnStreamEvent terms.
+// circular dep on ChatOrchestration.
 public protocol StreamingLLMClient: Sendable {
     func stream(
         prompt: String,

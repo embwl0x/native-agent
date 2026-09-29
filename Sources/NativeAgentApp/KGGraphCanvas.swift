@@ -1,4 +1,5 @@
 import SwiftUI
+import KnowledgeGraph
 
 // ---------------------------------------------------------------------------
 // MARK: - KGGraphCanvas — node-link force-directed graph (F3)
@@ -19,8 +20,8 @@ import SwiftUI
 // quadratic and the visual result gets meaningless.
 
 struct KGGraphCanvas: View {
-    let entities: [KGEntity]
-    let edges: [KGEdge]
+    let entities: [KnowledgeGraphEntity]
+    let edges: [KnowledgeGraphEdge]
     @Binding var selectedId: String?
 
     @State private var positions: [String: CGPoint] = [:]
@@ -33,11 +34,11 @@ struct KGGraphCanvas: View {
     /// One canonical graph slice drives drawing, hit testing, and force layout.
     /// This prevents duplicated/blank ids or edges outside the current filter
     /// from creating invisible physics participants.
-    private var visibleEntities: [KGEntity] {
+    private var visibleEntities: [KnowledgeGraphEntity] {
         KGGraphCanvasLayout.canonicalEntities(entities)
     }
 
-    private var visibleEdges: [KGEdge] {
+    private var visibleEdges: [KnowledgeGraphEdge] {
         KGGraphCanvasLayout.visibleEdges(edges, among: visibleEntities)
     }
 
@@ -143,7 +144,7 @@ struct KGGraphCanvas: View {
         }
     }
 
-    private func accessibleNode(_ entity: KGEntity) -> some View {
+    private func accessibleNode(_ entity: KnowledgeGraphEntity) -> some View {
         let selectionValue = selectedId == entity.id ? "Selected" : ""
         return Button(action: { selectedId = entity.id }) {
             Text(verbatim: entity.name)
@@ -207,7 +208,7 @@ enum KGGraphCanvasLayout {
     /// At most forty candidates; selected nodes win, then stable ID order.
     /// O(n²) rectangle checks remain bounded and run only during a draw.
     static func labelFrames(
-        entities: [KGEntity], positions: [String: CGPoint], in size: CGSize,
+        entities: [KnowledgeGraphEntity], positions: [String: CGPoint], in size: CGSize,
         selectedID: String?, nodeRadius: CGFloat
     ) -> [String: CGRect] {
         guard entities.count <= 40, size.width >= 24, size.height >= 20 else { return [:] }
@@ -247,14 +248,14 @@ enum KGGraphCanvasLayout {
         case tooLarge(entityCount: Int)
     }
 
-    static func renderSafety(for entities: [KGEntity]) -> RenderSafety {
+    static func renderSafety(for entities: [KnowledgeGraphEntity]) -> RenderSafety {
         let entityCount = canonicalEntities(entities).count
         return entityCount <= maximumRenderableEntities
             ? .render(entityCount: entityCount)
             : .tooLarge(entityCount: entityCount)
     }
 
-    static func canonicalEntities(_ entities: [KGEntity]) -> [KGEntity] {
+    static func canonicalEntities(_ entities: [KnowledgeGraphEntity]) -> [KnowledgeGraphEntity] {
         var seen = Set<String>()
         return entities
             .filter { !$0.id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
@@ -262,7 +263,7 @@ enum KGGraphCanvasLayout {
             .sorted { $0.id < $1.id }
     }
 
-    static func visibleEdges(_ edges: [KGEdge], among entities: [KGEntity]) -> [KGEdge] {
+    static func visibleEdges(_ edges: [KnowledgeGraphEdge], among entities: [KnowledgeGraphEntity]) -> [KnowledgeGraphEdge] {
         let ids = Set(entities.map(\.id))
         var seen = Set<String>()
         return edges
@@ -271,7 +272,7 @@ enum KGGraphCanvasLayout {
             .sorted { $0.id < $1.id }
     }
 
-    static func signature(entities: [KGEntity], edges: [KGEdge]) -> String {
+    static func signature(entities: [KnowledgeGraphEntity], edges: [KnowledgeGraphEdge]) -> String {
         let nodePart = entities.map(\.id).joined(separator: "|")
         let edgePart = edges.map(\.id).joined(separator: "|")
         return "\(nodePart)#\(edgePart)"
@@ -281,8 +282,8 @@ enum KGGraphCanvasLayout {
     /// of repulsion and visible-edge attraction. The final clamp guarantees
     /// every reported node center stays inside the drawable canvas.
     static func positions(
-        entities: [KGEntity],
-        edges: [KGEdge],
+        entities: [KnowledgeGraphEntity],
+        edges: [KnowledgeGraphEdge],
         in size: CGSize,
         nodeRadius: CGFloat
     ) -> [String: CGPoint] {

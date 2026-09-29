@@ -181,8 +181,27 @@ final class iCloudBridge: ObservableObject {
     // MARK: Published state
 
     @Published var available: Bool = false
-    @Published var lastSyncAt: Date?
-    @Published var syncStatus: String = "iCloud not checked"
+    @Published var lastSyncAt: Date? {
+        didSet {
+            PhoneRequestCoordinator.shared.syncDidSucceed()
+            Task { await PhonePlaces.shared.publish() }
+        }
+    }
+    @Published var syncStatus: String = "iCloud not checked" {
+        didSet {
+            if accountFailure != nil, syncStatus != DeviceSyncAccountFailure.phoneMessage {
+                syncStatus = DeviceSyncAccountFailure.phoneMessage
+            }
+        }
+    }
+    @Published private(set) var accountFailure: DeviceSyncAccountFailure?
+    private var accountFailureGeneration: UInt64 = 0
+
+    private func recordAccountFailure(_ failure: DeviceSyncAccountFailure) {
+        accountFailureGeneration &+= 1
+        accountFailure = failure
+        syncStatus = DeviceSyncAccountFailure.phoneMessage
+    }
 
     // MARK: Private
 
@@ -433,6 +452,9 @@ final class iCloudBridge: ObservableObject {
             resolvedProductionTransport = false
         }
         guard let transport = deviceTransport else { return }
+        (transport as? CloudKitDeviceTransport)?.observeAccountFailures { [weak self] failure in
+            await self?.recordAccountFailure(failure)
+        }
         available = true
         syncStatus = "CloudKit connecting…"
         NSLog("[iCloudBridge] device transport: CloudKit ACTIVE (role=ios)")
@@ -453,7 +475,7 @@ final class iCloudBridge: ObservableObject {
         }
 
         deviceIncomingSetupTask = Task {
-            await transport.observeIncoming { [weak self] msg in
+            await transport.observeIncoming { [weak self = self] msg in
                 await self?.handleIncomingFromTransport(msg) ?? false
             }
         }
@@ -466,7 +488,7 @@ final class iCloudBridge: ObservableObject {
             )
         }
         Task {
-            await transport.observePairing { [weak self] secret in
+            await transport.observePairing { [weak self = self] secret in
                 await self?.applyPairingMaterialFromTransport(secret) ?? false
             }
         }
@@ -596,7 +618,14 @@ final class iCloudBridge: ObservableObject {
         // follow-up (#7) — an oversized send surfaces loud, it doesn't corrupt the
         // legacy path.
         if let ck = deviceTransport {
-            try await ck.send(msg)
+            do {
+                try await ck.send(msg)
+            } catch {
+                if case .account(let failure) = error as? DeviceSyncError {
+                    recordAccountFailure(failure)
+                }
+                throw error
+            }
             lastSyncAt = Date()
             syncStatus = "Sending via CloudKit"
             return msg
@@ -641,6 +670,8 @@ final class iCloudBridge: ObservableObject {
             ]
         )
     }
+
+    var pairingSecretForPhoneRequests: Data? { pairingStore?.iCloudPairingSecret }
 
     // MARK: - Observe incoming messages from Mac
 
@@ -816,7 +847,8 @@ final class iCloudBridge: ObservableObject {
         let kind = msg.metadata?["kind"]
         if seenMessageIDs.contains(msg.id) { return true }
         if let secret = pairingStore?.iCloudPairingSecret,
-           isVerificationDeferred(msg.id, secret: secret, version: pairingStore?.knownSecretVersion ?? 0) {
+           isVerificationDeferred(msg.id, secret: secret, version: pairingStore?.knownSecretVersion ?? 0),
+           abs(Date().timeIntervalSince(msg.timestamp)) <= 24 * 60 * 60 {
             return false
         }
 
@@ -855,7 +887,7 @@ final class iCloudBridge: ObservableObject {
         // Signed records remain eligible until their exact consumer is ready.
         // Do this after foreign-target and resync handling: neither is a local
         // chat/notification delivery, and both must not wedge the cursor.
-        guard kind == "icloud_action_response"
+        guard kind == "icloud_action_response" || kind == PhoneRequest.messageKind
                 || !messageHandlers.isEmpty
                 || !notificationHandlers.isEmpty
                 || !rejectionHandlers.isEmpty else { return false }
@@ -868,14 +900,11 @@ final class iCloudBridge: ObservableObject {
             return self.pairingStore?.iCloudPairingSecret
         }
         if !verified {
-            // 2026-09-16: the same staleness rule as the verified branch below.
-            // An unverifiable record older than a day cannot be authenticated
-            // by any key this phone will ever get (it was a second Mac install
-            // signing into the shared container); kept forever it pinned the
-            // cursor and re-raised "could not verify one Mac reply" on every
-            // launch. It is archived, never dispatched — no trust is relaxed.
-            if kind != "icloud_action_response",
-               abs(Date().timeIntervalSince(msg.timestamp)) > 24 * 60 * 60 {
+            // Archive stale unverifiable records, including action responses
+            // signed before a pairing-secret change. Clear their diagnostic
+            // state and consume without dispatch or rejection so they cannot
+            // settle a transaction or re-raise the banner on the next launch.
+            if abs(Date().timeIntervalSince(msg.timestamp)) > 24 * 60 * 60 {
                 NSLog("[iCloudBridge] archiving >24h-old unverifiable Mac CK message %@ without dispatch", msg.id)
                 unverifiedRecords.removeAll { $0.id == msg.id }
                 persistUnverifiedRecords()
@@ -914,7 +943,14 @@ final class iCloudBridge: ObservableObject {
 
         // Route notification vs chat; consume only if the matching consumer
         // exists (else hold for retry — delivered in order when it registers).
-        if kind == "icloud_action_response" {
+        if kind == PhoneRequest.messageKind {
+            // verifyReply may have refreshed pairing while suspended. Bind
+            // durable acceptance to the key that authenticates the message now.
+            guard let requestSecret = pairingStore?.iCloudPairingSecret,
+                  msg.verifySignature(secret: requestSecret),
+                  await PhoneRequestCoordinator.shared.accept(msg, secret: requestSecret) else { return false }
+            recordSeenMacReplyID(msg.id); persistSeenMacReplyIDs()
+        } else if kind == "icloud_action_response" {
             guard let actionID = msg.correlationID,
                   await iCloudSyncEngine.shared.persistCloudKitActionResponse(
                     msg.text,
@@ -938,6 +974,7 @@ final class iCloudBridge: ObservableObject {
                 NSLog("[iCloudBridge] consumed CloudKit notification %@ without local duplicate; Apple owns visual presentation", msg.id)
             }
         } else {
+            PhoneTurnActivity.shared.receive(msg)
             guard !messageHandlers.isEmpty else { return false }
             recordSeenMacReplyID(msg.id); persistSeenMacReplyIDs()
             lastSyncAt = Date()
@@ -979,12 +1016,21 @@ final class iCloudBridge: ObservableObject {
                 }
             }
         }
-        let dispatched = await ck.drainIncoming()
+        let accountGeneration = accountFailureGeneration
+        let result = await ck.drainIncoming()
+        if case .failure(.account(let failure), _) = result {
+            recordAccountFailure(failure)
+        }
+        let dispatched = result.dispatchedCount
         if dispatched > 0 { NADeviceSyncRecoveryBudget.didApplyData?() }
         guard NADeviceSyncRecoveryBudget.hasTime else { return dispatched > 0 }
         await ck.drainPairing()
         guard NADeviceSyncRecoveryBudget.hasTime else { return dispatched > 0 }
         await ck.drainStatus()
+        if case .success = result, accountGeneration == accountFailureGeneration, accountFailure != nil {
+            accountFailure = nil
+            syncStatus = "CloudKit ready"
+        }
         return dispatched > 0
     }
 
@@ -1101,6 +1147,7 @@ final class iCloudBridge: ObservableObject {
         }
 
         recordSeenKVSProgressMessageID(msg.id)
+        PhoneTurnActivity.shared.receive(msg)
         lastSyncAt = Date()
         syncStatus = "Received Mac progress"
         for handler in messageHandlers.values {

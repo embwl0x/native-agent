@@ -1,6 +1,8 @@
 import AppKit
+import Agents
 import ApplicationServices
 import ChatOrchestration
+import MacControl
 import NativeAgentCore
 import PersistenceCore
 
@@ -14,7 +16,7 @@ import PersistenceCore
     enum Blocker: String, Error {
         case offline = "Muse isn't installed or wouldn't open. Nothing was sent."
         case permission = "Allow NativeAgent Accessibility access so it can use Muse's window. Nothing was sent."
-        case window = "Muse isn't showing its chat (is it signed in?). Nothing was sent."
+        case window = "Muse isn't showing its chat. Nothing was sent."
         case thread = "Agent's own chat in Muse couldn't be found or opened, so nothing was sent."
         case typing = "Muse's message box didn't take the text. Nothing was sent; check Muse's message box."
         case submission = "Muse didn't confirm the message. Check Agent's chat in Muse; it won't be resent automatically."
@@ -93,9 +95,13 @@ import PersistenceCore
             return .object(["status": .string("answered"), "agent": .string("peer:" + peerID), "transport": .string("desktopChat"),
                             "sent": .bool(true), "completed": .bool(true), "reply": .string(reply),
                             "conversation_id": .string(title), "continued": .bool(thread != nil), "untrusted_remote_data": .bool(true)])
+        } catch let covered as MacScreenLock.Covered {
+            return .object(["status": .string("unavailable"), "sent": .bool(false), "completed": .bool(false), "detail": .string(covered.detail + " Nothing was sent.")])
         } catch let blocker as Blocker {
             if [.moved, .timeout, .submission].contains(blocker) { return uncertain(blocker.detail(name)) }
-            return .object(["status": .string("unavailable"), "sent": .bool(false), "completed": .bool(false), "detail": .string(blocker.detail(name))])
+            // Say what Muse shows instead of its chat (09-25: a forced-update alert over its login window).
+            let detail = blocker == .window ? showing().map { "Muse isn't showing its chat; it shows \($0). Nothing was sent." } : nil
+            return .object(["status": .string("unavailable"), "sent": .bool(false), "completed": .bool(false), "detail": .string(detail ?? blocker.detail(name))])
         } catch {
             return uncertain(Blocker.submission.detail(name))
         }
@@ -104,7 +110,7 @@ import PersistenceCore
     // MARK: - One exchange
 
     static func send(_ message: String, thread: String?, first: String?) async throws -> (String, String) {
-        try unlocked()
+        try await unlocked()
         guard AXIsProcessTrusted() else { throw Blocker.permission }
         guard await ensureRunning() else { throw Blocker.offline }
         try await showWindow()
@@ -187,7 +193,7 @@ import PersistenceCore
         for _ in 0..<25 where CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: .keyDown) < 2 {
             try await Task.sleep(for: .milliseconds(200))
         }
-        try unlocked()
+        try await unlocked()
         let previous = NSWorkspace.shared.frontmostApplication
         let configuration = NSWorkspace.OpenConfiguration()
         configuration.activates = true
@@ -219,6 +225,7 @@ import PersistenceCore
             }
             for event in events {
                 guard front() else { throw Blocker.window }
+                NativeAgentMotorEpoch.notePostedHIDEvent()
                 event.post(tap: .cghidEventTap)
             }
         }
@@ -245,6 +252,7 @@ import PersistenceCore
         func keys(_ code: CGKeyCode, flags: CGEventFlags = []) throws {
             for event in try AX.keyEvents(code, flags: flags) {
                 guard front() else { throw Blocker.typing }
+                NativeAgentMotorEpoch.notePostedHIDEvent()
                 event.post(tap: .cghidEventTap)
             }
         }
@@ -287,7 +295,9 @@ import PersistenceCore
     struct Turn { let user: Bool; let text: String }
 
     /// Keys and paste on a locked Mac would go to the lock screen's password field.
-    static func unlocked() throws {
+    /// The screensaver sets the same flag, so it is woken first.
+    static func unlocked() async throws {
+        try await MacScreenLock.wakeIfCovered()
         // Fail closed: no session dictionary, or no proof it is on console and unlocked, sends nothing.
         guard let session = CGSessionCopyCurrentDictionary() as? [String: Any],
               session["kCGSSessionOnConsoleKey"] as? Bool == true,
@@ -297,6 +307,22 @@ import PersistenceCore
     static func windows() throws -> [AXUIElement] {
         guard let app = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first else { throw Blocker.offline }
         return AX.attribute(AXUIElementCreateApplication(app.processIdentifier), kAXWindowsAttribute) as? [AXUIElement] ?? []
+    }
+
+    /// What Muse's windows show when none holds the chat: each window's title
+    /// or, for a dialog, its words. Nil when nothing can be read.
+    static func showing() -> String? {
+        guard let all = try? windows() else { return nil }
+        if all.isEmpty { return "no window" + (NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first?.isHidden == true ? " (it is hidden)" : "") }
+        let seen = all.compactMap { window -> String? in
+            let words = AX.nodes(window).filter { AX.string($0, kAXRoleAttribute) == kAXStaticTextRole }
+                .map { AX.string($0, kAXValueAttribute).trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+            let title = AX.string(window, kAXTitleAttribute)
+            let text = AX.string(window, kAXSubroleAttribute) == "AXDialog" || title.isEmpty
+                ? words.prefix(2).joined(separator: ": ") : "a window titled \u{201C}\(title)\u{201D}"
+            return text.isEmpty ? nil : (text.hasPrefix("a window") ? text : "\u{201C}" + String(text.prefix(200)) + "\u{201D}")
+        }
+        return seen.isEmpty ? nil : seen.joined(separator: " and ")
     }
 
     static func hasLog(_ window: AXUIElement) -> Bool { walk(window).contains { AX.string($0, kAXTitleAttribute) == Muse.log } }

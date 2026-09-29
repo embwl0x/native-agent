@@ -1,3 +1,4 @@
+import FeedPolicy
 // SwiftNative port of the daemon's proactive-outcome ledger, scoped to the
 // slice the NOTIFICATION-inbox archive/dismiss writes depend on.
 //
@@ -39,7 +40,7 @@
 //     daemon's redaction is a verified pass-through for this exact shape — we
 //     therefore append the event verbatim rather than re-implementing the
 //     regex redactor. A future wave porting the activity feed wholesale
-//     (CUTOVER_PLAN.md retirement_path) subsumes this echo.
+//     subsumes this echo.
 //   * record/_notify_proactive_act_outcome push notifications and the broader
 //     act() follow-up turn (inbox_act) — those live behind the inbox /act and
 //     /reply routes, which stay HTTP (ChatOrchestration + autonomy follow-up

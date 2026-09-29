@@ -159,32 +159,9 @@ extension SwiftNativeTrustCenter {
                 "dream": .string("openai_oauth_direct"),
                 "autonomy": .string("openai_oauth_direct"),
             ]),
-            "fallback_chain": .object([
-                "chat": .array(Self.defaultFallbackChain),
-                "ios": .array(Self.defaultFallbackChain),
-                "telegram": .array(Self.defaultFallbackChain),
-                "swarms": .array(Self.defaultSwarmFallbackChain),
-            ]),
         ])
         return policy
     }
-
-    private static let defaultFallbackChain: [JSONValue] = [
-        .string("openai_oauth_direct"),
-        .string("anthropic_oauth_direct"),
-        .string("codex"),
-        .string("anthropic"),
-        .string("openrouter"),
-        .string("local"),
-    ]
-
-    private static let defaultSwarmFallbackChain: [JSONValue] = [
-        .string("openai_oauth_direct"),
-        .string("anthropic_oauth_direct"),
-        .string("codex"),
-        .string("openrouter"),
-        .string("local"),
-    ]
 
     /// `toolAutonomy` defaults. The glob-matched entries are load-bearing for
     /// `autonomyForTool` resolution.
@@ -305,17 +282,8 @@ extension SwiftNativeTrustCenter {
         "mail_*": .string("auto"),
         "reminders_*": .string("auto"),
         "mac.spotlight_search": .string("auto"),
-        // W1b — READ-ONLY accessibility perception. Explicit "auto" tier
-        // rather than fallback: they read the on-screen AX tree and mutate
-        // nothing, so they sit with spotlight_search, not with the
-        // send_approval mac.focus_app / mac.quit_app pair below. The
-        // Trust Center accessibility category still gates them.
-        "mac.ax_status": .string("auto"),
-        "mac.ax_tree": .string("auto"),
-        "mac.ax_find": .string("auto"),
-        // W3.5 — the fused view sits with them: perception, no approval. The
-        // accessibility category AND the Screen Recording system grant both
-        // still apply.
+        // Read-only Mac perception remains subject to the Accessibility gate.
+        // The fused view also requires the Screen Recording system grant.
         "mac.view": .string("auto"),
         "mac_view": .string("auto"),
         "mac.attention": .string("auto"),
@@ -325,14 +293,6 @@ extension SwiftNativeTrustCenter {
         // above carries both.
         "mac.look": .string("auto"),
         "mac_look": .string("auto"),
-        // W7 — mac_nudge sits with them: one bare mouse move, no click, no
-        // keystroke, no app state changed, so there is nothing to approve.
-        // Pinned under BOTH spellings for the same reason the injection pair
-        // below is — `autonomyForTool` matches the override key literally, and
-        // the gate is asked about `mac_nudge` while the connector registry and
-        // any card speak `mac.nudge`.
-        "mac.nudge": .string("auto"),
-        "mac_nudge": .string("auto"),
         // fable51 item 30 — THE CLIPBOARD ORGAN. Both spellings, for the same
         // reason every Mac pair above carries both: `autonomyForTool` matches
         // the override key LITERALLY, and the gate is asked about
@@ -374,35 +334,11 @@ extension SwiftNativeTrustCenter {
         // non-interactive surface (bridge / while he is away) — the exact moments
         // she needs to act. Full Mac + accessibility category + TCC still gate ALL
         // of these; this only removes the per-call prompt.
-        // W2/W3 — INPUT INJECTION. Previously send_approval, pinned under
-        // BOTH spellings on purpose: `autonomyForTool` matches the override key
-        // literally, and the autonomy gate is asked about the model-tool name
-        // (`mac_keystroke`) while the connector registry and the approval card
-        // speak the action id (`mac.keystroke`). One spelling alone would leave
-        // the other resolving through `autonomyDefault` instead of this floor.
-        //
-        // The checked admitted-Full-Mac authority now owns the runtime
-        // zero-prompt decision for these and every other confirm-shaped tool;
-        // this table keeps the non-YOLO default explicit.
-        "mac.keystroke": .string("auto"),
-        "mac.click": .string("auto"),
-        "mac.scroll": .string("auto"),
-        "mac.ax_act": .string("auto"),
-        "mac_keystroke": .string("auto"),
-        "mac_click": .string("auto"),
-        "mac_scroll": .string("auto"),
-        "mac_ax_act": .string("auto"),
         // W6 — mac_wake. Both spellings, same floor, for the same reason: it
         // posts a HID event. The result it returns is a mac_view, but the tier
         // follows the emission, not the payload.
         "mac.wake": .string("auto"),
         "mac_wake": .string("auto"),
-        // native-look item 3 — mac_act. Both spellings, same reason as every
-        // pair above: `autonomyForTool` matches the override key literally, and
-        // the gate is asked about `mac_act` while the connector registry and
-        // any approval card speak `mac.act`.
-        "mac.act": .string("auto"),
-        "mac_act": .string("auto"),
         // W7 — activity_query. Explicit "auto" rather than fallback, under BOTH
         // spellings for the same reason the Mac pairs above are: `autonomyForTool`
         // matches the override key LITERALLY, and the autonomy gate is asked
@@ -445,8 +381,6 @@ extension SwiftNativeTrustCenter {
         "mac.running_apps": .string("auto"),
         "mac.applescript": .string("auto"),
         "mac.jxa": .string("auto"),
-        "mac.focus_app": .string("auto"),
-        "mac.quit_app": .string("auto"),
         "mac.write_file": .string("auto"),
         "mac.set_volume": .string("auto"),
         "mac.sleep_display": .string("auto"),

@@ -27,12 +27,9 @@ enum SlimSettingsDataLimitsReference {
 
     typealias ResourceLookup = (_ name: String, _ extension: String?, _ subdirectory: String?) -> URL?
 
-    /// SwiftPM copies the document at the resource root while the signed
-    /// release layout keeps it in Resources/docs. Prefer the release layout,
-    /// then retain the development-bundle fallback.
+    /// install_app.sh and release.sh stage the document at Resources/docs.
     static func bundledURL(using resourceLookup: ResourceLookup) -> URL? {
         resourceLookup(resourceName, resourceExtension, preferredSubdirectory)
-            ?? resourceLookup(resourceName, resourceExtension, nil)
     }
 
     static func open(

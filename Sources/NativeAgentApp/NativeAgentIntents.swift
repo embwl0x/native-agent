@@ -2,6 +2,82 @@ import AppIntents
 import Foundation
 import NativeAgentCore
 import ChatOrchestration
+import PersonaEngine
+
+/// One resident agent, named by this installation's canonical persona.
+struct ResidentAgentEntity: AppEntity {
+    static let typeDisplayRepresentation: TypeDisplayRepresentation = "Agent"
+    static let defaultQuery = ResidentAgentQuery()
+
+    let id: String
+    let name: String
+
+    var displayRepresentation: DisplayRepresentation {
+        DisplayRepresentation(title: "\(name)")
+    }
+
+    static var current: ResidentAgentEntity {
+        ResidentAgentEntity(id: "resident", name: PersonaCompiler.agentDisplayName())
+    }
+}
+
+struct ResidentAgentQuery: EntityStringQuery {
+    @available(macOS 27, *)
+    static var allowedExecutionTargets: IntentExecutionTargets { .main }
+
+    func entities(for identifiers: [String]) async throws -> [ResidentAgentEntity] {
+        let agent = ResidentAgentEntity.current
+        return identifiers.contains(agent.id) ? [agent] : []
+    }
+
+    func entities(matching string: String) async throws -> [ResidentAgentEntity] {
+        let agent = ResidentAgentEntity.current
+        return agent.name.localizedCaseInsensitiveContains(string) ? [agent] : []
+    }
+
+    func suggestedEntities() async throws -> [ResidentAgentEntity] {
+        [.current]
+    }
+
+    func defaultResult() async -> ResidentAgentEntity? { .current }
+}
+
+/// The original Ask action stays source- and shortcut-compatible. This action
+/// adds a finite entity vocabulary; free-form messages are elicited by Siri,
+/// never interpolated as a second phrase parameter.
+struct AskResidentAgentIntent: AppIntent {
+    @available(macOS 27, *)
+    static var allowedExecutionTargets: IntentExecutionTargets { .main }
+
+    static let title: LocalizedStringResource = "Ask Your Agent"
+    static let description = IntentDescription("Ask the resident agent by name in the retained Shortcuts conversation.")
+    static let openAppWhenRun = false
+
+    @Parameter(title: "Agent")
+    var agent: ResidentAgentEntity
+
+    @Parameter(title: "Message")
+    var message: String
+
+    static var parameterSummary: some ParameterSummary {
+        Summary("Ask \(\.$agent) \(\.$message)")
+    }
+
+    func perform() async throws -> some IntentResult & ReturnsValue<String> & ProvidesDialog {
+        guard agent.id == ResidentAgentEntity.current.id else {
+            throw $agent.needsValueError("Choose the resident agent.")
+        }
+        let reply: String
+        if #available(macOS 27, *) {
+            reply = try await performBackgroundTask {
+                try await NativeAgentChatIntent.reply(to: message)
+            }
+        } else {
+            reply = try await NativeAgentChatIntent.reply(to: message)
+        }
+        return .result(value: reply, dialog: IntentDialog(stringLiteral: reply))
+    }
+}
 
 private func intentClient() -> NativeClient {
     let base = NativeBaseURLDefaults.read()
@@ -39,18 +115,27 @@ enum NativeAgentIntentSession {
 }
 
 struct NativeAgentStatusIntent: AppIntent {
+    @available(macOS 27, *)
+    static var allowedExecutionTargets: IntentExecutionTargets { .main }
+
     static let title: LocalizedStringResource = "Get NativeAgent Status"
     static let description = IntentDescription("Checks the local NativeAgent runtime and returns the current health state.")
     static let openAppWhenRun = false
 
     func perform() async throws -> some IntentResult & ProvidesDialog {
-        let health = try await intentClient().getHealth()
+        let health = NativeAgentEngine.live.doctor.readHealth()
         let state = health.ok ? "online" : "unavailable"
+        if #available(macOS 27, *), systemContext.isVoiceOnly {
+            return .result(dialog: "NativeAgent is \(state).")
+        }
         return .result(dialog: "NativeAgent is \(state). Version \(health.version).")
     }
 }
 
 struct NativeAgentChatIntent: AppIntent {
+    @available(macOS 27, *)
+    static var allowedExecutionTargets: IntentExecutionTargets { .main }
+
     static let title: LocalizedStringResource = "Ask NativeAgent"
     static let description = IntentDescription("Sends a message to NativeAgent's retained Shortcuts conversation.")
     static let openAppWhenRun = false
@@ -62,7 +147,19 @@ struct NativeAgentChatIntent: AppIntent {
         Summary("Ask NativeAgent \(\.$message)")
     }
 
-    func perform() async throws -> some IntentResult & ProvidesDialog {
+    func perform() async throws -> some IntentResult & ReturnsValue<String> & ProvidesDialog {
+        let reply: String
+        if #available(macOS 27, *) {
+            reply = try await performBackgroundTask {
+                try await Self.reply(to: message)
+            }
+        } else {
+            reply = try await Self.reply(to: message)
+        }
+        return .result(value: reply, dialog: IntentDialog(stringLiteral: reply))
+    }
+
+    static func reply(to message: String) async throws -> String {
         // No pick means no pick: an empty model resolves through the chat
         // surface's Providers group rather than a literal chosen here.
         let model = UserDefaults.standard.string(forKey: "chatModel") ?? ""
@@ -76,22 +173,34 @@ struct NativeAgentChatIntent: AppIntent {
             reasoningEffort: reasoningEffort,
             fileAccess: fileAccess
         )
-        return .result(dialog: "\(String(reply.output.prefix(260)))")
+        return reply.output
     }
 }
 
+@available(macOS 27, *)
+extension NativeAgentChatIntent: LongRunningIntent {}
+
+@available(macOS 27, *)
+extension AskResidentAgentIntent: LongRunningIntent {}
+
 struct NativeAgentDoctorIntent: AppIntent {
+    @available(macOS 27, *)
+    static var allowedExecutionTargets: IntentExecutionTargets { .main }
+
     static let title: LocalizedStringResource = "Run NativeAgent Doctor"
     static let description = IntentDescription("Runs the local Doctor check without unsafe repairs.")
     static let openAppWhenRun = true
 
     func perform() async throws -> some IntentResult & ProvidesDialog {
-        let report = try await intentClient().runDoctor(repair: false)
+        let report = try await intentClient().runDoctor()
         return .result(dialog: "Doctor finished with status \(report.status). \(report.checks.count) checks ran.")
     }
 }
 
 struct NativeAgentWorkshopTaskIntent: AppIntent {
+    @available(macOS 27, *)
+    static var allowedExecutionTargets: IntentExecutionTargets { .main }
+
     static let title: LocalizedStringResource = "Create NativeAgent Desk Task"
     static let description = IntentDescription("Creates a directed task on the configured agent's Desk.")
     static let openAppWhenRun = false
@@ -117,12 +226,15 @@ struct NativeAgentWorkshopTaskIntent: AppIntent {
 // `appShortcuts`, and the native action it invoked no longer exists.
 
 struct NativeAgentApprovalsIntent: AppIntent {
+    @available(macOS 27, *)
+    static var allowedExecutionTargets: IntentExecutionTargets { .main }
+
     static let title: LocalizedStringResource = "Review NativeAgent Approvals"
     static let description = IntentDescription("Shows the current NativeAgent approval count.")
     static let openAppWhenRun = true
 
     func perform() async throws -> some IntentResult & ProvidesDialog {
-        let approvals = try await intentClient().getApprovals()
+        let approvals = try await NativeAgentEngine.live.approvals.list()
         let pending = approvals.filter { $0.status == "pending" }.count
         return .result(dialog: "\(pending) NativeAgent approval\(pending == 1 ? "" : "s") pending.")
     }
@@ -130,6 +242,16 @@ struct NativeAgentApprovalsIntent: AppIntent {
 
 struct NativeAgentShortcuts: AppShortcutsProvider {
     static var appShortcuts: [AppShortcut] {
+        AppShortcut(
+            intent: AskResidentAgentIntent(),
+            phrases: [
+                "Ask \(\.$agent) in \(.applicationName)",
+                "Tell \(.applicationName)'s \(\.$agent)",
+                "Ask my agent in \(.applicationName)",
+            ],
+            shortTitle: "Ask Your Agent",
+            systemImageName: "person.bubble"
+        )
         AppShortcut(
             intent: NativeAgentStatusIntent(),
             phrases: ["Check \(.applicationName) status", "Ask \(.applicationName) status"],

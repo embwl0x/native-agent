@@ -226,6 +226,19 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
             )
         }
 
+        var coverageParts: [String] = []
+        if !summary.truncatedDays.isEmpty {
+            coverageParts.append(
+                "\(summary.truncatedDays.count) day file(s) were tailed to the read budget"
+                    + " (\(summary.truncatedDays.joined(separator: ", "))), so earlier turns"
+                    + " that day were not scanned"
+            )
+        }
+        if summary.malformedLines > 0 {
+            coverageParts.append("\(summary.malformedLines) trace line(s) did not parse")
+        }
+        let coverageDetail = coverageParts.isEmpty ? "" : " " + coverageParts.joined(separator: "; ") + "."
+
         let shapeLine = shapeMixLine(
             v2: v2CallCount, v1: v1CallCount, unshaped: unshapedCallCount
         ) + " Ignored \(ignoredSurfaces) calls outside chat and \(ignoredSmallCalls) chat calls"
@@ -233,7 +246,7 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
 
         if summary.isEmptyFeed {
             return CheckResult(
-                id: id, title: title, status: "warn",
+                id: id, title: title, status: "ok",
                 detail: "UNMEASURED \(window.describedAs) — no turn-trace day files under"
                     + " data/turn_traces. Prefix-cache health has not been observed."
                     + " \(shapeLine)",
@@ -242,11 +255,12 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
         }
         guard !v2FirstCalls.isEmpty else {
             return CheckResult(
-                id: id, title: title, status: "warn",
+                // A bounded tail is not a failed measurement before the first eligible turn.
+                id: id, title: title, status: v1CallCount > 0 || summary.malformedLines > 0 ? "warn" : "ok",
                 detail: "UNMEASURED \(window.describedAs) — \(summary.daysPresent.count)"
                     + " trace day(s) read and \(summary.matchedRows) row(s) in window, but not"
                     + " one eligible chat call used the current prompt format. Nothing about prefix reuse"
-                    + " can be measured. \(shapeLine)",
+                    + " can be measured. \(shapeLine)\(coverageDetail)",
                 repair: v1CallCount > 0
                     ? "The v2 prefix shape appears to be rolled back. Clear the"
                         + " \(ConversationPrefixShape.defaultsKey) user default to return to"
@@ -475,16 +489,7 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
                     + " and were UNJUDGED rather than counted as zero"
             )
         }
-        if !summary.truncatedDays.isEmpty {
-            parts.append(
-                "\(summary.truncatedDays.count) day file(s) were tailed to the read budget"
-                    + " (\(summary.truncatedDays.joined(separator: ", "))), so earlier turns"
-                    + " that day were not scanned"
-            )
-        }
-        if summary.malformedLines > 0 {
-            parts.append("\(summary.malformedLines) trace line(s) did not parse")
-        }
+        parts.append(contentsOf: coverageParts)
 
         var status = "ok"
         var repair: String? = nil
@@ -506,9 +511,8 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
             repair = "Low read share on an Anthropic lane means the cached prefix is being"
                 + " rebuilt more often than it is read. Compare volatileBlockChars against the"
                 + " stable mass for the affected sessions."
-        } else if !summary.truncatedDays.isEmpty || unjudgedFirstCalls > 0 {
-            // Not a defect, but not a clean bill of health either: part of the
-            // window went unread.
+        } else if !coverageParts.isEmpty || unjudgedFirstCalls > 0 {
+            // Incomplete coverage or missing metrics cannot certify health.
             status = "warn"
         }
 

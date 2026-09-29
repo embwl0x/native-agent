@@ -1,10 +1,17 @@
+import AppToolRuntime
+import Privacy
 import Foundation
+import AttentionRouting
 import ChatOrchestration
 import MacControl
 import MacIntegration
 import NativeAgentCore
 import PersistenceCore
 import TrustCenter
+import DeviceSync
+import NativeAgentShared
+import Dispatcher
+import TriggerScheduler
 
 /// App-side implementation of the `MacIntegrationToolBridge` protocol declared
 /// in ChatOrchestration. The chat tool dispatcher calls this whenever Agent
@@ -19,8 +26,12 @@ import TrustCenter
 /// `NativeAgentNotifications` for Mac local notifications, `MacSyncEngine` for
 /// iOS push, the MacControl-spotlight dispatch path). ChatOrchestration (Core)
 /// can't import them directly, so this bridge struct stitches them together
-/// app-side and gets injected via the factory in `AppChatToolDispatcher`.
-struct MacIntegrationBridgeImpl: MacIntegrationToolBridge {
+/// app-side and reaches the engine as a port (`NativeAgentEnginePorts`).
+struct MacIntegrationBridgeImpl: MacIntegrationToolBridge, PureToolArgumentValidating {
+    func argumentRefusal(tool: String, input: [String: JSONValue]) async -> JSONValue? {
+        await MacPIMConnectorActions.argumentRefusal(tool: tool, input: input)
+    }
+
     func calendarListUpcoming(input: [String: JSONValue]) async throws -> JSONValue {
         try await MacPIMConnectorActions.calendarListUpcoming(input: input)
     }
@@ -33,7 +44,7 @@ struct MacIntegrationBridgeImpl: MacIntegrationToolBridge {
         // Mirror the shape NativeClient.runMacNotify uses so the chat-tool
         // path returns the same envelope the connector-action path does.
         let (title, message) = try NativeAgentNotificationDefaults.parseInput(input, toolName: "mac_notify")
-        let result = await NativeAgentNotifications.postAndReport(title: title, body: message)
+        let result = await NativeAgentNotifications.postMessage(title: title, body: message)
         var obj = result.deliveryFields()
         obj.merge([
             "title": .string(NativeAppSecretRedactor.redactText(title)),
@@ -77,6 +88,48 @@ struct MacIntegrationBridgeImpl: MacIntegrationToolBridge {
             "messagePreview": .string(NativeAppSecretRedactor.redactText(String(message.prefix(200)))),
         ]) { _, new in new }
         return .object(obj)
+    }
+
+    func phoneRequest(input: [String: JSONValue]) async throws -> JSONValue {
+        guard let kindName = input["kind"]?.stringValue, let kind = PhoneRequest.Kind(rawValue: kindName) else {
+            throw DeviceSyncError.underlying(message: "kind must be location.current, photo.pick, or photo.capture.")
+        }
+        if let params = input["params"], params != .null, params != .object([:]) {
+            throw DeviceSyncError.underlying(message: "These phone requests take empty params.")
+        }
+        let wait: Int
+        if let value = input["wait_seconds"], value != .null {
+            guard case .int(let seconds) = value, (1...120).contains(seconds) else {
+                throw DeviceSyncError.underlying(message: "wait_seconds must be 1–120.")
+            }
+            wait = Int(seconds)
+        } else { wait = 60 }
+        let request = PhoneRequest(kind: kind, waitSeconds: wait)
+        let bridge = await NativeAgentEngine.liveDeviceSync.bridge
+        let reply = try await bridge.phoneRequests.request(request)
+        let result = try JSONDecoder().decode(PhoneRequestResult.self, from: Data(reply.text.utf8))
+        var output: [String: JSONValue] = [
+            "request_id": .string(result.requestID), "status": .string(result.status.rawValue),
+            "values": .object(result.values.mapValues { .string($0) })
+        ]
+        if let message = result.message { output["message"] = .string(message) }
+        if result.status == .completed, kind == .pickPhoto || kind == .capturePhoto {
+            guard let photo = reply.attachments?.first, reply.attachments?.count == 1,
+                  photo.type == "image", photo.mime == "image/jpeg",
+                  let data = Data(base64Encoded: photo.base64), data.count == photo.byteSize, data.count <= 450_000 else {
+                throw DeviceSyncError.underlying(message: "The phone result had no valid photo attachment.")
+            }
+            let root = NativeAgentEngine.liveDeviceSync.dataRoot.appendingPathComponent("generated/phone", isDirectory: true)
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            let path = root.appendingPathComponent("\(request.id).jpg")
+            try data.write(to: path, options: .atomic)
+            let vision = LocalToolImage.showProducedImage(at: path, name: "phone-photo.jpg")
+            output["attachments"] = .array([.object([
+                "type": .string("image"), "mime": .string("image/jpeg"), "path": .string(path.path),
+                "byteSize": .int(Int64(data.count)), "shownToModel": .bool(vision.shown), "visionNote": .string(vision.note)
+            ])])
+        }
+        return .object(output)
     }
 
     // MARK: - Phase 2 (2026-06-07): Contacts + AppleScript bridges
@@ -160,6 +213,9 @@ struct MacIntegrationBridgeImpl: MacIntegrationToolBridge {
     func remindersComplete(input: [String: JSONValue]) async throws -> JSONValue {
         try await MacPIMConnectorActions.remindersComplete(input: input)
     }
+    func remindersDelete(input: [String: JSONValue]) async throws -> JSONValue {
+        try await MacPIMConnectorActions.remindersDelete(input: input)
+    }
 
     // Mail manage (W2)
 
@@ -214,6 +270,31 @@ struct MacIntegrationBridgeImpl: MacIntegrationToolBridge {
 
     func schedulerCreateJob(input: [String: JSONValue]) async throws -> JSONValue {
         try await NativeClient.runSchedulerCreateJob(input: input)
+    }
+
+    func schedulerCancelJob(input: [String: JSONValue]) async throws -> JSONValue {
+        try await schedulerJobWriter().cancelJob(jobId: schedulerJobID(input))
+    }
+
+    func schedulerSetJobEnabled(input: [String: JSONValue], enabled: Bool) async throws -> JSONValue {
+        try await schedulerJobWriter().setJobEnabled(jobId: schedulerJobID(input), enabled: enabled)
+    }
+
+    func schedulerUpdateJob(input: [String: JSONValue]) async throws -> JSONValue {
+        let id = schedulerJobID(input)
+        // Routing context is not a job edit; keep unknown edit fields so the
+        // canonical writer still rejects them.
+        let changes = input.filter { !["job_id", "jobId", "id", "__session_id", "session_id"].contains($0.key) }
+        return try await schedulerJobWriter().updateJob(jobId: id, changes: changes)
+    }
+
+    private func schedulerJobWriter() -> any SchedulerJobWriter {
+        makeSchedulerJobWriter(connectorActionIDs: NativeClient.connectorActionIDSet())
+    }
+
+    private func schedulerJobID(_ input: [String: JSONValue]) -> String {
+        (input["job_id"]?.stringValue ?? input["jobId"]?.stringValue ?? input["id"]?.stringValue ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     // MARK: - Phase 1

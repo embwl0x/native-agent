@@ -25,8 +25,7 @@ import Darwin
 // error_code strings). NOTHING here is wired into a production caller yet:
 // `SwiftNativeDispatcher.dispatch` only consults this registry when explicitly
 // enabled (see `LocalConnectorActions`), and the production factory leaves it
-// off. Flipping callers through SwiftNative is a separate wave (CUTOVER_PLAN
-// §6.30 disposition).
+// off. Flipping callers through SwiftNative is a separate wave.
 //
 // Sandbox parity: the Python handlers gate on `_allowed_roots(context)` +
 // `_is_sensitive_data_path(path, context)`. We reproduce both — driven entirely
@@ -84,19 +83,10 @@ public struct ConnectorActionContext: Sendable {
     public var extraAllowedRoots: [String]
     /// Persona root (SOUL.md / USER.md / VOICE.md / GROWTH.md / AGENTS.md +
     /// `skills/bodies/`). Wave 34 W06: consumed by `persona_read` /
-    /// `persona_list_skills`. Mirrors Python `_resolve_na_persona_root(context)`
-    /// — in test mode (`_na_data_root` override) the daemon uses
-    /// `<dataRoot>/memory`, which is exactly what `fromDispatch` derives when a
-    /// data-root override is present. With NO data-root override, persona root
-    /// stays nil here and `PersonaSystemActions.personaRootURL` falls through to
-    /// `PersistenceCore.defaultPersonaRoot()` (env / stamped-repo / default),
-    /// mirroring `_resolve_persona_root_bt`.
-    ///
-    /// PARITY (gpt-5.5 review): the historical executor had NO `_na_persona_root`
-    /// context override; persona root is ONLY derived from `_na_data_root`
-    /// (test) or `_resolve_persona_root_bt()` (prod). So `fromDispatch` does NOT
-    /// read a `_na_persona_root` key; it derives `<dataRoot>/memory` ONLY when
-    /// `_na_data_root` is present.
+    /// `persona_list_skills`. `fromDispatch` leaves it nil, so
+    /// `PersonaSystemActions.personaRootURL` applies
+    /// `PersistenceCore.defaultPersonaRoot` to the `_na_data_root` override or
+    /// the process data root. There is no `_na_persona_root` context key.
     public var personaRoot: String?
     /// Workspace root (the `workspace/` dir `workspace_list` enumerates).
     /// Mirrors Python `context["_na_workspace_root"]` override /
@@ -133,15 +123,6 @@ public struct ConnectorActionContext: Sendable {
         if case .array(let arr)? = ctx.extra["_extra_allowed_roots"] {
             for v in arr { if case .string(let s) = v { extra.append(s) } }
         }
-        // Persona root: mirror `_resolve_na_persona_root` EXACTLY — under a
-        // data-root override (test mode) the daemon uses `<dataRoot>/memory`;
-        // otherwise it falls through to `_resolve_persona_root_bt()` which the
-        // Swift side handles in `personaRootURL` (nil here → defaultPersonaRoot).
-        // There is NO `_na_persona_root` override in Python, so we don't read one.
-        var personaRoot: String? = nil
-        if let dr = dataRoot {
-            personaRoot = URL(fileURLWithPath: dr).appendingPathComponent("memory").path
-        }
         var workspaceRoot: String? = nil
         if case .string(let s)? = ctx.extra["_na_workspace_root"] { workspaceRoot = s }
         return ConnectorActionContext(
@@ -149,7 +130,6 @@ public struct ConnectorActionContext: Sendable {
             fileAccess: fa,
             dataRoot: dataRoot,
             extraAllowedRoots: extra,
-            personaRoot: personaRoot,
             workspaceRoot: workspaceRoot
         )
     }
@@ -554,6 +534,10 @@ enum FileSystemActions {
             "has_more": .bool(hasMore),
             "content": .string(decodeUTF8Replacing(window.data)),
         ]
+        if FileReadEvidence.required {
+            result["utf8_valid"] = .bool(String(data: window.data, encoding: .utf8) != nil)
+            result["content_sha256"] = .string(SHA256.hash(data: window.data).map { String(format: "%02x", $0) }.joined())
+        }
         if let version = window.version {
             result["version"] = .string(version)
             if hasMore {
@@ -975,6 +959,9 @@ enum FileSystemActions {
                 code: "path_not_allowed"
             )
         }
+        if let names = FileReadEvidence.directoryNames {
+            return craftDirectoryEvidence(resolved, names: names)
+        }
         let fm = FileManager.default
         var isDir: ObjCBool = false
         let exists = fm.fileExists(atPath: resolved.path, isDirectory: &isDir)
@@ -1099,10 +1086,54 @@ enum FileSystemActions {
         return .object(result)
     }
 
+    /// Exact entries, including absence, from the authorized directory. This
+    /// is owner evidence for craft, not a paginated presentation listing.
+    private static func craftDirectoryEvidence(_ path: URL, names: [String]) -> JSONValue {
+        #if canImport(Darwin)
+        guard names.count <= 17, names.allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." && !$0.contains("/") && !$0.contains("\0") }) else {
+            return errResult("Invalid craft file names")
+        }
+        do {
+            let fd = try VerifiedPath.open(path, flags: O_RDONLY | O_DIRECTORY)
+            defer { close(fd) }
+            var parent = stat()
+            var volume = statfs()
+            guard fstat(fd, &parent) == 0, fstatfs(fd, &volume) == 0,
+                  volume.f_flags & UInt32(MNT_LOCAL) != 0 else { return errResult("Local directory evidence unavailable") }
+            var entries: [String: JSONValue] = [:]
+            for name in names {
+                var entry = stat()
+                if fstatat(fd, name, &entry, AT_SYMLINK_NOFOLLOW) != 0 {
+                    guard errno == ENOENT else { return errResult("Entry evidence unavailable") }
+                    entries[name] = .null
+                    continue
+                }
+                let kind = entry.st_mode & mode_t(S_IFMT)
+                guard (kind == mode_t(S_IFREG) || kind == mode_t(S_IFDIR)), entry.st_dev == parent.st_dev else {
+                    return errResult("Craft supports regular files and directories without symlinks")
+                }
+                entries[name] = .object([
+                    "kind": .string(kind == mode_t(S_IFDIR) ? "directory" : "file"),
+                    "identity": .string("\(entry.st_dev):\(entry.st_ino)"),
+                    "version": .string("\(entry.st_dev):\(entry.st_ino):\(entry.st_size):\(entry.st_mtimespec.tv_sec)"),
+                    "modified_ns": .string(String(entry.st_mtimespec.tv_nsec)),
+                ])
+            }
+            return .object(["ok": .bool(true), "path": .string(path.path),
+                "identity": .string("\(parent.st_dev):\(parent.st_ino)"), "entries": .object(entries)])
+        } catch { return errResult("Directory evidence unavailable: \(error)") }
+        #else
+        return errResult("Craft file evidence requires macOS")
+        #endif
+    }
+
     // MARK: - system_info
 
     static func systemInfo(_ input: [String: JSONValue], _ ctx: ConnectorActionContext) -> JSONValue {
-        var fields: [String: JSONValue] = [:]
+        let version = ProcessInfo.processInfo.operatingSystemVersion
+        var fields: [String: JSONValue] = [
+            "macos_version": .string("\(version.majorVersion).\(version.minorVersion).\(version.patchVersion)"),
+        ]
         var failures: [String] = []
 
         // Disk: statfs("/") → total/used/free GB + percent_used.

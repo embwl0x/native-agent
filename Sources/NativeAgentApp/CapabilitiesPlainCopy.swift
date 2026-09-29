@@ -1,4 +1,5 @@
 import Foundation
+import TrustCenter
 
 /// Display copy only. Tool schemas and saved descriptions keep their original text.
 enum CapabilitiesPlainCopy {
@@ -142,7 +143,7 @@ enum CapabilitiesPlainCopy {
         case "git_log": return "Read a project's change history."
         case "git": return "Manage a project's version history."
         case "swift_build": return "Build a Swift project."
-        case "swift_test", "run_tests": return "Run a project's tests."
+        case "swift_test": return "Run a project's tests."
         case "shell", "bash": return "Run commands on your Mac."
         case "apply_patch": return "Apply edits to project files."
         case "file_excerpt": return "Read part of a file."

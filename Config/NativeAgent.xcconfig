@@ -1,0 +1,25 @@
+// Mac app identity defaults — the same values script/build_and_run.sh falls
+// back to when local/nativeagent.local.env does not override them.
+NATIVEAGENT_MAC_BUNDLE_ID = io.github.embwl0x.nativeagent.mac
+NATIVEAGENT_MAC_WIDGET_BUNDLE_ID = $(NATIVEAGENT_MAC_BUNDLE_ID).widget
+NATIVEAGENT_MAC_APP_GROUP_ID = group.$(NATIVEAGENT_MAC_BUNDLE_ID)
+NATIVEAGENT_ICLOUD_CONTAINER_ID = iCloud.io.github.embwl0x.nativeagent
+NATIVEAGENT_MOBILE_SOURCE_KEY = mobile_app
+NATIVEAGENT_BACKGROUND_TASK_PREFIX = io.github.embwl0x.nativeagent
+NATIVEAGENT_DEVICE_SYNC = cloudkit
+// An empty expansion separates the slashes so xcconfig does not start a comment.
+NATIVEAGENT_RELEASE_PAGE_URL = https:/$()/github.com/embwl0x/native-agent/releases
+
+// Ad-hoc ("Sign to Run Locally") unless the ignored local file sets
+// DEVELOPMENT_TEAM, CODE_SIGN_IDENTITY, PROVISIONING_PROFILE_SPECIFIER and
+// CODE_SIGN_ENTITLEMENTS (e.g. local/NativeAgent.entitlements).
+CODE_SIGN_STYLE = Manual
+CODE_SIGN_IDENTITY = -
+CODE_SIGN_ENTITLEMENTS = NativeAgent.adhoc.entitlements
+
+// Release (NATIVEAGENT_BUILD_CONFIG=release installs) strips local symbols
+// from the bundle's executables; the dwarf-with-dsym dSYMs stay beside the
+// product in DerivedData for symbolication. Debug keeps its symbols for lldb.
+DEPLOYMENT_POSTPROCESSING[config=Release] = YES
+
+#include? "../local/NativeAgent.xcconfig"

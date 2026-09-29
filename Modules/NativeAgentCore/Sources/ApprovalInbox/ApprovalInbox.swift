@@ -18,7 +18,7 @@ import TrustCenter
 /// `executedAction` and `detail` are lossless post-execution fields: saved
 /// outcomes can have different JSON shapes. Unlike `resolvedAt`/`decision`,
 /// which are explicit JSON null on pending records, these are omitted when nil.
-public struct ApprovalRecord: Sendable, Equatable {
+public struct ApprovalRecord: Sendable, Equatable, Identifiable {
     public var id: String
     public var title: String
     public var action: String
@@ -127,8 +127,18 @@ extension ApprovalRecord {
         } else {
             self.resolutionProvenance = nil
         }
-        self.remoteResolvable = bool("remoteResolvable")
-        self.localOnly = bool("localOnly")
+        // Owner-review cards staged before User's 2026-09-25 ruling were
+        // stored local-only; a still-pending one reads as phone-answerable, so
+        // the card already waiting is one he can answer. Terminal history
+        // keeps the flags it was decided under.
+        if self.status == "pending",
+           SwiftNativeApprovalInbox.ownerReviewActions.contains(self.action) {
+            self.remoteResolvable = true
+            self.localOnly = false
+        } else {
+            self.remoteResolvable = bool("remoteResolvable")
+            self.localOnly = bool("localOnly")
+        }
         // Preserve the saved execution outcome's shape.
         if let v = obj["executedAction"], case .null = v {
             self.executedAction = nil
@@ -400,8 +410,8 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
     /// resolve calls can't interleave their read→mutate→write sequence.
     private var mutationTail: Task<Void, Never>? = nil
 
-    /// These actions change canonical authority or destructive local state and
-    /// can never become remotely resolvable through caller-supplied flags.
+    /// These actions retain local-only flags regardless of caller input.
+    /// A verified paired iPhone may decide them; Telegram may not.
     nonisolated static let hardLocalOnlyActions: Set<String> = [
         "agent.acp.permission",
         "backup_restore",
@@ -414,13 +424,25 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
         "improvement.revert",
         "autonomy.promote",
         "self_evolution.apply",
-        // The procedural lane's skill proposal (MemoryV2's
-        // `ProceduralSkillProposal.approvalAction`). Approving one writes a
-        // skill body that recall then surfaces — decided at the machine, never
-        // widened by a caller-supplied authority flag.
-        "skill.proposal",
         SwiftNativeApprovalInbox.procedureReviewApprovalAction,
         SwiftNativeApprovalInbox.procedureExactActivationApprovalAction,
+    ]
+
+    /// Owner-review cards: the agent proposing a change to its own memory,
+    /// skills or upkeep, for the owner to say yes or no. User's ruling
+    /// (2026-09-25): he answers these from his paired phone too. They are
+    /// always remote-resolvable whatever the caller passed; a phone decision
+    /// still goes through the same pairing, signature and provenance checks as
+    /// a tool approval, and Telegram still cannot answer them (it needs a card
+    /// bound to its own chat). Nothing here widens permissions or autonomy —
+    /// those kinds stay in `hardLocalOnlyActions`.
+    nonisolated static let ownerReviewActions: Set<String> = [
+        "self_improvement.apply",
+        "skill.proposal",
+        "rem.proposal",
+        "memory.repair",
+        "memory.kind_backfill",
+        "memory.consolidation.swap",
     ]
 
     /// - root: the canonical data root. The approvals
@@ -631,10 +653,13 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
         // overrides. Otherwise honor only a literal JSON Boolean; missing or
         // malformed flags default to false unless the action is remote-safe.
         let isHardLocalOnly = Self.hardLocalOnlyActions.contains(action)
+        let isOwnerReview = Self.ownerReviewActions.contains(action)
         let declaredRemoteResolvable = Self.strictBool(bodyObj["remoteResolvable"])
         let remoteResolvable: Bool
         if isHardLocalOnly {
             remoteResolvable = false
+        } else if isOwnerReview {
+            remoteResolvable = true
         } else if let declaredRemoteResolvable {
             remoteResolvable = declaredRemoteResolvable
         } else {
@@ -643,6 +668,8 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
         let localOnly: Bool
         if isHardLocalOnly {
             localOnly = true
+        } else if isOwnerReview {
+            localOnly = false
         } else if let declared = Self.strictBool(bodyObj["localOnly"]) {
             localOnly = declared
         } else {
@@ -776,29 +803,33 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
     /// Claim or complete the reporting turn independently of deletable chat history.
     /// Execution annotations may heal an outcome without replacing this state.
     public func annotateChatContinuation(
-        _ id: String, done: Bool, legacyStartedAt: String? = nil
+        _ id: String, done: Bool, legacyStartedAt: String? = nil,
+        clearQueuedDelivery: Bool = false, settlement: String? = nil
     ) async throws -> Bool {
         let now = clock()
         return try await updateChatContinuation(id) { record, state in
             if done {
                 guard state["done"] != .bool(true) else { return false }
                 state["done"] = .bool(true)
+                if let settlement { state["settlement"] = .string(settlement) }
                 state["delivery"] = nil
                 return true
             }
-            guard Self.continuationIsRecent(record, now: now),
+            guard Self.continuationIsPending(record, now: now),
                   state["done"] == nil, state["started"] == nil else { return false }
             state["started"] = .string(legacyStartedAt ?? Self.isoTimestamp(now))
+            if clearQueuedDelivery { state["delivery"] = nil }
             return true
         } && (done || legacyStartedAt == nil)
     }
 
     /// Telegram keeps its delivery payload here until the queued turn starts.
     /// 2026-09-18: queueing never replaces a claim, even after a restart.
-    public func queueChatContinuation(_ id: String, delivery: JSONValue, alreadyStarted: Bool = false) async throws -> Bool {
+    public func queueChatContinuation(_ id: String, delivery: JSONValue, alreadyStarted: Bool = false,
+                                      previouslyQueued: Bool = false) async throws -> Bool {
         let now = clock()
         return try await updateChatContinuation(id) { record, state in
-            guard Self.continuationIsRecent(record, now: now),
+            guard (previouslyQueued || Self.continuationIsPending(record, now: now)),
                   state["done"] == nil, state["started"] == nil else { return false }
             state["delivery"] = delivery
             if alreadyStarted { state["started"] = .string(Self.isoTimestamp(now)) }
@@ -806,7 +837,15 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
         }
     }
 
-    public nonisolated static func continuationIsRecent(_ record: ApprovalRecord, now: Date = Date()) -> Bool {
+    /// A queued delivery remains owed across downtime; age only bounds records
+    /// without that durable evidence. Started and completed claims never replay.
+    public nonisolated static func continuationIsPending(_ record: ApprovalRecord, now: Date = Date()) -> Bool {
+        guard record.status == "resolved", record.decision != nil else { return false }
+        if let saved = record.chatContinuation {
+            guard case .object(let state) = saved,
+                  state["started"] == nil, state["done"] == nil else { return false }
+            if case .object? = state["delivery"] { return true }
+        }
         guard let date = record.resolvedAt.flatMap(NativeTimestampFormat.parseISO8601) else { return false }
         return (0...600).contains(now.timeIntervalSince(date))
     }
@@ -825,7 +864,7 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
                     let record = ApprovalRecord(json: items[index]) else {
                     throw ApprovalInboxError.notFound(id)
                 }
-                guard record.status == "resolved", record.decision == "approved" else { return false }
+                guard record.status == "resolved", record.decision != nil else { return false }
                 var state: [String: JSONValue] = [:]
                 if let saved = object["chatContinuation"] {
                     guard case .object(let value) = saved else { return false }
@@ -884,7 +923,7 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
     // MARK: - Helpers
 
     /// The most rows `requests.json` keeps. Terminal rows above it are the
-    /// store's own history and are evictable; pending rows above it are not.
+    /// store's settled history and are evictable; pending work is not.
     public static let storedApprovalCap = 300
 
     /// The statuses a row can be in once it is no longer waiting on anyone.
@@ -923,7 +962,8 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
     /// 2026-09-06: trim `items` (newest-first) to `cap` by dropping TERMINAL
     /// rows, oldest first. A pending row is never evicted — it is a decision
     /// User has not made yet, and deleting it loses the request outright.
-    /// Throws `.queueFull` when there is no terminal row left to drop.
+    /// Continuation claims and queued deliveries remain until completed.
+    /// Throws `.queueFull` when there is no settled terminal row left to drop.
     ///
     /// 2026-09-17: a pending row was also never evictable AND never expired, so
     /// 300 cards nobody answered filled the store for good and every later
@@ -950,9 +990,19 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
                   case .string(let status)? = object["status"],
                   terminalApprovalStatuses.contains(status) else { continue }
             // Approval precedes execution. Denied and canceled decisions have
-            // no executor outcome to await and can be evicted immediately.
+            // no executor outcome to await, but may still owe a reporting turn.
             if status == "resolved", object["decision"] == .string("approved"),
                object["executedAction"] == nil || object["executedAction"] == .null {
+                continue
+            }
+            // A resolved decision is not settled while its reporting turn is
+            // unclaimed, queued or in flight. Durable state does not age out.
+            if let saved = object["chatContinuation"] {
+                guard case .object(let state) = saved,
+                      state["done"] == .bool(true) else { continue }
+            }
+            if let record = ApprovalRecord(json: items[index]),
+               continuationIsPending(record, now: now) {
                 continue
             }
             dropped.insert(index)
@@ -1110,35 +1160,26 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
                 id: id, reason: "decision provenance has no actor"
             )
         }
-        if provenance.isRemote {
-            guard record.remoteResolvable, !record.localOnly else {
-                throw ApprovalInboxError.resolutionNotAuthorized(
-                    id: id, reason: "approval is local-only"
-                )
-            }
-        }
         if case .signedIOS(let clientID, _) = provenance {
             guard !clientID.isEmpty else {
                 throw ApprovalInboxError.resolutionNotAuthorized(
                     id: id, reason: "signed iOS provenance has no client identity"
                 )
             }
-            // Telegram is bound to the card's own chat and user. A signed-iOS
-            // decision is verified against its per-device signing key and
-            // paired-device registry by MacSyncActionRouter before dispatch.
-            // This additional check binds the decision to the card's origin:
-            // even a verified phone must not approve a `mac_shell` a peer
-            // raised on the agent bridge.
-            //
-            // The phone speaks for the person's own surfaces (the Mac window,
-            // the desk, a scheduled run) and for the iOS family itself. It does
-            // not speak for a card that another party raised — an agent bridge,
-            // Telegram, Slack — and those stay for the machine, where the
-            // person can read who asked.
-            guard Self.signedIOSMayResolve(record) else {
+            // MacSyncActionRouter verifies the per-device signature and pairing.
+            // User may answer any request from that phone, whoever raised it;
+            // Agent alone decides her studio canon.
+            guard record.action != "studio.canon" else {
                 throw ApprovalInboxError.resolutionNotAuthorized(
-                    id: id,
-                    reason: "approval came from a remote surface the phone does not speak for"
+                    id: id, reason: "Agent decides her studio canon."
+                )
+            }
+            return
+        }
+        if provenance.isRemote {
+            guard record.remoteResolvable, !record.localOnly else {
+                throw ApprovalInboxError.resolutionNotAuthorized(
+                    id: id, reason: "approval is local-only"
                 )
             }
         }
@@ -1157,57 +1198,6 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
                 id: id, reason: "Telegram transport identity does not match approval origin"
             )
         }
-    }
-
-    /// The surfaces that ARE the person at this Mac (or their own phone).
-    ///
-    /// Deliberately an explicit allowlist rather than "not in the remote set":
-    /// an UNKNOWN surface must not read as local. A surface this list has not
-    /// been taught is one nobody has judged, and a card from it stays at the
-    /// machine instead of being handed to whichever paired device asks first.
-    /// Adding an entry is a decision about who may answer for that surface.
-    ///
-    /// Spellings are `ConversationSurfaceProfile` ids — lowercased, `_` folded
-    /// to `-`. `ios-icloud` is here because that profile does not fold it into
-    /// the iOS family, and it is the phone's own route.
-    nonisolated static let localApprovalSurfaces: Set<String> = [
-        "chat", "desk", "mac", "background", "mission", "observatory",
-        "inline-card", "interaction-act", "native-actions", "nextgen-action",
-        "connector-action", "mcp-ui", "ios-icloud",
-    ]
-
-    /// The surface the REQUEST came from, which is the binding. `origin` holds
-    /// the reply route — where an answer is delivered, not who asked — so it
-    /// is read only as a legacy fallback for rows written before the request
-    /// surface was stamped. Nil when the card records neither.
-    private nonisolated static func requestSurface(_ record: ApprovalRecord) -> String? {
-        guard case .object(let payload) = record.payload else { return nil }
-        if case .string(let surface)? = payload["surface"],
-           !surface.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return surface
-        }
-        if case .object(let origin)? = payload["origin"],
-           case .string(let surface)? = origin["surface"],
-           !surface.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return surface
-        }
-        return nil
-    }
-
-    /// True when a signed decision from the paired phone is the same person
-    /// answering.
-    ///
-    /// A card with NO surface recorded has no surface to classify, so it is not
-    /// judged here at all: the row's own `remoteResolvable` — already required
-    /// above for any remote provenance — stays the authority, exactly as before
-    /// this binding existed. That keeps the surface-less first-party cards
-    /// (a parked workshop step, an MCP tool gate) answerable from the phone,
-    /// which is what they are for, while every card that DOES name a surface
-    /// must name one the phone speaks for.
-    private nonisolated static func signedIOSMayResolve(_ record: ApprovalRecord) -> Bool {
-        guard let raw = requestSurface(record) else { return true }
-        let profile = ConversationSurfaceProfile(raw)
-        return profile.isIOSRemote || localApprovalSurfaces.contains(profile.id)
     }
 
     private nonisolated static func strip(_ value: String) -> String {

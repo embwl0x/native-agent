@@ -157,7 +157,8 @@ function validatePayload(action, payload) {
       return;
     case "navigate":
       requireLeaseAndSequence(payload);
-      requireHttpURL(payload.url);
+      // "back" / "forward" walk the leased tab's own history.
+      if (payload.url !== "back" && payload.url !== "forward") requireHttpURL(payload.url);
       return;
     case "page.snapshot.read":
       requireId(payload.leaseId, "leaseId");

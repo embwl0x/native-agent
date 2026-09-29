@@ -10,8 +10,10 @@
 // The page's own cards for the inner-life master, Moments and the hour stay in
 // SetupView; they are deliberately NOT repeated here.
 
+import Cognition
 import SwiftUI
 import Context
+import TrustCenter
 
 struct SetupFeatureRows: View {
     @Environment(AppModel.self) private var appModel
@@ -38,6 +40,7 @@ struct SetupFeatureRows: View {
     @State private var savingEmbeddings = false
     @State private var pendingEmbeddings: Bool?
     @State private var savingMemoryMode = false
+    @State private var releasingEmbeddings = false
     @State private var savingContextFlow = false
 
     var body: some View {
@@ -66,12 +69,12 @@ struct SetupFeatureRows: View {
         .task { await load() }
         // The policy is one document: a save anywhere in the app re-publishes
         // it, and these rows follow it rather than keeping their own copy.
-        .onChange(of: appModel.trustPolicy) { _, _ in
+        .onChange(of: appModel.engine.trust.policy) { _, _ in
             syncFromTrustPolicy()
             // The dream gate is a composite the policy only half carries;
             // re-read it the way the Dreams page does.
             guard !savingDream else { return }
-            Task { @MainActor in dreamCycleOn = await appModel.client.swiftDreamCompositeEnabled() }
+            Task { @MainActor in dreamCycleOn = await appModel.engine.cognitionView.dreamEnabled() }
         }
     }
 
@@ -88,7 +91,7 @@ struct SetupFeatureRows: View {
                 get: { reflectionEnabled },
                 set: { value in
                     reflectionEnabled = value
-                    Task { await NativeCognitionRuntime.shared.setReflectionEnabled(value) }
+                    Task { await NativeAgentEngine.liveCognition.setReflectionEnabled(value) }
                 }
             ),
             disabled: !subconsciousEnabled
@@ -108,7 +111,7 @@ struct SetupFeatureRows: View {
                 get: { organismEnabled },
                 set: { value in
                     organismEnabled = value
-                    Task { await NativeCognitionRuntime.shared.setOrganismKernelEnabled(value) }
+                    Task { await NativeAgentEngine.liveCognition.setOrganismKernelEnabled(value) }
                 }
             ),
             disabled: !subconsciousEnabled
@@ -147,7 +150,7 @@ struct SetupFeatureRows: View {
     private func setFluidContext(_ requested: ContextFlowMode) async {
         savingContextFlow = true
         defer { savingContextFlow = false }
-        let status = await NativeContextFlowRuntime.shared.setMode(requested)
+        let status = await NativeAgentEngine.live.contextFlow.setMode(requested)
         if status.effectiveMode != requested {
             appModel.systemToasts.push(
                 warn: "Fluid context is effectively \(OperationalSettingsControlPresentation.fluidContextLabel(status.effectiveMode)) right now."
@@ -183,7 +186,7 @@ struct SetupFeatureRows: View {
         if ok {
             // The gate is a composite of two policy fields; read it back the
             // way the Dreams page does rather than trusting the flip.
-            dreamCycleOn = await appModel.client.swiftDreamCompositeEnabled()
+            dreamCycleOn = await appModel.engine.cognitionView.dreamEnabled()
         } else {
             dreamCycleOn = !value
             appModel.systemToasts.push(
@@ -223,7 +226,7 @@ struct SetupFeatureRows: View {
     }
 
     private var remEnabledInPolicy: Bool {
-        appModel.trustPolicy?.trainingPolicy?.rem_cycle_enabled == true
+        appModel.engine.trust.policy?.trainingPolicy?.rem_cycle_enabled == true
     }
 
     // MARK: - Meaning-based memory (the embeddings backend)
@@ -435,6 +438,18 @@ struct SetupFeatureRows: View {
             title: "Memory mode",
             detail: memoryModeDetail
         ) {
+            // The model is loaded right now: give its memory back without
+            // waiting for the mode's idle timer.
+            if embeddingsStatus.map({ EmbeddingsSettingsActionPresentation.controls(status: $0, errorMessage: nil).showsReleaseNow }) == true {
+                Button(releasingEmbeddings ? "Releasing…" : "Release now") {
+                    Task { await releaseEmbeddings() }
+                }
+                .buttonStyle(.bordered)
+                .tint(NativeAgentShell.text)
+                .controlSize(.small)
+                .disabled(releasingEmbeddings || savingMemoryMode)
+                .accessibilityIdentifier("setup.feature.embeddings.release-now")
+            }
             Picker("Memory mode", selection: Binding(
                 get: { memoryMode },
                 set: { mode in Task { await setMemoryMode(mode) } }
@@ -447,7 +462,7 @@ struct SetupFeatureRows: View {
             .labelsHidden()
             // Nothing on this page truncates mid-word.
             .fixedSize()
-            .disabled(embeddingsStatus == nil || savingMemoryMode)
+            .disabled(embeddingsStatus == nil || savingMemoryMode || releasingEmbeddings)
             .accessibilityIdentifier("setup.feature.memoryMode")
         }
     }
@@ -481,6 +496,22 @@ struct SetupFeatureRows: View {
         }
     }
 
+    @MainActor
+    private func releaseEmbeddings() async {
+        releasingEmbeddings = true
+        defer { releasingEmbeddings = false }
+        let update: EmbeddingsSettingsActionPresentation.Update
+        do {
+            update = EmbeddingsSettingsActionPresentation.released(try await appModel.releaseEmbeddingsMemory())
+        } catch {
+            update = EmbeddingsSettingsActionPresentation.releaseFailed(error, preserving: embeddingsStatus)
+        }
+        embeddingsStatus = update.status
+        if let error = update.errorMessage {
+            appModel.systemToasts.push(error: error)
+        }
+    }
+
     // MARK: - Loading and reconciliation
 
     @MainActor
@@ -488,20 +519,20 @@ struct SetupFeatureRows: View {
         // The policy carries the REM gate and the whole memory policy. Setup
         // loads it too; this only fills the gap when these rows are mounted
         // before that read lands.
-        if appModel.trustPolicy == nil {
-            appModel.trustPolicy = try? await appModel.getTrustPolicy()
+        if appModel.engine.trust.policy == nil {
+            appModel.engine.trust.policy = try? await appModel.engine.trust.load()
         }
         syncFromTrustPolicy()
         // The dream gate is a COMPOSITE of two policy fields, so it is read
         // through the one function that owns that math.
-        dreamCycleOn = await appModel.client.swiftDreamCompositeEnabled()
+        dreamCycleOn = await appModel.engine.cognitionView.dreamEnabled()
         await refreshEmbeddings()
     }
 
     @MainActor
     private func syncFromTrustPolicy() {
         if !savingMemory {
-            memoryDraft = appModel.trustPolicy?.memoryPolicy ?? TrustMemoryPolicy()
+            memoryDraft = appModel.engine.trust.policy?.memoryPolicy ?? TrustMemoryPolicy()
         }
         if !savingRem {
             remCycleOn = remEnabledInPolicy

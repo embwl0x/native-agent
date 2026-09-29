@@ -1,62 +1,18 @@
 // Mac-side automatic iCloud pairing with manual key transfer as a fallback.
 import SwiftUI
-
-enum PairingPublicationPresentation {
-    static func error(kvsPublished: Bool, cloudKitPublished: Bool) -> String? {
-        switch (kvsPublished, cloudKitPublished) {
-        case (true, true):
-            return nil
-        case (false, true):
-            return "The new key is saved and CloudKit updated, but KVS did not accept it. iPhones using KVS bootstrap may not receive the new pairing key until KVS recovers."
-        case (true, false):
-            return "The new key is saved and KVS updated, but CloudKit did not accept it. Paired iPhones may reject signed messages until CloudKit recovers."
-        case (false, false):
-            return "The new key is saved, but neither KVS nor CloudKit accepted it yet."
-        }
-    }
-}
-
-/// The pairing key is already rotated when either publication route fails, so
-/// this warning must survive the settings view's local state. Otherwise a user
-/// can navigate away and lose the only indication that every paired phone may
-/// still hold the old key.
-enum PairingPublicationHealth {
-    static let warningDefaultsKey = "NativeAgent.pairing.publicationWarning.v1"
-
-    @discardableResult
-    static func record(
-        kvsPublished: Bool,
-        cloudKitPublished: Bool,
-        defaults: UserDefaults = .standard
-    ) -> String? {
-        let warning = PairingPublicationPresentation.error(
-            kvsPublished: kvsPublished,
-            cloudKitPublished: cloudKitPublished
-        )
-        if let warning {
-            defaults.set(warning, forKey: warningDefaultsKey)
-        } else {
-            defaults.removeObject(forKey: warningDefaultsKey)
-        }
-        return warning
-    }
-
-    static func currentWarning(defaults: UserDefaults = .standard) -> String? {
-        defaults.string(forKey: warningDefaultsKey)
-    }
-}
+import DeviceSync
 
 struct MacPairingView: View {
-    @ObservedObject private var bridge = iCloudBridge.shared
-    @ObservedObject private var pairedPhones = PairedPhoneStore.shared
+    @Environment(AppModel.self) private var appModel
+    private var sync: SyncFacade { appModel.engine.sync }
     // A quiet offscreen read of Connectors must not MAKE the pairing key it
     // is reading: `currentSecretBase64()` generates a missing secret on disk.
     // Offscreen we peek instead, and an absent key reads as absent.
     @Environment(\.quietOffscreenRead) private var quietOffscreenRead
-    @State private var secretBase64: String = ""
+    private var secretBase64: String { sync.secretBase64 }
     @State private var manualPairingExpanded = false
     @State private var copied = false
-    @State private var pairingError: String?
+    private var pairingError: String? { sync.pairingError }
     @AppStorage(PairingPublicationHealth.warningDefaultsKey) private var pairingPublicationWarning = ""
     // S.3: confirmation before regenerate
     @State private var showRegenConfirm = false
@@ -85,7 +41,7 @@ struct MacPairingView: View {
                 VStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
                     PairingSectionLabel(text: "iCloud status")
                     AliveGroupCard {
-                        Text(bridge.syncStatus)
+                        Text(sync.status)
                             .font(ShellType.label)
                             .foregroundStyle(NativeAgentShell.secondary)
                             .fixedSize(horizontal: false, vertical: true)
@@ -104,12 +60,12 @@ struct MacPairingView: View {
                         .foregroundStyle(NativeAgentShell.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                     AliveGroupCard {
-                        if pairedPhones.phones.filter({ $0.status != .removed }).isEmpty {
+                        if sync.phones.filter({ $0.status != .removed }).isEmpty {
                             Text("No phones paired yet. Open the companion app to request pairing.")
                                 .font(ShellType.label)
                                 .foregroundStyle(NativeAgentShell.secondary)
                         }
-                        ForEach(pairedPhones.phones.filter { $0.status != .removed }) { phone in
+                        ForEach(sync.phones.filter { $0.status != .removed }) { phone in
                             HStack(spacing: 8) {
                                 VStack(alignment: .leading, spacing: 3) {
                                     Text(phone.status == .paired ? "iPhone or iPad" : "Phone waiting to pair")
@@ -126,13 +82,13 @@ struct MacPairingView: View {
                                     text: phone.status == .paired ? "Paired" : "Waiting",
                                     tone: phone.status == .paired ? NativeAgentShell.calm : NativeAgentShell.needsYou)
                                 if phone.status == .pending {
-                                    Button("Pair") { pairedPhones.setStatus(.paired, id: phone.id) }
+                                    Button("Pair") { sync.setStatus(.paired, id: phone.id) }
                                 }
-                                Button("Remove", role: .destructive) { pairedPhones.setStatus(.removed, id: phone.id) }
+                                Button("Remove", role: .destructive) { sync.setStatus(.removed, id: phone.id) }
                             }
                         }
                     }
-                    if let message = pairedPhones.message {
+                    if let message = sync.message {
                         Text(message).foregroundStyle(NativeAgentShell.trouble)
                     }
                 }
@@ -255,31 +211,8 @@ struct MacPairingView: View {
             .padding(.bottom, 32)
         }
         .task {
-            // mainactor_icloud: currentSecretBase64() does blocking disk I/O —
-            // read it off the MainActor (awaited to preserve ordering), then
-            // hop back to mutate @State.
-            let quiet = quietOffscreenRead
-            let result = await Task.detached(priority: .utility) { () -> (String?, String?) in
-                do {
-                    if quiet {
-                        // Read-only. No key yet is not an error: the empty
-                        // string is what the page already says when the Mac
-                        // cannot read one.
-                        return (try PairingSecretManager.existingSecretBase64() ?? "", nil)
-                    }
-                    return (try PairingSecretManager.currentSecretBase64(), nil)
-                } catch {
-                    return (nil, error.localizedDescription)
-                }
-            }.value
-            guard !Task.isCancelled else { return }
-            if let secret = result.0 {
-                pairingError = nil
-                secretBase64 = secret
-            } else {
-                pairingError = "Pairing is unavailable. \(result.1 ?? "The Mac pairing key could not be loaded.")"
-                secretBase64 = ""
-            }
+            sync.observeStatus()
+            await sync.loadSecret(quiet: quietOffscreenRead)
         }
         .onDisappear {
             // S.7: cancel the auto-hide timer so it doesn't fire on a stale view
@@ -292,45 +225,9 @@ struct MacPairingView: View {
     // MARK: - Helpers
 
     private func regenerateSecret() {
-        Task {
-            // Make signing/verification explicitly unavailable before the
-            // canonical bytes move. No inbound action can be accepted with the
-            // previous cached key once rotation has begun.
-            MacSyncEngine.shared.beginPairingSecretRotation()
-            let result = await Task.detached(priority: .utility) { () -> (Data?, String?) in
-                do {
-                    return (try PairingSecretManager.rotateSecret(), nil)
-                } catch {
-                    return (nil, error.localizedDescription)
-                }
-            }.value
-
-            guard let persistedSecret = result.0 else {
-                MacSyncEngine.shared.finishPairingSecretRotation(with: nil)
-                let detail = result.1 ?? "The existing key was preserved."
-                pairingError = "Pairing key regeneration failed. \(detail)"
-                return
-            }
-
-            // Re-open the HMAC boundary with the exact durably read-back bytes
-            // BEFORE awaiting either network publication route.
-            MacSyncEngine.shared.finishPairingSecretRotation(with: persistedSecret)
-            async let kvsPublished = PairingSecretManager.publishMaterialToKVS(persistedSecret)
-            async let cloudKitPublished = iCloudBridge.shared.publishPairingSecret(persistedSecret)
-            let published = await (kvsPublished, cloudKitPublished)
-            // Each publication route has a distinct consumer. Neither a KVS
-            // success nor a CloudKit success may hide the other route's failure:
-            // doing so leaves some paired iPhones stale while this screen
-            // reports healthy delivery.
-            pairingError = nil
-            pairingPublicationWarning = PairingPublicationHealth.record(
-                kvsPublished: published.0,
-                cloudKitPublished: published.1
-            ) ?? ""
-            let newSecretBase64 = persistedSecret.base64EncodedString()
-            secretBase64 = newSecretBase64
-        }
+        Task { await sync.regenerateSecret() }
     }
+
 }
 
 // MARK: - Page kit

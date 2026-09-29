@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import Procedures
 
 public enum ProcedureExactActivationApprovalError: String, Error, Sendable, Equatable {
     case invalidProposal = "invalid_proposal"

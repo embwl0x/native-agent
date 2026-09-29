@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import Desk
 
 enum GitHubCheckState: String, Sendable {
     case failed

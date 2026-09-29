@@ -25,17 +25,17 @@ enum ProviderSettingsRefreshAction {
         refreshCatalog: Bool
     ) async -> Outcome {
         do {
+            let facade = appModel.engine.providers
             let catalog: ModelCatalogResponse?
             if refreshCatalog {
-                catalog = try await appModel.getModelCatalog(refresh: true)
+                catalog = try await facade.modelCatalog(refresh: true)
             } else {
-                catalog = try? await appModel.getModelCatalog(refresh: false)
+                catalog = try? await facade.modelCatalog(refresh: false)
             }
-            let providers = try await appModel.listProviders()
-            let root = appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot()
-            let routing = SwiftNativeProviderRouting(dataRoot: root)
+            let providers = try await facade.list()
+            let routing = facade.routing
             let rowSet = try await routing.providerSurfaceRowSet()
-            let activeProviders = try await NativeClient.readActiveProvidersFromDisk(dataRoot: root)
+            let activeProviders = try await facade.activeProviders()
             let preferences = try await routing.computeModelPreferences()
             return .loaded(Snapshot(
                 providers: providers,

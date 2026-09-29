@@ -1,5 +1,6 @@
 import SwiftUI
 import PersistenceCore
+import GitHubConnector
 
 extension DeskView {
     // MARK: GitHub Watcher — notification-only monitoring

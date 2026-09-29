@@ -1,3 +1,4 @@
+import AppToolRuntime
 // WindowHaze.swift
 // "Alive glass", first half — User approved the mockup 2026-09-23. Behind every
 // column's content sits ONE single-hue haze that drifts like soft light in
@@ -26,39 +27,7 @@ import SwiftUI
 
 // MARK: - The colour setting
 
-/// One hue, three shades. The whole palette — the agent may pick any of these
-/// by chat and nothing else (`settings.haze_color`).
-enum HazeColor: String, CaseIterable, Identifiable {
-    case teal, blue, violet, rose, amber, forest, graphite
-
-    static let key = "nativeagent.hazeColor"
-    static let storageKey = key
-    static let defaultValue: HazeColor = .teal
-
-    init(stored raw: String) { self = HazeColor(rawValue: raw) ?? .teal }
-
-    var id: String { rawValue }
-
-    /// The accessibility name, and the word the Settings swatch speaks.
-    var name: String {
-        switch self {
-        case .forest: return "Forest green"
-        default: return rawValue.capitalized
-        }
-    }
-
-    var shades: [UInt] {
-        switch self {
-        case .teal:     return [0x17A597, 0x0F7C78, 0x1CB8A6]
-        case .blue:     return [0x2F6FD6, 0x1F4FA8, 0x3C86E8]
-        case .violet:   return [0x7A52D6, 0x5A3AA8, 0x8D66EA]
-        case .rose:     return [0xC9486E, 0x9C3456, 0xDC5F84]
-        case .amber:    return [0xC9852C, 0x9C6220, 0xDC9A3D]
-        case .forest:   return [0x3F9A52, 0x2C753C, 0x4FB064]
-        case .graphite: return [0x6B7280, 0x4B5260, 0x7D8595]
-        }
-    }
-
+extension HazeColor {
     /// The haze itself, for glows on glass.
     var base: Color { swatch }
 
@@ -221,7 +190,7 @@ struct WindowHaze: View {
     /// set that changes a few times per turn, never per token.
     private var mood: HazeMood {
         guard let appModel, appModel.isBusy || appModel.isChatStreaming else { return .idle }
-        return appModel.replyingSessions.contains(appModel.activeChatSessionId) ? .replying : .busy
+        return appModel.engine.turns.replyingSessions.contains(appModel.activeChatSessionId) ? .replying : .busy
     }
 }
 

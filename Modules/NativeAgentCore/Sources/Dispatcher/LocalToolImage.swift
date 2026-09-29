@@ -44,7 +44,7 @@ public enum LocalToolImage {
         // Both carry a `capture_screenshot` flag through the same capture.
         "browser.open_url",
         "browser.navigate",
-        // The underscore spellings AppChatToolDispatcher canonicalizes: a call
+        // The underscore spellings ToolNameAliases canonicalizes: a call
         // that arrives under an alias is dispatched to the same capture, and a
         // name missing from this set would silently return no pixels at all.
         "browser_screenshot", "browser_capture_screenshot", "browser.capture_screenshot",

@@ -41,7 +41,7 @@ extension MCPSubprocessError: LocalizedError {
 /// Live snapshot mirroring `Runtime.list_mcp_session_statuses()` shape
 ///. One row per known server; pid + lastWarmedAt are
 /// populated only when the subprocess is currently running.
-public struct MCPSessionStatus: Sendable, Equatable, Codable {
+public struct MCPSessionStatus: Sendable, Hashable, Codable, Identifiable {
     public var id: String
     public var serverId: String
     public var serverName: String?

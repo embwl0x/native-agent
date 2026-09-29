@@ -10,6 +10,7 @@ import UniformTypeIdentifiers
 import NativeAgentShared
 import MemoryV2
 import PersistenceCore
+import TurnTrace
 import ChatOrchestration
 #if canImport(CoreSpotlight)
 import CoreSpotlight
@@ -94,7 +95,7 @@ enum InlineCardMount {
     /// reply in the visible page for `<tool_use` markers and rebuilt a
     /// dictionary and a set. Where a card mounts can only change when the rows
     /// change, and every write except the streaming delta bumps
-    /// `chatMessagesStructureVersion` — so that, plus the page the reader is
+    /// `engine.transcripts.structureVersion` — so that, plus the page the reader is
     /// on, is the whole key.
     @MainActor private static var slots: [String: Map] = [:]
     @MainActor private static var slotOrder: [String] = []
@@ -243,10 +244,6 @@ enum ChatFirstRenderTelemetry {
 }
 
 enum ToolCallGroupPresentation {
-    static func skillToolNames(catalog: ChatToolCatalogSnapshot?) -> Set<String> {
-        catalog?.skillReaderToolNames ?? SwiftToolDispatcher.skillReaderToolNames
-    }
-
     static func expandsInline(messages: [ChatMessage]) -> Bool {
         messages.contains { $0.metadata?.isPendingApproval == true }
     }
@@ -337,7 +334,7 @@ private final class _MessageGroupCache: @unchecked Sendable {
     private struct Slot {
         var stableKey: StableKey
         var lastMessage: ChatMessage?
-        /// 2026-09-06: `AppModel.chatMessagesStructureVersion` as of the
+        /// 2026-09-06: `engine.transcripts.structureVersion` as of the
         /// compute. It replaces a total-content-byte count, which was both a
         /// walk of every row per render AND collision-prone: an interior row
         /// swapped for one of the same length, or changed only in its
@@ -504,7 +501,6 @@ struct ChatMessageListView: View {
     /// 2026-09-06: the grouper cache keys on the transcript's mutation
     /// version, so the list needs the model, not just the rows it was handed.
     @Environment(AppModel.self) private var appModel
-    @AppStorage(NativeAgentShellPreference.classicShellKey) private var classicShell = false
 
     /// Rows shown at once. User, 2026-09-04: the transcript is a plain VStack
     /// (no LazyVStack, no prefetch loop), so every shown row is resident —
@@ -588,7 +584,7 @@ struct ChatMessageListView: View {
         let allGroups = MessageGrouper.projection(
             for: messages,
             sessionId: sessionId,
-            structureVersion: appModel.chatMessagesStructureVersion
+            structureVersion: appModel.engine.transcripts.structureVersion
         )
         let range = windowRange(for: allGroups)
         let hidden = range.lowerBound
@@ -612,7 +608,7 @@ struct ChatMessageListView: View {
         let cardMount = InlineCardMount.map(
             groups: groups,
             sessionId: sessionId,
-            structureVersion: appModel.chatMessagesStructureVersion
+            structureVersion: appModel.engine.transcripts.structureVersion
         )
         let relocatedRows = cardMount.relocated
         if hidden > 0 {
@@ -629,8 +625,7 @@ struct ChatMessageListView: View {
                     if msg.metadata?.isPendingApproval == true {
                         InlineApprovalCard(message: msg)
                             .transcriptLayoutProbe(rowID: msg.id, kind: .approval)
-                    } else if !classicShell,
-                              PersonaWriteReceiptRow.receipt(
+                    } else if PersonaWriteReceiptRow.receipt(
                                 for: msg, exemptTitle: appModel.firstConversationReceiptTitle
                               ) != nil {
                         // The first conversation's own line is the one piece of
@@ -642,12 +637,9 @@ struct ChatMessageListView: View {
                             message: msg, exemptTitle: appModel.firstConversationReceiptTitle
                         )
                         .transcriptLayoutProbe(rowID: msg.id, kind: .toolRow)
-                    } else if !classicShell {
+                    } else {
                         ShellToolRow(messages: [msg])
                             .transcriptLayoutProbe(rowID: msg.id, kind: .toolRow)
-                    } else {
-                        ToolPillView(message: msg)
-                            .transcriptLayoutProbe(rowID: msg.id, kind: .toolPill)
                     }
                     // 0.4.12 cards round: an interaction that blocks this tool
                     // row appears HERE, under the row it belongs to, and never
@@ -771,23 +763,7 @@ struct ToolCallGroup: View {
     /// True only for the currently-streaming last group: show the live
     /// flip-through box. Otherwise collapse to an "N tools used" summary.
     var isLive: Bool = false
-    @AppStorage(NativeAgentShellPreference.classicShellKey) private var classicShell = false
-    @State private var toolsExpanded = false
-    @State private var skillsExpanded = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-
-    // Skill use shows up as these tool calls — split them into their own
-    // "N skills used" box, separate from regular tools. The checked catalog
-    // owns the classification; the dispatcher taxonomy is only the startup
-    // fallback before this surface has a catalog snapshot.
-    private var skillToolNames: Set<String> {
-        ToolCallGroupPresentation.skillToolNames(catalog: appModel.chatToolCatalog)
-    }
-    private func isSkill(_ msg: ChatMessage) -> Bool {
-        skillToolNames.contains(msg.metadata?.toolName ?? "")
-    }
-    private var skillMsgs: [ChatMessage] { messages.filter(isSkill) }
-    private var toolMsgs: [ChatMessage] { messages.filter { !isSkill($0) } }
 
     // An unresolved approval must never be hidden behind a collapsed summary.
     private var hasPendingApproval: Bool {
@@ -801,7 +777,7 @@ struct ToolCallGroup: View {
             fullList.transition(.identity)
         } else if isLive {
             liveBox.transition(.identity)
-        } else if !classicShell {
+        } else {
             // ui-simplify 2026-09-02: one quiet row for the whole turn's tool
             // traffic — tools and skills together — instead of two collapsed
             // boxes of raw tool names.
@@ -826,8 +802,6 @@ struct ToolCallGroup: View {
                 }
             }
             .transition(.identity)
-        } else {
-            collapsedBox.transition(.identity)
         }
     }
 
@@ -852,49 +826,6 @@ struct ToolCallGroup: View {
             NativeAgentMotion.respecting(NativeAgentMotion.standard, reduceMotion: reduceMotion),
             value: messages.last?.id
         )
-    }
-
-    // When done: separate "N tools used" / "N skills used" boxes, each
-    // independently click-to-expand.
-    private var collapsedBox: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            if !toolMsgs.isEmpty {
-                summaryRow(items: toolMsgs, noun: "tool",
-                           icon: "wrench.and.screwdriver", expanded: $toolsExpanded)
-            }
-            if !skillMsgs.isEmpty {
-                summaryRow(items: skillMsgs, noun: "skill",
-                           icon: "text.book.closed", expanded: $skillsExpanded)
-            }
-        }
-    }
-
-    @ViewBuilder
-    private func summaryRow(items: [ChatMessage], noun: String, icon: String,
-                            expanded: Binding<Bool>) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Button {
-                withAnimation(NativeAgentMotion.respecting(
-                    NativeAgentMotion.quick, reduceMotion: reduceMotion
-                )) { expanded.wrappedValue.toggle() }
-            } label: {
-                HStack(spacing: 6) {
-                    Image(systemName: icon).font(.caption2).foregroundStyle(.secondary)
-                    Text("\(items.count) \(noun)\(items.count == 1 ? "" : "s") used")
-                        .font(.caption2.weight(.semibold)).foregroundStyle(.secondary)
-                    Image(systemName: expanded.wrappedValue ? "chevron.up" : "chevron.down")
-                        .font(.caption2).foregroundStyle(.tertiary)
-                }
-                .padding(.leading, 24)
-            }
-            .buttonStyle(.borderless)
-            if expanded.wrappedValue {
-                ForEach(items) { msg in
-                    if msg.metadata?.isPendingApproval == true { InlineApprovalCard(message: msg) }
-                    else { ToolPillView(message: msg) }
-                }
-            }
-        }
     }
 
     private var fullList: some View {
@@ -1089,8 +1020,8 @@ struct MessageBubble: View {
     /// `MessageBubble.body`.
     ///
     /// This compares exactly what the row draws. Every field listed here is
-    /// read somewhere in `bubbleBody`, `brainLine`, `messageProvenance` or the
-    /// failure line; the rest of the metadata envelope (tool plumbing, approval
+    /// read somewhere in `bubbleBody`, `messageProvenance`, the hover line
+    /// (`brainLine`) or the failure line; the rest of the metadata envelope (tool plumbing, approval
     /// ids, before/after diffs) belongs to the tool rows, not to this view. A
     /// field added to the bubble must be added here too, or the row will keep
     /// drawing the old value.
@@ -1115,12 +1046,24 @@ struct MessageBubble: View {
             && lm.attachments == rm.attachments
     }
 
+    /// The mind a reply ran on — model / effort / access — said on hover
+    /// beside its time, never in the reading line.
+    /// Each recorded field stands on its own; a model that was only asked
+    /// for says so rather than passing as the one that ran.
+    nonisolated static func brainLine(_ metadata: ChatMessageMetadata?) -> String? {
+        guard let metadata else { return nil }
+        let model = metadata.model ?? metadata.requestedModel.map { "requested \($0)" }
+        let fields = [model, metadata.reasoningEffort, metadata.fileAccessMode]
+            .compactMap { $0 }
+            .filter { !$0.isEmpty }
+        return fields.isEmpty ? nil : fields.joined(separator: " / ")
+    }
+
     @State private var voiceOutput = VoiceOutputController.sharedMessagePlayback
     @Environment(AppModel.self) private var appModel
     /// True in the offscreen copy a quiet page read mounts. Nothing here is on
     /// anybody's screen, so nothing here may claim a render the person made.
     @Environment(\.quietOffscreenRead) private var quietOffscreenRead
-    @AppStorage(NativeAgentShellPreference.classicShellKey) private var classicShell = false
     @State private var showJSONSheet = false
     @State private var bubbleToast: String? = nil
     @State private var isHovered = false
@@ -1145,27 +1088,10 @@ struct MessageBubble: View {
             origin: message.metadata?.origin
         )
     }
-    private var displayRole: String {
-        switch normalizedRole {
-        case "user": "You"
-        // The configured persona profile name — NOT the
-        // chatPersona style quick-switch, which can read "Custom"/"AI".
-        case "assistant": appModel.agentDisplayName
-        default: message.role.capitalized
-        }
-    }
-
-    private var userCorners: RectangleCornerRadii {
-        shellChrome
-            ? NativeAgentShellLayout.userBubbleCorners
-            : .init(topLeading: 8, bottomLeading: 8, bottomTrailing: 3, topTrailing: 8)
-    }
-
     // ui-simplify 2026-09-02 (Lane A): her replies are prose, not chat
     // furniture — plain text at 16pt on a 1.6 line height inside 600pt, with
-    // the user's own words in one soft bubble opposite. The classic bubble
-    // (accent fill, white text, 8pt corners) survives behind the kill switch.
-    private var shellChrome: Bool { !classicShell }
+    // the user's own words in one soft bubble opposite.
+    private var userCorners: RectangleCornerRadii { NativeAgentShellLayout.userBubbleCorners }
 
     /// The bridge writes `[from: claude, via bridge] …` into the message body
     /// so downstream consumers can see the route. That is plumbing: the room
@@ -1179,8 +1105,13 @@ struct MessageBubble: View {
         ChatShellConversationRow.isBridgeRouted(message.metadata?.origin)
     }
 
+    private var isPeerBridgeMessage: Bool {
+        isUser && message.metadata?.origin?.surface?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "agent-bridge"
+    }
+
     private var bridgeTag: String? {
-        guard shellChrome, isUser, isBridgeRouted else { return nil }
+        guard isUser, isBridgeRouted, !isPeerBridgeMessage else { return nil }
         return ChatShellConversationRow.bridgeAgentTag(message.content)
     }
 
@@ -1189,7 +1120,7 @@ struct MessageBubble: View {
     /// an inbound turn — it was never User. Rendering it in the right-hand
     /// bubble put Claude's and Codex's words in User's seat, so the room read
     /// as though he had said them. User's seat is User's only.
-    private var isBridgeMessage: Bool { bridgeTag != nil }
+    private var isBridgeMessage: Bool { bridgeTag != nil || isPeerBridgeMessage }
 
     /// Which side of the room this message sits on. Only the human's own
     /// words take the right.
@@ -1198,10 +1129,13 @@ struct MessageBubble: View {
     /// A bridge message renders on the left and QUIETER than her replies:
     /// smaller, secondary, and with no bubble behind it, so it reads as
     /// traffic passing through the room rather than as either voice in it.
-    private var isQuietBridge: Bool { shellChrome && isBridgeMessage }
+    private var isQuietBridge: Bool { isBridgeMessage }
 
     private var displayContent: String {
-        guard shellChrome, isBridgeRouted,
+        if isPeerBridgeMessage {
+            return SimpleViewStore.bridgedText(message.content)
+        }
+        guard isBridgeRouted,
               ChatShellConversationRow.hasBridgePrefix(message.content)
         else {
             return message.content
@@ -1211,11 +1145,11 @@ struct MessageBubble: View {
 
     var body: some View {
         // Agent, 2026-09-02: a worker's completion envelope is a note to her,
-        // not a conversation for User. In the new shell it folds like tools.
+        // not a conversation for User. It folds like tools.
         // 2026-09-06: `isBridgeRouted` for the same reason as `bridgeTag` — a
         // person who quotes a routing slip must not have their own message
         // folded away into a worker receipt.
-        if shellChrome, isUser, isBridgeRouted, ChatShellEnvelope.isEnvelope(message.content) {
+        if isUser, isBridgeRouted, ChatShellEnvelope.isEnvelope(message.content, envelope: message.metadata?.envelope) {
             ShellEnvelopeRow(content: message.content)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.vertical, 4)
@@ -1236,6 +1170,7 @@ struct MessageBubble: View {
         )
         let hasVisibleContent = ChatTranscriptPresentation.hasVisibleText(displayContent)
         let timestamp = UserDisplayFormatters.chatTimestamp(message.createdAt)
+        let bubbleHPad: CGFloat = seatsRight ? 16 : 0
         HStack(alignment: .bottom, spacing: NativeAgentSpacing.sm) {
             if seatsRight { Spacer(minLength: 60) }
 
@@ -1248,20 +1183,6 @@ struct MessageBubble: View {
                         .foregroundStyle(NativeAgentShell.secondary)
                         .accessibilityLabel("From \(bridgeTag), through the bridge")
                 }
-                if !isUser, !shellChrome {
-                    HStack(spacing: NativeAgentSpacing.xs) {
-                    Text(displayRole)
-                        .font(NativeAgentFont.label)
-                        .foregroundStyle(.secondary)
-                        if let brainLine {
-                        Text(brainLine)
-                            .font(NativeAgentFont.tag)
-                            .foregroundStyle(.tertiary)
-                                .opacity(isHovered ? 1 : 0)
-                        }
-                    }
-                }
-
                 // 658.14 session provenance. A user row that did not come from
                 // the human at this Mac says so, durably and above the bubble,
                 // so scrollback is readable as a trust boundary and not just as
@@ -1299,40 +1220,30 @@ struct MessageBubble: View {
                     // macOS font smoothing (stem darkening), which the app now
                     // turns off for itself at launch, the way Chromium apps
                     // draw; regular weight reads crisp without it.
-                    .font(shellChrome
-                        ? (isQuietBridge ? ShellType.label : ShellType.body)
-                        : NativeAgentFont.body)
+                    .font(isQuietBridge ? ShellType.label : ShellType.body)
                     .textSelection(.enabled)
-                    .lineSpacing(shellChrome && !isUser
+                    .lineSpacing(!isUser
                         ? NativeAgentShellLayout.replyLineSpacing
                         : 2)
-                    .frame(
-                        maxWidth: shellChrome
-                            ? (seatsRight
-                                ? NativeAgentShellLayout.userBubbleMaxWidth
-                                : NativeAgentShellLayout.replyMaxWidth)
-                            : (isUser ? 540 : NativeAgentLayout.maxReadableChatWidth),
-                        alignment: seatsRight ? .trailing : .leading
-                    )
-                    .padding(.horizontal, seatsRight ? (shellChrome ? 16 : NativeAgentSpacing.md) : 0)
-                    .padding(.vertical, seatsRight ? (shellChrome ? 12 : NativeAgentSpacing.sm + 2) : NativeAgentSpacing.xs)
+                    .padding(.horizontal, bubbleHPad)
+                    .padding(.vertical, seatsRight ? 12 : NativeAgentSpacing.xs)
                     .background {
                         if seatsRight {
                             UnevenRoundedRectangle(cornerRadii: userCorners, style: .continuous)
-                                .fill(shellChrome
-                                    ? AnyShapeStyle(NativeAgentShell.softFill)
-                                    : AnyShapeStyle(NativeAgentBrand.accentDeep))
+                                .fill(NativeAgentShell.softFill)
                         }
                     }
-                    .overlay {
-                        if isUser, !shellChrome {
-                            UnevenRoundedRectangle(cornerRadii: userCorners, style: .continuous)
-                                .strokeBorder(Color.white.opacity(0.18), lineWidth: 0.8)
-                        }
-                    }
-                    .foregroundStyle(shellChrome
-                        ? (isQuietBridge ? NativeAgentShell.secondary : NativeAgentShell.text)
-                        : (isUser ? Color.white : Color.primary))
+                    // The cap comes after the fill so the bubble hugs short
+                    // text; the padding is added back so long text still
+                    // wraps at the same width.
+                    .frame(
+                        maxWidth: (seatsRight
+                                ? NativeAgentShellLayout.userBubbleMaxWidth
+                                : NativeAgentShellLayout.replyMaxWidth)
+                            + 2 * bubbleHPad,
+                        alignment: seatsRight ? .trailing : .leading
+                    )
+                    .foregroundStyle(isQuietBridge ? NativeAgentShell.secondary : NativeAgentShell.text)
                     .contextMenu {
                         // PATCH-2026-06-06: chat-upgrades — message-level actions
                         Button {
@@ -1353,7 +1264,7 @@ struct MessageBubble: View {
                             }
                         }
 
-                        if !isUser && isLastAssistant {
+                        if !isUser && isLastAssistant && message.metadata?.providerRefusal != true {
                             Button {
                                 Task { await appModel.regenerateAssistantMessage(message) }
                             } label: {
@@ -1376,51 +1287,32 @@ struct MessageBubble: View {
                             Label("Show message data", systemImage: "curlybraces")
                         }
                     }
-                    // The classic shell keeps the floating bar exactly where it
-                    // was. The new shell does NOT — see the strip below.
-                    .overlay(alignment: seatsRight ? .topTrailing : .topLeading) {
-                        // Mounted only while hovered (2026-09-22): an
-                        // opacity-zero bar still built in every row.
-                        if !shellChrome, isHovered {
-                            hoverBar
-                                .padding(.horizontal, 8)
-                                .offset(y: -14)
-                                // This is a pointer-only duplicate of the
-                                // message's accessibility actions below.
-                                .accessibilityHidden(true)
-                                .transition(.opacity.combined(with: .scale(
-                                    scale: 0.96,
-                                    anchor: seatsRight ? .topTrailing : .topLeading
-                                )))
-                        }
-                    }
-
                 // Agent, 2026-09-02, named twice: the floating bar overlapped
                 // the top of the bubble and landed ON the first line of the
                 // message next to it — copy, speaker and thumbs sitting over
-                // her words. It must never cover text, so in the new shell it
-                // has its own strip UNDER the message.
+                // her words. It must never cover text, so it has its own strip
+                // UNDER the message.
                 //
                 // The strip is reserved whether or not the pointer is here.
                 // That keeps hover LAYOUT-NEUTRAL (User, 2026-07-25): a row
                 // that appears on hover changes the bubble's height, and every
                 // scroll strategy shows that as a hop.
-                if shellChrome {
-                    ZStack {
-                        if isHovered {
-                            hoverBar
-                                .accessibilityHidden(true)
-                                .transition(.opacity)
-                        }
+                ZStack {
+                    if isHovered {
+                        hoverBar
+                            .accessibilityHidden(true)
+                            .transition(.opacity)
                     }
-                    .frame(height: NativeAgentShellLayout.hoverBarStrip, alignment: .center)
                 }
+                .frame(height: NativeAgentShellLayout.hoverBarStrip, alignment: .center)
 
-                if !isUser, isLastAssistant, messageNeedsRetry {
+                if !isUser, isLastAssistant,
+                   (message.metadata?.providerRefusalDraft == true
+                    || (message.metadata?.providerRefusal != true && messageNeedsRetry)) {
                     Button {
                         Task { await appModel.regenerateAssistantMessage(message) }
                     } label: {
-                        Label("Try again", systemImage: "arrow.clockwise")
+                        Label(message.metadata?.providerRefusalDraft == true ? "Retry draft" : "Try again", systemImage: "arrow.clockwise")
                             .font(NativeAgentFont.label)
                     }
                     .buttonStyle(.bordered)
@@ -1440,11 +1332,11 @@ struct MessageBubble: View {
                 // not a colour, it is a fade, and it failed the 4.5:1 floor by
                 // a factor of 2.4. The shell's own tertiary token clears it in
                 // both appearances; 10pt (the HIG floor) is kept.
-                Text(timestamp)
-                    .font(shellChrome ? ShellType.caption : NativeAgentFont.tag)
-                    .foregroundStyle(shellChrome
-                        ? AnyShapeStyle(NativeAgentShell.secondary)
-                        : AnyShapeStyle(HierarchicalShapeStyle.tertiary))
+                Text([timestamp, isUser ? nil : Self.brainLine(message.metadata)]
+                        .compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " · "))
+                    .font(ShellType.caption)
+                    .lineLimit(1)
+                    .foregroundStyle(NativeAgentShell.secondary)
                     // Yield to bubbleToast below — both draw into the same
                     // gap, and the toast is the one the user just triggered.
                     .opacity(isHovered && bubbleToast == nil ? 1 : 0)
@@ -1461,9 +1353,7 @@ struct MessageBubble: View {
 
             }
             .frame(
-                maxWidth: shellChrome
-                    ? NativeAgentShellLayout.roomColumn
-                    : NativeAgentLayout.maxReadableChatWidth,
+                maxWidth: NativeAgentShellLayout.roomColumn,
                 alignment: seatsRight ? .trailing : .leading
             )
             .sheet(isPresented: $showJSONSheet) { MessageJSONSheet(message: message) }
@@ -1481,7 +1371,7 @@ struct MessageBubble: View {
         .animation(NativeAgentMotion.quick, value: bubbleToast)
         .modifier(MessageBubbleAccessibilityActions(
             isUser: isUser,
-            isLastAssistant: isLastAssistant,
+            isLastAssistant: isLastAssistant && message.metadata?.providerRefusal != true,
             onCopy: {
                 ChatClipboard.copy(message.content)
                 showBubbleToast("Copied")
@@ -1507,13 +1397,11 @@ struct MessageBubble: View {
         }
     }
 
-    /// The per-message actions. One construction, two placements: floating
-    /// over the bubble in the classic shell, in its own reserved strip under
-    /// the message in the new one.
+    /// The per-message actions, in their own reserved strip under the message.
     private var hoverBar: some View {
         BubbleHoverBar(
             message: message,
-            isLastAssistant: isLastAssistant,
+            isLastAssistant: isLastAssistant && message.metadata?.providerRefusal != true,
             onCopy: {
                 NSPasteboard.general.clearContents()
                 NSPasteboard.general.setString(message.content, forType: .string)
@@ -1548,7 +1436,7 @@ struct MessageBubble: View {
         Task {
             await voiceOutput.speak(
                 text: message.content,
-                resolution: VoiceOutputModeSelection.resolve(for: appModel.trustPolicy),
+                trust: appModel.engine.trust,
                 ownerID: speechOwnerID
             )
         }
@@ -1580,7 +1468,7 @@ struct MessageBubble: View {
         // user switches back to view it.
         // Cheap row-local checks first (2026-09-22): only the tail bubble may
         // observe `streamingSessions`, or every row re-renders per turn.
-        if isLastAssistant && message.role == "assistant" && appModel.isSessionStreaming(message.sessionId ?? appModel.activeChatSessionId) {
+        if isLastAssistant && message.role == "assistant" && appModel.engine.turns.isStreaming(message.sessionId ?? appModel.activeChatSessionId) {
             // Streaming stays raw: the in-flight bubble changes on every
             // coalesce tick, so neither the block split nor the markdown parse
             // may run here. Rich content resolves once the turn settles.
@@ -1777,17 +1665,6 @@ struct MessageBubble: View {
                 await MainActor.run { showBubbleToast("Feedback failed to send") }
             }
         }
-    }
-
-    private var brainLine: String? {
-        guard let metadata = message.metadata else { return nil }
-        let model = metadata.model ?? metadata.requestedModel
-        let effort = metadata.reasoningEffort
-        let access = metadata.fileAccessMode
-        if let model, let effort {
-            return [model, effort, access].compactMap { $0 }.joined(separator: " / ")
-        }
-        return model ?? effort
     }
 }
 

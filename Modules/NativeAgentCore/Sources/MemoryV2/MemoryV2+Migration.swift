@@ -277,7 +277,7 @@ public actor MemoryV2Migrator {
         let storage: any MemoryV2Storage
         if let provided = providedStorage {
             storage = provided
-        } else if let real = try? MemoryStorage(dataRoot: dataRoot) {
+        } else if let real = try? await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot) {
             storage = RealMemoryStorage(storage: real)
         } else {
             report.errors.append("MemoryV2Migrator: real SQLite storage unavailable; sentinel NOT written")

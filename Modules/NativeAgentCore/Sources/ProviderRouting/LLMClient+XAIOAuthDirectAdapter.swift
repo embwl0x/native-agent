@@ -76,10 +76,11 @@ public final class XAIOAuthDirectAdapter: LLMAdapter {
         // forced refresh so a rotation another caller already performed is taken
         // instead of burning a second single-use refresh_token — N simultaneous 401s
         // otherwise rotated N times and signed the user out.
+        let requestAccount = OAuthRequestAccount()
         var lastSentAccessToken: String?
         for attempt in 0...1 {
             let access = try await ensureFreshAccessToken(
-                forceRefresh: attempt == 1, staleToken: lastSentAccessToken)
+                forceRefresh: attempt == 1, staleToken: lastSentAccessToken, requestAccount: requestAccount)
             lastSentAccessToken = access
             var req = URLRequest(url: endpoint)
             req.httpMethod = "POST"
@@ -147,6 +148,8 @@ public final class XAIOAuthDirectAdapter: LLMAdapter {
             .textDeltas(omittingEmpty: true)
     }
 
+    public func messagesStreamKind(tools: [LLMToolSchema]?) -> LLMMessagesStreamKind { .incremental }
+
     public func streamMessages(
         messages: [LLMMessage],
         system: String?,
@@ -164,10 +167,11 @@ public final class XAIOAuthDirectAdapter: LLMAdapter {
                     // User, 2026-09-06: see the sibling note in
                     // completeMessages — the stale token keeps N simultaneous
                     // 401s from rotating the single-use refresh_token N times.
+                    let requestAccount = OAuthRequestAccount()
                     var lastSentAccessToken: String?
                     for attempt in 0...1 {
                         let access = try await self.ensureFreshAccessToken(
-                            forceRefresh: attempt == 1, staleToken: lastSentAccessToken)
+                            forceRefresh: attempt == 1, staleToken: lastSentAccessToken, requestAccount: requestAccount)
                         lastSentAccessToken = access
                         var req = URLRequest(url: endpoint)
                         req.httpMethod = "POST"
@@ -362,18 +366,14 @@ public final class XAIOAuthDirectAdapter: LLMAdapter {
         refreshQueueRegistry.queue(for: path)
     }
 
-    /// True when a signed-in xAI OAuth credential is on disk at this adapter's
-    /// own path (User, 2026-09-06 — see `OAuthCredentialPresence`).
-    var hasStoredOAuthCredential: Bool {
-        (try? Self.loadTokenState(path: tokenPath)) != nil
-    }
-
-    private func ensureFreshAccessToken(
+    func ensureFreshAccessToken(
         forceRefresh: Bool,
-        staleToken: String? = nil
+        staleToken: String? = nil,
+        requestAccount: OAuthRequestAccount = OAuthRequestAccount()
     ) async throws -> String {
-        try await refreshSerial.run { [self] in
-            let state = try Self.loadTokenState(path: self.tokenPath)
+        _ = try Self.loadTokenState(path: tokenPath, requestAccount: requestAccount, rejectedToken: staleToken)
+        return try await refreshSerial.run { [self] in
+            let state = try Self.loadTokenState(path: self.tokenPath, requestAccount: requestAccount)
             let access = state.accessToken
             // User, 2026-09-06: a forced refresh used to rotate unconditionally,
             // so N simultaneous 401s each rotated in turn and every rotation
@@ -386,7 +386,7 @@ public final class XAIOAuthDirectAdapter: LLMAdapter {
             }
             let shouldRefresh = forceRefresh || Self.accessTokenIsExpiring(state, skew: Self.tokenExpiryBufferSec)
             guard shouldRefresh else { return access }
-            let refreshed = try await self.refreshTokens(state: state)
+            let refreshed = try await self.refreshTokens(state: state, requestAccount: requestAccount)
             return refreshed.accessToken
         }
     }
@@ -403,18 +403,18 @@ public final class XAIOAuthDirectAdapter: LLMAdapter {
         var bytes: Data
     }
 
-    private static func loadTokenState(path: URL) throws -> TokenState {
+    private static func loadTokenState(
+        path: URL, requestAccount: OAuthRequestAccount? = nil, rejectedToken: String? = nil
+    ) throws -> TokenState {
         guard let data = try? Data(contentsOf: path),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw LLMError.notConfigured(provider: "xai_oauth_direct")
         }
-        let access = ((obj["access_token"] as? String)
-            ?? ((obj["tokens"] as? [String: Any])?["access_token"] as? String)
-            ?? "")
+        try requestAccount?.check(obj, provider: "xai_oauth_direct", rejectedToken: rejectedToken)
+        let tokenSet = OAuthRefreshBinding.tokenSet(obj, provider: "xai_oauth_direct")
+        let access = ((tokenSet["access_token"] as? String) ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        let refresh = ((obj["refresh_token"] as? String)
-            ?? ((obj["tokens"] as? [String: Any])?["refresh_token"] as? String)
-            ?? "")
+        let refresh = ((tokenSet["refresh_token"] as? String) ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !access.isEmpty, !refresh.isEmpty else {
             throw LLMError.notConfigured(provider: "xai_oauth_direct")
@@ -435,7 +435,8 @@ public final class XAIOAuthDirectAdapter: LLMAdapter {
         )
     }
 
-    private func refreshTokens(state: TokenState) async throws -> TokenState {
+    private func refreshTokens(state: TokenState, requestAccount: OAuthRequestAccount) async throws -> TokenState {
+        try OAuthRefreshBinding.requireRefresh(state.object, provider: "xai_oauth_direct")
         var req = URLRequest(url: state.tokenEndpoint)
         req.httpMethod = "POST"
         req.timeoutInterval = 20
@@ -463,7 +464,8 @@ public final class XAIOAuthDirectAdapter: LLMAdapter {
         // means the refresh token itself was rejected → genuinely revoked
         // (reconnect). A 429/5xx is a provider-side hiccup → transient: keep the
         // session so a stranger isn't told to reconnect over a temporary blip.
-        if status == 401 {
+        let refreshError = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        if status == 401 || (status == 400 && refreshError?["error"] as? String == "invalid_grant") {
             throw LLMError.authRejected(
                 provider: "xai_oauth_direct", detail: Self.boundedBodyString(data))
         }
@@ -495,6 +497,7 @@ public final class XAIOAuthDirectAdapter: LLMAdapter {
             "last_refresh": isoNow(),
             "discovery": ["token_endpoint": state.tokenEndpoint.absoluteString],
         ]
+        try OAuthRefreshBinding.requireSameAccount(payload, original: state.object, provider: "xai_oauth_direct")
         if let idToken = payload["id_token"] as? String {
             updates["id_token"] = idToken
         }
@@ -510,7 +513,7 @@ public final class XAIOAuthDirectAdapter: LLMAdapter {
         // queue, so writing unconditionally resurrected a removed credential
         // or clobbered a newer one. The bytes read before the network call are
         // the generation; a refresh whose generation moved skips its write and
-        // hands back whatever credential now owns the file.
+        // hands back the current credential only for the request's account.
         // User, 2026-09-06: the comparison and the write it guards now sit in
         // ONE critical section on the credential path's shared lock, which the
         // app's sign-in and sign-out take too — a compare followed by an
@@ -525,11 +528,15 @@ public final class XAIOAuthDirectAdapter: LLMAdapter {
         let generation = CredentialFileLock.credentialGeneration(ofFileContents: state.bytes)
         return try CredentialFileLock.withLock(tokenPath) {
             guard CredentialFileLock.credentialGeneration(ofFileAt: tokenPath) == generation else {
-                return try Self.loadTokenState(path: tokenPath)
+                return try Self.loadTokenState(path: tokenPath, requestAccount: requestAccount)
             }
             var object = (try? Data(contentsOf: tokenPath))
                 .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
                 ?? state.object
+            if object["access_token"] == nil && object["refresh_token"] == nil {
+                for (key, value) in OAuthRefreshBinding.tokenSet(object, provider: "xai_oauth_direct") { object[key] = value }
+                object.removeValue(forKey: "tokens")
+            }
             for (key, value) in updates { object[key] = value }
             try Self.writeJSONObject(object, to: tokenPath)
             return try Self.loadTokenState(path: tokenPath)

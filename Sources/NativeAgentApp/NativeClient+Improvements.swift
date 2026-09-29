@@ -344,7 +344,7 @@ extension NativeClient {
         let installsPath = capabilityPackInstallsPath(root: root)
         let nowISO = SwiftNativeManifestSigner.isoTimestamp(Date())
         let target = try await persistence.withFileLock(installsPath) {
-            let raw = await persistence.readJSON(installsPath, defaultValue: .array([]))
+            let raw = try await persistence.readJSON(installsPath, ifMissing: .array([]))
             var rows: [[String: JSONValue]] = []
             if case .array(let existing) = raw {
                 rows = existing.compactMap {
@@ -423,7 +423,7 @@ extension NativeClient {
         guard !items.isEmpty else { return }
         let path = root.appendingPathComponent("catalog/registry.json")
         try await persistence.withFileLock(path) {
-            var rows = await readObjectArray(path, persistence: persistence)
+            var rows = try await readObjectArray(path, persistence: persistence)
             let ids = Set(items.map { jsonString($0, "id") }.filter { !$0.isEmpty })
             rows.removeAll { ids.contains(jsonString($0, "id")) }
             for item in items {
@@ -452,7 +452,7 @@ extension NativeClient {
         guard !items.isEmpty else { return }
         let path = root.appendingPathComponent("workflows/registry.json")
         try await persistence.withFileLock(path) {
-            var rows = await readObjectArray(path, persistence: persistence)
+            var rows = try await readObjectArray(path, persistence: persistence)
             let ids = Set(items.map { jsonString($0, "id") }.filter { !$0.isEmpty })
             rows.removeAll { ids.contains(jsonString($0, "id")) }
             for item in items {
@@ -480,7 +480,7 @@ extension NativeClient {
         let path = root.appendingPathComponent("skills/registry.json")
         let bodiesDir = root.appendingPathComponent("skills/bodies", isDirectory: true)
         try await persistence.withFileLock(path) {
-            var rows = await readObjectArray(path, persistence: persistence)
+            var rows = try await readObjectArray(path, persistence: persistence)
             let ids = Set(items.map { skillPackID($0) }.filter { !$0.isEmpty })
             rows.removeAll { ids.contains(jsonString($0, "id")) }
             try FileManager.default.createDirectory(at: bodiesDir, withIntermediateDirectories: true)
@@ -552,7 +552,7 @@ extension NativeClient {
         let path = root.appendingPathComponent("skills/registry.json")
         let bodiesDir = root.appendingPathComponent("skills/bodies", isDirectory: true).standardizedFileURL
         try await persistence.withFileLock(path) {
-            var rows = await readObjectArray(path, persistence: persistence)
+            var rows = try await readObjectArray(path, persistence: persistence)
             var removedBodyPaths: [URL] = []
             rows.removeAll { row in
                 let marked = jsonString(row, "capabilityPackInstallId") == installID || jsonString(row, "installedByPack") == packID
@@ -582,7 +582,7 @@ extension NativeClient {
         persistence: SwiftNativePersistenceCore
     ) async throws {
         try await persistence.withFileLock(path) {
-            var rows = await readObjectArray(path, persistence: persistence)
+            var rows = try await readObjectArray(path, persistence: persistence)
             rows.removeAll { row in
                 let marked = jsonString(row, "capabilityPackInstallId") == installID || jsonString(row, "installedByPack") == packID
                 let matches = ids.isEmpty || ids.contains(jsonString(row, "id"))
@@ -600,7 +600,7 @@ extension NativeClient {
         let path = capabilityPackInstallsPath(root: root)
         let id = jsonString(receipt, "id")
         try await persistence.withFileLock(path) {
-            var rows = await readObjectArray(path, persistence: persistence)
+            var rows = try await readObjectArray(path, persistence: persistence)
             rows.removeAll { jsonString($0, "id") == id }
             rows.append(receipt)
             try await persistence.writeJSON(.array(rows.map { .object($0) }), to: path)
@@ -638,8 +638,8 @@ extension NativeClient {
             .appendingPathComponent("installs.json")
     }
 
-    private static func readObjectArray(_ path: URL, persistence: SwiftNativePersistenceCore) async -> [[String: JSONValue]] {
-        let raw = await persistence.readJSON(path, defaultValue: .array([]))
+    private static func readObjectArray(_ path: URL, persistence: SwiftNativePersistenceCore) async throws -> [[String: JSONValue]] {
+        let raw = try await persistence.readJSON(path, ifMissing: .array([]))
         guard case .array(let rows) = raw else { return [] }
         return rows.compactMap {
             if case .object(let obj) = $0 { return obj }

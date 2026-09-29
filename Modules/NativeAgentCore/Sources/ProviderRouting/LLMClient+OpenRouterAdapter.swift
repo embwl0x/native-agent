@@ -4,7 +4,7 @@ import PersistenceCore
 
 /// OpenRouter chat-completions adapter. OpenRouter speaks the OpenAI
 /// chat-completions wire format at `https://openrouter.ai/api/v1/chat/completions`
-/// and uses a Bearer api key resolved from env `OPENROUTER_API_KEY` or
+/// and uses the Bearer api key saved in
 /// `<dataRoot>/providers/openrouter.json::api_key`. Used by SwiftNativeLLMClient
 /// for slash-namespaced model ids (`anthropic/claude-...`, `openai/...`,
 /// `meta-llama/...`, etc.) — those are OpenRouter routing targets, not
@@ -62,14 +62,9 @@ public final class OpenRouterAdapter: LLMAdapter {
     private func resolveKey() -> String? {
         if let k = apiKeyOverride, !k.isEmpty { return k }
         let root = dataRootOverride ?? PersistenceCore.defaultDataRoot()
-        let includeEnvironment = dataRootOverride == nil
-            || root.standardizedFileURL
-                == PersistenceCore.defaultDataRoot().standardizedFileURL
         return LLMCredentialResolver.resolveAPIKey(
-            envVar: "OPENROUTER_API_KEY",
             providerConfigFile: "openrouter.json",
-            dataRoot: root,
-            includeEnvironment: includeEnvironment
+            dataRoot: root
         )
     }
 
@@ -160,6 +155,8 @@ public final class OpenRouterAdapter: LLMAdapter {
         )
         return try terminal.get()
     }
+
+    public func messagesStreamKind(tools: [LLMToolSchema]?) -> LLMMessagesStreamKind { .incremental }
 
     public func streamMessages(
         messages: [LLMMessage],

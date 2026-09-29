@@ -1,8 +1,11 @@
+import AppKit
+import AppToolRuntime
 import SwiftUI
 import NativeAgentCore
 import ChatOrchestration
 import PersistenceCore
 import StandingBots
+import NativeAgentShared
 import os
 
 // Simple view's window: one floating glass sidebar (the rail's plate) and the
@@ -25,11 +28,14 @@ struct SimpleContact: Identifiable, Equatable, Sendable {
     var link: Link? = nil
     /// Its initials tint: a palette slot three on from the row above (SimpleAvatar).
     var tintSlot: Int? = nil
+    /// Claude — the Claude Code bridge (Claude here) or Claude Desktop —
+    /// wears Clawd instead of an app icon (User 09-28).
+    var clawd = false
     var initial: String { name.first.map { String($0).uppercased() } ?? "?" }
 
     enum Link: Equatable, Sendable {
         case desktopApp, routine
-        var words: String { self == .desktopApp ? "Desktop app" : "Routine · replies come back" }
+        var words: String { self == .desktopApp ? "Desktop app" : "Routine" }
     }
 }
 
@@ -41,6 +47,53 @@ struct SimpleThreadLine: Identifiable, Equatable, Sendable {
     let at: Date
     /// Typed by the person in this thread rather than sent by the agent.
     var byPerson = false
+}
+
+/// What is moving on a contact's thread now: the other agent's live progress
+/// on the send in flight, follow-ups queued behind it, and a stop asked for
+/// on it. Nil when none of that is there.
+struct SimpleFlight: Equatable, Sendable {
+    let recordID: String
+    /// How agent_cancel names the contact and its conversation.
+    let agent: String
+    let label: String
+    let scope: String
+    /// The send is still going or its reply is still coming.
+    let inFlight: Bool
+    var live: AgentConversationLive?
+    var queued: [Queued]
+    /// Only the stop asked for on this send.
+    var stop: AgentConversationStop?
+
+    struct Queued: Identifiable, Equatable, Sendable {
+        enum State: Equatable, Sendable { case queued, sending, held(String) }
+        let id: String
+        let text: String
+        let at: Date
+        let byPerson: Bool
+        let state: State
+    }
+
+    init?(_ record: AgentConversationRecord, live: AgentConversationLive?) {
+        let queued = (record.queued ?? []).map { item in
+            Queued(id: item.id, text: item.text, at: item.queuedAt, byPerson: item.byPerson == true,
+                   state: item.held.map { .held($0) } ?? (item.id == record.queueReservation ? .sending : .queued))
+        }
+        let stop = record.stop?.operationID == record.operationID ? record.stop : nil
+        let inFlight = ["sending", "waiting"].contains(record.phase)
+        guard live != nil || !queued.isEmpty || stop != nil else { return nil }
+        (recordID, agent, label, scope) = (record.id, record.agent, record.label, record.scopeSessionID)
+        (self.inFlight, self.live, self.queued, self.stop) = (inFlight, live, queued, stop)
+    }
+
+    /// The other agent is on it right now (not just handed off).
+    var working: Bool { inFlight && live?.state == "working" }
+    /// Streamed words so far, when its lane streams them.
+    var partial: String? {
+        guard working, live?.streams == true, let text = live?.partial?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !text.isEmpty else { return nil }
+        return live?.partialTruncated == true ? "…" + text : text
+    }
 }
 
 /// A crew the agent sent out (`agent_swarm`): a few workers on one task, for
@@ -115,8 +168,11 @@ final class SimpleViewStore {
     var lines: [String: [SimpleThreadLine]] = [:]
     /// Contacts with a message still on its way or awaiting a reply.
     var waiting: Set<String> = []
-    /// Contacts whose latest message ended with no reply coming back.
-    var unanswered: Set<String> = []
+    /// Where each contact's latest send stands when no reply is owed or
+    /// none came: delivered, read, failed, not delivered.
+    var status: [String: AgentConversationDelivery] = [:]
+    /// Per contact id: its live reply, queue and stop, while there are any.
+    var flights: [String: SimpleFlight] = [:]
     var helpers: [BotsShelfRecord] = []
     /// False until the first read lands, so an empty list isn't claimed early.
     var loaded = false
@@ -129,9 +185,16 @@ final class SimpleViewStore {
         var contacts: [SimpleContact]
         var lines: [String: [SimpleThreadLine]]
         var waiting: Set<String>
-        var unanswered: Set<String>
+        var status: [String: AgentConversationDelivery]
+        var flights: [String: SimpleFlight]
         var helpers: [BotsShelfRecord]
         var running: Set<UUID>
+        /// Not compared: which record each contact's flight comes from, and the
+        /// records file as last read, so a live-only tick re-reads just flights.
+        var flightRecords: [String: String] = [:]
+        var recordsStamp = ""
+        // 2026-09-28: finished bridge replies invalidate lines even without a records change.
+        var bridgeReplies: [String: AgentConversationLive] = [:]
     }
 
     /// What a read changed, worked out off the main actor; nil is unchanged.
@@ -139,7 +202,8 @@ final class SimpleViewStore {
         var contacts: [SimpleContact]?
         var lines: [String: [SimpleThreadLine]]?
         var waiting: Set<String>?
-        var unanswered: Set<String>?
+        var status: [String: AgentConversationDelivery]?
+        var flights: [String: SimpleFlight]?
         var helpers: [BotsShelfRecord]?
         var running: Set<UUID>?
     }
@@ -148,11 +212,12 @@ final class SimpleViewStore {
         let delta = Delta(contacts: old.contacts == new.contacts ? nil : new.contacts,
                           lines: old.lines == new.lines ? nil : new.lines,
                           waiting: old.waiting == new.waiting ? nil : new.waiting,
-                          unanswered: old.unanswered == new.unanswered ? nil : new.unanswered,
+                          status: old.status == new.status ? nil : new.status,
+                          flights: old.flights == new.flights ? nil : new.flights,
                           helpers: old.helpers == new.helpers ? nil : new.helpers,
                           running: old.running == new.running ? nil : new.running)
         let unchanged = delta.contacts == nil && delta.lines == nil && delta.waiting == nil
-            && delta.unanswered == nil && delta.helpers == nil && delta.running == nil
+            && delta.status == nil && delta.flights == nil && delta.helpers == nil && delta.running == nil
         return unchanged ? nil : delta
     }
 
@@ -180,32 +245,54 @@ final class SimpleViewStore {
 
     /// Reload whenever the contact list, the conversation records, a Grok Bot
     /// answer or the helpers' shelf change on disk, a helper's run takes its
-    /// claim (`run.lock`), or one ends (in memory, so the queue says so).
+    /// claim (`run.lock`), or one ends (in memory, so the queue says so), or
+    /// a built-in lane's inbox marks a message read. The live hub's partials
+    /// (a few writes a second while a reply streams) re-read only the flights.
     func watch(root: URL, helpers ids: [UUID]) async {
         let paths = ["agents/peers.json", "agents/conversations.json", "agents/grok-requests", "bots/definitions",
-                     "bots/shelf-index.json", "bots/run-queue.json"] + ids.map { "bots/\($0.uuidString)/run.lock" }
-        let events = FileChangeEvents(paths: paths.map { root.appendingPathComponent($0) }, emitInitial: true)
+                     "bots/shelf-index.json", "bots/run-queue.json", "agents/conversation-live.json"]
+            + ids.map { "bots/\($0.uuidString)/run.lock" }
+        let liveFile = root.appendingPathComponent("agents/conversation-live.json").standardizedFileURL
+        let bridges = NativeAgentPaths.bridgeConfigRoot(dataRoot: root)
+        let inboxes = ["claude", "codex", "omp"].compactMap { AgentConversationDelivery.inbox(agent: $0, bridgeConfigRoot: bridges) }
+        let events = FileChangeEvents(paths: paths.map { root.appendingPathComponent($0) } + inboxes, emitInitial: true)
         let (ticks, tick) = AsyncStream.makeStream(of: Void.self, bufferingPolicy: .bufferingNewest(1))
         // Set by every change, cleared just before a read: a tick buffered
         // while that read's burst settled finds it clear and is skipped.
-        let pending = OSAllocatedUnfairLock(initialState: false)
-        let files = Task { for await _ in events.stream { pending.withLock { $0 = true }; tick.yield() } }
+        // `full` for anything but the live file, which sets only `live`.
+        let pending = OSAllocatedUnfairLock(initialState: (full: false, live: false))
+        let files = Task {
+            for await url in events.stream {
+                pending.withLock { if url == liveFile { $0.live = true } else { $0.full = true } }
+                tick.yield()
+            }
+        }
         let ended = NotificationCenter.default.addObserver(forName: BotRunQueue.didChange, object: nil, queue: nil) { _ in
-            pending.withLock { $0 = true }
+            pending.withLock { $0.full = true }
             tick.yield()
         }
-        var last = Snapshot(contacts: contacts, lines: lines, waiting: waiting, unanswered: unanswered,
+        var last = Snapshot(contacts: contacts, lines: lines, waiting: waiting, status: status, flights: flights,
                             helpers: helpers, running: running)
         var list: ContactList?
         await withTaskCancellationHandler {
             for await _ in ticks {
                 guard !Task.isCancelled else { break }
-                guard pending.withLock({ $0 }) else { continue }
+                guard pending.withLock({ $0.full || $0.live }) else { continue }
                 // One message writes several files; let the burst land first.
                 if loaded { try? await Task.sleep(for: .milliseconds(150)) }
                 guard !Task.isCancelled else { break }
-                pending.withLock { $0 = false }
+                let first = !loaded
+                let full = pending.withLock { state in
+                    defer { state = (false, false) }
+                    return state.full || first
+                }
                 let (next, contactList, delta) = await Task.detached(priority: .userInitiated) { [last, list] in
+                    // A records change that rode in on the live file's tick still gets its full read.
+                    if !full, let flights = Self.readFlights(root: root, last: last) {
+                        var next = last
+                        next.flights = flights
+                        return (next, list, Self.changes(from: last, to: next))
+                    }
                     let (next, contactList) = Self.read(root: root, cached: list)
                     return (next, contactList, Self.changes(from: last, to: next))
                 }.value
@@ -215,7 +302,8 @@ final class SimpleViewStore {
                     if let value = delta.contacts { contacts = value }
                     if let value = delta.lines { lines = value }
                     if let value = delta.waiting { waiting = value }
-                    if let value = delta.unanswered { unanswered = value }
+                    if let value = delta.status { status = value }
+                    if let value = delta.flights { flights = value }
                     if let value = delta.helpers { helpers = value }
                     if let value = delta.running { running = value }
                 }
@@ -244,15 +332,22 @@ final class SimpleViewStore {
     }
 
     /// The contact's own app when it is on this Mac: its desktop address, else
-    /// its known-agent row. None for a routine, so Grok Bot does not wear the
-    /// icon of the Grok desktop app it runs through.
+    /// its known-agent row. Grok Bot wears the Grok app's icon (User 09-27);
+    /// only a desktop-app contact carries the small window badge.
     nonisolated private static func appBundleID(_ row: AgentContactRow) -> String? {
-        guard row.contact?.transport != .grokBot else { return nil }
+        if row.contact?.transport == .grokBot {
+            return NSWorkspace.shared.urlForApplication(withBundleIdentifier: GrokBotRoute.bundleID) == nil
+                ? nil : GrokBotRoute.bundleID
+        }
         let host = row.builtIn ? String(row.id.dropFirst("builtin:".count))
             : row.contact.flatMap { AgentPeerStore.hostRowID($0.endpoint) } ?? row.id
         let bundle = row.contact.flatMap { AgentPeerStore.desktopBundleID($0.endpoint) }
             ?? AgentHostDirectory.rows.first { $0.id == host }?.bundleIDs.first
         return bundle.flatMap { NSWorkspace.shared.urlForApplication(withBundleIdentifier: $0) == nil ? nil : $0 }
+    }
+
+    nonisolated private static func isClaude(_ row: AgentContactRow) -> Bool {
+        row.id == "builtin:claude" || row.contact?.endpoint.absoluteString == "mcp://claude-desktop"
     }
 
     /// Listed only while the agent can reach it now: connected, set up to
@@ -280,7 +375,8 @@ final class SimpleViewStore {
         var contacts = AgentContactRow.rows(peers: peers, candidates: [], usable: usable).filter(reachable).map { row in
             SimpleContact(id: row.builtIn ? String(row.id.dropFirst("builtin:".count)) : row.id,
                           name: row.name, builtIn: row.builtIn, via: via(row), appBundleID: appBundleID(row),
-                          link: link(row))
+                          link: link(row),
+                          clawd: isClaude(row))
         }
         // A tint is who a contact is, so it follows the contact, not its row:
         // in stable id order each initials avatar sits three hues of the eight
@@ -293,7 +389,37 @@ final class SimpleViewStore {
         return ContactList(stamp: stamps, programs: programs, contacts: contacts)
     }
 
-    nonisolated private static func read(root: URL, cached: ContactList?) -> (Snapshot, ContactList) {
+    nonisolated static func mobileThreads(root: URL) throws -> [MobileAgentThread] {
+        // A damaged authority store must not publish an invented empty contact list.
+        _ = try AgentPeerStore(dataRoot: root).list()
+        _ = try AgentConversationStore(dataRoot: root).records()
+        let snapshot = read(root: root, cached: nil, includeHelpers: false).0
+        return snapshot.contacts.map { contact in
+            let lines = snapshot.lines[contact.id] ?? []
+            let status: String
+            if snapshot.waiting.contains(contact.id) { status = "Waiting for reply" }
+            else {
+                switch snapshot.status[contact.id] {
+                case .sending?, .waiting?: status = "Waiting for reply"
+                case .delivered?: status = "Delivered"
+                case .read?: status = "Read"
+                case .answered?: status = "Replied"
+                case .failed?: status = "No reply"
+                case .notDelivered?: status = "Not delivered"
+                case nil: status = ""
+                }
+            }
+            let row = MobileAgentRow(id: contact.id, name: contact.name, via: contact.via,
+                                     lastExchange: String((lines.last?.text ?? "").prefix(240)), status: status)
+            let tail = lines.suffix(32)
+            return MobileAgentThread(agent: row, lines: tail.map {
+                MobileAgentLine(id: $0.id, speaker: $0.byPerson ? "You" : $0.fromAgent ? "Agent" : contact.name,
+                                text: String($0.text.prefix(2_000)), at: $0.at.timeIntervalSince1970)
+            }, truncated: lines.count > tail.count || tail.contains { $0.text.count > 2_000 })
+        }
+    }
+
+    nonisolated private static func read(root: URL, cached: ContactList?, includeHelpers: Bool = true) -> (Snapshot, ContactList) {
         let list = contactList(root: root, cached: cached)
         let contacts = list.contacts
         let ids = Set(contacts.map(\.id))
@@ -312,6 +438,7 @@ final class SimpleViewStore {
         for contact in contacts where contact.id.hasPrefix("peer:") { alias[String(contact.id.dropFirst(5))] = contact.id }
 
         let requests = grokRequests(root: root)
+        let recordsStamp = stamp(root.appendingPathComponent("agents/conversations.json").path)
         let records = (try? AgentConversationStore(dataRoot: root).records()) ?? []
         var lines: [String: [SimpleThreadLine]] = [:]
         var replies: [String: [SimpleThreadLine]] = [:]
@@ -359,6 +486,15 @@ final class SimpleViewStore {
         for (id, line) in bridgedTurns(root: root, sessions: sessions, alias: alias) {
             lines[id, default: []].append(line)
         }
+        // The built-in bridges (Codex, OMP, Claude) answer on their own lane
+        // with no conversation record; the finished reply is in the live file.
+        let bridgeReplies = finishedBridgeReplies(root: root)
+        for entry in bridgeReplies.values {
+            guard let text = entry.partial?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty,
+                  let id = owner(entry.agent, name: "") else { continue }
+            replies[id, default: []].append(.init(id: entry.key + ":reply", fromAgent: false, text: text,
+                                                  at: entry.finishedAt ?? entry.lastActivityAt))
+        }
         // A receipt can keep a copy of a bridged answer; show it once.
         for (id, said) in replies {
             let heard = Set((lines[id] ?? []).filter { !$0.fromAgent }.map { $0.text.trimmingCharacters(in: .whitespacesAndNewlines) })
@@ -371,15 +507,29 @@ final class SimpleViewStore {
 
         let answered = Set(requests.filter { $0.state == "answered" }.map(\.message))
         var waiting: Set<String> = []
-        var unanswered: Set<String> = []
+        var status: [String: AgentConversationDelivery] = [:]
+        let bridges = NativeAgentPaths.bridgeConfigRoot(dataRoot: root)
         for (id, record) in latest {
             let message: String? = if case .string(let value)? = record.readInput?["message_id"] { value } else { nil }
-            if ["sending", "waiting"].contains(record.phase), !(message.map(answered.contains) ?? false) {
-                waiting.insert(id)
-            } else if record.phase == "attention", lines[id]?.last?.fromAgent ?? true {
-                unanswered.insert(id)
+            // Answered only on this send's own evidence: its exchange's reply
+            // (`AgentConversationDelivery.answered`) or Grok Bot's answer to
+            // this exact message id, never another conversation's latest line.
+            if record.phase != "sending", message.map(answered.contains) ?? false { continue }
+            // Read: the recipient's own inbox marked this message read.
+            let read = message.flatMap { message in
+                AgentConversationDelivery.inbox(agent: record.agent, bridgeConfigRoot: bridges).map {
+                    DelegationStatusProjector.requestTexts(inbox: $0, ids: [message], field: "read")[message] != nil
+                }
+            } ?? false
+            switch AgentConversationDelivery.of(record, read: read) {
+            case .sending, .waiting: waiting.insert(id)
+            case .answered: break
+            case let state: status[id] = state
             }
         }
+        let hub = AgentConversationLiveStore(dataRoot: root)
+        var flights: [String: SimpleFlight] = [:]
+        for (id, record) in latest { flights[id] = SimpleFlight(record, live: hub.current(for: record)) }
         let ordered = contacts.enumerated().sorted { a, b in
             switch (lastActive[a.element.id], lastActive[b.element.id]) {
             case let (x?, y?): return x != y ? x > y : a.offset < b.offset
@@ -388,11 +538,31 @@ final class SimpleViewStore {
             case (nil, nil): return a.offset < b.offset
             }
         }.map(\.element)
-        let helpers = (try? BotsShelfView.readRecords(root: root)) ?? []
+        let helpers = includeHelpers ? (try? BotsShelfView.readRecords(root: root)) ?? [] : []
         // Queued, or claimed by a runner in this app: the shelf's own "Running".
         let running = (try? BotRunQueue(dataRoot: root).activeOrQueuedIDs()) ?? []
-        return (Snapshot(contacts: ordered, lines: lines, waiting: waiting, unanswered: unanswered, helpers: helpers,
-                         running: running), list)
+        return (Snapshot(contacts: ordered, lines: lines, waiting: waiting, status: status, flights: flights,
+                         helpers: helpers, running: running, flightRecords: latest.mapValues(\.id),
+                         recordsStamp: recordsStamp, bridgeReplies: bridgeReplies), list)
+    }
+
+    nonisolated private static func finishedBridgeReplies(root: URL) -> [String: AgentConversationLive] {
+        AgentConversationLiveStore(dataRoot: root).all().filter { $0.value.recordID == nil && $0.value.state == "finished" }
+    }
+
+    /// Only the flights, for a tick of the live file alone. Nil when the
+    /// records or finished bridge replies moved since the last full read.
+    nonisolated private static func readFlights(root: URL, last: Snapshot) -> [String: SimpleFlight]? {
+        guard stamp(root.appendingPathComponent("agents/conversations.json").path) == last.recordsStamp,
+              finishedBridgeReplies(root: root) == last.bridgeReplies,
+              let records = try? AgentConversationStore(dataRoot: root).records() else { return nil }
+        let byID = Dictionary(records.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+        let hub = AgentConversationLiveStore(dataRoot: root)
+        var flights: [String: SimpleFlight] = [:]
+        for (contact, id) in last.flightRecords {
+            if let record = byID[id] { flights[contact] = SimpleFlight(record, live: hub.current(for: record)) }
+        }
+        return flights
     }
 
     /// How a contact is reached, in words a person uses.
@@ -473,11 +643,13 @@ final class SimpleViewStore {
         return found
     }
 
-    /// A bridged turn without the bracketed notes the bridge puts on top.
+    /// A bridged turn without the bracketed notes the bridge puts on top (and
+    /// the bare contact-metadata line replies carried before 09-25).
     nonisolated static func bridgedText(_ content: String) -> String {
-        var rows = content.split(separator: "\n", omittingEmptySubsequences: false)[...]
+        let text = ChatShellConversationRow.stripBridgePrefix(content)
+        var rows = text.split(separator: "\n", omittingEmptySubsequences: false)[...]
         while let first = rows.first?.trimmingCharacters(in: .whitespaces),
-              first.isEmpty || (first.hasPrefix("[") && first.hasSuffix("]")) {
+              first.isEmpty || (first.hasPrefix("[") && first.hasSuffix("]")) || (first.hasPrefix("{\"agent\"") && first.hasSuffix("}")) {
             rows = rows.dropFirst()
         }
         return rows.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
@@ -528,7 +700,7 @@ struct SimpleShellView: View {
     }
 
     var body: some View {
-        ShellFrame(classic: false) {
+        ShellFrame {
             SimpleSidebar(store: store, pane: $pane)
         } detail: {
             let showingChat = pane == .agent
@@ -577,97 +749,50 @@ struct SimpleShellView: View {
     }
 }
 
-/// The menu the person row opens, upward from the plate's foot: a waiting
-/// update, the haze colour, the warmth switch, and the way to all settings.
-/// Rows in the composer card's recipe; the same keys Advanced writes.
-private struct SimpleSettingsMenu: View {
-    let close: () -> Void
+/// The Settings menu's items: a waiting update, the haze colour, the warmth
+/// switch, and the way to all settings. The same keys Advanced writes.
+private struct SimpleSettingsMenuItems: View {
     @AppStorage(MoodTintPreference.key) private var warmth = true
     @AppStorage(SimpleViewMode.key) private var viewMode = ""
+    @AppStorage(HazeColor.key) private var hazeRaw = HazeColor.defaultValue.rawValue
     @Environment(\.colorScheme) private var scheme
     @State private var updates = UpdateController.shared
-    @State private var hovered: String?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            if let version = updates.status.availableVersion {
-                button("update", icon: "arrow.down.circle", "Version \(version) is ready", fill: NativeAgentShell.quietFill) {
-                    close()
-                    updates.checkForUpdates()
-                } trailing: {
-                    Text("Install").font(ShellType.labelMedium).foregroundStyle(NativeAgentShell.text)
-                }
-                hairline
+        if let version = updates.status.availableVersion {
+            Button("Install version \(version)", systemImage: "arrow.down.circle") {
+                updates.checkForUpdates()
             }
-            VStack(alignment: .leading, spacing: 6) {
-                label("paintpalette", "Colour")
-                HazeSwatches().padding(.leading, 16)
-            }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 6)
-            // The warmth only lands in dark mode (MoodTintGate); in light the
-            // switch would change nothing, so it isn't offered.
-            if scheme == .dark {
-                Toggle(isOn: $warmth) { label("sun.max", "Warmth in the glass") }
-                    .toggleStyle(.switch)
-                    .controlSize(.mini)
-                    .hazeTinted()
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 6)
-            }
-            hairline
-            button("more", icon: "gearshape", "More settings") {
-                close()
-                viewMode = SimpleViewMode.advanced
-                _ = NativeAgentAppCoordinator.shared.request(.sidebar(.settings))
-            } trailing: {
-                Image(systemName: "chevron.right")
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundStyle(NativeAgentShell.secondary)
-            }
+            Divider()
         }
-        .padding(NativeAgentSpacing.md)
-        .frame(width: 264, alignment: .leading)
-    }
-
-    private var hairline: some View {
-        Rectangle().fill(NativeAgentShell.hairline).frame(height: 1).padding(.vertical, 6)
-    }
-
-    private func label(_ icon: String, _ title: String) -> some View {
-        HStack(spacing: 8) {
-            Image(systemName: icon)
-                .font(.system(size: 12))
-                .foregroundStyle(NativeAgentShell.secondary)
-                .frame(width: 16)
-            Text(title)
-                .font(ShellType.labelMedium)
-                .foregroundStyle(NativeAgentShell.text)
-                .lineLimit(1)
+        Picker(selection: $hazeRaw) {
+            ForEach(HazeColor.allCases) { color in
+                Label { Text(color.name) } icon: { Image(nsImage: Self.swatch(color)) }
+                    .tag(color.rawValue)
+            }
+        } label: {
+            Label("Colour", systemImage: "paintpalette")
+        }
+        // The warmth only lands in dark mode (MoodTintGate).
+        if scheme == .dark {
+            Toggle(isOn: $warmth) { Label("Warmth in the glass", systemImage: "sun.max") }
+        }
+        Divider()
+        Button("More settings…", systemImage: "gearshape") {
+            viewMode = SimpleViewMode.advanced
+            _ = NativeAgentAppCoordinator.shared.request(.sidebar(.settings))
         }
     }
 
-    private func button<Trailing: View>(_ id: String, icon: String, _ title: String, fill: Color? = nil,
-                                        action: @escaping () -> Void,
-                                        @ViewBuilder trailing: () -> Trailing) -> some View {
-        Button(action: action) {
-            HStack(spacing: 6) {
-                label(icon, title)
-                Spacer(minLength: 4)
-                trailing()
-            }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 6)
-            .background {
-                if hovered == id || fill != nil {
-                    RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .fill(hovered == id ? NativeAgentShell.softFill : fill ?? .clear)
-                }
-            }
-            .contentShape(Rectangle())
+    /// A filled circle in the haze colour; menus draw template images grey.
+    static func swatch(_ color: HazeColor) -> NSImage {
+        let image = NSImage(size: NSSize(width: 12, height: 12), flipped: false) { rect in
+            NSColor(color.base).setFill()
+            NSBezierPath(ovalIn: rect.insetBy(dx: 1, dy: 1)).fill()
+            return true
         }
-        .buttonStyle(.plain)
-        .onHover { hovered = $0 ? id : (hovered == id ? nil : hovered) }
+        image.isTemplate = false
+        return image
     }
 }
 
@@ -679,11 +804,8 @@ private struct SimpleSidebar: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @Environment(\.controlActiveState) private var activeState
-    @Environment(\.simpleSettingsMenuDrawnOpen) private var drawMenuOpen
-    @Namespace private var bar
     @State private var showQuiet = false
     @State private var showCrews = false
-    @State private var showSettings = false
     /// "last ran … ago" is measured from this, re-stamped when the plate
     /// appears, the window comes forward, a helper changes or the pointer
     /// arrives; no timer.
@@ -702,22 +824,34 @@ private struct SimpleSidebar: View {
         // Talked to, newest first; the rest fold at the end.
         let talked = store.contacts.filter { !isQuiet($0) }
         let unheard = store.contacts.filter(isQuiet)
-        ScrollView {
-            VStack(alignment: .leading, spacing: 2) {
-                SimpleAgentCard(selected: pane == .agent, bar: bar) { pane = .agent }
-                    .padding(.bottom, Self.sectionGap)
-                sectionTitle("Agents", "Other AIs I work with.")
+        // The Mac's own sidebar List (User 09-27: all controls native): its
+        // selection, arrow keys and folds.
+        // Her card is home, not a row: it wears its own quiet wash instead
+        // of the system's blue block (User 09-27: tune her back after native).
+        List(selection: Binding<SimpleShellView.Pane?>(get: { pane == .agent ? nil : pane },
+                                                       set: { if let next = $0 { pane = next } })) {
+            Button { pane = .agent } label: {
+                SimpleAgentCard(selected: pane == .agent).contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .selectionDisabled()
+                .padding(.bottom, Self.sectionGap)
+            Section {
                 if store.loaded && store.contacts.isEmpty {
                     quiet("None connected yet. Ask \(agentName) to connect one.")
                 }
                 ForEach(talked) { contactRow($0) }
                 if !unheard.isEmpty {
-                    fold("Not talked to yet", count: unheard.count, open: $showQuiet)
-                    if showQuiet {
+                    DisclosureGroup(isExpanded: $showQuiet) {
                         ForEach(unheard) { contactRow($0) }
+                    } label: {
+                        foldLabel("Not talked to yet", count: unheard.count)
                     }
                 }
-                sectionTitle("Helpers", "Bots I made that can do real work for you. Talk to any of them here.").padding(.top, Self.sectionGap)
+            } header: {
+                sectionTitle("Agents", "Other AIs I work with.")
+            }
+            Section {
                 // Crews at work lead the section, and leave it when they finish.
                 ForEach(store.crews.filter(\.live)) { crewRow($0) }
                 if store.loaded && store.helpers.isEmpty {
@@ -727,7 +861,7 @@ private struct SimpleSidebar: View {
                     let selected = pane == .helper(helper.id)
                     let timing = Self.timing(helper, now: now)
                     let working = store.running.contains(helper.id) || store.waiting.contains(SimpleViewStore.key(helper.id))
-                    row(selected: selected, action: { pane = .helper(helper.id) }) {
+                    row(.helper(helper.id)) {
                         HStack(spacing: 10) {
                             SimpleClockTile(size: 30, working: working)
                             rowText(helper.definition.name, timing, selected: selected)
@@ -737,17 +871,20 @@ private struct SimpleSidebar: View {
                 }
                 let finished = store.crews.filter { !$0.live }
                 if !finished.isEmpty {
-                    fold("Recent crews", count: finished.count, open: $showCrews)
-                    if showCrews {
+                    DisclosureGroup(isExpanded: $showCrews) {
                         ForEach(finished) { crewRow($0) }
+                    } label: {
+                        foldLabel("Recent crews", count: finished.count)
                     }
                 }
+            } header: {
+                sectionTitle("Helpers", "Bots I made that can do real work for you. Talk to any of them here.")
             }
-            // Below the traffic lights, which sit on the plate's top edge.
-            .padding(.top, 30)
-            .padding(.bottom, 14)
-            .animation(NativeAgentMotion.respecting(NativeAgentMotion.standard, reduceMotion: reduceMotion), value: pane)
         }
+        .listStyle(.sidebar)
+        .scrollContentBackground(.hidden)
+        // Below the traffic lights, which sit on the plate's top edge.
+        .contentMargins(.top, 30, for: .scrollContent)
         .scrollIndicators(.never)
         // Settings stays on the plate's foot: under the lists while there is
         // room, and in a short window the lists scroll beneath it, its own
@@ -771,16 +908,6 @@ private struct SimpleSidebar: View {
         }
         .padding([.top, .bottom, .leading], NativeAgentShellLayout.railPlateInset)
         .padding(.trailing, 6)
-        .overlay(alignment: .bottomLeading) {
-            if drawMenuOpen {
-                let card = RoundedRectangle(cornerRadius: 14, style: .continuous)
-                SimpleSettingsMenu {}
-                    .background(card.fill(TodayPalette.cardFill))
-                    .overlay(card.strokeBorder(TodayPalette.cardStroke, lineWidth: 1))
-                    .padding(.leading, NativeAgentShellLayout.railPlateInset + 12)
-                    .padding(.bottom, NativeAgentShellLayout.railPlateInset + 46)
-            }
-        }
         .onAppear { now = Date() }
         .onChange(of: activeState) { now = Date() }
         .onChange(of: store.helpers) { now = Date() }
@@ -792,23 +919,27 @@ private struct SimpleSidebar: View {
     /// A little gear and the word, at the plate's foot (User, 09-24: "just a
     /// settings thing"); it opens the settings menu upward.
     private var settingsRow: some View {
-        Button { showSettings = true } label: {
-            HStack(spacing: 6) {
-                Image(systemName: "gearshape")
-                    .font(.system(size: 12))
-                Text("Settings")
-                    .font(Self.rowLine)
+        // The Mac's own menu (User 09-27: all controls native).
+        HStack(spacing: 0) {
+            Menu {
+                SimpleSettingsMenuItems()
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "gearshape")
+                        .font(.system(size: 12))
+                    Text("Settings")
+                        .font(Self.rowLine)
+                }
+                .foregroundStyle(NativeAgentShell.secondary)
             }
-            .foregroundStyle(NativeAgentShell.secondary)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.leading, NativeAgentShellLayout.railWordInset)
-            .frame(height: 32)
-            .contentShape(Rectangle())
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .shellKeyboardTarget(.rail, sortsLast: true)
+            Spacer(minLength: 0)
         }
-        .buttonStyle(.plain)
-        .popover(isPresented: $showSettings, arrowEdge: .top) {
-            SimpleSettingsMenu { showSettings = false }
-        }
+        .padding(.leading, NativeAgentShellLayout.railWordInset)
+        .frame(height: 32)
         .padding(.bottom, 8)
         // A flat coat of the room, fading in over 16pt, so rows sliding under
         // it are gone before they reach the word (the edge effect alone left
@@ -826,28 +957,11 @@ private struct SimpleSidebar: View {
         }
     }
 
-    private func fold(_ title: String, count: Int, open: Binding<Bool>) -> some View {
-        Button {
-            withAnimation(NativeAgentMotion.respecting(NativeAgentMotion.standard, reduceMotion: reduceMotion)) {
-                open.wrappedValue.toggle()
-            }
-        } label: {
-            HStack(spacing: 6) {
-                Image(systemName: "chevron.right")
-                    .font(.system(size: 10, weight: .semibold))
-                    .rotationEffect(.degrees(open.wrappedValue ? 90 : 0))
-                Text("\(title) (\(count))")
-                    .font(Self.rowLine)
-            }
+    private func foldLabel(_ title: String, count: Int) -> some View {
+        Text("\(title) (\(count))")
+            .font(Self.rowLine)
             .foregroundStyle(NativeAgentShell.secondary)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.leading, NativeAgentShellLayout.railWordInset)
-            .frame(height: 32)
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .accessibilityLabel("\(title), \(count)")
-        .accessibilityValue(open.wrappedValue ? "Expanded" : "Collapsed")
+            .accessibilityLabel("\(title), \(count)")
     }
 
     /// "Working now · <task> · 3 workers" while it runs; the task and how it
@@ -857,7 +971,7 @@ private struct SimpleSidebar: View {
         let workers = crew.workers.count == 1 ? "1 worker" : "\(crew.workers.count) workers"
         let name = crew.live ? "Working now" : crew.task
         let line = crew.live ? "\(crew.task) · \(workers)" : "\(SimpleCrewThread.outcome(crew)) · \(workers)"
-        return row(selected: selected, action: { pane = .crew(crew.id) }) {
+        return row(.crew(crew.id)) {
             HStack(spacing: 10) {
                 SimpleClockTile(size: 30, symbol: "person.3", working: crew.live)
                 rowText(name, line, selected: selected)
@@ -868,7 +982,7 @@ private struct SimpleSidebar: View {
 
     private func isQuiet(_ contact: SimpleContact) -> Bool {
         (store.lines[contact.id] ?? []).isEmpty && !store.waiting.contains(contact.id)
-            && !store.unanswered.contains(contact.id)
+            && store.status[contact.id] == nil && store.flights[contact.id] == nil
     }
 
     private func contactRow(_ contact: SimpleContact) -> some View {
@@ -876,7 +990,7 @@ private struct SimpleSidebar: View {
         // Lead with how it is connected, so two contacts behind one app's
         // icon ("Grok", "Grok Bot") read as the two things they are.
         let line = [contact.link?.words, lastLine(contact)].compactMap { $0 }.joined(separator: " · ")
-        return row(selected: selected, action: { pane = .contact(contact.id) }) {
+        return row(.contact(contact.id)) {
             HStack(spacing: 10) {
                 SimpleAvatar(contact: contact, size: 30)
                     .overlay { if store.waiting.contains(contact.id) { WorkingRim(cornerRadius: 15) } }
@@ -908,12 +1022,35 @@ private struct SimpleSidebar: View {
     }
 
     private func lastLine(_ contact: SimpleContact) -> String {
-        if store.waiting.contains(contact.id) { return "Waiting for a reply" }
-        guard let last = store.lines[contact.id]?.last else {
-            return store.unanswered.contains(contact.id) ? "No reply came back" : "No messages yet"
+        let moving = flightWord(contact)
+        if moving == nil, store.waiting.contains(contact.id) { return "Waiting for a reply" }
+        // A quiet word for where the last send stands, ahead of its line.
+        let delivery: String? = switch store.status[contact.id] {
+        case .delivered?: "Delivered"
+        case .read?: "Read"
+        case .failed?: "No reply came back"
+        case .notDelivered?: "Not delivered"
+        default: nil
         }
+        let word = moving ?? delivery
+        guard let last = store.lines[contact.id]?.last else { return word ?? "No messages yet" }
         let text = SimpleViewStore.firstLine(last.text)
-        return last.fromAgent ? "\(agentName): \(text)" : text
+        let line = last.fromAgent ? "\(agentName): \(text)" : text
+        return word.map { "\($0) · \(line)" } ?? line
+    }
+
+    /// What is moving on the thread now, in a word; it outranks Delivered
+    /// and Read. Nil leaves the waiting or delivery word to speak.
+    private func flightWord(_ contact: SimpleContact) -> String? {
+        guard let flight = store.flights[contact.id] else { return nil }
+        if flight.stop?.state == "stopping" { return "Stopping…" }
+        if flight.stop?.state == "stopped", !flight.inFlight { return "Stopped" }
+        if flight.working { return flight.partial != nil ? "Typing…" : "Working…" }
+        if flight.queued.contains(where: { $0.state == .sending }) { return "Sending…" }
+        if flight.inFlight { return nil }
+        if flight.queued.contains(where: { $0.state == .queued }) { return "Queued" }
+        if flight.queued.contains(where: { if case .held = $0.state { true } else { false } }) { return "Not sent" }
+        return nil
     }
 
     /// A section's word, and one line saying what lives there, so a stranger
@@ -929,7 +1066,6 @@ private struct SimpleSidebar: View {
                 .foregroundStyle(NativeAgentShell.secondary)
                 .fixedSize(horizontal: false, vertical: true)
         }
-        .padding(.horizontal, NativeAgentShellLayout.railWordInset)
         .padding(.bottom, 6)
     }
 
@@ -938,39 +1074,16 @@ private struct SimpleSidebar: View {
             .font(Self.rowLine)
             .foregroundStyle(NativeAgentShell.secondary)
             .fixedSize(horizontal: false, vertical: true)
-            .padding(.horizontal, NativeAgentShellLayout.railWordInset)
             .padding(.vertical, 4)
+            .selectionDisabled()
     }
 
-    private func row<Content: View>(selected: Bool, action: @escaping () -> Void,
+    private func row<Content: View>(_ target: SimpleShellView.Pane,
                                     @ViewBuilder content: () -> Content) -> some View {
-        Button(action: action) {
-            content()
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.leading, NativeAgentShellLayout.railWordInset)
-                .padding(.trailing, 12)
-                .frame(height: 44)
-                .overlay(alignment: .leading) { SimpleSelectionBar(selected: selected, bar: bar) }
-                .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .accessibilityAddTraits(selected ? [.isButton, .isSelected] : .isButton)
-    }
-}
-
-/// "A bar means here" (house rule 2): 2pt by 20, 4pt in, travelling between rows.
-private struct SimpleSelectionBar: View {
-    let selected: Bool
-    let bar: Namespace.ID
-
-    var body: some View {
-        if selected {
-            RoundedRectangle(cornerRadius: 1, style: .continuous)
-                .fill(NativeAgentShell.text)
-                .frame(width: 2, height: 20)
-                .padding(.leading, NativeAgentShellLayout.barInset)
-                .matchedGeometryEffect(id: "simple.sidebar.bar", in: bar)
-        }
+        content()
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .frame(height: 44)
+            .tag(target)
     }
 }
 
@@ -979,8 +1092,6 @@ private struct SimpleSelectionBar: View {
 /// Its own view so the turn-state reads stay out of the rest of the sidebar.
 private struct SimpleAgentCard: View {
     let selected: Bool
-    let bar: Namespace.ID
-    let open: () -> Void
     @Environment(AppModel.self) private var appModel
 
     /// The mockup's serif title: the one name in the window with presence.
@@ -991,7 +1102,7 @@ private struct SimpleAgentCard: View {
     private var doing: (text: String, waiting: Bool) {
         if appModel.isThinkingBeforeReply { return ("Thinking…", false) }
         if appModel.isBusy || appModel.isChatStreaming { return ("Replying…", false) }
-        let waiting = appModel.approvals.contains {
+        let waiting = appModel.engine.approvals.records.contains {
             $0.status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "pending"
         }
         return waiting ? ("Waiting on you", true) : ("Here", false)
@@ -1002,39 +1113,34 @@ private struct SimpleAgentCard: View {
         let line = doing
         // The rim while the reply streams; before it, the plate shimmers.
         let replying = (appModel.isBusy || appModel.isChatStreaming) && !appModel.isThinkingBeforeReply
-        Button(action: open) {
-            VStack(alignment: .leading, spacing: 8) {
-                HStack(spacing: 12) {
-                    SimpleBreathingOrb(replying: replying)
-                    Text(name)
-                        .font(Self.nameFont)
-                        .foregroundStyle(NativeAgentShell.text)
-                        .lineLimit(1)
-                        .minimumScaleFactor(0.7)
-                }
-                // The selection bar marks the name's line, as on every row.
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .overlay(alignment: .leading) {
-                    SimpleSelectionBar(selected: selected, bar: bar)
-                        .padding(.leading, -NativeAgentShellLayout.railWordInset)
-                }
-                HStack(spacing: 6) {
-                    if line.waiting {
-                        Circle().fill(NativeAgentShell.needsYou).frame(width: 7, height: 7)
-                    }
-                    Text(line.text)
-                        .font(ShellType.label)
-                        .foregroundStyle(NativeAgentShell.secondary)
-                        .lineLimit(1)
-                }
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 12) {
+                SimpleBreathingOrb(replying: replying)
+                Text(name)
+                    .font(Self.nameFont)
+                    .foregroundStyle(NativeAgentShell.text)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.7)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.leading, NativeAgentShellLayout.railWordInset)
-            .padding(.trailing, 14)
-            .padding(.vertical, 6)
-            .contentShape(Rectangle())
+            HStack(spacing: 6) {
+                if line.waiting {
+                    Circle().fill(NativeAgentShell.needsYou).frame(width: 7, height: 7)
+                }
+                Text(line.text)
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.secondary)
+                    .lineLimit(1)
+            }
         }
-        .buttonStyle(.plain)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.vertical, 6)
+        .background {
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(selected ? NativeAgentShell.softFill : .clear)
+                .padding(.horizontal, -8)
+        }
+        .accessibilityElement(children: .combine)
         .accessibilityLabel("\(name). \(line.text)")
         .accessibilityHint("Opens the chat with \(name)")
         .accessibilityAddTraits(selected ? [.isButton, .isSelected] : .isButton)
@@ -1146,7 +1252,9 @@ struct SimpleAvatar: View {
 
     var body: some View {
         Group {
-            if let icon = contact.appBundleID.flatMap(Self.icon) {
+            if contact.clawd {
+                ClawdMark(size: size)
+            } else if let icon = contact.appBundleID.flatMap(Self.icon) {
                 // The icon's squircle fills the circle; its transparent margin falls outside.
                 Image(nsImage: icon).resizable().interpolation(.high).scaledToFit().scaleEffect(1.24)
             } else {
@@ -1173,5 +1281,38 @@ struct SimpleAvatar: View {
             }
         }
         .accessibilityHidden(true)
+    }
+}
+
+/// Clawd, Claude Code's little pixel mascot, on a dark disc: body, two eye
+/// holes, arms and four legs on a 9×5 grid of square blocks, each snapped to
+/// whole device pixels so he stays crisp at sidebar size.
+struct ClawdMark: View {
+    var size: CGFloat
+    @Environment(\.displayScale) private var displayScale
+    private static let rows = [
+        " ####### ",
+        " # ### # ",
+        "#########",
+        " ####### ",
+        " # # # # ",
+    ]
+
+    var body: some View {
+        Canvas { context, canvas in
+            let scale = max(displayScale, 1)
+            let pixel = max(1, (canvas.width * 0.9 / 9 * scale).rounded(.down)) / scale
+            let origin = CGPoint(x: ((canvas.width - pixel * 9) / 2 * scale).rounded() / scale,
+                                 y: ((canvas.height - pixel * 5) / 2 * scale).rounded() / scale)
+            for (y, row) in Self.rows.enumerated() {
+                for (x, cell) in row.enumerated() where cell == "#" {
+                    let rect = CGRect(x: origin.x + CGFloat(x) * pixel, y: origin.y + CGFloat(y) * pixel,
+                                      width: pixel, height: pixel)
+                    context.fill(Path(rect), with: .color(Color(red: 0.851, green: 0.467, blue: 0.341)))
+                }
+            }
+        }
+        .frame(width: size, height: size)
+        .background(Color(red: 0.12, green: 0.118, blue: 0.114))
     }
 }

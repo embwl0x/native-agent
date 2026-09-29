@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import Transcripts
 
 extension DreamCycleRunner {
     private static let convCharBudget: Int = 80_000

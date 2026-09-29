@@ -1,6 +1,6 @@
 // The Trust Center / Setup memory switches, read at the point of use.
 //
-// Audit docs/audits/settings-audit-2026-09-04-memory.md: six memoryPolicy keys
+// The 2026-09-04 settings audit found six memoryPolicy keys
 // round-tripped to <dataRoot>/trust/policy.json and nothing in the runtime ever
 // read them. This is the one reader every gate goes through.
 //

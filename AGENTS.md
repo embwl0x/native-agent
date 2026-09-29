@@ -32,3 +32,22 @@ subsystem doors)? Full text: docs/NORTHSTAR.md.
 - Verify screen-moving behavior on the installed revision with bounded
   direct checks; involve the resident agent where useful, without a repeated
   conversation or UI load campaign.
+
+## Where things are
+
+This file is the entry point for agents working on the repository. Read
+[docs/NORTHSTAR.md](docs/NORTHSTAR.md) for intent and
+[PROJECT_STATUS.md](PROJECT_STATUS.md) for where things stand; history lives
+in `git log`, [CHANGELOG.md](CHANGELOG.md) and `docs/release-notes/`.
+
+- **Docs map:** [docs/README.md](docs/README.md) lists every current document,
+  including the files the app and scripts read (keep those paths stable).
+- **Source owners:** [docs/ARCHITECTURE_BLUEPRINT.md](docs/ARCHITECTURE_BLUEPRINT.md);
+  `script/check_architecture_blueprint.swift` holds its table rows to the files
+  on disk.
+- **Tool schemas:** [docs/TOOL_LOADING.md](docs/TOOL_LOADING.md) is the contract;
+  changing it needs User's word.
+- **Private notes:** `docs/HANDOFF_CURRENT.md` (newest section is current) and
+  `docs/build_plans/` — stripped from the public export, history not a queue.
+- **This file is not the agent's persona.** The resident agent's own
+  `AGENTS.md` lives under `persona/<name>/`; nothing loads this one at runtime.

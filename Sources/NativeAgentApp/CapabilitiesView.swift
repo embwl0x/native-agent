@@ -1,5 +1,7 @@
 import Foundation
+import Research
 import SwiftUI
+import TrustCenter
 
 
 enum CapabilitiesDisclosurePreference {
@@ -340,35 +342,6 @@ struct CapabilityCatalogInstallOutcomeRow: View {
 }
 
 struct CapabilitiesView: View {
-    #if DEBUG
-    private var snapshotOnly = false
-
-    @MainActor
-    static func renderCopyReview(to directory: URL) throws {
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        let root = FileManager.default.temporaryDirectory.appendingPathComponent("capabilities-copy-\(UUID().uuidString)")
-        defer { try? FileManager.default.removeItem(at: root) }
-        let app = AppModel(dataRootOverride: root, startBackgroundTasks: false,
-                           activeChatSessionIDWriter: { _ in }, chatSnapshotPublisher: {})
-        app.nativeActions = Array(NativeClient.swiftNativeActionRecords().prefix(8))
-        for expanded in [false, true] {
-            var view = CapabilitiesView(loadsOnAppear: false)
-            view.snapshotOnly = true
-            view._showAllNativeActions = State(initialValue: expanded)
-            for scheme in [ColorScheme.light, .dark] {
-                try BotsShelfSnapshots.write(ShellFrame(classic: false) {
-                    ShellSidebarRail(selection: .constant(.capabilities), botsPreviewOverride: false)
-                } detail: {
-                    ShellPageFrame(title: "Capabilities", showsBack: false, wide: true) {
-                        view.environment(app)
-                    }
-                },
-                    name: "actions-\(expanded ? "expanded" : "collapsed")-\(scheme == .dark ? "dark" : "light")",
-                    size: CGSize(width: 1280, height: 1000), scheme: scheme, directory: directory, scale: 1)
-            }
-        }
-    }
-    #endif
     @Environment(AppModel.self) private var appModel
     @State private var mode: CapabilityWorkspaceMode
     @State private var routeText = "Research a topic, save it as a reusable tool if it comes up again, and ask me before anything risky."
@@ -385,7 +358,6 @@ struct CapabilitiesView: View {
     @State private var nativeActionYoloAdmission: [String: Bool] = [:]
     @State private var showAllNativeActions = false
     @State private var capabilitySearch = ""
-    private let loadsOnAppear: Bool
     // 2026-07-22 page-tighten: the two heaviest always-expanded blocks
     // (Next-Gen Runtime migration cockpit in Overview, MCP Builder in Build —
     // whose canonical home is the dedicated MCP tab) collapse by default;
@@ -395,21 +367,12 @@ struct CapabilitiesView: View {
     // lab, the demo pack and the gauntlet — behind one fold at the bottom.
     @State private var showDeveloperTools = false
 
-    init(initialMode: CapabilityWorkspaceMode = .canDo, loadsOnAppear: Bool = true) {
+    init(initialMode: CapabilityWorkspaceMode = .canDo) {
         _mode = State(initialValue: initialMode)
-        self.loadsOnAppear = loadsOnAppear
     }
 
     var body: some View {
-        #if DEBUG
-        if snapshotOnly {
-            nativeMacPower
-        } else {
-            pageBody
-        }
-        #else
         pageBody
-        #endif
     }
 
     private var pageBody: some View {
@@ -460,7 +423,6 @@ struct CapabilitiesView: View {
         .navigationTitle("Capabilities")
         .motionArrival(when: appModel.panelRefreshStatus[.capabilities] != nil)
         .quietReadTask {
-            guard loadsOnAppear else { return }
             await appModel.refreshForSidebarItem(.capabilities)
             await refreshNativeActionYoloAdmission()
             await refreshResearchLabRuns()
@@ -475,7 +437,7 @@ struct CapabilitiesView: View {
         let failed = refresh.failedEndpoints.contains {
             $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "capability summary"
         }
-        guard !failed, let counts = appModel.capabilitySummary?.summary else {
+        guard !failed, let counts = appModel.engine.trust.capabilitySummary?.summary else {
             return "I couldn't read all my capabilities just now."
         }
         // Total and ready come from the same summary the list's count reads,
@@ -491,12 +453,12 @@ struct CapabilitiesView: View {
 
     private var summaryGrid: some View {
         let tiles = CapabilitiesRefreshPresentation.summary(
-            capabilityCount: appModel.capabilitySummary?.summary.total,
+            capabilityCount: appModel.engine.trust.capabilitySummary?.summary.total,
             workflowCount: appModel.workflows.count,
             mcpCount: appModel.mcpServers.count,
             nextGenReadyCount: nextGenReadyCount,
             nextGenTotalCount: nextGenTotalCount,
-            approvalCount: appModel.approvals.filter { $0.status.lowercased() == "pending" }.count,
+            approvalCount: appModel.engine.approvals.records.filter { $0.status.lowercased() == "pending" }.count,
             refresh: appModel.panelRefreshStatus[.capabilities]
         )
         // Alive glass (2026-09-23): the five tiles fold into one quiet line of
@@ -573,7 +535,7 @@ struct CapabilitiesView: View {
             }
 
             AdvancedSection(title: "Capabilities I can use") {
-                switch CapabilitiesFoundryIndexPresentation.state(summary: appModel.capabilitySummary) {
+                switch CapabilitiesFoundryIndexPresentation.state(summary: appModel.engine.trust.capabilitySummary) {
                 case .populated(let summary):
                     HStack(spacing: 12) {
                         // Fold, don't badge: a quiet count; a word only when it asks something.
@@ -817,7 +779,7 @@ struct CapabilitiesView: View {
                         Task { await appModel.checkCapabilityUpdates() }
                     }
                     .controlSize(.small)
-                    if let capability = appModel.capabilitySummary?.records.first {
+                    if let capability = appModel.engine.trust.capabilitySummary?.records.first {
                         Button("Check trust") {
                             Task { await appModel.evaluateCapabilityTrust(capability) }
                         }
@@ -856,10 +818,10 @@ struct CapabilitiesView: View {
                         .accessibilityIdentifier("capabilities.catalogSource.outcome")
                 }
 
-                if !appModel.capabilityCatalogSources.isEmpty || appModel.capabilityTrust != nil || appModel.latestCapabilityUpdateCheck != nil {
+                if !appModel.capabilityCatalogSources.isEmpty || appModel.engine.trust.capabilityNetwork != nil || appModel.latestCapabilityUpdateCheck != nil {
                     LazyVGrid(columns: [GridItem(.adaptive(minimum: 150), spacing: 16)], spacing: 16) {
                         AdvancedStat(title: "Sources", value: "\(appModel.capabilityCatalogSources.count)", detail: appModel.capabilityCatalogSources.first?.status ?? "not checked")
-                        AdvancedStat(title: "Trusted", value: "\(appModel.capabilityTrust?.summary?.trusted ?? 0)", detail: "\(appModel.capabilityTrust?.summary?.review ?? 0) to review")
+                        AdvancedStat(title: "Trusted", value: "\(appModel.engine.trust.capabilityNetwork?.summary?.trusted ?? 0)", detail: "\(appModel.engine.trust.capabilityNetwork?.summary?.review ?? 0) to review")
                         AdvancedStat(title: "Updates", value: "\(appModel.latestCapabilityUpdateCheck?.updates.count ?? 0)", detail: appModel.latestCapabilityUpdateCheck?.status ?? "not checked")
                     }
                 }
@@ -1095,7 +1057,7 @@ struct CapabilitiesView: View {
         researchLabMessage = CapabilitiesResearchLabPresentation.message(for: outcome)
         if case .recorded(let run) = outcome {
             researchLabRunsState = CapabilitiesResearchLabPresentation.list(
-                rows: [run] + appModel.researchLabRuns.filter { $0.id != run.id }
+                rows: [run] + appModel.engine.desk.researchRuns.filter { $0.id != run.id }
             )
             await refreshResearchLabRuns()
         }
@@ -1363,11 +1325,15 @@ struct CapabilitiesRunGauntletAndBrowserActions: View {
     @State private var isRunningBrowserDryRun = false
     @State private var isRunningGauntlet = false
 
-    private var latestGauntlet: ImprovementGauntletRun? {
-        appModel.latestGauntletRun ?? appModel.improvementGauntletStatus?.latestRun
+    private var latestGauntlet: Result<ImprovementGauntletRun?, Error> {
+        Result {
+            let storedRun = try appModel.improvementGauntletStatus?.latestDisplayRun
+            return appModel.latestGauntletRun ?? storedRun
+        }
     }
 
     var body: some View {
+        let gauntletRead = latestGauntlet
         VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 8) {
                 Button("Browser dry run") {
@@ -1399,7 +1365,7 @@ struct CapabilitiesRunGauntletAndBrowserActions: View {
                 .accessibilityIdentifier("capabilities.run-gauntlet")
 
                 Spacer()
-                if let latestGauntlet {
+                if case .success(let latestGauntlet?) = gauntletRead {
                     AdvancedStatusWord(status: latestGauntlet.status)
                 }
             }
@@ -1414,7 +1380,14 @@ struct CapabilitiesRunGauntletAndBrowserActions: View {
                 .accessibilityIdentifier("capabilities.browser-dry-run.outcome")
             }
 
-            if let gauntlet = latestGauntlet {
+            if case .failure(let error) = gauntletRead {
+                Text(error.localizedDescription)
+                    .font(ShellType.caption)
+                    .foregroundStyle(NativeAgentShell.trouble)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            if case .success(let gauntlet?) = gauntletRead {
                 let presentation = CapabilitiesRunActionPresentation.gauntletOutcome(for: gauntlet)
                 CapabilityDetailRow(
                     title: presentation.title,
@@ -1483,7 +1456,7 @@ struct CapabilitiesApprovalInboxPanel: View {
 
     private var readState: CapabilitiesApprovalInboxPresentation.ReadState {
         CapabilitiesApprovalInboxPresentation.readState(
-            approvalCount: appModel.approvals.count,
+            approvalCount: appModel.engine.approvals.records.count,
             refresh: appModel.panelRefreshStatus[.capabilities]
         )
     }
@@ -1526,11 +1499,11 @@ struct CapabilitiesApprovalInboxPanel: View {
     }
 
     private var approvalRows: some View {
-            ForEach(appModel.approvals.prefix(8)) { approval in
+            ForEach(appModel.engine.approvals.records.prefix(8)) { approval in
                 HStack(alignment: .top, spacing: 8) {
                     CapabilityDetailRow(
                         title: approval.title,
-                        detail: approval.reason ?? approval.action,
+                        detail: approval.reason,
                         status: approval.status.lowercased() == "pending" ? approval.risk : approval.status
                     )
                     Spacer()
@@ -1585,8 +1558,8 @@ struct CapabilityRow: View {
             }
             HStack(spacing: 8) {
                 // "Tool" is the common case; only another kind earns a word.
-                if capability.kind.lowercased() != "tool" {
-                    AdvancedMeta(AdvancedStatusWords.label(capability.kind))
+                if capability.kind?.lowercased() != "tool" {
+                    AdvancedMeta(AdvancedStatusWords.label(capability.kind ?? ""))
                 }
                 // Low is the norm; only a higher risk earns a word.
                 if let risk = capability.riskClass, !risk.isEmpty, risk.lowercased() != "low" {

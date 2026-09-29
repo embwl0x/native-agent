@@ -198,14 +198,13 @@ public enum MemoryConsolidationGate {
         }
 
         // 2) Snapshot the live fingerprint, then build the candidate.
-        let livePath = liveStorage.path
-        let liveFingerprint = try fingerprint(ofDatabaseAt: livePath)
+        let liveFingerprint = try fingerprint(of: liveStorage)
         let runId = Self.makeRunId(now: now())
         let candidateDB = candidateDBPath(dataRoot: dataRoot, runId: runId)
         do {
             try FileManager.default.createDirectory(
                 at: candidateDB.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try Self.onlineBackup(from: livePath, to: candidateDB)
+            try Self.onlineBackup(from: liveStorage.dbPool, to: candidateDB)
         } catch {
             cleanupCandidate(dataRoot: dataRoot, runId: runId)
             throw MemoryConsolidationGateError.candidateBuildFailed("\(error)")
@@ -259,7 +258,7 @@ public enum MemoryConsolidationGate {
             cleanupCandidate(dataRoot: dataRoot, runId: runId)
             throw MemoryConsolidationGateError.probeGateUnavailable("\(error)")
         }
-        let diff = try computeDiff(livePath: livePath, candidatePath: candidateDB, plan: plan)
+        let diff = try computeDiff(liveStorage: liveStorage, candidatePath: candidateDB, plan: plan)
         guard scores.candidateIsAtLeastLive else {
             logger.error(
                 "consolidation gate: REFUSED — candidate lost probes [\(scores.lostProbeIds.joined(separator: ", "), privacy: .public)] (live \(scores.live.summary, privacy: .public), candidate \(scores.candidate.summary, privacy: .public)); candidate discarded"
@@ -410,10 +409,24 @@ public enum MemoryConsolidationGate {
                 // applied marker in the live store settles it, and `applySwap`
                 // takes the already-applied path and reconciles the pending
                 // projections.
-                guard candidateExists
-                    || swapMarkerApplied(
-                        livePath: liveStorePath(dataRoot: dataRoot), runId: runId
-                    ) else {
+                var markerApplied = false
+                if !candidateExists,
+                   FileManager.default.fileExists(atPath: liveStorePath(dataRoot: dataRoot).path) {
+                    // The marker is read through the live store's owner. An
+                    // owner that cannot open is no answer either way: leave
+                    // the run for the next reconcile rather than settle it.
+                    do {
+                        let liveStorage = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
+                        markerApplied = swapMarkerApplied(liveStorage: liveStorage, runId: runId)
+                    } catch {
+                        outcomes.append(.failed(
+                            runId: runId,
+                            reason: "live memory store unavailable for the applied-marker check: \(error)"
+                        ))
+                        continue
+                    }
+                }
+                guard candidateExists || markerApplied else {
                     // Approved but the candidate is gone and no receipt —
                     // unrecoverable; write a terminal failure receipt so we
                     // never loop on it.
@@ -536,12 +549,18 @@ public enum MemoryConsolidationGate {
         let livePath = liveStorePath(dataRoot: dataRoot)
         let candidatePath = candidateDBPath(dataRoot: dataRoot, runId: runId)
         do {
+            // Resolving the owner must never mint a store the staged run was
+            // not scored against; a missing live file stays a transient failure.
+            guard FileManager.default.fileExists(atPath: livePath.path) else {
+                throw MemoryStorageError.databaseUnavailable("live memory store missing: \(livePath.path)")
+            }
+            let liveStorage = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
             // User, 2026-09-06: the applied marker is read BEFORE the candidate
             // is touched. Once the swap has committed the candidate's state
             // says nothing about this run — a half-finished cleanup or a
             // drifted candidate file must not turn a landed swap into a
             // terminal "failed" with its projections never reconciled.
-            let markerApplied = swapMarkerApplied(livePath: livePath, runId: runId)
+            let markerApplied = swapMarkerApplied(liveStorage: liveStorage, runId: runId)
             // Integrity: the candidate on disk must be the one that was scored.
             let candidateFP = markerApplied
                 ? manifest.candidateFingerprint
@@ -563,7 +582,7 @@ public enum MemoryConsolidationGate {
                 cleanupCandidate(dataRoot: dataRoot, runId: runId)
                 return .failed(runId: runId, reason: "candidate fingerprint drifted since staging")
             }
-            let liveFP = try fingerprint(ofDatabaseAt: livePath)
+            let liveFP = try fingerprint(of: liveStorage)
             // Crash-after-commit window: swap already landed. User, 2026-09-06:
             // the committed store matches the candidate's fingerprint only when
             // nothing changed it on the way in — the usage veto and the row-cap
@@ -577,6 +596,7 @@ public enum MemoryConsolidationGate {
                 swapCommitted = true
                 let projections = try await reconcileDerivedProjections(
                     dataRoot: dataRoot,
+                    liveStorage: liveStorage,
                     livePath: livePath,
                     runId: runId,
                     environment: projectionEnvironment ?? .live(dataRoot: dataRoot)
@@ -606,10 +626,10 @@ public enum MemoryConsolidationGate {
             // Backup, then the atomic table swap. The swap re-checks the
             // live fingerprint INSIDE its immediate transaction and throws
             // SwapStaleError if a write slipped in after the check above.
-            let backupPath = try backupLiveStore(livePath: livePath, dataRoot: dataRoot)
+            let backupPath = try backupLiveStore(liveStorage: liveStorage, dataRoot: dataRoot)
             do {
                 let boundEvictions = try transactionalTableSwap(
-                    livePath: livePath, candidatePath: candidatePath,
+                    liveStorage: liveStorage, candidatePath: candidatePath,
                     expectedLiveFingerprint: manifest.liveFingerprint,
                     appliedRunId: runId)
                 await MemoryStorage.recordBoundEvictions(
@@ -626,6 +646,7 @@ public enum MemoryConsolidationGate {
             // still leaves the next reconcile a consistent answer.
             let projections = try await reconcileDerivedProjections(
                 dataRoot: dataRoot,
+                liveStorage: liveStorage,
                 livePath: livePath,
                 runId: runId,
                 environment: projectionEnvironment ?? .live(dataRoot: dataRoot)
@@ -669,11 +690,13 @@ public enum MemoryConsolidationGate {
 
     private static func reconcileDerivedProjections(
         dataRoot: URL,
+        liveStorage storage: MemoryStorage,
         livePath: URL,
         runId: String,
         environment: MemoryConsolidationProjectionEnvironment
     ) async throws -> MemoryProjectionReconciliationSummary {
-        let storage = try MemoryStorage(dataRoot: dataRoot)
+        // The same check a fresh open of the swapped store used to run.
+        try await storage.requireSemanticIntegrity()
         let generator = UserMDGenerator(
             storage: storage,
             dataRoot: dataRoot,

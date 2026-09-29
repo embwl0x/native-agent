@@ -1,7 +1,9 @@
 import Foundation
 import PersistenceCore
 import ProviderRouting
+import Research
 import TrustCenter
+import MCPDispatcher
 import SystemOps
 
 // 2026-09-01: `WorkflowResidentOutcomeProjector` was retired with the workflow
@@ -37,19 +39,18 @@ extension NativeClient {
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
         codexCacheURL: URL? = nil
     ) async throws -> ModelCatalogResponse {
+        let validateSelection = try await Self.providerSelectionValidator(dataRoot: dataRoot)
         try await SwiftNativeProviderRouting(dataRoot: dataRoot).saveSurfaceConfiguration(
             surface: surface,
             model: model,
             reasoningEffort: reasoningEffort,
             serviceTier: serviceTier,
             providerId: providerID,
-            seedMissingControls: true
+            seedMissingControls: true,
+            selectionValidator: validateSelection
         )
-        return try await getModelCatalog(
-            refresh: false,
-            dataRoot: dataRoot,
-            codexCacheURL: codexCacheURL
-        )
+        return try await ProvidersFacade(dataRoot: dataRoot)
+            .modelCatalog(refresh: false, codexCacheURL: codexCacheURL)
     }
 
     func configureModel(
@@ -65,13 +66,15 @@ extension NativeClient {
         // into `<dataRoot>/providers/surfaces.json` under flock. Returns the
         // freshly-read catalog so the UI re-renders with the new pref.
         let inferredProvider = inferProvider ? Self.inferProviderID(forModel: model) : nil
+        let validateSelection = try await Self.providerSelectionValidator(dataRoot: dataRoot)
         try await SwiftNativeProviderRouting(dataRoot: dataRoot).saveSurfaceConfiguration(
             surface: surface,
             model: model,
             reasoningEffort: reasoningEffort,
             serviceTier: serviceTier,
             providerId: inferredProvider,
-            seedMissingControls: true
+            seedMissingControls: true,
+            selectionValidator: validateSelection
         )
         // Only an explicitly provider-less model selection may move the
         // active-provider pin. Think/Fast changes carry the current model too,
@@ -86,11 +89,8 @@ extension NativeClient {
         // is namespace-aware: OpenRouter "anthropic/..." ids pin openrouter
         // (the namespace's provider), never the Anthropic OAuth provider;
         // unknown families return nil and leave the pin untouched.
-        return try await getModelCatalog(
-            refresh: false,
-            dataRoot: dataRoot,
-            codexCacheURL: codexCacheURL
-        )
+        return try await ProvidersFacade(dataRoot: dataRoot)
+            .modelCatalog(refresh: false, codexCacheURL: codexCacheURL)
     }
 
     // PATCH-2026-05-28 (per-surface model): set just the model for a surface,
@@ -121,49 +121,18 @@ extension NativeClient {
         // active.json. Inference is intentionally simple — the UI's explicit
         // setActiveProvider path is the source of truth; this is a hint.
         let inferredProvider = inferProvider ? Self.inferProviderID(forModel: model) : nil
+        let validateSelection = try await Self.providerSelectionValidator(dataRoot: dataRoot)
         try await SwiftNativeProviderRouting(dataRoot: dataRoot).saveSurfaceConfiguration(
             surface: surface,
             model: model,
             reasoningEffort: nil,
             serviceTier: nil,
             providerId: inferredProvider,
-            seedMissingControls: true
+            seedMissingControls: true,
+            selectionValidator: validateSelection
         )
-        return try await getModelCatalog(
-            refresh: false,
-            dataRoot: dataRoot,
-            codexCacheURL: codexCacheURL
-        )
-    }
-
-    /// App compatibility seam. Persistence ownership remains in
-    /// `SwiftNativeProviderRouting`; this wrapper exists for the few app
-    /// surfaces and regression tests that still call the static helper.
-    static func writeSurfacePref(
-        surface: String,
-        model: String,
-        reasoningEffort: String?,
-        serviceTier: String?,
-        dataRoot: URL = PersistenceCore.defaultDataRoot()
-    ) async throws {
-        try await SwiftNativeProviderRouting(dataRoot: dataRoot).saveSurfacePreference(
-            surface: surface,
-            model: model,
-            reasoningEffort: reasoningEffort,
-            serviceTier: serviceTier,
-            seedMissingControls: true
-        )
-    }
-
-    /// Read `<dataRoot>/providers/active.json` (surface → provider hint).
-    /// Missing is empty; damaged existing state throws. This is the READ-SIDE counterpart
-    /// to `writeActiveProvider(surface:providerID:)` — the UI's picker and
-    /// the SwiftNativeLLMClient dispatch tiebreaker both pull from here so
-    /// save/read are unified.
-    static func readActiveProvidersFromDisk(
-        dataRoot: URL = PersistenceCore.defaultDataRoot()
-    ) async throws -> [String: String] {
-        try await SwiftNativeProviderRouting(dataRoot: dataRoot).readActiveProvidersChecked()
+        return try await ProvidersFacade(dataRoot: dataRoot)
+            .modelCatalog(refresh: false, codexCacheURL: codexCacheURL)
     }
 
     static func writeActiveProvider(
@@ -175,6 +144,20 @@ extension NativeClient {
             surface: surface,
             providerId: providerID
         )
+    }
+
+    /// Use the same served catalog as the Mac/phone picker, including the
+    /// signed account catalog. The routing owner calls this before any write,
+    /// with the route resolved inside its transaction lock.
+    private static func providerSelectionValidator(dataRoot: URL) async throws -> @Sendable (String, String) throws -> Void {
+        let providers = try await ProvidersFacade(dataRoot: dataRoot).list()
+        return { route, model in
+            guard let provider = providers.first(where: { $0.provider_id == route }),
+                  provider.auth_status.state == "ready",
+                  provider.models.contains(where: { $0.id == model }) else {
+                throw ProviderRoutingError.configurationFailed("\(route) cannot serve \(model). Refresh Providers and choose an available model.")
+            }
+        }
     }
 
     static func inferProviderID(forModel model: String) -> String? {
@@ -190,15 +173,18 @@ extension NativeClient {
     func planRoute(message: String) async throws -> IntentRoutePlan {
         let impl = makeRouterPlanClient()
         let swiftResult = try await impl.planRoute(message: message)
-        // Bridge SystemOps.RoutePlanResult → NativeAgentApp.IntentRoutePlan via JSON.
-        // Field overlap is exact (id, message, goalType, recommendedSurface,
-        // risk, requiresApproval, matchedCapabilities, nextActions, createdAt).
-        // DORMANT aspect: `matchedCapabilities` arrives as `[]` from the Swift
-        // port because `select_context_capabilities` couples to daemon-loaded
-        // capability records that aren't Swift-native yet — IntentRoutePlan's
-        // `[CapabilityRecord]` decodes the empty array fine.
-        let data = try swiftResult.toJSON().serializedData(pretty: false)
-        return try JSONDecoder().decode(IntentRoutePlan.self, from: data)
+        return IntentRoutePlan(
+            id: swiftResult.id, message: swiftResult.message, goalType: swiftResult.goalType,
+            recommendedSurface: swiftResult.recommendedSurface, risk: swiftResult.risk,
+            requiresApproval: swiftResult.requiresApproval,
+            matchedCapabilities: try swiftResult.matchedCapabilities.map { value in
+                guard case .object(let row) = value else {
+                    throw DecodingError.dataCorrupted(.init(codingPath: [], debugDescription: "A capability is a JSON object."))
+                }
+                return try CapabilityRecord(catalogRow: row)
+            },
+            nextActions: swiftResult.nextActions, createdAt: swiftResult.createdAt
+        )
     }
 
     func runResearchLab(objective: String) async throws -> ResearchLabRun {
@@ -294,19 +280,4 @@ extension NativeClient {
         let data = try JSONValue.object(result).serializedData(pretty: false)
         return try JSONDecoder().decode(CapabilityUpdateCheck.self, from: data)
     }
-
-    // SwiftNativeCapabilityTrust evaluates capability trust in-process from the
-    // native capability records and trust metadata.
-    func evaluateCapabilityTrust(id: String) async throws -> CapabilityTrustEvaluation {
-        let impl = makeCapabilityTrust()
-        let swiftResult = try await impl.evaluate(capabilityId: id)
-        // Bridge TrustCenter.CapabilityTrustEvaluation → NativeAgentApp.CapabilityTrustEvaluation.
-        // Both Codable, byte-identical shapes (verified 2026-05-31 against
-        // CapabilityTrust.swift wire types vs Models.swift L1629). JSON round-trip
-        // is the canonical seam — when the eventual full aggregator port lands,
-        // this stays one line.
-        let data = try JSONEncoder().encode(swiftResult)
-        return try JSONDecoder().decode(CapabilityTrustEvaluation.self, from: data)
-    }
-
 }

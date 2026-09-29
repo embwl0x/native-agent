@@ -6,8 +6,8 @@ import PersistenceCore
 /// disk cache with the IDENTICAL read/refresh/backoff orchestration — the
 /// `models()` state machine, `cacheIsStale`, `writeCache`, and the
 /// `staleRefresh*` backoff lock were byte-duplicated ~90 lines apart. Only the
-/// parse/fetch/fallback/cache-path specifics differ, and those arrive as the
-/// config's closures; each catalog keeps its own parse/fetch/capabilities.
+/// parse/fetch/cache-path specifics differ, and those arrive as the config's
+/// closures; each catalog keeps its own parse/fetch/capabilities.
 ///
 /// Two behavior fixes rode in with the extraction:
 ///  - R-L5 (a): the failed-refresh backoff state is keyed PER cache-file path
@@ -30,12 +30,13 @@ public enum ModelCatalogFreshness: String, Sendable, Equatable {
     case liveIncomplete = "live_incomplete"
     /// Served from the on-disk cache without attempting the network.
     case cached
-    /// The network was attempted and FAILED; this is the cached copy.
+    /// The network was attempted and FAILED; this is the last list the
+    /// provider gave, served labelled as such with the time it was fetched.
     case staleAfterFailedRefresh = "stale"
-    /// Nothing usable was cached and no refresh was attempted.
-    case builtIn = "built_in"
-    /// The network was attempted and FAILED, and nothing was cached.
-    case builtInAfterFailedRefresh = "built_in_stale"
+    /// No list at all: nothing was ever fetched, or the fetch failed with
+    /// nothing cached. S12a: a compiled-in list used to be served here as if
+    /// it were the provider's; now the picker is empty and says why.
+    case unavailable
 
     /// True when this read reached the provider AND carried the whole list —
     /// the only case a caller may treat as authoritative enough to prune rows
@@ -46,9 +47,10 @@ public enum ModelCatalogFreshness: String, Sendable, Equatable {
     /// partial page are still fresh data; they may be added, never pruned on.
     public var reachedProvider: Bool { self == .live || self == .liveIncomplete }
 
-    /// True when a refresh was attempted and did not reach the provider.
+    /// True when the list is not the provider's current answer: a refresh
+    /// failed, or no list has ever been fetched.
     public var refreshFailed: Bool {
-        self == .staleAfterFailedRefresh || self == .builtInAfterFailedRefresh
+        self == .staleAfterFailedRefresh || self == .unavailable
     }
 }
 
@@ -56,6 +58,24 @@ public enum ModelCatalogFreshness: String, Sendable, Equatable {
 public struct ModelCatalogRead: Sendable {
     public let models: [ProviderModelDescriptor]
     public let freshness: ModelCatalogFreshness
+    /// Why the provider's list could not be fetched (`stale`, `unavailable`).
+    public var failure: String? = nil
+    /// When the served list was fetched from the provider (`cached`, `stale`).
+    public var fetchedAt: Date? = nil
+
+    /// The line the Providers page shows beside this provider's models; nil
+    /// when the list is the provider's current answer.
+    public var note: String? {
+        switch freshness {
+        case .unavailable:
+            return "Couldn't load models: \(failure ?? "no list has been fetched yet"). Refresh to try again."
+        case .staleAfterFailedRefresh:
+            let when = fetchedAt.map { " from \($0.formatted(date: .abbreviated, time: .shortened))" } ?? ""
+            return "Couldn't load models: \(failure ?? "the refresh failed"). Showing the last-known list\(when)."
+        case .live, .liveIncomplete, .cached:
+            return nil
+        }
+    }
 }
 
 /// One live fetch: the rows, and whether the fetcher could establish that they
@@ -102,13 +122,13 @@ struct ModelCatalogTTLCache: Sendable {
     /// needs (User, 2026-09-06). `nil` for a catalogue that arrives whole or
     /// not at all — then a successful fetch is complete by construction.
     var fetchLiveComplete: (@Sendable (URL, URLSession) async throws -> ModelCatalogFetch)?
-    /// The explicit built-in fallback list when nothing cached is usable.
-    var fallback: @Sendable () -> [ProviderModelDescriptor]
 
     // R-L5 (a): backoff state keyed per cache-file path. One dict serves both
-    // catalogs because the cache filenames differ per provider.
+    // catalogs because the cache filenames differ per provider. S12a: the
+    // stamp carries the failure's reason so a backed-off read can still say
+    // why its list is last-known.
     private static let backoffLock = NSLock()
-    nonisolated(unsafe) private static var lastFailedByPath: [String: Date] = [:]
+    nonisolated(unsafe) private static var lastFailedByPath: [String: (at: Date, reason: String)] = [:]
 
     private func backoffKey(_ dataRoot: URL) -> String {
         cachePath(dataRoot).standardizedFileURL.path
@@ -119,20 +139,27 @@ struct ModelCatalogTTLCache: Sendable {
         Self.backoffLock.lock()
         defer { Self.backoffLock.unlock() }
         guard let last = Self.lastFailedByPath[key] else { return true }
-        return now.timeIntervalSince(last) >= staleRefreshRetryBackoff
+        return now.timeIntervalSince(last.at) >= staleRefreshRetryBackoff
     }
 
-    func noteStaleRefreshFailed(dataRoot: URL, now: Date = Date()) {
+    private func lastFailureReason(dataRoot: URL) -> String? {
         let key = backoffKey(dataRoot)
         Self.backoffLock.lock()
-        Self.lastFailedByPath[key] = now
+        defer { Self.backoffLock.unlock() }
+        return Self.lastFailedByPath[key]?.reason
+    }
+
+    func noteStaleRefreshFailed(dataRoot: URL, reason: String = "the refresh failed", now: Date = Date()) {
+        let key = backoffKey(dataRoot)
+        Self.backoffLock.lock()
+        Self.lastFailedByPath[key] = (now, reason)
         // Bound the per-path dict: entries otherwise clear only on a SUCCESSFUL
         // refresh of the same path, so many transient roots (tests, secondary
         // runtimes) grow it for process lifetime (gpt-5.5 fix round, LOW).
         // Evicting the OLDEST stamp on overflow just re-allows one stale
         // refresh early — safe direction. Production uses 2 paths.
         if Self.lastFailedByPath.count > 64,
-           let oldest = Self.lastFailedByPath.min(by: { $0.value < $1.value }) {
+           let oldest = Self.lastFailedByPath.min(by: { $0.value.at < $1.value.at }) {
             Self.lastFailedByPath.removeValue(forKey: oldest.key)
         }
         Self.backoffLock.unlock()
@@ -166,60 +193,72 @@ struct ModelCatalogTTLCache: Sendable {
     /// UI reported "Model catalog refreshed" for a refresh that never reached
     /// the network — and a caller could not know whether its list was
     /// authoritative enough to prune obsolete rows against.
+    ///
+    /// S12a: there is no built-in list any more. A read serves the provider's
+    /// own answer — live, or the last one it gave, labelled with its time and
+    /// the reason the refresh failed — or nothing, `.unavailable`, with why.
     func modelsWithFreshness(
         dataRoot: URL,
         session: URLSession,
         refresh: Bool
     ) async -> ModelCatalogRead {
-        let cached = readCache(dataRoot)
-        if refresh {
-            if let live = await attemptLiveRefresh(dataRoot: dataRoot, session: session) {
-                // R-L5 (b): an explicit successful refresh clears any stale
-                // failure stamp so the passive stale path isn't still backed off.
-                noteStaleRefreshSucceeded(dataRoot: dataRoot)
-                // User, 2026-09-06: a partial page is still a live read — it is
-                // labelled `liveIncomplete` rather than `cached`, which claimed
-                // no network had happened. Only `.live` grants the standing to
-                // prune.
+        let cached = readCache(dataRoot).flatMap { $0.isEmpty ? nil : $0 }
+        let fetchedAt = cacheUpdatedAt(dataRoot)
+        if !refresh {
+            // A passive read never reaches the network without a cache — the
+            // same as before; the list arrives on Refresh or a key save.
+            guard let cached else {
                 return ModelCatalogRead(
-                    models: live.models,
-                    freshness: live.isComplete ? .live : .liveIncomplete)
+                    models: [], freshness: .unavailable,
+                    failure: lastFailureReason(dataRoot: dataRoot))
             }
-            if let cached, !cached.isEmpty {
-                return ModelCatalogRead(models: cached, freshness: .staleAfterFailedRefresh)
-            }
-            return ModelCatalogRead(models: fallback(), freshness: .builtInAfterFailedRefresh)
-        }
-        if let cached, !cached.isEmpty {
-            if !cacheIsStale(dataRoot: dataRoot) {
-                return ModelCatalogRead(models: cached, freshness: .cached)
+            // The last attempt failed (a success clears the stamp): the list is
+            // last-known and says so until a fetch succeeds, fresh TTL or not.
+            if let reason = lastFailureReason(dataRoot: dataRoot) {
+                guard cacheIsStale(dataRoot: dataRoot), staleRefreshAllowed(dataRoot: dataRoot) else {
+                    return ModelCatalogRead(
+                        models: cached, freshness: .staleAfterFailedRefresh,
+                        failure: reason, fetchedAt: fetchedAt)
+                }
+            } else if !cacheIsStale(dataRoot: dataRoot) {
+                return ModelCatalogRead(models: cached, freshness: .cached, fetchedAt: fetchedAt)
             }
             // TTL expired: try to freshen, but never block the caller — serve the
             // stale copy if the network/credentials are unavailable, and back off
-            // failed attempts so a dead network isn't re-probed on every read.
-            guard staleRefreshAllowed(dataRoot: dataRoot) else {
-                return ModelCatalogRead(models: cached, freshness: .cached)
-            }
-            if let live = await attemptLiveRefresh(dataRoot: dataRoot, session: session) {
-                noteStaleRefreshSucceeded(dataRoot: dataRoot)
-                return ModelCatalogRead(
-                    models: live.models,
-                    freshness: live.isComplete ? .live : .liveIncomplete)
-            }
-            noteStaleRefreshFailed(dataRoot: dataRoot)
-            return ModelCatalogRead(models: cached, freshness: .staleAfterFailedRefresh)
+            // failed attempts so a dead network isn't re-probed on every read
+            // (a backed-off read returned just above).
         }
-        return ModelCatalogRead(models: fallback(), freshness: .builtIn)
+        switch await attemptLiveRefresh(dataRoot: dataRoot, session: session) {
+        case .success(let live):
+            // R-L5 (b): a successful refresh clears any stale failure stamp so
+            // the passive stale path isn't still backed off.
+            noteStaleRefreshSucceeded(dataRoot: dataRoot)
+            // User, 2026-09-06: a partial page is still a live read — it is
+            // labelled `liveIncomplete` rather than `cached`, which claimed
+            // no network had happened. Only `.live` grants the standing to
+            // prune.
+            return ModelCatalogRead(
+                models: live.models,
+                freshness: live.isComplete ? .live : .liveIncomplete)
+        case .failure(let failure):
+            noteStaleRefreshFailed(dataRoot: dataRoot, reason: failure.reason)
+            guard let cached else {
+                return ModelCatalogRead(models: [], freshness: .unavailable, failure: failure.reason)
+            }
+            return ModelCatalogRead(
+                models: cached, freshness: .staleAfterFailedRefresh,
+                failure: failure.reason, fetchedAt: fetchedAt)
+        }
     }
 
     /// Fetch live models and update the disk cache. Returns the live list on
-    /// success, `nil` on any failure — swallowing the error so `models()` never
+    /// success, or the reason it could not be fetched — `models()` never
     /// throws. Writing the cache changes the file's mtime, which is what
     /// invalidates the catalogs' stat()-keyed membership memo.
     private func attemptLiveRefresh(
         dataRoot: URL,
         session: URLSession
-    ) async -> ModelCatalogFetch? {
+    ) async -> Result<ModelCatalogFetch, FetchFailure> {
         do {
             let fetched: ModelCatalogFetch
             if let fetchLiveComplete {
@@ -228,21 +267,29 @@ struct ModelCatalogTTLCache: Sendable {
                 fetched = ModelCatalogFetch(
                     models: try await fetchLive(dataRoot, session), isComplete: true)
             }
-            if !fetched.models.isEmpty {
-                // User, 2026-09-06: an incomplete list IS cached and stamped.
-                // Withholding it meant a partial answer was re-fetched on every
-                // single read — no TTL ever started — while the completeness
-                // verdict no longer depends on the cached row count, so there is
-                // no baseline to ratchet. What incompleteness costs is the
-                // standing to prune, which lives in the freshness label.
-                writeCache(fetched.models, dataRoot: dataRoot, isComplete: fetched.isComplete)
-                return fetched
+            guard !fetched.models.isEmpty else {
+                return .failure(FetchFailure("the provider returned no models"))
             }
+            // User, 2026-09-06: an incomplete list IS cached and stamped.
+            // Withholding it meant a partial answer was re-fetched on every
+            // single read — no TTL ever started — while the completeness
+            // verdict no longer depends on the cached row count, so there is
+            // no baseline to ratchet. What incompleteness costs is the
+            // standing to prune, which lives in the freshness label.
+            writeCache(fetched.models, dataRoot: dataRoot, isComplete: fetched.isComplete)
+            return .success(fetched)
+        } catch LLMError.notConfigured {
+            return .failure(FetchFailure("no API key is saved for this provider"))
+        } catch ProviderRoutingError.invalidResponse(let status) {
+            return .failure(FetchFailure("the provider answered HTTP \(status)"))
         } catch {
-            // The catalog must remain usable offline; callers fall back to the
-            // (possibly stale) cache or the explicit fallback list.
+            return .failure(FetchFailure(error.localizedDescription))
         }
-        return nil
+    }
+
+    struct FetchFailure: Error {
+        let reason: String
+        init(_ reason: String) { self.reason = reason }
     }
 
     /// User, 2026-09-06: the completeness verdict is PERSISTED alongside the

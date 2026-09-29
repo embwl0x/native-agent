@@ -288,6 +288,8 @@ extension CognitiveSubstrate {
         /// The one line that NAMES the rut, spoken through the same cadence
         /// gate as the signature. Nil exactly when `wornSignature` is nil.
         var rutLine: String? = nil
+        /// Her newest reply used a rutted form again.
+        var rutFedAgain: Bool = false
 
         static let silent = SoundEchoSelection(line: nil, leadingWasNegative: nil, wornSignature: nil)
     }
@@ -394,10 +396,11 @@ extension CognitiveSubstrate {
         )
         let rutSignature = Self.verbalRutSignature(ruts)
         let rutLine = verbalRutLine(ruts)
+        let rutFedAgain = ruts.contains(where: \.inNewest)
         func quiet() -> SoundEchoSelection {
             SoundEchoSelection(
                 line: nil, leadingWasNegative: nil,
-                wornSignature: rutSignature, rutLine: rutLine)
+                wornSignature: rutSignature, rutLine: rutLine, rutFedAgain: rutFedAgain)
         }
         guard !assistantTurns.isEmpty else { return quiet() }
         // W7/P5 — THE SIGN GATE IS GONE. `emotionalValence > 0` used to stand
@@ -525,7 +528,8 @@ extension CognitiveSubstrate {
             line: line,
             leadingWasNegative: (leadValence ?? 0) < 0,
             wornSignature: rutSignature,
-            rutLine: rutLine
+            rutLine: rutLine,
+            rutFedAgain: rutFedAgain
         )
     }
 
@@ -540,6 +544,8 @@ extension CognitiveSubstrate {
         var phrase: String
         var count: Int
         var window: Int
+        /// The newest reply carries this form.
+        var inNewest = false
         var signature: String { "\(kind.name):\(phrase)" }
     }
 
@@ -572,7 +578,8 @@ extension CognitiveSubstrate {
     ) -> [VerbalRut] {
         struct Form: Hashable { var kind: Int; var phrase: String }
         var counts: [Form: Int] = [:]
-        for reply in replies {
+        var newestForms = Set<Form>()
+        for (index, reply) in replies.enumerated() {
             let head = soundRutSentences(reply.text)
             guard let first = head.first else { continue }
             // A cut head's last sentence may itself be cut, and a tail starts
@@ -608,6 +615,7 @@ extension CognitiveSubstrate {
                 }
             }
             for form in forms { counts[form, default: 0] += 1 }
+            if index == 0 { newestForms = forms }
         }
         // Up to two forms, most frequent first, so a loud rut cannot hide a
         // second real one.
@@ -622,7 +630,8 @@ extension CognitiveSubstrate {
             .compactMap { entry in
                 VerbalRut.Kind(rawValue: entry.key.kind).map {
                     VerbalRut(kind: $0, phrase: entry.key.phrase,
-                              count: entry.value, window: replies.count)
+                              count: entry.value, window: replies.count,
+                              inNewest: newestForms.contains(entry.key))
                 }
             }
     }
@@ -710,7 +719,12 @@ extension CognitiveSubstrate {
     /// capsules have passed (so it can never land on consecutive turns) — and
     /// otherwise only after `soundRutRepeatTurnGap` capsules or
     /// `soundRutRepeatWindow` of wall clock, which keeps an unchanging rut from
-    /// going permanently unmentioned.
+    /// going permanently unmentioned. A rut she FEEDS again after it was named
+    /// (`fedAgain`: her newest reply used the form) earns ONE early repeat per
+    /// signature, after the same minimum gap; then the long gate applies again
+    /// (latched in `soundRutEarlyRepeatSpent`, re-armed by a new signature).
+    /// Live 2026-09-25, ", boss." was named once, skipped for one reply, then
+    /// came back in 3 of the next 5 while the 20-turn repeat gap held it silent.
     ///
     /// Called EXACTLY ONCE per capsule render, with or without a rut, because
     /// a lapsed rut must be forgotten here. It READS the since-surfaced counter
@@ -722,12 +736,14 @@ extension CognitiveSubstrate {
         signature: String?,
         at now: Date,
         dynamics dyn: PersonalityDynamicsConfiguration,
-        presentationState: inout CognitiveCapsulePresentationState
+        presentationState: inout CognitiveCapsulePresentationState,
+        fedAgain: Bool = false
     ) -> Bool {
         guard let signature else {
             // The rut lapsed. Forget it so its RETURN reads as a change rather
             // than as the same old nag resuming mid-cooldown.
             presentationState.soundRutSignature = nil
+            presentationState.soundRutEarlyRepeatSpent = false
             return false
         }
         let previous = presentationState.soundRutSignature
@@ -735,16 +751,23 @@ extension CognitiveSubstrate {
         let elapsed = presentationState.soundRutLastSurfacedAt
             .map { now.timeIntervalSince($0) }
         let speak: Bool
+        var earlyRepeat = false
         if previous == nil {
             // Never told about this rut: saying it once is the whole point.
             speak = true
         } else if previous != signature {
             speak = turnsSince >= dyn.soundRutMinimumTurnGap
         } else {
-            speak = turnsSince >= dyn.soundRutRepeatTurnGap
+            let due = turnsSince >= dyn.soundRutRepeatTurnGap
                 || (elapsed.map { $0 >= dyn.soundRutRepeatWindow } ?? false)
+            earlyRepeat = !due && fedAgain
+                && !presentationState.soundRutEarlyRepeatSpent
+                && turnsSince >= dyn.soundRutMinimumTurnGap
+            speak = due || earlyRepeat
         }
         if speak {
+            presentationState.soundRutEarlyRepeatSpent =
+                previous == signature && (earlyRepeat || presentationState.soundRutEarlyRepeatSpent)
             presentationState.soundRutSignature = signature
             presentationState.soundRutLastSurfacedAt = now
             presentationState.soundRutTurnsSinceSurfaced = 0

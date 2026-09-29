@@ -84,10 +84,10 @@ These readouts stay bounded and routed rather than becoming prompt mass.
 - iOS chat must stay visually stable while typing, streaming, or showing progress updates.
 - iOS should show lightweight live activity while Agent is working: received, thinking, attachment reading, tool/action progress where available.
 - Mac and iOS controls should converge around a single policy model: model, think level, file/Mac access, autonomy, remote permissions.
-- The default Mac rail exposes, in order, Chat, Today, Memories, Desk, Notifications and Bots above the hairline, then Personality, Providers, Trust, Connectors, Capabilities and Diagnostics, with Settings at the foot (`SidebarItem.shellPrimaryItems` plus the Bots rail preference, default on). Mac integration is a Trust tab; MCP, Telegram, and iPhone are Connector tabs; Skills and Tools are Diagnostic tabs. The classic sidebar remains optional in Settings. The phone tabs are Chat, Activity, Memories, Desk, and More, with Desk tasks and notifications named for their purpose.
+- The Mac window has Simple, Advanced and Agent views (a fresh install opens in Simple: the agent, its agents and helpers beside the chat, no settings pages). The Advanced rail exposes, in order, Chat, Today, Memories, Desk, Notifications and Helpers above the hairline, then Personality, Providers, Trust, Connectors, Capabilities and Diagnostics, with Settings at the foot (`SidebarItem.shellPrimaryItems` plus the Bots rail preference, default on). Mac integration is a Trust tab; MCP, Telegram, and iPhone are Connector tabs; Skills and Tools are Diagnostic tabs. The phone tabs are Chat, Activity, Memories, Desk, and More, with Desk tasks and notifications named for their purpose.
 - Setup starts with names and an optional overview. Providers leads with connected accounts and Manage, keeps sign-in and API key routes visible, and groups activity choices as Chat, Work, and Memory and mind, each captioned Explicit override, Same as Chat, or Built-in default, with Use default to clear a saved one. Browser sign-in can be cancelled; first chat offers Open Providers when no account is ready.
 - Trust leads with Safe, Work mode, Builder, and Full Mac. Presets save as they are chosen and there is no policy draft; Feature permissions cards (Multimodal, Chrome Control, Self-Improvement, Desk Autonomy, Living Memory) and an Advanced fold for safety boundaries, privacy map, policy simulator, and backups sit below them. Set up Chrome opens the bundled extension and installation steps. Pairing starts with the same Apple Account and Check for Mac before verified manual correction.
-- Memories puts Keep / Don't keep beside proposals and reveals more loaded history on request. Today offers Read dream; Personality labels documents by purpose; classic Settings says App status. Connectors offers Choose Folder… and distinct search states, and Capabilities offers Show all actions. The Bots page, on the rail by default since 0.4.10, exposes a live Minimum interval floor; configured read tool sources never grant action permission.
+- Memories puts Keep / Don't keep beside proposals and reveals more loaded history on request. Today offers Read dream; Personality labels documents by purpose. Connectors offers Choose Folder… and distinct search states, and Capabilities offers Show all actions. The Helpers page exposes a live Minimum interval floor; configured read tool sources never grant action permission.
 - Doctor should remain non-LLM by default and capable of opening OAuth login paths when auth breaks.
 - Autonomy visibility should favor one command readout over separate proposal queues: what is running, what is provisional, what became permanent, what needs approval, and which policy gate is responsible.
 
@@ -111,16 +111,10 @@ These readouts stay bounded and routed rather than becoming prompt mass.
 ## Verification Baseline
 
 Assemble the coherent change, build the integrated target, then validate the
-finished workflow in proportion to its scope. See the
-[validation map](README.md#validation-boundaries) for coverage and the difference
-between package tests, iOS execution, installed behavior, and release proof.
+finished workflow in the installed app. There is no automated test suite.
 
-- Shared package: `swift test --package-path Modules/NativeAgentShared`
-- Core package full sweep: `swift test --package-path Modules/NativeAgentCore --no-parallel`
 - Mac app package: `swift build --jobs 4 --force-resolved-versions --skip-update`
-- iOS simulator tests: `./script/test_ios.sh --require` selects an available iPhone simulator and verifies actual test execution.
 - Swift smoke sweep: `./script/smoke_all.sh`
-- Full repo check: `./script/test.sh`; `--require-ios` refuses a simulator skip, and release receipt mode requires one clean unchanged source revision.
 - Install/restart Mac app: `./script/install_app.sh`
 - Swift-only checks: tracked source scan, working-tree retired-script scan outside generated/runtime caches, installed-app artifact scan, and retired-runtime process scan.
 

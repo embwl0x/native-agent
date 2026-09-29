@@ -99,11 +99,10 @@ enum ActivityScreenPresentation {
         )
     }
 
-    /// A partial approval record must never unlock a remote decision. Older
-    /// snapshots without these fields remain readable, but are Mac-only until
-    /// the canonical authority explicitly says the decision is resolvable.
-    static func canDecideRemotely(localOnly: Bool?, remoteResolvable: Bool?) -> Bool {
-        localOnly == false && remoteResolvable == true
+    /// Signed, paired iOS may decide owner cards regardless of origin or flags.
+    /// Studio canon belongs to Agent; the Mac enforces the same exception.
+    static func canDecideRemotely(action: String) -> Bool {
+        action != "studio.canon"
     }
 
     /// Preserve wire order for ordinary actions, but make a resolving action
@@ -195,9 +194,12 @@ enum InlineMemoryProposalDecisionPresentation {
     }
 }
 
+
 struct ActivityView: View {
     @EnvironmentObject private var approvalsStore: ApprovalsStore
     @EnvironmentObject private var inboxStore: InboxStore
+    @EnvironmentObject private var bridgeClient: MacBridgeClient
+    @EnvironmentObject private var pairingStore: PairingStore
     @ObservedObject private var sync = iCloudSyncEngine.shared
     @Binding var skipInitialRefresh: Bool
     @Binding var navigationTarget: ActivitySection?
@@ -285,26 +287,55 @@ struct ActivityView: View {
         )
     }
 
+    /// The first two of each queue, in one list, so the landing can answer
+    /// them in place. Each queue's full list is one row further down.
+    private var waitingItems: [ActivityWaitingItem] {
+        var items: [ActivityWaitingItem] = pendingApprovals.prefix(2).map { .approval($0) }
+        items += pendingInbox.prefix(2).map { .inbox($0) }
+        items += pendingMemoryProposals.prefix(2).map { .memory($0) }
+        let trainings = pendingTrainingProposals.prefix(2)
+        items += trainings.map { .training($0) }
+        items += pendingPromotionCandidates.prefix(2 - trainings.count).map { .promotion($0) }
+        return items
+    }
+
+    /// The page's one line, and the only place sync state is said.
+    private var headerLine: String {
+        let known = [pendingApprovalsCount, pendingInboxCount, pendingMemoryProposalsCount, pendingSelfImprovementCount]
+        let total = known.compactMap { $0 }.reduce(0, +)
+        if total > 0 {
+            return total == 1
+                ? "One thing is waiting on you."
+                : "\(AliveWords.spelled(total)) things are waiting on you."
+        }
+        if known.contains(where: { $0 == nil }) {
+            return pairingStore.usesICloudTransport
+                ? "Checking with your Mac for anything new."
+                : "Pair with your Mac and what needs you will show up here."
+        }
+        return "Nothing needs you right now."
+    }
+
     // MARK: - Body
 
     var body: some View {
         NavigationStack(path: $path) {
-            List {
-                approvalsSection
-                inboxSection
-                memoryProposalsSection
-                selfImprovementSection
+            AlivePage(title: "Activity", line: headerLine, style: .root) {
+                let items = waitingItems
+                if !items.isEmpty {
+                    AliveSection("Waiting for you", surface: .waiting) {
+                        ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
+                            if index > 0 { AliveDivider() }
+                            waitingRow(item)
+                        }
+                    }
+                }
+                AliveSection("Everything") { queueRows }
             }
-            .listStyle(.insetGrouped)
-            .mobileReadingScreen()
-            .navigationTitle("Activity")
             // Sweep R4 C11.3 / C11.4 — render-only surfacing of state this
             // screen's own `sync` engine and the shared bridge client already
             // publish. No new polling.
             .macSyncErrorBanner()
-            .safeAreaInset(edge: .top, spacing: 0) {
-                MacStatusChip().frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 16)
-            }
             .navigationDestination(for: ActivitySection.self) { section in
                 // `embedInNavigationStack: false` — these destinations live
                 // INSIDE Activity's NavigationStack; if they wrap themselves
@@ -345,6 +376,7 @@ struct ActivityView: View {
             }
             .onAppear {
                 openRequestedSection(navigationTarget)
+                openDesignSampleScreen()
             }
             // 2026-06-07: dream-card "More" → read the full dream right here.
             // Reuses InboxDetailSheet (the same sheet InboxView presents),
@@ -373,165 +405,131 @@ struct ActivityView: View {
         navigationTarget = nil
     }
 
-    // MARK: - Sections
-
-    @ViewBuilder
-    private var approvalsSection: some View {
-        Section {
-            NavigationLink(value: ActivitySection.approvals) {
-                ActivityCardRow(
-                    title: "Approvals",
-                    subtitle: "Tool calls waiting on you",
-                    systemImage: "checkmark.shield",
-                    tint: .orange,
-                    count: pendingApprovalsCount
-                )
-            }
-            ForEach(Array(pendingApprovals.prefix(2))) { approval in
-                InlineApprovalPreviewCard(approval: approval) {
-                    path.append(ActivitySection.approvals)
-                }
-                .listRowSeparator(.hidden)
-                .listRowBackground(Color.clear)
-            }
-            if ActivityScreenPresentation.showsOverflow(total: pendingApprovals.count) {
-                Button {
-                    path.append(ActivitySection.approvals)
-                } label: {
-                    Label("All \(pendingApprovals.count) approvals", systemImage: "arrow.right")
-                        .font(.callout)
-                        .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
-                }
-                .buttonStyle(.plain)
-            }
-        } header: {
-            Text("Needs your eyes").font(.headline)
+    /// Screenshot fixtures only (DEBUG `-designScreen`): open the queue or
+    /// sheet a design pass asked for, since a simulator cannot be tapped.
+    private func openDesignSampleScreen() {
+        switch MobileDesignSamples.screen {
+        case "approvals": openRequestedSection(.approvals)
+        case "inbox": openRequestedSection(.inbox)
+        case "inboxItem": inboxDetailItem = pendingInbox.first
+        default: break
         }
     }
 
+    // MARK: - Pieces
+
     @ViewBuilder
-    private var inboxSection: some View {
-        Section {
-            NavigationLink(value: ActivitySection.inbox) {
-                ActivityCardRow(
-                    title: "Inbox",
-                    subtitle: "Proactive cards from \(sync.personality?.name ?? "your agent")",
-                    systemImage: "tray",
-                    tint: .blue,
-                    count: pendingInboxCount
-                )
+    private func waitingRow(_ item: ActivityWaitingItem) -> some View {
+        switch item {
+        case .approval(let approval):
+            InlineApprovalPreviewCard(approval: approval) {
+                path.append(ActivitySection.approvals)
             }
-            ForEach(Array(pendingInbox.prefix(2))) { item in
-                InlineInboxPreviewCard(item: item) {
-                    // 2026-06-07: present the detail sheet directly with
-                    // the tapped item instead of pushing onto the parent
-                    // NavigationPath — see comment on inboxDetailItem.
-                    inboxDetailItem = item
-                }
-                .listRowSeparator(.hidden)
-                .listRowBackground(Color.clear)
+        case .inbox(let inboxItem):
+            InlineInboxPreviewCard(item: inboxItem) {
+                // 2026-06-07: present the detail sheet directly with the
+                // tapped item instead of pushing onto the parent
+                // NavigationPath — see comment on inboxDetailItem.
+                inboxDetailItem = inboxItem
             }
-            if ActivityScreenPresentation.showsOverflow(total: pendingInbox.count) {
-                Button {
-                    path.append(ActivitySection.inbox)
-                } label: {
-                    Label("All \(pendingInbox.count) inbox items", systemImage: "arrow.right")
-                        .font(.callout)
-                        .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
-                }
-                .buttonStyle(.plain)
+        case .memory(let proposal):
+            InlineMemoryProposalPreviewCard(proposal: proposal)
+        case .training(let proposal):
+            InlineSelfImprovementPreviewCard(
+                title: proposal.title,
+                summary: proposal.proposed ?? proposal.rationale ?? ""
+            ) {
+                path.append(ActivitySection.selfImprovement)
+            }
+        case .promotion(let candidate):
+            InlineSelfImprovementPreviewCard(
+                title: candidate.title,
+                summary: "Something I learned that I'd like to make part of how I work."
+            ) {
+                path.append(ActivitySection.selfImprovement)
             }
         }
     }
 
     @ViewBuilder
-    private var memoryProposalsSection: some View {
-        Section {
-            NavigationLink(value: ActivitySection.memoryProposals) {
-                ActivityCardRow(
-                    title: "Memory Proposals",
-                    subtitle: "Memories the agent wants to keep",
-                    systemImage: "brain.head.profile",
-                    tint: .purple,
-                    count: pendingMemoryProposalsCount
-                )
-            }
-            ForEach(Array(pendingMemoryProposals.prefix(2))) { proposal in
-                InlineMemoryProposalPreviewCard(proposal: proposal)
-                    .listRowSeparator(.hidden)
-                    .listRowBackground(Color.clear)
-            }
-            if ActivityScreenPresentation.showsOverflow(total: pendingMemoryProposals.count) {
-                Button {
-                    path.append(ActivitySection.memoryProposals)
-                } label: {
-                    Label("All \(pendingMemoryProposals.count) memory proposals", systemImage: "arrow.right")
-                        .font(.callout)
-                        .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
-                }
-                .buttonStyle(.plain)
-            }
-        }
+    private var queueRows: some View {
+        ActivityQueueRow(section: .approvals, title: "Approvals",
+                         line: "What I'll do once you say yes", count: pendingApprovalsCount)
+        AliveDivider()
+        ActivityQueueRow(section: .inbox, title: "Inbox",
+                         line: "Things I noticed for you", count: pendingInboxCount)
+        AliveDivider()
+        ActivityQueueRow(section: .memoryProposals, title: "Memories to keep",
+                         line: "What I'd like to remember", count: pendingMemoryProposalsCount)
+        AliveDivider()
+        ActivityQueueRow(section: .selfImprovement, title: "Improvements",
+                         line: "Changes I'd make to how I work", count: pendingSelfImprovementCount)
     }
+}
 
-    @ViewBuilder
-    private var selfImprovementSection: some View {
-        Section {
-            NavigationLink(value: ActivitySection.selfImprovement) {
-                ActivityCardRow(
-                    title: "Self-Improvement",
-                    subtitle: "Harness changes proposed by the agent",
-                    systemImage: "wand.and.stars",
-                    tint: .pink,
-                    count: pendingSelfImprovementCount
-                )
-            }
-            // Show top 2 training proposals; top up with promotion candidates
-            // if we have fewer than 2 trainings.
-            let trainings = Array(pendingTrainingProposals.prefix(2))
-            ForEach(trainings) { proposal in
-                InlineSelfImprovementPreviewCard(
-                    title: proposal.targetDoc ?? proposal.title,
-                    summary: proposal.proposed ?? proposal.rationale ?? "Training proposal.",
-                    tint: .pink
-                ) {
-                    path.append(ActivitySection.selfImprovement)
-                }
-                .listRowSeparator(.hidden)
-                .listRowBackground(Color.clear)
-            }
-            if trainings.count < 2 {
-                let take = 2 - trainings.count
-                ForEach(Array(pendingPromotionCandidates.prefix(take))) { candidate in
-                    InlineSelfImprovementPreviewCard(
-                        title: "Promotion \u{00b7} \(candidate.source ?? "candidate")",
-                        summary: candidate.title,
-                        tint: .pink
-                    ) {
-                        path.append(ActivitySection.selfImprovement)
-                    }
-                    .listRowSeparator(.hidden)
-                    .listRowBackground(Color.clear)
-                }
-            }
-            if let total = pendingSelfImprovementCount,
-               ActivityScreenPresentation.showsOverflow(total: total) {
-                Button {
-                    path.append(ActivitySection.selfImprovement)
-                } label: {
-                    Label("All \(total) self-improvement items", systemImage: "arrow.right")
-                        .font(.callout)
-                        .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
-                }
-                .buttonStyle(.plain)
-            }
+private enum ActivityWaitingItem: Identifiable {
+    case approval(ApprovalRequest)
+    case inbox(InboxItemRecord)
+    case memory(MemoryProposalRecord)
+    case training(TrainingProposalSummary)
+    case promotion(PromotionCandidateSummary)
+
+    var id: String {
+        switch self {
+        case .approval(let value): return "approval-\(value.id)"
+        case .inbox(let value): return "inbox-\(value.id)"
+        case .memory(let value): return "memory-\(value.id)"
+        case .training(let value): return "training-\(value.id)"
+        case .promotion(let value): return "promotion-\(value.id)"
         }
     }
 }
 
-// MARK: - Inline preview cards
+// MARK: - Waiting rows
 
-/// Compact approval card with Approve / Deny / View. Mirrors the Mac
+/// One row inside the "Waiting for you" card: the dot, what kind of thing it
+/// is, what it says, and the answers.
+private struct ActivityWaitingRow<Actions: View>: View {
+    let kind: String
+    let title: String
+    var detail: String? = nil
+    var note: String? = nil
+    var noteIsError = false
+    @ViewBuilder var actions: () -> Actions
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 12) {
+            AliveWaitingDot()
+            VStack(alignment: .leading, spacing: 5) {
+                Text(kind)
+                    .font(.caption)
+                    .foregroundStyle(AlivePalette.secondary)
+                Text(title)
+                    .font(.body.weight(.medium))
+                    .foregroundStyle(AlivePalette.text)
+                    .fixedSize(horizontal: false, vertical: true)
+                if let detail, !detail.isEmpty {
+                    Text(detail)
+                        .font(.subheadline)
+                        .foregroundStyle(AlivePalette.secondary)
+                        .lineLimit(4)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if let note, !note.isEmpty {
+                    Text(note)
+                        .font(.footnote)
+                        .foregroundStyle(noteIsError ? NativeAgentMobileTheme.Colors.trouble : AlivePalette.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                actions()
+                    .padding(.top, 6)
+            }
+        }
+        .aliveRow()
+    }
+}
+
+/// Approval with Approve / Deny in place. Mirrors the Mac
 /// `InlineApprovalPreviewCard` but uses iCloudSyncEngine.shared for the
 /// decision call (iOS has no AppModel).
 private struct InlineApprovalPreviewCard: View {
@@ -550,97 +548,47 @@ private struct InlineApprovalPreviewCard: View {
         pairingStore.isICloudSigned && bridge.available && bridgeClient.bridgeStatus != .deviceOffline
     }
 
-    private var isMacOnly: Bool {
-        !ActivityScreenPresentation.canDecideRemotely(
-            localOnly: approval.localOnly,
-            remoteResolvable: approval.remoteResolvable
-        )
+    private var isAgentDecision: Bool {
+        !ActivityScreenPresentation.canDecideRemotely(action: approval.action)
+    }
+
+    private var kind: String {
+        let risk = approval.risk.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return risk.isEmpty ? "Before I go ahead" : "Before I go ahead · \(risk) risk"
+    }
+
+    private var note: String? {
+        if let decisionStatusText { return decisionStatusText }
+        if isAgentDecision { return ApprovalText.agentDecision }
+        if !canSendDecision { return "Pair with your Mac to answer from here." }
+        return nil
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            MobileAdaptiveRow(alignment: .top, spacing: 8) {
-                Image(systemName: "exclamationmark.shield.fill")
-                    .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(approval.title.isEmpty ? approval.action : approval.title)
-                        .font(.headline)
-                        .fixedSize(horizontal: false, vertical: true)
-                    Text(approval.action)
-                        .font(.callout)
-                        .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
-                        .fixedSize(horizontal: false, vertical: true)
+        ActivityWaitingRow(
+            kind: kind,
+            title: ApprovalText.title(approval),
+            detail: approval.reason.map(ApprovalText.readable).flatMap { $0.isEmpty ? nil : $0 }
+                ?? ApprovalText.kind(approval.action),
+            note: note,
+            noteIsError: decisionStatusIsError
+        ) {
+            AliveActionRow {
+                if !isAgentDecision {
+                    Button("Approve") { decide(approve: true) }
+                        .alivePrimaryButton()
+                        .disabled(isDeciding || !canSendDecision)
+                    Button("Deny") { decide(approve: false) }
+                        .aliveSecondaryButton()
+                        .disabled(isDeciding || !canSendDecision)
                 }
-                Spacer()
-                Text(approval.risk.uppercased())
-                    .font(.caption)
-                    .foregroundStyle(.primary)
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 2)
-                    .background(NativeAgentMobileTheme.Colors.quietFill, in: Capsule())
-            }
-            if let reason = approval.reason, !reason.isEmpty {
-                Text(reason)
-                    .font(.body)
-                    .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            if let decisionStatusText {
-                Text(decisionStatusText)
-                    .font(.caption)
-                    .foregroundStyle(decisionStatusIsError ? .red : .secondary)
-            }
-            if isMacOnly {
-                Label("Review this one on the Mac app", systemImage: "macwindow.badge.exclamationmark")
-                    .font(.callout)
-                    .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
-            if !isMacOnly && !canSendDecision {
-                Text("Still pending. Connect iCloud and pair with the Mac to send a decision. Decisions are not automatically retried.")
-                    .font(.callout)
-                    .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
-            }
-            MobileActionRow {
-                if !isMacOnly {
-                    Button {
-                        decide(approve: true)
-                    } label: {
-                        Label("Approve", systemImage: "checkmark")
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .foregroundStyle(NativeAgentMobileTheme.Colors.onAccent)
-                    .controlSize(.large)
-                    .tint(NativeAgentMobileTheme.Colors.accentText)
-                    .disabled(isDeciding || !canSendDecision)
-
-                    Button {
-                        decide(approve: false)
-                    } label: {
-                        Label("Deny", systemImage: "xmark")
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.large)
-                    .tint(NativeAgentMobileTheme.Colors.accentText)
-                    .disabled(isDeciding || !canSendDecision)
-                }
-
-                Button {
-                    onView()
-                } label: {
-                    Label("View", systemImage: "arrow.up.right.square")
-                }
-                .buttonStyle(.bordered)
-                .tint(NativeAgentMobileTheme.Colors.accentText)
-                .controlSize(.large)
-
+                Button("Details") { onView() }
+                    .aliveSecondaryButton()
                 if isDeciding {
                     ProgressView().controlSize(.small)
                 }
-                Spacer()
             }
         }
-        .modifier(MobileReadingSurfaceModifier())
     }
 
     private func decide(approve: Bool) {
@@ -679,10 +627,10 @@ private struct InlineApprovalPreviewCard: View {
     }
 }
 
-/// Compact inbox card showing the top two non-`view`/`read` actions plus a
-/// "More" button. The owning Activity view passes a callback that presents
-/// the InboxDetailSheet directly with this card's item (the previous "drill
-/// into InboxView" wiring bounced on iOS — see ActivityView.inboxDetailItem).
+/// Inbox card with its top two actions plus "Read". The owning Activity view
+/// passes a callback that presents the InboxDetailSheet directly with this
+/// card's item (the previous "drill into InboxView" wiring bounced on iOS —
+/// see ActivityView.inboxDetailItem).
 private struct InlineInboxPreviewCard: View {
     @EnvironmentObject private var inboxStore: InboxStore
     let item: InboxItemRecord
@@ -695,80 +643,33 @@ private struct InlineInboxPreviewCard: View {
         ActivityScreenPresentation.visibleInboxActions(item.actions)
     }
 
+    private var kind: String {
+        item.relativeCreatedAt.isEmpty ? item.sourceWords : "\(item.sourceWords) · \(item.relativeCreatedAt)"
+    }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            MobileAdaptiveRow(alignment: .top, spacing: 8) {
-                Image(systemName: item.sourceIcon)
-                    .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(item.title)
-                        .font(.headline)
-                        .fixedSize(horizontal: false, vertical: true)
-                    Text(item.sourceBadgeLabel)
-                        .font(.caption)
-                        .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
-                }
-                Spacer()
-                Text(item.severity.uppercased())
-                    .font(.caption)
-                    .foregroundStyle(.primary)
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 2)
-                    .background(NativeAgentMobileTheme.Colors.quietFill, in: Capsule())
-            }
-            if !item.summary.isEmpty {
-                Text(item.summary)
-                    .font(.body)
-                    .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            if let errorText {
-                Text(errorText)
-                    .font(.caption)
-                    .foregroundStyle(.red)
-            }
-            MobileActionRow {
+        ActivityWaitingRow(kind: kind, title: item.title, detail: item.summary,
+                           note: errorText, noteIsError: true) {
+            AliveActionRow {
                 ForEach(topActions, id: \.id) { action in
                     if ActivityScreenPresentation.isPrimaryInboxAction(action.id) {
-                        Button {
-                            runAction(action.id)
-                        } label: {
-                            Text(action.label)
-                        }
-                        .buttonStyle(.borderedProminent)
-                    .foregroundStyle(NativeAgentMobileTheme.Colors.onAccent)
-                        .controlSize(.large)
-                        .tint(NativeAgentMobileTheme.Colors.accentText)
-                        .disabled(runningActionID != nil)
+                        Button(action.label) { runAction(action.id) }
+                            .alivePrimaryButton()
+                            .disabled(runningActionID != nil)
                     } else {
-                        Button {
-                            runAction(action.id)
-                        } label: {
-                            Text(action.label)
-                        }
-                        .buttonStyle(.bordered)
-                .tint(.secondary)
-                        .controlSize(.large)
-                        .disabled(runningActionID != nil)
+                        Button(action.label) { runAction(action.id) }
+                            .aliveSecondaryButton()
+                            .disabled(runningActionID != nil)
                     }
                 }
-                Button {
-                    onMore()
-                } label: {
-                    Label("More", systemImage: "ellipsis")
-                }
-                .buttonStyle(.bordered)
-                .tint(.secondary)
-                .controlSize(.large)
-                .disabled(runningActionID != nil)
-
+                Button("Read") { onMore() }
+                    .aliveSecondaryButton()
+                    .disabled(runningActionID != nil)
                 if runningActionID != nil {
                     ProgressView().controlSize(.small)
                 }
-                Spacer()
             }
         }
-        .modifier(MobileReadingSurfaceModifier())
     }
 
     private func runAction(_ actionID: String) {
@@ -791,71 +692,33 @@ private struct InlineInboxPreviewCard: View {
     }
 }
 
-/// Compact memory-proposal card with Accept / Reject. Calls the same
-/// iCloudSyncEngine methods as the full Memory view.
+/// Memory proposal with Remember / Skip. Calls the same iCloudSyncEngine
+/// methods as the full Memory view.
 private struct InlineMemoryProposalPreviewCard: View {
     let proposal: MemoryProposalRecord
 
     @State private var decisionState: InlineMemoryProposalDecisionPresentation.State = .ready
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            MobileAdaptiveRow(alignment: .top, spacing: 8) {
-                Image(systemName: "brain.head.profile")
-                    .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Memory proposal")
-                        .font(.headline)
-                    if let layer = proposal.layer, !layer.isEmpty {
-                        Text(layer)
-                            .font(.callout)
-                            .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
-                    }
-                    Text(proposal.evidenceSummary)
-                        .font(.callout)
-                        .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
-                }
-                Spacer()
-            }
-            Text(proposal.displayText ?? proposal.text)
-                .font(.body)
-                .fixedSize(horizontal: false, vertical: true)
-                .textSelection(.enabled)
-            if let feedback = decisionState.feedback {
-                Text(feedback.message)
-                    .font(.caption)
-                    .foregroundStyle(feedback.isError ? .red : .secondary)
-            }
-            MobileActionRow {
-                Button {
-                    decide(approve: true)
-                } label: {
-                    Label("Accept", systemImage: "checkmark")
-                }
-                .buttonStyle(.borderedProminent)
-                    .foregroundStyle(NativeAgentMobileTheme.Colors.onAccent)
-                .controlSize(.large)
-                .tint(NativeAgentMobileTheme.Colors.accentText)
-                .disabled(!decisionState.canDecide)
-
-                Button {
-                    decide(approve: false)
-                } label: {
-                    Label("Reject", systemImage: "xmark")
-                }
-                .buttonStyle(.bordered)
-                .tint(.secondary)
-                .controlSize(.large)
-                .tint(.secondary)
-                .disabled(!decisionState.canDecide)
-
+        ActivityWaitingRow(
+            kind: "Worth remembering · \(proposal.evidenceSummary.lowercased())",
+            title: proposal.displayText ?? proposal.text,
+            note: decisionState.feedback?.message,
+            noteIsError: decisionState.feedback?.isError ?? false
+        ) {
+            AliveActionRow {
+                Button("Remember") { decide(approve: true) }
+                    .alivePrimaryButton()
+                    .disabled(!decisionState.canDecide)
+                Button("Skip") { decide(approve: false) }
+                    .aliveSecondaryButton()
+                    .disabled(!decisionState.canDecide)
                 if decisionState.showsProgress {
                     ProgressView().controlSize(.small)
                 }
-                Spacer()
             }
         }
-        .modifier(MobileReadingSurfaceModifier())
+        .textSelection(.enabled)
     }
 
     private func decide(approve: Bool) {
@@ -886,91 +749,57 @@ private struct InlineMemoryProposalPreviewCard: View {
     }
 }
 
-/// Compact self-improvement card. View-only — actual approve/reject lives
-/// in the Autonomy view because the proposal types fan out into multiple
-/// buckets (training, promotion candidates).
+/// Self-improvement proposal. View-only — approve/reject lives in the
+/// Autonomy view because the proposal types fan out into multiple buckets
+/// (training, promotion candidates).
 private struct InlineSelfImprovementPreviewCard: View {
     let title: String
     let summary: String
-    let tint: Color
     var onView: () -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            MobileAdaptiveRow(alignment: .top, spacing: 8) {
-                Image(systemName: "wand.and.stars")
-                    .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
-                Text(title)
-                    .font(.headline)
-                    .fixedSize(horizontal: false, vertical: true)
-                Spacer()
-            }
-            Text(summary)
-                .font(.body)
-                .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
-                .fixedSize(horizontal: false, vertical: true)
-            Label("Apply changes on the Mac", systemImage: "macwindow.badge.exclamationmark")
-                .font(.callout)
-                .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
-            MobileActionRow {
-                Button {
-                    onView()
-                } label: {
-                    Label("View", systemImage: "arrow.up.right.square")
-                }
-                .buttonStyle(.bordered)
-                .tint(.secondary)
-                .controlSize(.large)
-                Spacer()
+        ActivityWaitingRow(kind: "A change to how I work", title: title, detail: summary,
+                           note: "You decide this one on your Mac.") {
+            AliveActionRow {
+                Button("Details") { onView() }
+                    .aliveSecondaryButton()
             }
         }
-        .modifier(MobileReadingSurfaceModifier())
     }
 }
 
-// MARK: - Drill-down row (kept from the previous ActivityView)
+// MARK: - Queue row
 
-private struct ActivityCardRow: View {
+/// One row of the "Everything" card: the queue's name, one line, and how
+/// many wait there. While a queue has not arrived it says nothing; the page
+/// line already says the phone is still checking.
+private struct ActivityQueueRow: View {
+    let section: ActivitySection
     let title: String
-    let subtitle: String
-    let systemImage: String
-    let tint: Color
+    let line: String
     let count: Int?
 
     var body: some View {
-        MobileAdaptiveRow(spacing: 16) {
-            Image(systemName: systemImage)
-                .font(.title3)
-                .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
-                .frame(width: 32)
-
-            VStack(alignment: .leading, spacing: 4) {
-                Text(title).font(.headline)
-                Text(subtitle)
-                    .font(.callout)
-                    .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
-            }
-
-            Spacer()
-
-            switch ActivityScreenPresentation.sectionCountState(for: count) {
-            case .pending(let count):
-                Text("\(count)")
-                    .font(.callout)
-                    .foregroundStyle(.primary)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 2)
-                    .background(NativeAgentMobileTheme.Colors.quietFill, in: Capsule())
-            case .clear:
-                Text("Clear")
-                    .font(.caption)
-                    .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
-            case .unavailable:
-                Text("Syncing")
-                    .font(.caption)
-                    .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
+        NavigationLink(value: section) {
+            AliveRow(title, detail: line) {
+                switch ActivityScreenPresentation.sectionCountState(for: count) {
+                case .pending(let count):
+                    HStack(spacing: 7) {
+                        AliveWaitingDot()
+                        Text(count == 1 ? "1 waiting" : "\(count) waiting")
+                            .font(.subheadline.weight(.medium))
+                            .foregroundStyle(AlivePalette.text)
+                    }
+                case .clear:
+                    Text("Clear")
+                        .font(.subheadline)
+                        .foregroundStyle(AlivePalette.secondary)
+                case .unavailable:
+                    EmptyView()
+                }
+                AliveChevron()
             }
         }
-        .padding(.vertical, 4)
+        .aliveRowButtonStyle()
     }
 }

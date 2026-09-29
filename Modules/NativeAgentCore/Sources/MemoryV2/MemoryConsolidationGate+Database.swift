@@ -25,19 +25,19 @@ extension MemoryConsolidationGate {
     /// transaction changes the in-transaction fingerprint → SwapStaleError
     /// → rollback. No window remains in which a fresh write can be deleted
     /// by the swap.
+    ///
+    /// Runs on the live MemoryStorage's own writer connection (memory.sqlite
+    /// has one owner): every in-process write queues behind the swap instead
+    /// of racing it for SQLite's lock.
     static func transactionalTableSwap(
-        livePath: URL,
+        liveStorage: MemoryStorage,
         candidatePath: URL,
         expectedLiveFingerprint: String,
         memoryLimit: Int = memoryStoredRowCap,
         appliedRunId: String? = nil
     ) throws -> [StoredMemory] {
-        var config = Configuration()
-        config.busyMode = .timeout(5)
-        let queue = try DatabaseQueue(path: livePath.path, configuration: config)
-        defer { try? queue.close() }
         var boundEvictions: [StoredMemory] = []
-        try queue.inDatabase { db in
+        try liveStorage.dbPool.writeWithoutTransaction { db in
             try db.execute(sql: "ATTACH DATABASE ? AS cand", arguments: [candidatePath.path])
             do {
                 try db.inTransaction(.immediate) {
@@ -107,12 +107,6 @@ extension MemoryConsolidationGate {
                     // the transaction returns leaves a window in which a
                     // committed swap reads as stale.
                     if let appliedRunId {
-                        try db.execute(sql: """
-                            CREATE TABLE IF NOT EXISTS \(appliedMarkerTable) (
-                              run_id TEXT PRIMARY KEY,
-                              applied_at TEXT NOT NULL
-                            )
-                        """)
                         try db.execute(
                             sql: "INSERT OR REPLACE INTO \(appliedMarkerTable) "
                                 + "(run_id, applied_at) VALUES (?, ?)",
@@ -133,7 +127,7 @@ extension MemoryConsolidationGate {
     /// Transactionally-consistent pre-swap backup via the SQLite online
     /// backup API (robust against concurrent WAL writers — the fix wave-1's
     /// checkpoint+copy comment wished for).
-    static func backupLiveStore(livePath: URL, dataRoot: URL) throws -> String {
+    static func backupLiveStore(liveStorage: MemoryStorage, dataRoot: URL) throws -> String {
         let suffix = UUID().uuidString.lowercased().prefix(8)
         let dir = dataRoot
             .appendingPathComponent("memory", isDirectory: true)
@@ -141,7 +135,7 @@ extension MemoryConsolidationGate {
             .appendingPathComponent("pre-consolidation-\(Self.timestamp())-\(suffix)", isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let dest = dir.appendingPathComponent("memory.sqlite")
-        try onlineBackup(from: livePath, to: dest)
+        try onlineBackup(from: liveStorage.dbPool, to: dest)
         return dir.path
     }
 
@@ -213,17 +207,13 @@ extension MemoryConsolidationGate {
     }
 
     /// SQLite online backup source → dest (full copy, consistent snapshot).
-    static func onlineBackup(from source: URL, to dest: URL) throws {
-        var sourceConfig = Configuration()
-        sourceConfig.busyMode = .timeout(5)
-        sourceConfig.readonly = true
-        let sourceQueue = try DatabaseQueue(path: source.path, configuration: sourceConfig)
-        defer { try? sourceQueue.close() }
+    /// The source is the live MemoryStorage's own pool.
+    static func onlineBackup(from source: DatabasePool, to dest: URL) throws {
         var destConfig = Configuration()
         destConfig.busyMode = .timeout(5)
         let destQueue = try DatabaseQueue(path: dest.path, configuration: destConfig)
         defer { try? destQueue.close() }
-        try sourceQueue.backup(to: destQueue)
+        try source.backup(to: destQueue)
     }
 
     // MARK: - Fingerprint
@@ -246,6 +236,12 @@ extension MemoryConsolidationGate {
     // these columns hashed, the in-transaction re-check throws SwapStaleError
     // instead of installing mismatched vectors (fail-closed).
 
+    /// Fingerprint of the live store, read through its owner's pool.
+    static func fingerprint(of liveStorage: MemoryStorage) throws -> String {
+        try liveStorage.dbPool.read { db in try fingerprint(in: db) }
+    }
+
+    /// Fingerprint of a candidate file (never the live store).
     static func fingerprint(ofDatabaseAt path: URL) throws -> String {
         var config = Configuration()
         config.busyMode = .timeout(5)
@@ -306,24 +302,22 @@ extension MemoryConsolidationGate {
     // MARK: - Diff
 
     static func computeDiff(
-        livePath: URL, candidatePath: URL, plan: ConsolidationReport
+        liveStorage: MemoryStorage, candidatePath: URL, plan: ConsolidationReport
     ) throws -> MemoryConsolidationDiff {
-        func counts(_ path: URL) throws -> (activeMemories: Int, pendingProposals: Int) {
-            var config = Configuration()
-            config.busyMode = .timeout(5)
-            config.readonly = true
-            let queue = try DatabaseQueue(path: path.path, configuration: config)
-            defer { try? queue.close() }
-            return try queue.read { db in
-                let mem = try Int.fetchOne(
-                    db, sql: "SELECT COUNT(*) FROM memories WHERE status = 'active'") ?? 0
-                let prop = try Int.fetchOne(
-                    db, sql: "SELECT COUNT(*) FROM proposals WHERE status = 'pending'") ?? 0
-                return (mem, prop)
-            }
+        func counts(_ db: Database) throws -> (activeMemories: Int, pendingProposals: Int) {
+            let mem = try Int.fetchOne(
+                db, sql: "SELECT COUNT(*) FROM memories WHERE status = 'active'") ?? 0
+            let prop = try Int.fetchOne(
+                db, sql: "SELECT COUNT(*) FROM proposals WHERE status = 'pending'") ?? 0
+            return (mem, prop)
         }
-        let live = try counts(livePath)
-        let cand = try counts(candidatePath)
+        let live = try liveStorage.dbPool.read { db in try counts(db) }
+        var config = Configuration()
+        config.busyMode = .timeout(5)
+        config.readonly = true
+        let candidateQueue = try DatabaseQueue(path: candidatePath.path, configuration: config)
+        defer { try? candidateQueue.close() }
+        let cand = try candidateQueue.read { db in try counts(db) }
         return MemoryConsolidationDiff(
             memoriesActiveBefore: live.activeMemories,
             memoriesActiveAfter: cand.activeMemories,

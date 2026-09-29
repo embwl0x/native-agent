@@ -33,7 +33,6 @@ enum TranscriptLayoutProbe {
         case toolRow
         case toolGroup
         case approval
-        case toolPill
     }
 }
 

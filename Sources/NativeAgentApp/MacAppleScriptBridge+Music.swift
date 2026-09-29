@@ -172,7 +172,7 @@ extension MacAppleScriptBridge {
                     repeat with playlistIndexNum from startIndexNum to endIndexNum
                         set playlistItem to item playlistIndexNum of playlistsList
                         set playlistNameString to ""
-                        set playlistTrackCountString to "0"
+                        set playlistTrackCountString to "unknown"
                         set playlistPersistentIDString to ""
                         set playlistSpecialKindString to ""
                         try

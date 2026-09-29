@@ -1,10 +1,14 @@
 # Build artifacts
 .build/
 .swiftpm/
+# Local packages consume the root pins; their standalone lockfiles are generated.
+/Modules/*/Package.resolved
 **/build/
 DerivedData/
 *.xcresult/
 dist/
+/NativeAgent.xcodeproj/
+/iOS/NativeAgentMobile/NativeAgentMobile.xcodeproj/
 *.xcodeproj/xcuserdata/
 *.xcworkspace/xcuserdata/
 
@@ -138,8 +142,6 @@ workspace/*
 # Skill bodies are committed — they are built-in capabilities useful to everyone
 # (no ignore entry needed; persona/skills/bodies/ is not excluded above)
 .claude/
-iOS/NativeAgentMobile/NativeAgentMobile.xcodeproj/xcuserdata/
-iOS/NativeAgentMobile/NativeAgentMobile.xcodeproj/project.xcworkspace/xcuserdata/
 iOS/NativeAgentMobile/build/
 
 # Ad-hoc working backups created by Agent during ops (registry/inbox edits)
@@ -151,7 +153,10 @@ data.backup.*/
 
 # Hermes/codex agent job workspaces parked in the repo root (foreign embedded repos)
 .hermes-*/
-tests/activity_watch/verify_ground_truth.py
 
 # Large embedding model staged into release builds; never in git
 extras/embedding/
+
+# Local capture/replay leftovers from the deleted test suites (personal data; never commit)
+tests/
+DerivedData-ios/

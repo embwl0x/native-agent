@@ -739,6 +739,7 @@ extension iCloudSyncEngine {
             msgId = try await sendAction(action, intentionalNewRequest: intentionalNewRequest)
         } catch {
             syncError = "iCloud action send failed: \(error.localizedDescription)"
+            lastActionSendFailure = syncError
             return nil
         }
         // Poll for response
@@ -749,6 +750,9 @@ extension iCloudSyncEngine {
             expectedAction: action.action
         ) {
             if resp["code"] == "signature_required" || resp["code"] == "signature_invalid" {
+                // Ciphertext authenticates the original action ID. Re-pair and
+                // explicitly submit again; never copy it into a replacement ID.
+                if action.payload[SecretActionEnvelope.field] != nil { return resp }
                 // (a)(b) Re-sign with new msgId/createdAt and resubmit once
                 let retryAction = InboxAction.make(action: action.action, payload: action.payload)
                 // 2026-09-06: the submission owner must retry this replacement
@@ -775,15 +779,17 @@ extension iCloudSyncEngine {
                     return retryResp
                 }
                 syncError = "Retry after signature recovery timed out — check iCloud Drive connectivity."
+                lastActionSendFailure = nil
                 return nil
             }
             return resp
         }
         if await pendingCloudKitAction(msgId: msgId) != nil {
-            syncError = "Action outcome is unknown. Retrying will check or resend the same action, without creating a second transaction."
+            syncError = "Your Mac hasn't confirmed this yet. Trying again is safe — it won't do it twice."
         } else {
             syncError = "iCloud action timed out waiting for Mac response after \(Int(pollTimeoutSeconds))s."
         }
+        lastActionSendFailure = nil
         return nil
     }
 
@@ -800,7 +806,15 @@ extension iCloudSyncEngine {
         timeoutMessage: String = "Mac did not return a response."
     ) throws -> [String: String] {
         guard let response else {
-            throw SyncError.timeout(syncError ?? timeoutMessage)
+            // The thrown error carries the text to the caller, which tells the
+            // person; leaving it in the shared banner too shows one failure twice.
+            let message = syncError ?? timeoutMessage
+            syncError = nil
+            if lastActionSendFailure != nil {
+                lastActionSendFailure = nil
+                throw SyncError.sendFailed(message)
+            }
+            throw SyncError.timeout(message)
         }
         let status = (response["status"] ?? "").lowercased()
         let error = response["error"] ?? response["code"]
@@ -1195,21 +1209,72 @@ extension iCloudSyncEngine {
         return try await macRunShortcut(name: name, input: input)
     }
 
-    // MARK: - Provider control (iOS → Mac inbox-routed; keys never leave the Mac)
-    // PATCH-2026-05-07: leftover-1 provider inbox helpers — API keys stored on Mac only
+    // MARK: - Telegram control
+    func changeTelegram(_ change: MobileTelegramChange) async throws -> MobileTelegramSnapshot {
+        let action: InboxAction
+        switch change {
+        case .enabled(let value):
+            var payload = ["setting": "enabled", "value": String(value)]
+            if value { payload["confirmed"] = "true" }
+            action = .make(action: "set_telegram_settings", payload: payload)
+        case .requireMention(let value):
+            var payload = ["setting": "requireMention", "value": String(value)]
+            if !value { payload["confirmed"] = "true" }
+            action = .make(action: "set_telegram_settings", payload: payload)
+        case .disconnect:
+            action = .make(action: "disconnect_telegram", payload: ["confirmed": "true"])
+        }
+        let response = try requireSuccessfulActionResponse(await sendActionWithSignatureRetry(action))
+        guard let json = response["telegram"],
+              let recovered = try? JSONDecoder().decode(MobileTelegramSnapshot.self, from: Data(json.utf8)) else {
+            throw SyncError.unsupported("The Mac did not return readable Telegram settings. Refresh before trying again.")
+        }
+        return recovered
+    }
 
-    /// Configure a provider on the Mac (e.g. save an API key). The key travels via iCloud inbox → Mac only.
+    // MARK: - Provider control (signed actions; credential bodies are encrypted)
+
+    /// Encrypt before any transport persistence. Only the Mac credential owner
+    /// receives plaintext; replies contain verified state, never provider output.
     // N7: route through sendActionWithSignatureRetry.
     @discardableResult
     func configureProvider(providerId: String, apiKey: String? = nil, authMode: String? = nil) async throws -> String {
         var payload: [String: String] = ["providerId": providerId]
         if let k = apiKey, !k.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            throw SyncError.unsupported("API keys cannot be sent through iCloud. Open NativeAgent on the Mac to save provider keys locally.")
+            guard let secret = pairingStore?.iCloudPairingSecret else { throw SyncError.notSigned }
+            var action = InboxAction.make(action: "configure_provider_secret", payload: [:])
+            action.payload = [SecretActionEnvelope.field: try SecretActionEnvelope.seal(
+                ["providerId": providerId, "api_key": k], secret: secret,
+                actionID: action.msgId, actionName: action.action
+            )]
+            let result = try requireSuccessfulActionResponse(await sendActionWithSignatureRetry(
+                action, intentionalNewRequest: true, pollTimeoutSeconds: 90
+            ))
+            guard result["provider_id"] == providerId,
+                  ["verified", "unverified"].contains(result["connection_state"] ?? "") else {
+                throw SyncError.persistence("The Mac did not return a verified provider receipt.")
+            }
+            return result["message"] ?? "Connection not verified."
+        }
+        if authMode == "oauth" {
+            _ = try await startProviderSignIn(providerId: providerId)
+            return "Sign-in started on Mac."
         }
         if let m = authMode { payload["auth_mode"] = m }
         let action = InboxAction.make(action: "configure_provider", payload: payload)
         let result = try requireSuccessfulActionResponse(await sendActionWithSignatureRetry(action))
         return result["result"] ?? result["status"] ?? ""
+    }
+
+    /// The short start receipt identifies the exact flow to observe in snapshots.
+    func startProviderSignIn(providerId: String) async throws -> String {
+        let action = InboxAction.make(action: "start_provider_sign_in", payload: ["providerId": providerId])
+        let result = try requireSuccessfulActionResponse(await sendActionWithSignatureRetry(action))
+        guard result["provider_id"] == providerId, result["connection_state"] == "pending",
+              let requestID = result["request_id"], UUID(uuidString: requestID) != nil else {
+            throw SyncError.persistence("The Mac did not confirm the sign-in request.")
+        }
+        return requestID
     }
 
     /// Run a connection test for a provider on the Mac. Result arrives in responses/<msgId>.json.
@@ -1284,8 +1349,49 @@ extension iCloudSyncEngine {
         return try MobileSurfaceSelectionReceipt(response: result, expectedSurface: surface)
     }
 
+    func setConnectorEnabled(id: String, enabled: Bool) async throws -> ConnectorRecord {
+        try await connectorMutation(action: "set_connector_enabled", id: id, enabled: enabled)
+    }
+
+    func disconnectConnector(id: String) async throws -> ConnectorRecord {
+        try await connectorMutation(action: "disconnect_connector", id: id, enabled: nil)
+    }
+
+    private func connectorMutation(action: String, id: String, enabled: Bool?) async throws -> ConnectorRecord {
+        var payload = ["id": id]
+        if let enabled { payload["enabled"] = String(enabled) }
+        let result = try requireSuccessfulActionResponse(await sendActionWithSignatureRetry(
+            InboxAction.make(action: action, payload: payload)
+        ))
+        guard let json = result["connector"],
+              let row = try? JSONDecoder().decode(ConnectorRecord.self, from: Data(json.utf8)),
+              row.id == id, row.enabled == (enabled ?? false),
+              row.canToggle != nil, row.canDisconnect != nil, row.supportsSetup != nil,
+              enabled != nil || row.authState == "not_connected" else {
+            throw SyncError.persistence("The Mac did not return confirmed connector settings. Refresh before trying again.")
+        }
+        return row
+    }
+
     /// Mutate Mac integration authority through the signed action ledger and
     /// return the canonical read-back tuple from the Mac owner.
+    func setTrustPolicy(_ request: MobileTrustAction) async throws -> TrustPolicy {
+        guard MobileTrustAction(payload: request.payload) != nil else {
+            throw SyncError.unsupported("Invalid or unconfirmed trust change.")
+        }
+        let action = InboxAction.make(action: "set_trust_policy", payload: request.payload)
+        let result = try requireSuccessfulActionResponse(await sendActionWithSignatureRetry(action))
+        guard let raw = result["policy"],
+              let recovered = try? JSONDecoder().decode(TrustPolicy.self, from: Data(raw.utf8)),
+              recovered.permissionLevel != nil, recovered.autonomyDefault != nil,
+              recovered.effectiveRequireBackups != nil, recovered.effectiveOutsideDefault != nil,
+              recovered.developerMode != nil else {
+            throw SyncError.persistence("Mac did not return the saved trust policy. Refresh Trust before trying again.")
+        }
+        trustPolicy = recovered
+        return recovered
+    }
+
     func setMacIntegrationPermission(
         id: String,
         read: Bool,
@@ -1306,6 +1412,68 @@ extension iCloudSyncEngine {
             }
         }
         return (try exactBool("read"), try exactBool("write"))
+    }
+
+    func helperAction(_ name: String, payload: [String: String]) async throws -> (MobileHelperEdit, [String: String]) {
+        let lifecycle = lifecycleGeneration
+        let result = try requireSuccessfulActionResponse(await sendActionWithSignatureRetry(.make(action: name, payload: payload)))
+        guard lifecycle == lifecycleGeneration else { throw CancellationError() }
+        guard let raw = result["helper"] else { throw SyncError.persistence("The Mac did not return the saved helper.") }
+        let helper = try JSONDecoder().decode(MobileHelperEdit.self, from: Data(raw.utf8))
+        guard let rawRow = result["helper_row"] else { throw SyncError.persistence("The Mac did not return the helper status.") }
+        var row = try JSONDecoder().decode(MobileHelperRow.self, from: Data(rawRow.utf8))
+        if result["run_id"] != nil { row.status = "Run queued." }
+        if var snapshot = helpersSnapshot {
+            if let index = snapshot.helpers.firstIndex(where: { $0.id == row.id }) { snapshot.helpers[index] = row }
+            else { snapshot.helpers.append(row) }
+            helpersSnapshot = snapshot
+        }
+        return (helper, result)
+    }
+
+    func agentThreadAction(id: String, text: String? = nil, sessionID: String? = nil) async throws -> MobileAgentThread {
+        let lifecycle = lifecycleGeneration
+        var payload = ["id": id]
+        if let text {
+            guard let session = ChatStore.cleanSessionID(sessionID) else {
+                throw SyncError.persistence("Open a chat before sending to an agent.")
+            }
+            payload["text"] = text; payload["session_id"] = session
+        }
+        let result = try requireSuccessfulActionResponse(await sendActionWithSignatureRetry(
+            .make(action: text == nil ? "get_agent_thread" : "send_agent_message", payload: payload), pollTimeoutSeconds: text == nil ? 30 : 120))
+        guard lifecycle == lifecycleGeneration else { throw CancellationError() }
+        guard let raw = result["thread"] else { throw SyncError.persistence("The Mac did not return the agent thread.") }
+        return try JSONDecoder().decode(MobileAgentThread.self, from: Data(raw.utf8))
+    }
+
+    @discardableResult
+    func changeSchedulerJob(action: String, payload: [String: String]) async throws -> MobileSchedulerJob {
+        let lifecycle = lifecycleGeneration
+        let result = try requireSuccessfulActionResponse(await sendActionWithSignatureRetry(
+            InboxAction.make(action: action, payload: payload)
+        ))
+        guard lifecycle == lifecycleGeneration,
+              let data = result["scheduler_job"]?.data(using: .utf8),
+              let snapshot = try? JSONDecoder().decode(MobileSchedulerSnapshot.self, from: data),
+              snapshot.jobs.count == 1,
+              let id = result["id"],
+              payload["id"] == nil || payload["id"] == id,
+              let job = snapshot.jobs.first(where: { $0.id == id }) else {
+            throw SyncError.persistence("The Mac did not return the saved scheduler job. Refresh before trying again.")
+        }
+        // This receipt proves one job, not a successful full-list refresh.
+        var merged = schedulerSnapshot ?? MobileSchedulerSnapshot(capturedAt: 0, jobs: [])
+        if snapshot.capturedAt >= max(merged.capturedAt, schedulerJobReceiptTimes[id] ?? 0) {
+            if let index = merged.jobs.firstIndex(where: { $0.id == id }) {
+                merged.jobs[index] = job
+            } else {
+                merged.jobs.append(job)
+            }
+            schedulerJobReceiptTimes[id] = snapshot.capturedAt
+            schedulerSnapshot = merged
+        }
+        return job
     }
 
     @discardableResult

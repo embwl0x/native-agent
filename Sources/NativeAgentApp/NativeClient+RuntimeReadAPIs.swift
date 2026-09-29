@@ -62,49 +62,10 @@ enum NativeClientRuntimeReadError: LocalizedError, Equatable {
 }
 
 extension NativeClient {
-    /// When THIS runtime started. `ProcessInfo.systemUptime` measures the
-    /// machine, which made Status report days of "uptime" for an app launched
-    /// a minute ago.
-    static let processStartedAt = Date()
-
-    func getHealth() async throws -> RuntimeHealth {
-        // DAEMON-KILL P1: Mac process IS the runtime. Return a synthetic
-        // health snapshot reflecting the in-process state.
-        let root = dataRootOverride ?? PersistenceCore.defaultDataRoot()
-        let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev"
-        let payload: [String: Any] = [
-            "ok": true,
-            "app": "NativeAgent",
-            "version": version,
-            "dataDir": root.path,
-            // `systemUptime` is the MACHINE's uptime, not this process's — so
-            // Status reported ~36h on an app that had been running for one
-            // minute, and relaunching never reset it. The honest number is how
-            // long THIS runtime has been up (2026-08-02).
-            "uptimeSeconds": Date().timeIntervalSince(Self.processStartedAt),
-        ]
-        let data = try JSONSerialization.data(withJSONObject: payload)
-        return try JSONDecoder.nativeAgent.decode(RuntimeHealth.self, from: data)
-    }
-
-    func searchCommandPalette(query: String, limit: Int = 25) async throws -> [CoordinationCommandEntry] {
+    func searchCommandPalette(query: String, limit: Int = 25) async throws -> [CommandPaletteEntry] {
         // WAVE 15 (2026-06-01): Swift-only — daemon route retired.
         let context = await makeCommandPaletteContext()
-        let entries = CommandPalette.searchCommandPalette(query, limit: limit, context: context)
-        return entries.map { e in
-            CoordinationCommandEntry(
-                id: e.id,
-                title: e.title,
-                subtitle: e.subtitle,
-                category: e.category,
-                systemImage: e.systemImage,
-                route: e.route,
-                endpoint: e.endpoint,
-                keywords: e.keywords,
-                status: e.status,
-                count: e.count
-            )
-        }
+        return CommandPalette.searchCommandPalette(query, limit: limit, context: context)
     }
 
     /// Subsystem #17 cluster C4 / WAVE 5 (2026-05-31): builds the
@@ -142,80 +103,7 @@ extension NativeClient {
     func makeCommandPaletteContext(
         macAssistantStatusClient: (any MacAssistantStatusClient)? = nil
     ) async -> CommandPaletteContext {
-        // Persona name: read profile.json directly via the non-isolated static
-        // so we don't need to spin up a PersonaCompiler actor + cross the
-        // boundary just to grab one string.
-        let personaName = PersonaCompiler.agentDisplayName()
-
-        // Pending-approval count via SwiftNativeApprovalInbox. Keep this call
-        // best-effort: a failure here just means the count badge defaults to 0.
-        var approvalsCount = 0
-        let inbox = makeApprovalInbox()
-        do {
-            let pending = try await inbox.list(filter: .pending)
-            approvalsCount = pending.count
-        } catch {
-            NSLog("[CommandPalette] approval inbox count failed: \(error.localizedDescription) — defaulting to 0")
-        }
-
-        // enableAutonomy from SwiftNativeTrustCenter. Missing/corrupt authority
-        // stays false so a status projection never depicts autonomy as ready
-        // while the canonical policy is unavailable.
-        var enableAutonomy = false
-        // loadTrustPolicy is on the SwiftNative actor — instantiate directly
-        // (its init uses PersistenceCore.defaultDataRoot()). We always want the
-        // Swift loader here.
-        let trust = SwiftNativeTrustCenter()
-        let policy = await trust.loadTrustPolicy()
-        if case .bool(let b) = policy["enableAutonomy"] {
-            enableAutonomy = b
-        }
-
-        // improvementFailedCount via SwiftNativeSelfImprovement. The local
-        // summary reads runs.json directly via PersistenceCore, so the
-        // Best-effort: any failure leaves the count at 0 (the
-        // self-improvement-scoreboard entry stays "ready").
-        var improvementFailedCount = 0
-        let selfImprov = SwiftNativeSelfImprovement()
-        do {
-            let summary = try await selfImprov.improvementSummaryLocal()
-            improvementFailedCount = summary.failedCount ?? 0
-        } catch {
-            NSLog("[CommandPalette] self-improvement summary failed: \(error.localizedDescription) — defaulting to 0")
-        }
-
-        let macAssistant = macAssistantStatusClient ?? makeAppMacAssistantStatusClient()
-        let macAssistantProjection: (status: String, templateAttentionCount: Int)
-        do {
-            let result = try await macAssistant.macAssistantStatus(lightweight: true)
-            let status = result.status.trimmingCharacters(in: .whitespacesAndNewlines)
-            if status.isEmpty || result.templateAttentionCount < 0 {
-                NSLog("[CommandPalette] mac assistant status was invalid — presenting unavailable")
-                macAssistantProjection = ("unavailable", 0)
-            } else {
-                macAssistantProjection = (status, result.templateAttentionCount)
-            }
-        } catch {
-            NSLog("[CommandPalette] mac assistant status failed: \(error.localizedDescription) — presenting unavailable")
-            macAssistantProjection = ("unavailable", 0)
-        }
-
-        return CommandPaletteContext(
-            personaName: personaName,
-            telegramHealthStatus: "optional",
-            connectorNeedsProof: false,
-            macAssistantStatus: macAssistantProjection.status,
-            macAssistantTemplateAttentionCount: macAssistantProjection.templateAttentionCount,
-            foundryReviewCount: 0,
-            // Mirror approvalsCount into the Python autonomy.counts.pendingApprovals
-            // slot so the `approvals` entry's badge stays correct even without
-            // an autonomy_command_center_summary port.
-            pendingApprovalsCount: approvalsCount,
-            skillDraftCount: 0,
-            multimodalStatus: "ready",
-            enableAutonomy: enableAutonomy,
-            improvementFailedCount: improvementFailedCount
-        )
+        await RuntimeReadProjection.makeCommandPaletteContext(macAssistantStatusClient: macAssistantStatusClient ?? makeAppMacAssistantStatusClient())
     }
 
     /// Both the panel and palette must observe the same native status owner
@@ -236,50 +124,10 @@ extension NativeClient {
         )
     }
 
-    func getMacAssistantStatus() async throws -> MacAssistantStatusResponse {
+    func getMacAssistantStatus() async throws -> MacAssistantStatusResult {
         let impl = makeAppMacAssistantStatusClient()
         // UI consumes the full access/template lists — request non-lightweight.
-        let swiftResult = try await impl.macAssistantStatus(lightweight: false)
-        let data = try swiftResult.toJSON().serializedData(pretty: false)
-        return try JSONDecoder().decode(MacAssistantStatusResponse.self, from: data)
-    }
-
-    func getCapabilities() async throws -> CapabilitySummaryResponse {
-        // DAEMON-DEAD PORT (2026-06-03): TrustCenter now owns the full
-        // capability_records() aggregator in Swift. Project the same records
-        // into the Mac app's summary model instead of leaving the panel
-        // fail-closed.
-        let nowISO = SwiftNativeManifestSigner.isoTimestamp(Date())
-        let rawRecords = await capabilityRecordsFull(
-            dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot(),
-            nowISO: nowISO
-        )
-        let data = try JSONValue.array(rawRecords.map { .object($0) }).serializedData(pretty: false)
-        let records: [CapabilityRecord] = try Self.decodeLossyArray(data, context: "getCapabilities(swiftNative)")
-        var byKind: [String: Int] = [:]
-        var active = 0
-        var review = 0
-        var autoloaded = 0
-        let activeStatuses: Set<String> = ["active", "installed", "ready", "configured"]
-        let reviewStatuses: Set<String> = ["review", "proposal", "draft", "drafted", "needs_setup"]
-        for record in records {
-            byKind[record.kind, default: 0] += 1
-            let status = (record.status ?? "").lowercased()
-            if activeStatuses.contains(status) { active += 1 }
-            if reviewStatuses.contains(status) { review += 1 }
-            if record.autoload == true { autoloaded += 1 }
-        }
-        return CapabilitySummaryResponse(
-            records: records,
-            summary: CapabilityCounts(
-                total: records.count,
-                active: active,
-                review: review,
-                autoloaded: autoloaded,
-                byKind: byKind
-            ),
-            createdAt: nowISO
-        )
+        return try await impl.macAssistantStatus(lightweight: false)
     }
 
     func getWorkflows() async throws -> [WorkflowRecord] {
@@ -308,19 +156,8 @@ extension NativeClient {
         return try JSONDecoder().decode(WorkflowRecord.self, from: data)
     }
 
-    func getApprovals() async throws -> [ApprovalRequest] {
-        return try await swiftListApprovals()
-    }
-
     func getMCPServers() async throws -> [MCPServerRecord] {
         return try await swiftListMCPServers()
-    }
-
-    // Live MCP subprocess lifecycle (warm/restart/session table) is now
-    // routed through SwiftNativeMCPDispatcher when .mcpDispatcher is on —
-    // see MCPSubprocessClient.swift for the actor pool + 60s cache.
-    func getMCPSessions() async throws -> [MCPSessionStatus] {
-        return try await swiftListMCPSessions()
     }
 
     func getMCPConsent() async throws -> [MCPConsentRecord] {
@@ -339,27 +176,12 @@ extension NativeClient {
         return try await swiftListMCPResourcesLive(serverId: serverId)
     }
 
-    func getResearchLabRuns() async throws -> [ResearchLabRun] {
-        // Subsystem #17 wave 30 (W17): when .research is on, read the lab runs
-        // in-process from data/research/lab/runs.json (sorted newest-first),
-        // matching the daemon's research_lab_runs().
-        return try await swiftResearchLabRuns()
-    }
-
     func getTraces() async throws -> [RuntimeTrace] {
-        switch getCapabilityTraceTimeline() {
-        case .current(let traces):
-            return traces
-        case .sourceAbsent, .empty:
-            // No trace source and a successfully read empty ledger are both
-            // legitimate empty histories. They remain distinct to consumers
-            // that request the stateful feed above.
-            return []
-        case .partial(_, let rejectedRows):
-            throw NativeClientRuntimeReadError.traceEvidencePartial(rejectedRows: rejectedRows)
-        case .unavailable(let detail):
-            throw NativeClientRuntimeReadError.traceEvidenceUnavailable(detail)
-        }
+        try await RuntimeReadProjection.getTraces(
+            dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot(),
+            partial: NativeClientRuntimeReadError.traceEvidencePartial,
+            unavailable: NativeClientRuntimeReadError.traceEvidenceUnavailable
+        )
     }
 
     /// The Capabilities timeline is backed by the shared durable ledger used
@@ -375,7 +197,7 @@ extension NativeClient {
         let projection = try await Self.canonicalAgentGraphProjection(
             graphPath: knowledgeGraphPath
         )
-        let executionCount = try? await getWorkshopExecutions().count
+        let executionCount = try? await DeskFacade(dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()).taskRows().count
         return Self.agentGraph(from: projection, executionCount: executionCount)
     }
 
@@ -391,185 +213,15 @@ extension NativeClient {
     }
 
     func searchGraph(query: String) async throws -> GraphSearchResponse {
-        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else {
-            return GraphSearchResponse(
-                query: query,
-                results: [],
-                summary: GraphSearchCounts(resultCount: 0, nodeCount: 0, edgeCount: 0),
-                createdAt: ISO8601DateFormatter().string(from: Date())
-            )
-        }
-        let envelope = try await makeKnowledgeGraphReader(graphPath: knowledgeGraphPath)
-            .searchChecked(q: trimmed)
-        guard case .object(let object) = envelope,
-              case .array(let rawResults)? = object["results"] else {
-            throw KnowledgeGraphReadError.malformedEnvelope(
-                "search projection did not contain a results array"
-            )
-        }
-        let results: [GraphSearchResult] = rawResults.prefix(50).compactMap { value in
-            guard case .object(let raw) = value,
-                  let id = Self.graphString(raw["id"]),
-                  !id.isEmpty else { return nil }
-            let entity = Self.graphEntity(id: id, object: raw)
-            return GraphSearchResult(
-                id: entity.id,
-                node: AgentGraphNode(
-                    id: entity.id,
-                    label: entity.name,
-                    kind: entity.kind,
-                    status: nil
-                ),
-                score: Self.graphDouble(raw["score"]) ?? 0,
-                matchedTerms: [trimmed],
-                matchedEntities: [entity.name],
-                relatedEdges: nil,
-                explanation: nil
-            )
-        }
-        return GraphSearchResponse(
-            query: query,
-            results: results,
-            summary: GraphSearchCounts(resultCount: results.count, nodeCount: results.count, edgeCount: 0),
-            createdAt: ISO8601DateFormatter().string(from: Date())
-        )
+        try await KnowledgeGraphReadProjection.searchGraph(query: query, graphPath: knowledgeGraphPath)
     }
 
     func getAutonomyKernel() async throws -> AutonomyKernelSummary {
-        // DAEMON-DEAD PORT (2026-06-03): summarize the Swift-owned autonomy
-        // gates from Trust policy plus local improvement run state. This is a
-        // status surface only; action execution remains guarded by its own
-        // native engines.
-        let policy = try await getTrustPolicy()
-        // U5 W-A item 1 (:5156): propagate — a failed improvements read
-        // previously rendered as "0 running improvements" (healthy-empty).
-        let improvements = try await getImprovements()
-        let runningImprovements = improvements.filter {
-            ["running", "queued", "planning", "executing"].contains($0.status.lowercased())
-        }.count
-        let processEnabled = true
-        let trustEnabled = policy.enableAutonomy
-        let enabled = processEnabled && trustEnabled
-        let mode = policy.autonomyDefault ?? "supervised"
-        let disabledReason: String? = {
-            if !processEnabled { return "App autonomy process gate is disabled" }
-            if !trustEnabled { return "Trust Center autonomy is disabled" }
-            return nil
-        }()
-
-        let outside = policy.filePolicy?.outsideWorkspaceDefault ?? "deny"
-        let backupRequired = policy.filePolicy?.requireBackupBeforeWrite ?? true
-        let trainingEnabled = policy.trainingPolicy?.autonomous_training ?? false
-        let promotionEnabled = policy.promotionPolicy?.enabled ?? false
-        let memoryHygiene = policy.memoryPolicy?.hygiene_enabled ?? true
-
-        return AutonomyKernelSummary(
-            status: enabled ? "ok" : "off",
-            mode: mode,
-            enabled: enabled,
-            processEnabled: processEnabled,
-            trustEnabled: trustEnabled,
-            disabledReason: disabledReason,
-            guardrails: [
-                KernelGuardrail(
-                    id: "trust.enableAutonomy",
-                    title: "Trust autonomy switch",
-                    status: trustEnabled ? "ok" : "off"
-                ),
-                KernelGuardrail(
-                    id: "file.outsideWorkspaceDefault",
-                    title: "Outside-workspace file policy",
-                    status: outside == "allow" ? "wide" : "guarded"
-                ),
-                KernelGuardrail(
-                    id: "file.requireBackupBeforeWrite",
-                    title: "Write backup requirement",
-                    status: backupRequired ? "ok" : "warn"
-                ),
-                KernelGuardrail(
-                    id: "training.autonomous_training",
-                    title: "Autonomous training",
-                    status: trainingEnabled ? "ok" : "off"
-                ),
-                KernelGuardrail(
-                    id: "promotion.enabled",
-                    title: "Promotion engine",
-                    status: promotionEnabled ? "ok" : "off"
-                ),
-                KernelGuardrail(
-                    id: "memory.hygiene_enabled",
-                    title: "Memory hygiene",
-                    status: memoryHygiene ? "ok" : "off"
-                ),
-            ],
-            approvalClasses: [
-                ApprovalClass(id: "external_send", title: "External sends", requiresApproval: true),
-                ApprovalClass(id: "filesystem_write", title: "Filesystem writes", requiresApproval: true),
-                ApprovalClass(id: "system_change", title: "System changes", requiresApproval: true),
-                ApprovalClass(id: "safe_read", title: "Safe reads", requiresApproval: false),
-            ],
-            runningImprovements: runningImprovements,
-            createdAt: SwiftNativeManifestSigner.isoTimestamp(Date())
-        )
+        try await RuntimeReadProjection.getAutonomyKernel(dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot(), improvements: { try await getImprovements() })
     }
 
     func getPersonalOS() async throws -> PersonalOSSummary {
-        /// HONEST MINIMAL: NativeAgent ships a single active persona today
-        /// (persona/profile.json), so the PersonalOS summary surfaces exactly
-        /// one space derived from that file's `name`/`active` key. The daemon
-        /// never aggregated additional spaces — there is no fan-out to port —
-        /// so this is the real shape, not a stub. If/when multi-persona
-        /// support lands, this aggregator is the seam to extend.
-        let path = (dataRootOverride ?? PersistenceCore.defaultDataRoot())
-            .appendingPathComponent("persona", isDirectory: true)
-            .appendingPathComponent("profile.json")
-        let primaryName: String?
-        if FileManager.default.fileExists(atPath: path.path) {
-            do {
-                let data = try Data(contentsOf: path)
-                guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                    throw NativeClientRuntimeReadError.unreadableFeed(
-                        "Persona profile is not a JSON object"
-                    )
-                }
-                if let name = object["name"] {
-                    guard let string = name as? String else {
-                        throw NativeClientRuntimeReadError.unreadableFeed(
-                            "Persona profile name is not text"
-                        )
-                    }
-                    primaryName = string
-                } else if let active = object["active"] {
-                    guard let string = active as? String else {
-                        throw NativeClientRuntimeReadError.unreadableFeed(
-                            "Persona profile active name is not text"
-                        )
-                    }
-                    primaryName = string
-                } else {
-                    primaryName = nil
-                }
-            } catch let error as NativeClientRuntimeReadError {
-                throw error
-            } catch {
-                throw NativeClientRuntimeReadError.unreadableFeed(
-                    "Persona profile is unreadable: \(error.localizedDescription)"
-                )
-            }
-        } else {
-            primaryName = nil
-        }
-        let spaces: [PersonalOSSpace]
-        if let name = primaryName {
-            spaces = [PersonalOSSpace(id: "persona", name: name, count: 1, kind: "persona")]
-        } else {
-            spaces = []
-        }
-        return PersonalOSSummary(
-            spaces: spaces,
-            createdAt: ISO8601DateFormatter().string(from: Date())
-        )
+        try await RuntimeReadProjection.getPersonalOS(dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot(), unreadableFeed: NativeClientRuntimeReadError.unreadableFeed)
     }
 
     // PORTED wave 30 W07 (2026-06-01): `.capabilityTrust` snapshot routes
@@ -588,7 +240,7 @@ extension NativeClient {
     // semantics are byte-identical to Python.
     func getCapabilityCatalog() async throws -> [CapabilityCatalogItem] {
         let nowISO = SwiftNativeManifestSigner.isoTimestamp(Date())
-        let merged = await listCapabilityCatalog(
+        let merged = try await listCapabilityCatalog(
             dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot(),
             nowISO: nowISO
         )
@@ -632,19 +284,4 @@ extension NativeClient {
             .serializedData(pretty: false)
         return try JSONDecoder().decode([CapabilityPackInstall].self, from: data)
     }
-
-    // SwiftNativeCapabilityTrust now serves the trust network in-process from
-    // native capability records, catalog sources, and trust roots.
-    func getCapabilityTrust() async throws -> CapabilityTrustNetwork {
-        let impl = makeCapabilityTrust()
-        let swiftResult = try await impl.network()
-        // Bridge TrustCenter.CapabilityTrustNetwork → NativeAgentApp.CapabilityTrustNetwork.
-        // Both are Codable with byte-identical shapes (verified 2026-05-31 against
-        // CapabilityTrust.swift wire types vs Models.swift L1620). JSON round-trip
-        // is the canonical seam — when the eventual full aggregator port lands,
-        // this stays one line.
-        let data = try JSONEncoder().encode(swiftResult)
-        return try JSONDecoder().decode(CapabilityTrustNetwork.self, from: data)
-    }
-
 }

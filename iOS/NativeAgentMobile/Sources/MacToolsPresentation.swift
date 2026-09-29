@@ -167,7 +167,7 @@ enum MacToolsPrivilegePresentation {
 /// target and its post-action wording separate from an observed Mac state.
 enum MacVolumeControlPresentation {
     static let defaultTargetFraction = 0.5
-    static let currentVolumeDisclosure = "The Mac does not publish its current output volume to iPhone. This is a target to send, not a readback."
+    static let currentVolumeDisclosure = "Your Mac doesn\u{2019}t share its current volume with this iPhone, so none shows here. Pick a level to send; it\u{2019}s a target, not a readback."
 
     static func targetPercent(for fraction: Double) -> Int {
         guard fraction.isFinite else { return 50 }

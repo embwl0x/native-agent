@@ -2,6 +2,7 @@ import ApprovalInbox
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import Procedures
 
 // MARK: - Procedural skill proposals: the landing strip
 //
@@ -26,7 +27,6 @@ public enum ProceduralSkillProposalError: String, Error, Sendable, Equatable {
     case emptyDraftBody = "empty_draft_body"
     case bodyFailsHygiene = "body_fails_hygiene"
     case approvalNotApproved = "approval_not_approved"
-    case approvalNotLocal = "approval_not_local"
     case approvalPayloadMismatch = "approval_payload_mismatch"
     case unsafeSkillName = "unsafe_skill_name"
     case tooFewDistinctActions = "too_few_distinct_actions"
@@ -81,13 +81,15 @@ public enum ProceduralSkillProposal {
             "reason": .string(
                 "This exact sequence ran \(procedure.occurrenceCount) times across "
                 + "\(procedure.distinctDayCount) days, verified successful every time. "
-                + "Approve to save the draft below as a skill body — she will find it "
+                + "Approve to save the draft below as a skill body — I'll find it "
                 + "through recall when a conversation enters its territory. It grants no "
                 + "permission, activates nothing, and runs nothing on its own. "
                 + "Deny and nothing is written."
             ),
-            "remoteResolvable": .bool(false),
-            "localOnly": .bool(true),
+            // Owner review: answerable from the paired phone (the inbox's
+            // `ownerReviewActions`, User 2026-09-25).
+            "remoteResolvable": .bool(true),
+            "localOnly": .bool(false),
             // Her words, verbatim, and only her words (7beadffd).
             "payloadPreview": .string(body),
             "payload": binding(procedure: procedure, body: body),
@@ -173,9 +175,6 @@ public enum ProceduralSkillProposal {
         }
         guard decision == ApprovalDecision.approved.rawValue else {
             return .declined(skillName: skillName)
-        }
-        guard record.localOnly, !record.remoteResolvable else {
-            throw ProceduralSkillProposalError.approvalNotLocal
         }
         // The card's own preview is the contract. If the stored preview and
         // the stored body ever disagree, the owner approved something other

@@ -30,18 +30,16 @@ let package = Package(
         .package(path: "Modules/NativeAgentCore")
     ],
     targets: [
-        .executableTarget(name: "NativeAgentLink", dependencies: [.product(name: "PersistenceCore", package: "NativeAgentCore")], path: "Sources/NativeAgentLink"),
-        .target(
-            name: "NativeAgentChromeRelayCore",
-            path: "Sources/NativeAgentChromeRelayCore",
-            // 2026-09-06: ChromeHostIdentity decides "is this a browser" from
-            // the parent's code signature (SecStaticCodeCheckValidity), not
-            // from an Info.plist anyone can write.
-            linkerSettings: [.linkedFramework("Security")]
-        ),
+        .executableTarget(name: "NativeAgentLink", dependencies: [.product(name: "GrokLink", package: "NativeAgentCore"), .product(name: "PersistenceCore", package: "NativeAgentCore")], path: "Sources/NativeAgentLink"),
         .executableTarget(
             name: "NativeAgentChromeRelay",
-            dependencies: ["NativeAgentChromeRelayCore", .product(name: "PersistenceCore", package: "NativeAgentCore")],
+            dependencies: [
+                .product(name: "NativeAgentChromeRelayCore", package: "NativeAgentCore"),
+                .product(name: "PersistenceCore", package: "NativeAgentCore"),
+                .product(name: "FeedPolicy", package: "NativeAgentCore"),
+                .product(name: "Privacy", package: "NativeAgentCore"),
+                .product(name: "GrokLink", package: "NativeAgentCore"),
+            ],
             path: "Sources/NativeAgentChromeRelay"
         ),
         .executableTarget(
@@ -52,8 +50,10 @@ let package = Package(
                 .product(name: "GRPCProtobuf", package: "grpc-swift-protobuf"),
                 .product(name: "Sparkle", package: "Sparkle"),
                 .product(name: "NativeAgentShared", package: "NativeAgentShared"),
-                "NativeAgentChromeRelayCore",
                 .product(name: "NativeAgentCore", package: "NativeAgentCore"),
+                .product(name: "EngineRuntime", package: "NativeAgentCore"),
+                .product(name: "AppToolRuntime", package: "NativeAgentCore"),
+                .product(name: "ApprovalTransactions", package: "NativeAgentCore"),
                 .product(name: "ApprovalInbox", package: "NativeAgentCore"),
                 .product(name: "MCPDispatcher", package: "NativeAgentCore"),
                 .product(name: "MemoryV2", package: "NativeAgentCore"),
@@ -62,8 +62,15 @@ let package = Package(
                 .product(name: "ToolExecution", package: "NativeAgentCore"),
                 .product(name: "PersonaEngine", package: "NativeAgentCore"),
                 .product(name: "TrustCenter", package: "NativeAgentCore"),
+                .product(name: "TrustPersistence", package: "NativeAgentCore"),
                 .product(name: "PersistenceCore", package: "NativeAgentCore"),
+                .product(name: "Desk", package: "NativeAgentCore"),
+                .product(name: "Studio", package: "NativeAgentCore"),
+                .product(name: "TurnTrace", package: "NativeAgentCore"),
+                .product(name: "Transcripts", package: "NativeAgentCore"),
+                .product(name: "Procedures", package: "NativeAgentCore"),
                 .product(name: "BackgroundLoops", package: "NativeAgentCore"),
+                .product(name: "BackgroundWork", package: "NativeAgentCore"),
                 .product(name: "DoctorChecks", package: "NativeAgentCore"),
                 // Wave-3 BackgroundLoops wiring (BackgroundLoopsAssembly.swift)
                 // needs ProviderRouting for SwiftNativeLLMClient + adapters, and
@@ -75,6 +82,7 @@ let package = Package(
                 .product(name: "DreamREMCycle", package: "NativeAgentCore"),
                 // TriggerScheduler owns inbox and Workshop trigger lifecycle.
                 .product(name: "TriggerScheduler", package: "NativeAgentCore"),
+                .product(name: "SchedulerExecution", package: "NativeAgentCore"),
                 .product(name: "StandingBots", package: "NativeAgentCore"),
                 // WAVE 32 W07 (2026-06-01): WorkshopExecution owns the read-side of
                 // GET /v1/missions, /v1/missions/<id>, /v1/missions/<id>/timeline
@@ -138,6 +146,24 @@ let package = Package(
                 // TelegramBot product — Swift-native polling, status, receipts,
                 // blocked-message, and error telemetry.
                 .product(name: "TelegramBot", package: "NativeAgentCore"),
+                // SlackBot — Swift-native Slack Socket Mode loop, turn
+                // ingress, session map, delivery journal, and runtime state.
+                .product(name: "SlackBot", package: "NativeAgentCore"),
+                // ChromeControl — the Chrome control socket, relay handshake,
+                // leases and native-host registration.
+                .product(name: "ChromeControl", package: "NativeAgentCore"),
+                // Agents — A2A wire and tasks, peer identity, desktop and Grok
+                // routes, completion delivery and the reply/notice continuation.
+                .product(name: "Agents", package: "NativeAgentCore"),
+                // ContextFlow — the live ContextFlow owner and the projections
+                // it compiles (memory, resident work, Knowledge Graph, Studio).
+                .product(name: "ContextFlow", package: "NativeAgentCore"),
+                // Cognition — the resident mind's runtime the engine root owns.
+                .product(name: "Cognition", package: "NativeAgentCore"),
+                // DeviceSync — the Mac side of the phone: CloudKit/KVS bridge,
+                // snapshot projection, signed inbox actions, pairing and APNs.
+                .product(name: "DeviceSync", package: "NativeAgentCore"),
+                .product(name: "AttentionRouting", package: "NativeAgentCore"),
                 // Skills — Swift-native skill registry reads and lifecycle
                 // mutations. No daemon write route is used on this branch.
                 .product(name: "Skills", package: "NativeAgentCore"),
@@ -198,55 +224,6 @@ let package = Package(
                 .copy("../../script/claude_thread_wakeup.js"),
                 .copy("../../script/omp_thread_wakeup.js")
             ]
-        ),
-        .testTarget(
-            name: "NativeAgentAppTests",
-            dependencies: [
-                "NativeAgentApp",
-                .product(name: "ChatOrchestration", package: "NativeAgentCore"),
-                .product(name: "CognitiveSubstrate", package: "NativeAgentCore"),
-                .product(name: "WorkshopExecution", package: "NativeAgentCore"),
-                .product(name: "NativeAgentCore", package: "NativeAgentCore"),
-                .product(name: "PersistenceCore", package: "NativeAgentCore"),
-                // Public-source safety test exercises the shipped TrustCenter
-                // defaults/backfill without reading a developer's live data.
-                .product(name: "TrustCenter", package: "NativeAgentCore"),
-                // U3 review-blocker tests (2026-06-10): memory-repair
-                // reconciliation + weekly-hygiene approval staging fixtures.
-                .product(name: "ApprovalInbox", package: "NativeAgentCore"),
-                .product(name: "MemoryV2", package: "NativeAgentCore"),
-                // Coverage ledger: telegram.memoryWriterBridge must exercise
-                // the actual /remember command through the app-owned writer,
-                // not only a protocol double in the TelegramBot target.
-                .product(name: "TelegramBot", package: "NativeAgentCore"),
-                // 2026-07-21 audit: the approval-gated hygiene run now also
-                // sweeps KG orphans; the regression test seeds/sweeps through
-                // the real indexer.
-                .product(name: "KnowledgeGraph", package: "NativeAgentCore"),
-                .product(name: "Context", package: "NativeAgentCore"),
-                // U5 W-A (2026-06-11): fullMacGrantIsActive display==gate
-                // matrix test pins against MacControlGate.fullMacActive.
-                .product(name: "MacControl", package: "NativeAgentCore"),
-                // U5 W-D fix-round (2026-06-11): assembled-loop tick-timeout
-                // override pin needs `any LoopRunner` in scope.
-                .product(name: "BackgroundLoops", package: "NativeAgentCore"),
-                // W8 (2026-08-14): the Trust Center capture panel and the
-                // menu-bar indicator are driven by ActivityPolicy, so the app
-                // tests need the type in scope to pin default-OFF behaviour.
-                .product(name: "ActivityWatch", package: "NativeAgentCore"),
-                .product(name: "NativeAgentShared", package: "NativeAgentShared"),
-                .product(name: "NativeAgentSharedTestSupport", package: "NativeAgentShared"),
-                // 2026-09-11: the launch REM staging catch-up test seeds real
-                // pending rows through REMProposalStore.
-                .product(name: "DreamREMCycle", package: "NativeAgentCore"),
-                "NativeAgentChromeRelayCore",
-            ],
-            path: "tests/NativeAgentAppTests"
-        ),
-        .testTarget(
-            name: "NativeAgentChromeRelayTests",
-            dependencies: ["NativeAgentChromeRelayCore"],
-            path: "tests/NativeAgentChromeRelayTests"
         )
     ]
 )

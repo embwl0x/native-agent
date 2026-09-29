@@ -21,13 +21,26 @@ This replacement adds no always-on names or background reads.
 The current count includes `agent_contacts` and `agent_message` from the
 previous natural agent-conversation work.
 
-1. **Always on (22 names).** `SwiftToolDispatcher.alwaysOnCoreNames`. These are
-   the only tools in every request. Agent's working-set ruling of 2026-09-11.
+1. **Always on (33 names).** `SwiftToolDispatcher.alwaysOnCoreNames`. These are
+   the only native tools in every request. The fixed floor is emitted in
+   alphabetical order, independent of tool use, session load order and set
+   iteration order. The names are `act`, `agent_connect`, `agent_contacts`,
+   `agent_introspect`, `agent_message`, `agent_read`, `codex_message`,
+   `commit_memory`, `context_expand`, `claude_message`, `delegation_status`,
+   `desk_read`, `go`, `inner_state`, `list_dir`, `list_skills`,
+   `mac_calendar_list_upcoming`, `mail_list_recent`, `read_file`, `read_skill`,
+   `recall_memory`, `recent_trace_summary`, `screen`, `search_chat_history`,
+   `shelf_entry`, `time_now`, `tool_catalog`, `tool_load`, `tool_result_page`,
+   `tool_unload`, `wait`, `workspace`, `write_file`.
+   User 2026-09-29: widened to them measured working set so the tool array stays byte-stable and prompt caching holds on every provider.
    Four are the Mac verbs (`screen`, `act`, `go`, `wait`), whose
    schemas are emitted only while Full Mac accessibility is active
    (`BuiltInToolSchemaFactory+MacSchemas.swift`, `SwiftToolDispatcher+Sandbox.swift`),
-   so an install without it rides eighteen.
-   The one addition: while an MCP server is mounted, its tool schemas ride the
+   so an install without it rides twenty-nine.
+   The six requested `browser.chrome_*` schemas remain lazy: the app-owned
+   catalog currently admits contributed schemas by session-active names, not
+   by the core always-on set.
+   MCP exception: while an MCP server is mounted, its tool schemas ride the
    session contract automatically, without a `tool_load` or a preload
    (`ChatSessionActiveTools.swift`,
    `ChatOrchestrationClient+StructuredChat.swift`).
@@ -38,14 +51,14 @@ previous natural agent-conversation work.
    **keeps its offered slot across idle turns**. Turn-only predictions also
    enter persisted load order. Usage still comes from real dispatch; a
    prediction never counts as a call.
-   App-owned tools are lazy like every other name, and the app shim runs the
-   same gate over its own set before delegating
-   (`AppChatToolDispatcher.appOwnedLazyLoadingRefusal`). Its set is the notify
-   pair, the browser/Chrome group, `doctor_status` / `telegram_status`,
-   `reflex_review`, and — since 0.4.14 — the five quiet self-administration
-   tools: `app_page_read`, `app_page_screenshot`, `app_settings_list`,
-   `app_setting_set`, `interaction_act` (category `app`). None
-   of them is always-on.
+   App-owned tools are lazy like every other name: their descriptors reach
+   Core's one catalog through the engine's port (`AppToolExecutor`), and Core's
+   own gate covers them before their executor runs. The set is the notify pair
+   (Core's schemas, run by the app), the browser/Chrome group, `doctor_status` /
+   `telegram_status`, `reflex_review`, and — since 0.4.14 — the quiet
+   self-administration tools: `app_page_read`, `app_page_screenshot`,
+   `app_settings_list`, `app_setting_set`, `interaction_act`, `chat_reply`
+   (category `app`). None of them is always-on.
    `app_page_screenshot` renders offscreen, where a material has no backdrop to
    sample, so the composer shell and card surfaces substitute a solid slate fill
    for their live glass — a capture reads like the settled window, not through it.

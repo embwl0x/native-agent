@@ -134,7 +134,6 @@ extension SwiftNativeTrustCenter {
             ["securityPolicy"],
             ["providerPolicy"],
             ["providerPolicy", "active_per_surface"],
-            ["providerPolicy", "fallback_chain"],
         ]
 
         for path in objectPaths {
@@ -531,13 +530,8 @@ extension SwiftNativeTrustCenter {
     ///      - `developerMode` backfilled to false when absent or malformed;
     ///        an explicit operator-enabled true is preserved as the separate
     ///        destructive/system-level escalation.
-    ///   4. `providerPolicy`:
-    ///      - `active_per_surface` merged: default ∪ saved (saved wins).
-    ///      - `fallback_chain` merged per surface; for each of
-    ///        ("chat","ios","telegram") the chain is taken from saved-or-chat-
-    ///        default, then `anthropic_oauth_direct` is INSERTED at the
-    ///        canonical position if missing (after openai_oauth_direct if
-    ///        present, taking min with an existing anthropic index.
+    ///   4. `providerPolicy.active_per_surface` merged: default ∪ saved
+    ///      (saved wins).
     ///   5. `personalityPolicy.completion_guard_max_repairs`:
     ///      - bounded to [0,2] (out-of-range → clamp; non-int → 2)
     ///      - floored to 2 when `completion_guard_enabled` is truthy.
@@ -617,7 +611,7 @@ extension SwiftNativeTrustCenter {
             out["macControlPolicy"] = .object(macPolicy)
         }
 
-        // 4. providerPolicy active_per_surface + fallback_chain backfill.
+        // 4. providerPolicy active_per_surface merge.
         var providerPolicy: [String: JSONValue] = [:]
         if case .object(let pp)? = out["providerPolicy"] { providerPolicy = pp }
 
@@ -636,46 +630,7 @@ extension SwiftNativeTrustCenter {
         var mergedActive = defaultActive
         for (k, v) in savedActive { mergedActive[k] = v }
 
-        let defaultFallback: [String: JSONValue] = {
-            if case .object(let f)? = defaultProviderPolicy["fallback_chain"] {
-                return f
-            }
-            return [:]
-        }()
-        let savedFallback: [String: JSONValue] = {
-            if case .object(let f)? = providerPolicy["fallback_chain"] {
-                return f
-            }
-            return [:]
-        }()
-        var mergedFallback = defaultFallback
-        for (k, v) in savedFallback { mergedFallback[k] = v }
-
-        // anthropic_oauth_direct insertion per surface.
-        // Provider fallback insertion for surfaces that should include the
-        // Anthropic OAuth direct path next to the OpenAI OAuth direct path.
-        for surface in ["chat", "ios", "telegram"] {
-            var chain: [String] = []
-            let surfaceVal = mergedFallback[surface] ?? mergedFallback["chat"]
-            if case .array(let arr)? = surfaceVal {
-                for el in arr {
-                    if case .string(let s) = el { chain.append(s) }
-                }
-            }
-            if !chain.contains("anthropic_oauth_direct") {
-                var insertAt = chain.contains("openai_oauth_direct") ? 1 : 0
-                if let anthropicIdx = chain.firstIndex(of: "anthropic") {
-                    let alt = (insertAt != 0) ? insertAt : anthropicIdx
-                    insertAt = min(anthropicIdx, alt)
-                }
-                if insertAt > chain.count { insertAt = chain.count }
-                chain.insert("anthropic_oauth_direct", at: insertAt)
-                mergedFallback[surface] = .array(chain.map { .string($0) })
-            }
-        }
-
         providerPolicy["active_per_surface"] = .object(mergedActive)
-        providerPolicy["fallback_chain"] = .object(mergedFallback)
         out["providerPolicy"] = .object(providerPolicy)
 
         // 5. personalityPolicy.completion_guard_max_repairs floor.

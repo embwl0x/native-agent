@@ -1,4 +1,6 @@
+import ChatOrchestration
 import SwiftUI
+import ApprovalInbox
 import CoreGraphics
 import NativeAgentCore
 import NativeAgentShared
@@ -134,6 +136,7 @@ enum MacChatTurnCardProjection {
     static func isVisible(_ state: MacChatTurnLifecycleState?, sessionId: String) -> Bool {
         guard let state, !sessionId.isEmpty,
               state.identity.sessionId == sessionId else { return false }
+        if state.replyTextSettled { return false }
         switch state.presentation.phase {
         case .completed, .failed, .canceled:
             return false
@@ -152,7 +155,7 @@ enum MacChatTurnCardProjection {
     static func isVisible(
         _ state: MacChatTurnLifecycleState?,
         sessionId: String,
-        approvals: [ApprovalRequest]
+        approvals: [ApprovalRecord]
     ) -> Bool {
         if isVisible(state, sessionId: sessionId) { return true }
         guard let state, !sessionId.isEmpty,
@@ -162,7 +165,7 @@ enum MacChatTurnCardProjection {
 
     static func approval(
         for state: MacChatTurnLifecycleState,
-        approvals: [ApprovalRequest]
+        approvals: [ApprovalRecord]
     ) -> MacChatTurnCardApproval? {
         MacChatTurnApprovalProjection.approval(
             sessionId: state.identity.sessionId,
@@ -176,7 +179,7 @@ enum MacChatTurnCardProjection {
         sessionId: String,
         personaName: String,
         at instant: Date,
-        approvals: [ApprovalRequest] = [],
+        approvals: [ApprovalRecord] = [],
         stalledAfter: TimeInterval = TurnPresentationReducer.defaultStalledAfter
     ) -> MacChatTurnCardModel? {
         // Identity fence. A card belongs to exactly one session and one turn;
@@ -495,26 +498,10 @@ struct MacChatTurnCard: View {
     private static let thumbnailHeight: CGFloat = 28
     private static let thumbnailWidth: CGFloat = 44.8
 
-    #if DEBUG
-    /// Windowless evidence uses the existing material treatment; live glass
-    /// needs a compositor. Content, padding and controls remain identical.
-    var snapshotWithoutLiveGlass: Bool = false
-    #endif
-
     /// What the agent is looking at, while it is driving the Mac. `nil` for
     /// every turn that never touches the four verbs, and the card then renders
-    /// exactly as it always has. Declared last on purpose: the memberwise
-    /// initializer follows declaration order, and the DEBUG-only input above
-    /// must keep the position its existing callers pass it in.
+    /// exactly as it always has.
     var preview: MacChatScreenPreview? = nil
-
-    private var materialForSnapshot: Bool {
-        #if DEBUG
-        snapshotWithoutLiveGlass
-        #else
-        false
-        #endif
-    }
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
@@ -534,7 +521,7 @@ struct MacChatTurnCard: View {
     var body: some View {
         // lightweight: the card floats over the transcript in the main window;
         // clear glass keeps any text it momentarily overlaps legible.
-        GlassCard(tint: model.tone == .working ? nil : tint, scrollRow: materialForSnapshot, lightweight: true) {
+        GlassCard(tint: model.tone == .working ? nil : tint, lightweight: true) {
             HStack(alignment: .center, spacing: NativeAgentSpacing.md) {
             VStack(alignment: .leading, spacing: 3) {
                 HStack(alignment: .firstTextBaseline, spacing: NativeAgentSpacing.sm) {
@@ -868,7 +855,7 @@ struct MacChatTurnCardHost: View {
     static let phaseTick: TimeInterval = 5
 
     var body: some View {
-        let state = appModel.chatTurnLifecycle(for: sessionId)
+        let state = appModel.engine.turns.lifecycle(for: sessionId)
         Group {
             if let state, !state.presentation.isTerminal {
                 // The card itself is NOT on a one-second schedule any more —
@@ -894,7 +881,7 @@ struct MacChatTurnCardHost: View {
 
     @ViewBuilder
     private func card(state: MacChatTurnLifecycleState?, at instant: Date) -> some View {
-        // `appModel.approvals` IS the canonical inbox as this process last read
+        // `appModel.engine.approvals.records` IS the canonical inbox as this process last read
         // it — the same rows Activity → Approvals renders, refreshed by the
         // existing approvals file watch. The card opens no reader of its own.
         if let model = MacChatTurnCardProjection.card(
@@ -902,7 +889,7 @@ struct MacChatTurnCardHost: View {
             sessionId: sessionId,
             personaName: appModel.agentDisplayName,
             at: instant,
-            approvals: appModel.approvals
+            approvals: appModel.engine.approvals.records
         ) {
             MacChatTurnCard(
                 model: model,
@@ -916,7 +903,7 @@ struct MacChatTurnCardHost: View {
                 // Present only while this session's turn is actually driving the
                 // Mac; the app clears the slot when the turn opens and when its
                 // intake closes, so a settled card never carries a frame.
-                preview: appModel.macScreenPreview(for: sessionId)
+                preview: appModel.engine.turns.screenPreview(for: sessionId)
             )
         }
     }

@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import TurnTrace
 import BackgroundLoops
 import ProviderRouting
 

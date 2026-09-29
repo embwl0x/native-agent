@@ -1,3 +1,4 @@
+import AppToolRuntime
 // AlivePageKit.swift
 // "Alive glass", the pages — User approved the mockup 2026-09-23. The shared
 // pieces Today and Desk are built from in the Advanced shell. Content layer:
@@ -28,8 +29,7 @@ enum AlivePalette {
     static let rim = adaptive(dark: NSColor.white.withAlphaComponent(0.05),
                               light: NSColor.black.withAlphaComponent(0.06))
     /// Row dividers inside a group card.
-    static let divider = adaptive(dark: NSColor.white.withAlphaComponent(0.06),
-                                  light: NSColor.black.withAlphaComponent(0.07))
+    static let divider = Color(nsColor: .separatorColor)
 
     private static func adaptive(dark: NSColor, light: NSColor) -> Color {
         Color(nsColor: NSColor(name: nil) { appearance in

@@ -1,3 +1,5 @@
+import Cognition
+import TurnTrace
 import SwiftUI
 
 enum CognitionObservatoryPanelID: String, CaseIterable, Sendable {
@@ -69,7 +71,9 @@ enum CognitionSurfaceDispositionPresentation {
 import Observation
 import CognitiveSubstrate
 import Context
+import ContextFlow
 import PersistenceCore
+import Desk
 
 struct CognitionObservatoryView: View {
     struct Dependencies {
@@ -86,39 +90,81 @@ struct CognitionObservatoryView: View {
                 dataRoot: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot(),
                 agentDisplayName: appModel.agentDisplayName,
                 systemToasts: appModel.systemToasts,
-                contextFlowHealth: { await NativeContextFlowRuntime.shared.observatoryHealthState() },
-                contextFlowFallback: { await ContextFlowFallbackReader.load() },
+                contextFlowHealth: { await appModel.engine.contextFlow.observatoryHealthState() },
+                contextFlowFallback: { await ContextFlowFallbackReader.load(reader: TurnTraceRecentReader(dataRootOverride: appModel.engine.dataRoot)) },
                 organismToggleDidRender: { _ in }
             )
         }
     }
 
+    let cognition: CognitionViewFacade
     let runtime: NativeCognitionRuntime
     let dependencies: Dependencies
-    @State private var detail: CognitiveObservatoryDetail?
-    @State private var detailEvidenceStatus: CognitiveObservatoryDetailRead.EvidenceStatus?
-    @State private var contextFlowHealth: ContextFlowObservatoryHealthState = .unavailable
-    @State private var contextFlowFallback: ContextFlowFallbackState?
-    @State private var workshop: WorkshopObservatorySnapshot?
-    @State private var enabled = false
-    @State private var capsuleEnabled = false
-    @State private var backgroundEnabled = false
-    @State private var reflectionEnabled = false
-    @State private var organismEnabled = false
-    @State private var organismControlReadinessRevision: UInt64 = 0
-    @State private var reflectionBudget = 0
-    @State private var refreshCoordinator = CognitionObservatoryRefreshCoordinator()
+    private var detail: CognitiveObservatoryDetail? {
+        get { cognition.detail }
+        nonmutating set { cognition.detail = newValue }
+    }
+    private var detailEvidenceStatus: CognitiveObservatoryDetailRead.EvidenceStatus? {
+        get { cognition.detailEvidenceStatus }
+        nonmutating set { cognition.detailEvidenceStatus = newValue }
+    }
+    private var contextFlowHealth: ContextFlowObservatoryHealthState {
+        get { cognition.contextFlowHealth }
+        nonmutating set { cognition.contextFlowHealth = newValue }
+    }
+    private var contextFlowFallback: ContextFlowFallbackState? {
+        get { cognition.contextFlowFallback }
+        nonmutating set { cognition.contextFlowFallback = newValue }
+    }
+    private var workshop: WorkshopObservatorySnapshot? {
+        get { cognition.workshop }
+        nonmutating set { cognition.workshop = newValue }
+    }
+    private var enabled: Bool {
+        get { cognition.enabled }
+        nonmutating set { cognition.enabled = newValue }
+    }
+    private var capsuleEnabled: Bool {
+        get { cognition.capsuleEnabled }
+        nonmutating set { cognition.capsuleEnabled = newValue }
+    }
+    private var backgroundEnabled: Bool {
+        get { cognition.backgroundEnabled }
+        nonmutating set { cognition.backgroundEnabled = newValue }
+    }
+    private var reflectionEnabled: Bool {
+        get { cognition.reflectionEnabled }
+        nonmutating set { cognition.reflectionEnabled = newValue }
+    }
+    private var organismEnabled: Bool {
+        get { cognition.organismEnabled }
+        nonmutating set { cognition.organismEnabled = newValue }
+    }
+    private var organismControlReadinessRevision: UInt64 {
+        get { cognition.organismControlReadinessRevision }
+        nonmutating set { cognition.organismControlReadinessRevision = newValue }
+    }
+    private var reflectionBudget: Int {
+        get { cognition.reflectionBudget }
+        nonmutating set { cognition.reflectionBudget = newValue }
+    }
+    private var refreshCoordinator: CognitionObservatoryRefreshCoordinator { cognition.refreshCoordinator }
     @State private var isRunningReflection = false
     @State private var isRunningEvaluationSamplers = false
     @State private var evaluationSamplerOutcome: CognitiveEvaluationSamplerOutcome?
     @State var reflexReviewsInFlight: Set<String> = []
-    @State private var lastRefresh: Date?
+    private var lastRefresh: Date? {
+        get { cognition.lastRefresh }
+        nonmutating set { cognition.lastRefresh = newValue }
+    }
     @State private var pinNotice: String?
 
     init(
-        runtime: NativeCognitionRuntime = .shared,
+        cognition: CognitionViewFacade,
+        runtime: NativeCognitionRuntime,
         dependencies: Dependencies
     ) {
+        self.cognition = cognition
         self.runtime = runtime
         self.dependencies = dependencies
     }
@@ -199,7 +245,7 @@ struct CognitionObservatoryView: View {
                             .disabled(refreshCoordinator.isRefreshing)
                             Button("Think now", systemImage: "waveform.path.ecg") {
                                 Task {
-                                    await NativeCognitionRuntime.shared.runMicrocycle(reason: "observatory manual run")
+                                    await runtime.runMicrocycle(reason: "observatory manual run")
                                     await refresh()
                                 }
                             }
@@ -208,7 +254,7 @@ struct CognitionObservatoryView: View {
                                 Task {
                                     isRunningReflection = true
                                     let outcome = await CognitionObservatoryActions.reflectWithOutcome(
-                                        runtime: .shared
+                                        runtime: runtime
                                     )
                                     CognitionObservatoryControlFeedback.publish(outcome.status, to: dependencies.systemToasts)
                                     await refresh()
@@ -218,7 +264,7 @@ struct CognitionObservatoryView: View {
                             .disabled(!enabled || !reflectionEnabled || reflectionBudget <= 0 || isRunningReflection)
                             Button("Clear", systemImage: "trash") {
                                 Task {
-                                    let outcome = await NativeCognitionRuntime.shared.clearTransientState()
+                                    let outcome = await runtime.clearTransientState()
                                     switch outcome {
                                     case .cleared:
                                         dependencies.systemToasts.push(success: "Thinking and body state cleared.")
@@ -231,7 +277,7 @@ struct CognitionObservatoryView: View {
                             .disabled(!enabled)
                             Button("Settle body", systemImage: "leaf") {
                                 Task {
-                                    let result = await CognitionObservatoryActions.settleBodyChecked()
+                                    let result = await CognitionObservatoryActions.settleBodyChecked(runtime: runtime)
                                     CognitionObservatoryControlFeedback.publish(result.outcome, action: "settle", to: dependencies.systemToasts)
                                     await refresh()
                                 }
@@ -239,7 +285,7 @@ struct CognitionObservatoryView: View {
                             .disabled(!enabled || !organismEnabled)
                             Button("Reset body", systemImage: "waveform.path.ecg.rectangle") {
                                 Task {
-                                    let result = await CognitionObservatoryActions.resetBodyChecked()
+                                    let result = await CognitionObservatoryActions.resetBodyChecked(runtime: runtime)
                                     CognitionObservatoryControlFeedback.publish(result.outcome, action: "reset", to: dependencies.systemToasts)
                                     await refresh()
                                 }
@@ -264,28 +310,28 @@ struct CognitionObservatoryView: View {
                             .disabled(!enabled || isRunningEvaluationSamplers)
                             Button("Export", systemImage: "square.and.arrow.down") {
                                 Task {
-                                    _ = await NativeCognitionRuntime.shared.exportResearchTrace()
+                                    _ = await runtime.exportResearchTrace()
                                     await refresh()
                                 }
                             }
                             .disabled(!enabled)
                             Button("Leave workspace out", systemImage: "eye.slash") {
                                 Task {
-                                    await NativeCognitionRuntime.shared.setAblation("workspace", enabled: false)
+                                    await runtime.setAblation("workspace", enabled: false)
                                     await refresh()
                                 }
                             }
                             .disabled(!enabled || workspaceAblated)
                             Button("Include workspace", systemImage: "eye") {
                                 Task {
-                                    await NativeCognitionRuntime.shared.setAblation("workspace", enabled: true)
+                                    await runtime.setAblation("workspace", enabled: true)
                                     await refresh()
                                 }
                             }
                             .disabled(!enabled || !workspaceAblated)
                             Button("Pin a concern", systemImage: "pin") {
                                 Task {
-                                    pinNotice = await NativeCognitionRuntime.shared.pinTopConcern()
+                                    pinNotice = await runtime.pinTopConcern()
                                         .map { "Pinned: \($0)" } ?? "Nothing pressing to pin right now."
                                     await refresh()
                                 }
@@ -439,7 +485,7 @@ struct CognitionObservatoryView: View {
         // owns the navigation chrome, so no navigationTitle/toolbar here. The
         // Controls panel already carries a Refresh button.
         .task {
-            let changes = await runtime.changes()
+            let changes = await cognition.changes()
             // Subscribe before the initial read. A cognition event that lands
             // while refresh is in flight is then buffered instead of being
             // lost between the old polling replacement's read and watch arm.
@@ -510,7 +556,10 @@ struct CognitionObservatoryView: View {
 
     func refresh() async {
         let refreshGeneration = refreshCoordinator.begin()
-        let nextRead = await CognitionObservatoryActions.refreshRead(runtime: runtime)
+        guard let nextRead = await cognition.observatoryRead() else {
+            _ = refreshCoordinator.settle(refreshGeneration)
+            return
+        }
         let next = nextRead.detail
         let nextContextFlowHealth = await dependencies.contextFlowHealth()
         let nextContextFlowFallback = await dependencies.contextFlowFallback()

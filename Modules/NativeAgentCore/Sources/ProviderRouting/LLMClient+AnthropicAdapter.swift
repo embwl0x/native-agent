@@ -24,7 +24,6 @@ public final class AnthropicAdapter: LLMAdapter {
     /// providers reuse this adapter with a distinct providerId + credential
     /// env var / config file rather than forking the wire code
     /// (shared-primitives rule). Defaults preserve the Anthropic api-key path.
-    private let credentialEnvVar: String
     private let credentialConfigFile: String
     /// When non-nil, credential discovery is confined to this data root.
     /// Production callers may leave it nil to preserve dynamic default-root
@@ -65,23 +64,14 @@ public final class AnthropicAdapter: LLMAdapter {
         dataRootOverride ?? PersistenceCore.defaultDataRoot()
     }
 
-    private var includesProcessEnvironmentCredentials: Bool {
-        dataRootOverride == nil
-            || credentialRoot.standardizedFileURL
-                == PersistenceCore.defaultDataRoot().standardizedFileURL
-    }
-
-    /// The exact credential-discovery ladder every request path in this
-    /// adapter uses, in one place so the native-tools lane cannot drift from
-    /// it (override → env var → provider config file, all confined to the
-    /// injected data root).
+    /// The one credential lookup every request path in this adapter uses, in
+    /// one place so the native-tools lane cannot drift from it (the saved
+    /// provider config file under the injected data root; override is tests).
     func resolvedCredentialKey() throws -> String {
         guard let key = apiKeyOverride
                 ?? LLMCredentialResolver.resolveAPIKey(
-                    envVar: credentialEnvVar,
                     providerConfigFile: credentialConfigFile,
-                    dataRoot: credentialRoot,
-                    includeEnvironment: includesProcessEnvironmentCredentials),
+                    dataRoot: credentialRoot),
               !key.isEmpty else {
             throw LLMError.notConfigured(provider: providerId)
         }
@@ -96,7 +86,6 @@ public final class AnthropicAdapter: LLMAdapter {
         dataRootOverride: URL? = nil,
         telemetryDataRootOverride: URL? = nil,
         providerId: String = "anthropic",
-        credentialEnvVar: String = "ANTHROPIC_API_KEY",
         credentialConfigFile: String = "anthropic.json",
         nativeToolKeepAliveInterval: TimeInterval = 30,
         firstPartyAnthropicToolContract: Bool = true
@@ -107,7 +96,6 @@ public final class AnthropicAdapter: LLMAdapter {
         self.maxTokensOverride = maxTokens
         self.dataRootOverride = dataRootOverride
         self.providerId = providerId
-        self.credentialEnvVar = credentialEnvVar
         self.credentialConfigFile = credentialConfigFile
         self.nativeToolKeepAliveInterval = max(0.001, nativeToolKeepAliveInterval)
         self.firstPartyAnthropicToolContract = firstPartyAnthropicToolContract
@@ -157,7 +145,6 @@ public final class AnthropicAdapter: LLMAdapter {
             dataRootOverride: dataRootOverride,
             telemetryDataRootOverride: telemetryDataRootOverride,
             providerId: "kimi-code",
-            credentialEnvVar: "KIMI_CODE_API_KEY",
             credentialConfigFile: "kimi-code.json",
             nativeToolKeepAliveInterval: nativeToolKeepAliveInterval,
             // Kimi's coding endpoint was probed for shapes A/B/C only (request
@@ -259,10 +246,8 @@ public final class AnthropicAdapter: LLMAdapter {
     public func complete(prompt: String, system: String?, model: String) async throws -> String {
         guard let key = apiKeyOverride
                 ?? LLMCredentialResolver.resolveAPIKey(
-                    envVar: credentialEnvVar,
                     providerConfigFile: credentialConfigFile,
-                    dataRoot: credentialRoot,
-                    includeEnvironment: includesProcessEnvironmentCredentials),
+                    dataRoot: credentialRoot),
               !key.isEmpty else {
             throw LLMError.notConfigured(provider: providerId)
         }
@@ -334,6 +319,17 @@ public final class AnthropicAdapter: LLMAdapter {
         return text
     }
 
+    /// The single-prompt lane sends no `tools` array; native tools ride only
+    /// the messages lane (`completeMessages` / `streamMessages`).
+    public func complete(
+        prompt: String,
+        system: String?,
+        model: String,
+        tools: [LLMToolSchema]?
+    ) async throws -> String {
+        try await complete(prompt: prompt, system: system, model: model)
+    }
+
     // MARK: - Structured messages (native vision)
 
     /// Native-vision `completeMessages` override. The api-key Anthropic path is
@@ -341,7 +337,7 @@ public final class AnthropicAdapter: LLMAdapter {
     /// no provider/credential combo silently loses images.
     ///
     /// BYTE-IDENTITY: when the conversation carries NO image block, we DELEGATE
-    /// to `complete(prompt:)` via the inherited default flatten — that keeps the
+    /// to `complete(prompt:)` via a role-prefixed flatten — that keeps the
     /// text-only request body byte-identical to the pre-vision path. We only
     /// build a structured Messages-API body when an `.image` block is present.
     public func completeMessages(
@@ -386,10 +382,8 @@ public final class AnthropicAdapter: LLMAdapter {
 
         guard let key = apiKeyOverride
                 ?? LLMCredentialResolver.resolveAPIKey(
-                    envVar: credentialEnvVar,
                     providerConfigFile: credentialConfigFile,
-                    dataRoot: credentialRoot,
-                    includeEnvironment: includesProcessEnvironmentCredentials),
+                    dataRoot: credentialRoot),
               !key.isEmpty else {
             throw LLMError.notConfigured(provider: providerId)
         }
@@ -595,19 +589,15 @@ public final class AnthropicAdapter: LLMAdapter {
         let apiKeyOverride = self.apiKeyOverride
         let maxTokens = requestMaxTokens(model: model)
         let credentialRoot = self.credentialRoot
-        let includesProcessEnvironmentCredentials = self.includesProcessEnvironmentCredentials
         let telemetry = self.telemetry
         let providerId = self.providerId
-        let credentialEnvVar = self.credentialEnvVar
         let credentialConfigFile = self.credentialConfigFile
         return AsyncThrowingStream { continuation in
             let task = Task {
                 guard let key = apiKeyOverride
                         ?? LLMCredentialResolver.resolveAPIKey(
-                            envVar: credentialEnvVar,
                             providerConfigFile: credentialConfigFile,
-                            dataRoot: credentialRoot,
-                            includeEnvironment: includesProcessEnvironmentCredentials),
+                            dataRoot: credentialRoot),
                       !key.isEmpty else {
                     continuation.finish(throwing: LLMError.notConfigured(provider: providerId))
                     return

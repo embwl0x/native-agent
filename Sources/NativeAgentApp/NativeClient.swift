@@ -1,3 +1,4 @@
+import TrustPersistence
 import Foundation
 import Observation
 import Darwin
@@ -18,9 +19,7 @@ import ProviderRouting
 // public `MemoryRecord` type. The app's UI/decoding has always used the
 // NativeAgentShared variant — alias it at file scope so every existing
 // unqualified `MemoryRecord` reference keeps resolving the same way it did
-// before the Swift subsystem imports landed. (`ToolRecord` is defined
-// internally in this app module, so module-local lookup already wins over
-// `ToolRegistry.ToolRecord`.)
+// before the Swift subsystem imports landed.
 typealias MemoryRecord = NativeAgentShared.MemoryRecord
 // Wave 16 (2026-06-01): ChatOrchestration product also exports a
 // `MultimodalAttachment` (its own wire-mirror — see comment in
@@ -60,13 +59,7 @@ import SystemOps
 // NativeScreenCapture shim) the chat composer's "Show agent my screen"
 // button. Fail-closed on permission denial; no daemon HTTP fallback.
 import ScreenVision
-// TelegramBot owns status, test, and log-clear management. The Mac UI's
-// own TelegramStatus / TelegramTestResponse models stay the wire contract;
-// the SwiftNative path round-trips through the module impl and re-decodes
-// into them (lossless — receipts/blocked/errors ride the status `extras`).
-// `TelegramBot.` qualification disambiguates the module's TelegramStatus /
-// TelegramTestResult from the Mac app's same-named structs. See
-// CUTOVER_PLAN.md §6.34.
+// Telegram management reads live in engine.telegram; mutation executors remain here.
 import TelegramBot
 // Dispatcher owns the Swift-native POST /v1/dispatch path.
 import Dispatcher
@@ -106,26 +99,9 @@ struct TrustCenterMacControlPolicyProvider: MacControlPolicyProvider {
     }
 }
 
-struct CodexCheckResponse: Codable {
-    var ok: Bool
-    var model: String
-}
+typealias CodexCheckResponse = ProviderRouting.CodexCheckResponse
 
-struct ChatResponse: Codable {
-    var runId: String
-    var model: String
-    var requestedModel: String?
-    var reasoningEffort: String?
-    var output: String
-    var sessionId: String?
-    var attachments: [MultimodalAttachment]?
-    var message: ChatMessage?
-    var messages: [ChatMessage]?
-    var personaFingerprint: String?
-    var contextFingerprint: String?
-}
-
-struct NativeClient {
+struct NativeClient: Sendable {
     typealias GauntletProcessRunner = @Sendable (
         _ executable: String,
         _ arguments: [String],
@@ -138,18 +114,15 @@ struct NativeClient {
     /// the same canonical store boundary, used by isolated app integration
     /// tests and never by a second in-memory store.
     var dataRootOverride: URL? = nil
-    /// Shared across the model's short-lived client values; canonical disk
-    /// identity decides whether a converted transcript can be reused.
-    var chatTranscriptCache: ChatTranscriptCache? = nil
     /// Watchdog reads observe the already-owned manager. Tests may inject an
     /// isolated manager; this client never starts a manager as a read effect.
     var backgroundLoopsManager: BackgroundLoopsManager = .shared
-    static let codexDeviceLoginManager = SwiftCodexDeviceLoginManager()
+    static let codexDeviceLoginManager = SwiftCodexDeviceLoginManager(platform: AppCodexDeviceLoginPlatform())
     /// The Mac surface keeps one immutable orchestration body resident. The
     /// client owns no canonical mind state; it reuses the same live cognition,
     /// memory, routing, TrustCenter, and tool owners while preserving their
     /// per-turn reads and effect-time checks.
-    static let residentMacChatClient = makeNativeAgentAppChatOrchestrationClient(
+    static let residentMacChatClient = NativeAgentEngine.live.chatClient(
         profile: .mac
     )
     private static let tailJSONLMaxBytes = 1_048_576
@@ -201,69 +174,18 @@ struct NativeClient {
     }
 
     static func decodeTailLines(_ data: Data, dropFirstPartial: Bool) -> [String] {
-        let text: String
-        if let utf8 = String(data: data, encoding: .utf8) {
-            text = utf8
-        } else {
-            text = String(decoding: data, as: UTF8.self)
-        }
-        var parts = text.components(separatedBy: "\n")
-        if parts.last == "" { parts.removeLast() }
-        if dropFirstPartial && !parts.isEmpty { parts.removeFirst() }
-        return parts
+        RuntimeReadProjection.decodeTailLines(data, dropFirstPartial: dropFirstPartial)
     }
 
-    static func graphEntity(id: String, object: [String: JSONValue]) -> GraphEntity {
-        GraphEntity(
-            id: id,
-            name: graphString(object["name"]) ?? id,
-            aliases: graphStringArray(object["aliases"]).isEmpty ? nil : graphStringArray(object["aliases"]),
-            kind: graphString(object["type"]) ?? graphString(object["kind"]),
-            confidence: graphDouble(object["confidence"]),
-            mentions: {
-                let value = graphInt(object["mentions"])
-                return value == 0 ? nil : value
-            }(),
-            sourceNodeIds: {
-                let snake = graphStringArray(object["source_node_ids"])
-                if !snake.isEmpty { return snake }
-                let camel = graphStringArray(object["sourceNodeIds"])
-                return camel.isEmpty ? nil : camel
-            }(),
-            updatedAt: graphString(object["updated_at"]) ?? graphString(object["updatedAt"])
-        )
-    }
 
-    static func graphString(_ value: JSONValue?) -> String? {
-        guard let value else { return nil }
-        if case .string(let string) = value { return string }
-        return nil
-    }
 
-    static func graphStringArray(_ value: JSONValue?) -> [String] {
-        guard case .array(let values)? = value else { return [] }
-        return values.compactMap { graphString($0) }
-    }
 
-    static func graphInt(_ value: JSONValue?) -> Int {
-        guard let value else { return 0 }
-        switch value {
-        case .int(let int): return Int(int)
-        case .double(let double): return Int(exactly: double.rounded(.towardZero)) ?? 0
-        case .string(let string): return Int(string) ?? 0
-        default: return 0
-        }
-    }
 
-    static func graphDouble(_ value: JSONValue?) -> Double? {
-        guard let value else { return nil }
-        switch value {
-        case .double(let double): return double
-        case .int(let int): return Double(int)
-        case .string(let string): return Double(string)
-        default: return nil
-        }
-    }
+
+
+
+
+
 
     static func privacyCategories(
         dataRoot: URL,
@@ -374,18 +296,7 @@ struct NativeClient {
     /// `userInfo["code"] == "not_implemented"` to render a "panel-disabled" badge
     /// instead of a success toast. See docs/zombie_stub_audit.md.
     static func notImplemented(method: String, reason: String, followup: String) -> NSError {
-        return NSError(
-            domain: "NativeAgentNotImplemented",
-            code: -501,
-            userInfo: [
-                NSLocalizedDescriptionKey: "\(method): \(reason)",
-                "code": "not_implemented",
-                "method": method,
-                "reason": reason,
-                "followup": followup,
-                "panelDisabled": true,
-            ]
-        )
+        NativeActionRouteSupport.notImplemented(method: method, reason: reason, followup: followup)
     }
 
     /// Lossy array decode shared by the HTTP `getList` path and the SwiftNative
@@ -394,46 +305,14 @@ struct NativeClient {
     /// dropped (not fatal to the whole batch), but an all-fail on a non-empty
     /// array throws so the caller's decodeLogged records it.
     static func decodeLossyArray<T: Decodable>(_ data: Data, context: String) throws -> [T] {
-        let decoder = JSONDecoder.nativeAgent
-        // Decode into an array of element containers; if the top level isn't an
-        // array, fall back to the strict decode (preserves prior behavior for
-        // dict-wrapped or otherwise-shaped responses).
-        guard let elements = try? decoder.decode([LossyElement<T>].self, from: data) else {
-            return try decoder.decode([T].self, from: data)
-        }
-        var firstDropError: Error? = nil
-        let survivors: [T] = elements.compactMap { element in
-            switch element.result {
-            case .success(let value):
-                return value
-            case .failure(let error):
-                if firstDropError == nil { firstDropError = error }
-                print("[NativeAgent] \(context) dropped a malformed element: \(error)")
-                return nil
-            }
-        }
-        // FIX (B): partial success (some survivors) is fine and returns the good
-        // elements. But if the raw array was non-empty and EVERY element failed
-        // to decode (e.g. a server-side schema change), a silent [] would be
-        // indistinguishable from a genuinely empty list. Throw so the caller's
-        // decodeLogged records it in lastRefreshError; the caller still falls
-        // back to an empty list, so the returned data is unchanged.
-        if !elements.isEmpty && survivors.isEmpty {
-            throw firstDropError ?? NSError(
-                domain: "NativeAgent",
-                code: -2,
-                userInfo: [NSLocalizedDescriptionKey: "\(context): all \(elements.count) element(s) failed to decode"]
-            )
-        }
-        return survivors
+        try RuntimeReadProjection.decodeLossyArray(data, context: context)
     }
 
     /// Decode a SwiftNative route-replacement's JSONValue result into the model
     /// type the HTTP path returns, using the SAME JSONDecoder.nativeAgent. Used
     /// by the wave-32 W15 skill mutation gates (updateSkill → SkillRecord).
     static func decodeJSONValue<T: Decodable>(_ value: JSONValue, as type: T.Type, context: String) throws -> T {
-        let data = try value.serializedData(pretty: false)
-        return try JSONDecoder.nativeAgent.decode(T.self, from: data)
+        try RuntimeReadProjection.decodeJSONValue(value, as: type, context: context)
     }
 
     /// U5 W-A item 1: honest JSONL read. `readJSONL` returns [] for a
@@ -489,7 +368,7 @@ struct NativeClient {
                     .appendingPathComponent("auto_doctor", isDirectory: true)
                     .appendingPathComponent("config.json")
                 try await persistence.withFileLock(autoDoctorPath) {
-                    let current = await persistence.readJSON(autoDoctorPath, defaultValue: .object([:]))
+                    let current = try await persistence.readJSON(autoDoctorPath, ifMissing: .object([:]))
                     var root: [String: JSONValue]
                     if case .object(let obj) = current { root = obj } else { root = [:] }
                     for (key, value) in autoDoctorEntries {
@@ -512,7 +391,7 @@ struct NativeClient {
                     .appendingPathComponent("research", isDirectory: true)
                     .appendingPathComponent("config.json")
                 try await persistence.withFileLock(researchPath) {
-                    let current = await persistence.readJSON(researchPath, defaultValue: .object([:]))
+                    let current = try await persistence.readJSON(researchPath, ifMissing: .object([:]))
                     var root: [String: JSONValue]
                     if case .object(let obj) = current { root = obj } else { root = [:] }
                     root["searxng_base_url"] = value
@@ -548,17 +427,6 @@ struct NativeClient {
 }
 
 struct EmptyResponse: Codable {}
-
-struct SurfaceModelPreferencesResponse: Codable {
-    var preferences: [SurfaceModelPreferenceEntry]
-}
-
-struct SurfaceModelPreferenceEntry: Codable {
-    var surface: String
-    var model: String
-    var reasoningEffort: String
-    var serviceTier: String? = nil
-}
 
 // PATCH-Phase7b: DispatchResult — receipt returned by POST /v1/dispatch
 struct DispatchResult: Decodable {
@@ -641,21 +509,6 @@ struct DispatchOutput: Decodable {
     }
 }
 
-// Local errors for Swift-native app routes. Retired-route callers either use a
-// native implementation or throw an explicit notImplemented envelope.
-enum DaemonError: Error, LocalizedError {
-    case notFound(String)
-    case swiftNativeNotImplemented(String)
-
-    var errorDescription: String? {
-        switch self {
-        case .notFound(let path): return "Not found: \(path)"
-        case .swiftNativeNotImplemented(let what):
-            return "Swift-native impl for \(what) is not built yet."
-        }
-    }
-}
-
 /// Minimal Any-JSON leaf decoder used by DispatchOutput.
 enum AnyDecodableValue: Decodable {
     case string(String), int(Int), double(Double), bool(Bool), null
@@ -677,24 +530,5 @@ enum AnyDecodableValue: Decodable {
         if let d = try? c.decode(Double.self) { self = .double(d); return }
         if let s = try? c.decode(String.self) { self = .string(s); return }
         self = .null
-    }
-}
-
-
-extension JSONDecoder {
-    static var nativeAgent: JSONDecoder {
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
-        return decoder
-    }
-}
-
-extension URL {
-    func appendingNativeRelativePath(_ relativePath: String) -> URL {
-        relativePath
-            .split(separator: "/")
-            .reduce(self) { partial, component in
-                partial.appendingPathComponent(String(component))
-            }
     }
 }

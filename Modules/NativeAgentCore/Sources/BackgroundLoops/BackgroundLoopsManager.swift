@@ -49,6 +49,7 @@ public struct LoopEventListenerHealth: Sendable, Equatable {
 
 public struct LoopStatus: Sendable, Equatable {
     public let name: String
+    public let interval: TimeInterval
     public let lastRun: Date?
     public let nextRun: Date?
     public let runCount: Int
@@ -76,6 +77,7 @@ public struct LoopStatus: Sendable, Equatable {
 
     public init(
         name: String,
+        interval: TimeInterval = 300,
         lastRun: Date?,
         nextRun: Date?,
         runCount: Int,
@@ -90,6 +92,7 @@ public struct LoopStatus: Sendable, Equatable {
         firstSeenAt: Date? = nil
     ) {
         self.name = name
+        self.interval = interval
         self.lastRun = lastRun
         self.nextRun = nextRun
         self.runCount = runCount
@@ -544,6 +547,7 @@ public actor BackgroundLoopsManager {
             for loop in loops where registrations[loop.loopId] == nil {
                 await register(loop)
             }
+            await scheduler.start()
             return false
         }
         starting = true
@@ -599,6 +603,7 @@ public actor BackgroundLoopsManager {
                 .min()
             result.append(LoopStatus(
                 name: state.loopId,
+                interval: registrations[state.loopId]?.runner.interval ?? 300,
                 lastRun: lastRun,
                 nextRun: nextRun,
                 runCount: max(state.tickCount, snapshot?.runCount ?? 0),

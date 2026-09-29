@@ -179,26 +179,9 @@ struct ProviderSettingsView: View {
         let text: String
     }
     @State private var inlineReceipts: [String: SaveReceipt] = [:]
-    private var loadsOnAppear = true
 
     init() {}
 
-    #if DEBUG
-    init(snapshot: ProviderSettingsRefreshAction.Snapshot, explicitSurfaces: Set<String>, savedReceipt: String? = nil) {
-        _providers = State(initialValue: snapshot.providers)
-        _rowSet = State(initialValue: snapshot.rowSet)
-        _activeSurface = State(initialValue: snapshot.activeProviders)
-        _surfaceModel = State(initialValue: snapshot.preferences.mapValues(\.model))
-        _surfaceReasoningEffort = State(initialValue: snapshot.preferences.mapValues(\.reasoningEffort))
-        _surfaceFastMode = State(initialValue: snapshot.preferences.mapValues { $0.serviceTier == "priority" })
-        _explicitSurfaces = State(initialValue: explicitSurfaces)
-        _inlineReceipts = State(initialValue: savedReceipt.map {
-            [ProviderSettingsSurfaceGroup.chat.id: SaveReceipt(text: $0)]
-        } ?? [:])
-        _statusText = State(initialValue: savedReceipt ?? "")
-        loadsOnAppear = false
-    }
-    #endif
 
     // Opaque local surfaces keep secondary text legible over the shell wallpaper.
     private var secondaryInk: Color { colorScheme == .dark ? Color(white: 0.82) : Color(white: 0.28) }
@@ -398,7 +381,10 @@ struct ProviderSettingsView: View {
     }
 
     private func modelsForProvider(_ providerId: String) -> [SurfaceModelChoice] {
-        if let prov = providers.first(where: { $0.provider_id == providerId }), !prov.models.isEmpty {
+        // S12a: a fetched catalog that could not load is empty and says why
+        // (`models_note`); it never borrows the provider-neutral list below.
+        if let prov = providers.first(where: { $0.provider_id == providerId }),
+           !prov.models.isEmpty || Self.dynamicCatalogProviders.contains(providerId) {
             return prov.models.map {
                 SurfaceModelChoice(
                     id: $0.id,
@@ -425,9 +411,8 @@ struct ProviderSettingsView: View {
     }
 
     /// Providers whose catalogue is fetched rather than compiled in. Their
-    /// `models` list can be a two-entry offline fallback served when no live
-    /// catalogue has ever arrived, so its silence about a model is not
-    /// evidence of anything.
+    /// `models` list can be empty or last-known when no live catalogue could
+    /// be loaded, so its silence about a model is not evidence of anything.
     private static let dynamicCatalogProviders: Set<String> = ["openrouter", "moonshot"]
 
     /// Whether a LIVE catalogue for this provider says the saved model is gone.
@@ -565,7 +550,7 @@ struct ProviderSettingsView: View {
             }
             .environment(appModel)
         }
-        .quietReadTask { if loadsOnAppear { await loadProviders() } }
+        .quietReadTask { await loadProviders() }
     }
 
     @ViewBuilder
@@ -797,7 +782,7 @@ struct ProviderSettingsView: View {
                         .foregroundStyle(statusColor(status.tone))
                         .fixedSize(horizontal: false, vertical: true)
                         .textSelection(.enabled)
-                        .accessibilityLabel(status.text)
+                        // macOS 27: selectable text + a custom accessibility label loops SwiftUI AX and crashes the app.
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -920,14 +905,14 @@ struct ProviderSettingsView: View {
             } label: {
                 let id = activeSurface[lead] ?? "codex"
                 let account = providers.first { $0.provider_id == id }
-                let name = account?.display_name ?? id
-                Text(name + (account?.auth_status.state == "ready" ? "" : " · not connected"))
+                let name = account?.display_name ?? (id.isEmpty ? "Choose an account" : id)
+                let suffix = id.isEmpty || account?.auth_status.state == "ready" ? "" : " · not connected"
+                Text(name + suffix)
                     .lineLimit(1)
-                    .help(name + (account?.auth_status.state == "ready" ? "" : " · not connected"))
+                    .help(name + suffix)
             }
             .font(ShellType.label)
             .disabled(saving)
-            .accessibilityLabel("\(group.title) provider")
             } model: {
             // PATCH-2026-05-28 (per-surface model): model picker scoped to the
             // provider chosen for THIS group. Plain dropdown (no search) even
@@ -964,7 +949,6 @@ struct ProviderSettingsView: View {
             .font(ShellType.label)
             .frame(maxWidth: .infinity, alignment: .leading)
             .disabled(surfModels.isEmpty || saving)
-            .accessibilityLabel("\(group.title) model")
             } think: {
                 Picker("Think", selection: Binding(
                     get: {
@@ -989,7 +973,6 @@ struct ProviderSettingsView: View {
                 .disabled(selectedChoice?.isUnavailable == true
                     || supportedEfforts.isEmpty
                     || saving)
-                .accessibilityLabel("\(group.title) reasoning effort")
             } fast: {
                 if selectedChoice?.supportsFast == true {
                 Toggle("Fast", isOn: Binding(
@@ -1006,7 +989,6 @@ struct ProviderSettingsView: View {
                 .disabled(selectedChoice?.isUnavailable == true
                     || selectedChoice?.supportsFast != true
                     || saving)
-                .accessibilityLabel("\(group.title) Fast mode")
                 .help(selectedChoice?.supportsFast == true
                     ? "Use the account's priority service tier for these activities."
                     : "This account and model do not offer a priority tier.")
@@ -1016,6 +998,10 @@ struct ProviderSettingsView: View {
             // the field would push Model, Think and Fast off the baseline.
             if let caption = ProviderToolCapability.caption(providerID: activeSurface[lead] ?? "codex") {
                 Text(caption).font(.caption).foregroundStyle(NativeAgentShell.secondary)
+            }
+            if let note = providers.first(where: { $0.provider_id == (activeSurface[lead] ?? "codex") })?.models_note {
+                Text(note).font(.caption).foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             if let receipt = inlineReceipts[group.id] {
                 Text(receipt.text).font(.caption).foregroundStyle(NativeAgentShell.secondary)
@@ -1136,8 +1122,9 @@ struct ProviderSettingsView: View {
                 } else if let chatRoute = snapshot.activeProviders["chat"] {
                     activeSurface[surface] = chatRoute
                 } else {
-                    activeSurface[surface] = snapshot.preferences[surface]
-                        .flatMap { NativeClient.inferProviderID(forModel: $0.model) } ?? ""
+                    // S12a: no route anywhere reads as unchosen, never as one
+                    // inferred from the model — a later save would persist it.
+                    activeSurface[surface] = ""
                 }
             }
             // PATCH-2026-05-28 (per-surface model): load the global catalog
@@ -1164,14 +1151,10 @@ struct ProviderSettingsView: View {
                 guard refreshCatalog else { return nil }
                 switch snapshot.catalog?.catalogFreshness
                     .flatMap(ModelCatalogFreshness.init(rawValue:)) {
-                case .staleAfterFailedRefresh:
-                    return "model catalog refresh failed, showing the cached list"
-                case .builtInAfterFailedRefresh:
-                    return "model catalog refresh failed, showing the built-in list"
+                case .staleAfterFailedRefresh, .unavailable:
+                    return snapshot.catalog?.catalogNote ?? "couldn't load models"
                 case .cached:
                     return "model catalog unchanged, showing the cached list"
-                case .builtIn:
-                    return "model catalog showing the built-in list"
                 case .liveIncomplete:
                     return "model catalog refreshed; the provider's list may be partial"
                 case .live, .none:

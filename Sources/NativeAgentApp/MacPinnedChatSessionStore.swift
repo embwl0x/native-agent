@@ -1,5 +1,26 @@
 import Foundation
+import Observation
 import PersistenceCore
+import Transcripts
+
+/// Phone activity in a background chat stays unread until that chat opens.
+@MainActor @Observable
+final class MacChatUnreadSessions {
+    static let shared = MacChatUnreadSessions()
+    private static let key = "NativeAgent.unreadPhoneChatSessions"
+    private(set) var ids = Set(UserDefaults.standard.stringArray(forKey: MacChatUnreadSessions.key) ?? [])
+
+    func received(in sessionID: String) {
+        guard sessionID != UserDefaults.standard.string(forKey: "activeChatSessionId") else { return }
+        ids.insert(sessionID)
+        UserDefaults.standard.set(Array(ids), forKey: Self.key)
+    }
+
+    func markRead(_ sessionID: String) {
+        guard ids.remove(sessionID) != nil else { return }
+        UserDefaults.standard.set(Array(ids), forKey: Self.key)
+    }
+}
 
 /// The one Mac-side mutation seam for the ordered pinned-chat strip.
 ///

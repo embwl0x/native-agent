@@ -13,7 +13,7 @@ import PersistenceCore
 // expectedHead CAS, 3-way apply, identity-pinned commit) with the validation
 // callback upgraded per plan design #2: instead of the NativeAgentCore-only
 // inline build, the gate is a PRIOR GREEN candidate result.json for the SAME
-// diff sha — the full-app worktree build+test is the real evidence.
+// diff sha — the full-app worktree build is the real evidence.
 //
 // SAFETY: nothing here installs, restarts, or touches policy files. The
 // output is exactly one git commit on the live repo (or a typed refusal).

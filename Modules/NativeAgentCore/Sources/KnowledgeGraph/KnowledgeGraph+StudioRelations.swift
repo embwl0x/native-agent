@@ -41,6 +41,7 @@ import CryptoKit
 import Foundation
 import GRDB
 import PersistenceCore
+import Studio
 
 /// What one indexing pass actually wrote. Returned so the caller can say it out
 /// loud rather than assert it.

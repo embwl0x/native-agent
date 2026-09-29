@@ -1,5 +1,5 @@
+import FeedPolicy
 import Foundation
-import MacControl
 import PersistenceCore
 
 enum SecurityRisk: String, Sendable, Comparable {
@@ -84,7 +84,7 @@ public actor SwiftNativeSecurityCenter {
         )
     }
 
-    public func status(limit: Int = 8) async -> SecurityCenterStatus {
+    public func status(limit: Int = 8) async throws -> SecurityCenterStatus {
         let policy: [String: JSONValue]
         do {
             policy = try await trustCenter.loadTrustPolicyChecked()
@@ -116,7 +116,7 @@ public actor SwiftNativeSecurityCenter {
         let fullMac = Self.fullMacActive(policy: policy)
         let receipts = (try? await persistence.tailJSONL(auditReceiptsPath, limit: limit, maxBytes: 512 * 1024)) ?? []
         let recent = receipts.compactMap(Self.receiptSummary)
-        let trustedOrigins = await trustedOriginCount()
+        let trustedOrigins = try await trustedOriginCount()
         let killSwitch = Self.bool(security["killSwitchEnabled"], default: false)
         let auditEnabled = Self.bool(security["auditReceiptsEnabled"], default: true)
         let flags = [
@@ -229,7 +229,7 @@ public actor SwiftNativeSecurityCenter {
         do {
             let snapshot = try await trustCenter.loadAuthorizationSnapshotChecked()
             let evaluatedAt = clock()
-            return await evaluateTool(
+            return try await evaluateTool(
                 tool: tool,
                 input: input,
                 origin: origin,
@@ -255,14 +255,14 @@ public actor SwiftNativeSecurityCenter {
         enforceAutonomy: Bool,
         snapshot: TrustPolicyAuthorizationSnapshot,
         evaluatedAt: Date
-    ) async -> SecurityToolEnvelope {
+    ) async throws -> SecurityToolEnvelope {
         let policy = snapshot.policy
         let security = Self.object(policy["securityPolicy"])
         let developerMode = Self.bool(policy["developerMode"], default: false)
         let filePolicy = Self.object(policy["filePolicy"])
         let connectorPolicy = Self.object(policy["connectorPolicy"])
         let fullMac = Self.fullMacActive(policy: policy)
-        let canonicalTool = Self.canonicalToolName(tool)
+        let canonicalTool = Self.policyToolName(tool)
         let trustedRoots = Self.trustedWorkspaceRoots(
             policy: policy,
             filePolicy: filePolicy,
@@ -280,7 +280,7 @@ public actor SwiftNativeSecurityCenter {
         // trust from generation B, authorizing a combination that never
         // existed. Connector-owned Telegram/Slack allowlists remain live reads
         // from their own authority domains.
-        let originAssessment = await assessOrigin(origin, policy: policy)
+        let originAssessment = try await assessOrigin(origin, policy: policy)
         let fullMacYoloAuthority = Self.fullMacYoloAuthority(
             tool: canonicalTool,
             surface: origin.surface,
@@ -314,7 +314,7 @@ public actor SwiftNativeSecurityCenter {
         // W2/W3-FIX-R2 2 — `redactedInputPreview` is PERSISTED to
         // security/audit.jsonl by `record`, and this class's own redactor only
         // catches secret-NAMED keys and secret-SHAPED strings. The literal
-        // characters of `mac_keystroke.text` / `mac_ax_act.value` are neither:
+        // characters of `legacy keystroke tool.text` / `legacy AX act tool.value` are neither:
         // "hunter2" is a short ordinary string under an ordinary key. Run the
         // injection-argument redactor first so the typed characters cannot
         // reach the audit file even if a caller hands us the raw body. The
@@ -323,7 +323,7 @@ public actor SwiftNativeSecurityCenter {
         let redacted = Self.redactValue(
             .object(MacInjectionArgRedaction.redacted(tool: canonicalTool, input: input))
         )
-        let signedToolKnown = await isSignedOrBuiltinTool(canonicalTool)
+        let signedToolKnown = try await isSignedOrBuiltinTool(canonicalTool)
         let rollbackRequired = profile.capabilities.contains("filesystem_write")
             || profile.capabilities.contains("filesystem_delete")
             || profile.capabilities.contains("destructive")
@@ -340,7 +340,7 @@ public actor SwiftNativeSecurityCenter {
         }
         // USER 2026-08-12 — YOLO: an unknown/unsigned tool signature is recorded
         // as a NOTE, not a block. It was denying her own built-in Mac tools
-        // (mac_focus_app) on his machine. Trust Center categories + Full Mac +
+        // (legacy app focus tool) on his machine. Trust Center categories + Full Mac +
         // the macOS TCC grant remain the real gates.
         if !signedToolKnown {
             reasons.append(.init(.note, "This tool’s signature is unknown; it can still run."))
@@ -476,7 +476,7 @@ public actor SwiftNativeSecurityCenter {
         // the user 2026-06-13 ("yolo IS dev mode — she can do everything on yolo"):
         // an ACTIVE Full Mac (yolo) window satisfies the Developer-Mode
         // requirement for critical actions (the builder tools shell/git/
-        // apply_patch/run_tests profile as .critical) — but with hard
+        // apply_patch profile as .critical) — but with hard
         // limits:
         //   1. Remote origins must be authenticated by their canonical surface
         //      owner (Telegram allowlist, paired iOS identity, verified Slack).
@@ -519,8 +519,19 @@ public actor SwiftNativeSecurityCenter {
             reasons.insert(.init(.cause, "writing into another app's settings needs your go-ahead"), at: 0)
         }
 
+        // A reply turn from an authenticated contact gets the same answer as the
+        // person's own turn: under Full Mac her sends pass this ask (flattened
+        // below), so do a reply turn's messages and reads — to that contact or
+        // any other saved agent (User, 2026-09-25; widened 2026-09-27: "open it
+        // up on full mac"). claude/codex/omp_message are not in this list: they
+        // wake coding agents with local authority and keep their own ask.
+        let replyingContact = origin.userId.map { "peer:" + $0 }
+        let peerContinuation = peerBridgeOrigin && fullMac && !peerBridgeEffect
+            && ["agent_message", "agent_read"].contains(PeerTurnEffectPolicy.normalized(tool))
+            && replyingContact != nil
         if decision != .block,
            profile.capabilities.contains("external_send"),
+           !peerContinuation,
            !profile.capabilities.contains("notification"),
            !profile.capabilities.contains("approval_stage"),
            Self.bool(connectorPolicy["sendExternalMessagesRequiresApproval"], default: true) {
@@ -561,7 +572,7 @@ public actor SwiftNativeSecurityCenter {
 
         // USER 2026-08-12 — YOLO: an unsigned high-risk tool is no longer blocked
         // on his machine. This was denying her own built-in Mac tools
-        // (mac_focus_app) because they are not in the signature registry.
+        // (legacy app focus tool) because they are not in the signature registry.
         // `toolSigningRequired` now defaults FALSE; set it true in security
         // policy to restore the block.
         if decision != .block,
@@ -634,7 +645,7 @@ public actor SwiftNativeSecurityCenter {
         do {
             let snapshot = try await trustCenter.loadAuthorizationSnapshotChecked()
             let evaluatedAt = clock()
-            let envelope = await evaluateTool(
+            let envelope = try await evaluateTool(
                 tool: tool,
                 input: input,
                 origin: origin,
@@ -673,7 +684,7 @@ public actor SwiftNativeSecurityCenter {
         error: any Error,
         evaluatedAt: Date
     ) -> SecurityToolEnvelope {
-        let canonicalTool = Self.canonicalToolName(tool)
+        let canonicalTool = Self.policyToolName(tool)
         return SecurityToolEnvelope(
             id: UUID().uuidString,
             createdAt: Self.isoTimestamp(evaluatedAt),
@@ -903,7 +914,7 @@ public actor SwiftNativeSecurityCenter {
     func assessOrigin(
         _ origin: SecurityOriginContext,
         policy: [String: JSONValue]
-    ) async -> OriginAssessment {
+    ) async throws -> OriginAssessment {
         let surfaceProfile = ConversationSurfaceProfile(origin.surface)
         let surface = surfaceProfile.id
         // Defense-in-depth (gpt-5.5 review, 2026-06-09): a KNOWN remote chat
@@ -933,7 +944,7 @@ public actor SwiftNativeSecurityCenter {
             //
             // Identity now comes from the transport, bound on the envelope, or
             // the origin fails closed WITH A REASON — never silently.
-            let allowed = await telegramSecurityAllowlist()
+            let allowed = try await telegramSecurityAllowlist()
             if let reason = allowed.matches(chatId: origin.chatId, userId: origin.userId) {
                 return OriginAssessment(trusted: true, reason: reason, isRemote: true)
             }
@@ -953,7 +964,7 @@ public actor SwiftNativeSecurityCenter {
             // access on a forged proof. Trust now roots in an explicit
             // allowlist, mirroring telegram. (The forged binding is removed at
             // the handler; no caller may reintroduce it.)
-            let allowed = await slackSecurityAllowlist()
+            let allowed = try await slackSecurityAllowlist()
             if let reason = allowed.matches(chatId: origin.chatId, userId: origin.userId) {
                 return OriginAssessment(trusted: true, reason: reason, isRemote: true)
             }
@@ -1030,11 +1041,11 @@ public actor SwiftNativeSecurityCenter {
         )
     }
 
-    private func trustedOriginCount() async -> Int {
-        await telegramSecurityAllowlist().count
+    private func trustedOriginCount() async throws -> Int {
+        try await telegramSecurityAllowlist().count
     }
 
-    private func slackSecurityAllowlist() async -> TelegramSecurityAllowlist {
+    private func slackSecurityAllowlist() async throws -> TelegramSecurityAllowlist {
         // Mirrors the slack connector's own config probe
         // (SlackSocketModeConfig.tokenObjects): connectors/slack/auth.json +
         // oauth_tokens/slack.json under the data root. Channel ids are the
@@ -1049,7 +1060,7 @@ public actor SwiftNativeSecurityCenter {
         var chatIds: Set<String> = []
         var userIds: Set<String> = []
         for path in paths {
-            let raw = await persistence.readJSON(path, defaultValue: .object([:]))
+            let raw = try await persistence.readJSON(path, ifMissing: .object([:]))
             let obj = Self.object(raw)
             chatIds.formUnion(Self.stringSet(obj["allowed_channel_ids"]))
             chatIds.formUnion(Self.stringSet(obj["allowedChannelIds"]))
@@ -1061,11 +1072,11 @@ public actor SwiftNativeSecurityCenter {
         return TelegramSecurityAllowlist(chatIds: chatIds, userIds: userIds, surfaceLabel: "slack")
     }
 
-    private func telegramSecurityAllowlist() async -> TelegramSecurityAllowlist {
+    private func telegramSecurityAllowlist() async throws -> TelegramSecurityAllowlist {
         let path = dataRoot
             .appendingPathComponent("telegram", isDirectory: true)
             .appendingPathComponent("config.json")
-        let raw = await persistence.readJSON(path, defaultValue: .object([:]))
+        let raw = try await persistence.readJSON(path, ifMissing: .object([:]))
         let obj = Self.object(raw)
         return TelegramSecurityAllowlist(
             chatIds: Self.stringSet(obj["allowed_chat_ids"]).union(Self.stringSet(obj["allowedChatIds"])),
@@ -1073,7 +1084,7 @@ public actor SwiftNativeSecurityCenter {
         )
     }
 
-    private func isSignedOrBuiltinTool(_ tool: String) async -> Bool {
+    private func isSignedOrBuiltinTool(_ tool: String) async throws -> Bool {
         if Self.builtinToolPrefixes.contains(where: { tool.hasPrefix($0) })
             || Self.builtinToolNames.contains(tool)
             || Self.notificationToolNames.contains(tool)
@@ -1083,7 +1094,7 @@ public actor SwiftNativeSecurityCenter {
         let registryPath = dataRoot
             .appendingPathComponent("tools", isDirectory: true)
             .appendingPathComponent("registry.json")
-        let raw = await persistence.readJSON(registryPath, defaultValue: .object([:]))
+        let raw = try await persistence.readJSON(registryPath, ifMissing: .object([:]))
         return Self.registryContainsSignedTool(raw, tool: tool)
     }
 }

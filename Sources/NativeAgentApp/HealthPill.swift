@@ -12,14 +12,14 @@ extension AppModel {
         // Prefer an explicit Doctor run. Otherwise reuse the health card that
         // Chat already keeps current instead of launching a second full Doctor
         // pass from this always-mounted toolbar control.
-        if let checks = doctorReport?.checks {
+        if let checks = engine.doctor.report?.checks {
             let failCount = checks.filter { $0.status.lowercased() == "fail" }.count
             let warnCount = checks.filter { $0.status.lowercased() == "warn" }.count
             if failCount > 0 { return .error(count: failCount) }
             if warnCount > 0 { return .warn(count: warnCount) }
             return .ok
         }
-        guard let subsystems = healthCard?.subsystems else { return .unknown }
+        guard let subsystems = engine.doctor.healthCard?.subsystems else { return .unknown }
         let failCount = subsystems.filter {
             ["fail", "error"].contains($0.status.lowercased())
         }.count
@@ -165,7 +165,7 @@ public struct HealthPill: View {
         summary: SystemHealthSummary,
         statusColor: Color
     ) -> some View {
-        let isChecking = appModel.doctorRunning
+        let isChecking = appModel.engine.doctor.isRunning
         let action = HealthPillPopoverPresentation.action(isChecking: isChecking)
 
         VStack(alignment: .leading, spacing: 10) {
@@ -215,7 +215,7 @@ public struct HealthPill: View {
             // actually running, so a machine that never ran a check displayed
             // a permanent progress claim. "Checking" now belongs to a real
             // in-flight run; a cold pill says it has no answer yet.
-            appModel.doctorRunning ? "Checking" : "Not checked"
+            appModel.engine.doctor.isRunning ? "Checking" : "Not checked"
         case .ok:
             "OK"
         case .warn(let count):

@@ -1,12 +1,13 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import TrustCenter
 
 /// Local connector credential revocation and registry updates. OAuth token
 /// exchange and sign-in persistence belong to the app's NativeOAuthFlow.
 public protocol ConnectorAuthClient: Sendable {
-    /// Unlink credentials under their path locks, then mark the registry entry
-    /// disabled. Registry write failure does not undo a successful unlink.
+    /// Mark the registry entry disabled before unlinking credentials under their
+    /// path locks. Registry write failure leaves credentials untouched.
     func revokeConnector(provider: String) async throws -> JSONValue
 
     /// Mark an existing provider connected only after a usable token is saved.
@@ -69,17 +70,10 @@ public final class SwiftNativeConnectorAuthClient: ConnectorAuthClient {
     ]
 
     public func revokeConnector(provider: String) async throws -> JSONValue {
-        // Unlink failures propagate. These locks also exclude refresh and sign-in
-        // publication; the registry lock is acquired separately afterward.
-        for tok in Set(tokenPaths(provider)) {
-            try await persistence.withFileLock(tok) {
-                if FileManager.default.fileExists(atPath: tok.path) {
-                    try FileManager.default.removeItem(at: tok)
-                }
-            }
+        guard Self.knownProviders.contains(provider) else {
+            throw ConnectorAuthError.unknownProvider(provider)
         }
-
-        await updateRegistry(provider: provider, connected: false)
+        try await updateRegistry(provider: provider, connected: false)
 
         return .object([
             "ok": .bool(true),
@@ -97,7 +91,7 @@ public final class SwiftNativeConnectorAuthClient: ConnectorAuthClient {
             throw ConnectorAuthError.tokenNotSaved(provider)
         }
 
-        await updateRegistry(provider: provider, connected: true)
+        try await updateRegistry(provider: provider, connected: true)
 
         return .object([
             "provider": .string(provider),
@@ -106,31 +100,66 @@ public final class SwiftNativeConnectorAuthClient: ConnectorAuthClient {
         ])
     }
 
-    private func updateRegistry(provider: String, connected: Bool) async {
-        // Registry updates are best effort; token presence remains the readiness
-        // source. Preserve the successful credential operation if this write fails.
-        do {
-            try await persistence.withFileLock(connectorsPath) { [persistence, connectorsPath] in
-                // 2026-09-06: this operation only updates an existing registry.
-                // Missing or damaged bytes are never permission to replace it with an empty array.
-                let raw = try JSONValue.parse(Data(contentsOf: connectorsPath))
-                guard case .array(var connectors) = raw,
-                      connectors.allSatisfy({ if case .object = $0 { return true }; return false }) else {
-                    throw PersistenceCoreError.ioFailure("Connector registry is not an array of objects")
+    private func updateRegistry(provider: String, connected: Bool) async throws {
+        // A credential effect alone is not confirmation of the registry change.
+        try await persistence.withFileLock(connectorsPath) { [self] in
+            // 2026-09-06: this operation only updates an existing registry.
+            // Missing or damaged bytes are never permission to replace it with an empty array.
+            let raw = try JSONValue.parse(Data(contentsOf: connectorsPath))
+            let rows = try ConnectorOAuthRegistry.checkedConnectorRows(from: raw)
+            guard rows.contains(where: { Self.providerID(Self.idString($0["id"])) == Self.providerID(provider) }) else {
+                throw ConnectorAuthError.unknownProvider(provider)
+            }
+            func updatedEntry(_ entry: JSONValue, keyedBy key: String? = nil) throws -> JSONValue {
+                guard case .object(var obj) = entry else {
+                    throw PersistenceCoreError.ioFailure("Connector registry contains a non-object entry")
                 }
-                for (idx, entry) in connectors.enumerated() {
-                    guard case .object(var obj) = entry else { continue }
-                    if Self.providerID(Self.idString(obj["id"]))
-                        == Self.providerID(provider) {
-                        obj["enabled"] = .bool(connected)
-                        obj["authState"] = .string(connected ? "connected" : "not_connected")
-                        obj["healthStatus"] = .string(connected ? "ok" : "planned")
-                        connectors[idx] = .object(obj)
+                if Self.providerID(key ?? Self.idString(obj["id"])) == Self.providerID(provider) {
+                    obj["enabled"] = .bool(connected)
+                    obj["authState"] = .string(connected ? "connected" : "not_connected")
+                    obj["healthStatus"] = .string(connected ? "ok" : "planned")
+                    obj["updatedAt"] = .string(SwiftNativeManifestSigner.isoTimestamp(Date()))
+                }
+                return .object(obj)
+            }
+            let updated: JSONValue
+            switch raw {
+            case .array(let connectors):
+                updated = .array(try connectors.map { try updatedEntry($0) })
+            case .object(var connectors):
+                // Legacy registries identify rows by their keys, as the
+                // canonical registry owner does. Preserve keys and shape.
+                for (key, entry) in connectors {
+                    connectors[key] = try updatedEntry(entry, keyedBy: key)
+                }
+                updated = .object(connectors)
+            default:
+                throw PersistenceCoreError.ioFailure("Connector registry is not an array or object")
+            }
+            let paths = Array(Set(tokenPaths(provider))).sorted { $0.path < $1.path }
+            try await withCredentialLocks(paths[...]) {
+                for path in paths {
+                    _ = try ConnectorOAuthRegistry.checkedCredentialObject(at: path)
+                }
+                try await self.persistence.writeJSON(updated, to: self.connectorsPath)
+                if !connected {
+                    // All saved inputs have passed validation and the durable
+                    // disabled row exists before the first destructive step.
+                    for path in paths where FileManager.default.fileExists(atPath: path.path) {
+                        try FileManager.default.removeItem(at: path)
                     }
                 }
-                try await persistence.writeJSON(.array(connectors), to: connectorsPath)
             }
-        } catch {
+        }
+    }
+
+    private func withCredentialLocks(
+        _ paths: ArraySlice<URL>,
+        operation: @escaping @Sendable () async throws -> Void
+    ) async throws {
+        guard let path = paths.first else { return try await operation() }
+        try await persistence.withFileLock(path) {
+            try await self.withCredentialLocks(paths.dropFirst(), operation: operation)
         }
     }
 

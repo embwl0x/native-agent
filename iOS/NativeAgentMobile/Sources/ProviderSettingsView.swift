@@ -126,10 +126,12 @@ enum ProviderSelectionRollbackPresentation {
     }
 }
 
+
 // MARK: - Main View
 
 struct ProviderSettingsView: View {
     @StateObject private var sync = iCloudSyncEngine.shared
+    @EnvironmentObject private var pairingStore: PairingStore
 
     // CANONICAL SURFACE LIST — SOURCE OF TRUTH is the Mac's `MODEL_SURFACES`
     // (Modules/NativeAgentCore/Sources/ProviderRouting/ProviderRouting.swift,
@@ -152,6 +154,9 @@ struct ProviderSettingsView: View {
         Self.canonicalSurfaces
     }
 
+    /// The first few activities show; the rest fold behind one row.
+    private static let foldedSurfaceCount = 3
+
     // Active provider per surface (local UI state; saves on change)
     @State private var activeSurface: [String: String] = [:]
     @State private var requestedModel: [String: String] = [:]
@@ -160,9 +165,18 @@ struct ProviderSettingsView: View {
     @State private var configSheet: ProviderInfo? = nil
     @State private var statusText = ""
     @State private var isRefreshing = false
+    @State private var showsAllSurfaces = false
+
+    /// The Mac's provider projection (a DEBUG design sample when there is none).
+    private var providers: [ProviderInfo] {
+        #if DEBUG
+        if MobileDesignSamples.screen != nil, sync.providers.isEmpty { return ProviderDesignSample.providers }
+        #endif
+        return sync.providers
+    }
 
     private var selectableProviders: [ProviderInfo] {
-        sync.providers.filter { $0.auth_status.state == "ready" }
+        providers.filter { $0.auth_status.state == "ready" }
     }
 
     private var defaultProviderID: String {
@@ -170,137 +184,19 @@ struct ProviderSettingsView: View {
     }
 
     private func selectableModels(for providerID: String) -> [ProviderModelInfo] {
-        sync.providers.first(where: { $0.provider_id == providerID })?.models ?? []
+        providers.first(where: { $0.provider_id == providerID })?.models ?? []
     }
 
     var body: some View {
-        List {
-            // ── Per-surface active picker ─────────────────────────────────
-            Section {
-                if selectableProviders.isEmpty {
-                    Text("Connect a provider on the Mac to configure surfaces.")
-                        .font(.footnote).foregroundStyle(.secondary)
-                }
-                DisclosureGroup("Models by activity") {
-                ForEach(renderedSurfaces, id: \.self) { surface in
-                    if !selectableProviders.isEmpty {
-                        MobileAdaptiveRow {
-                            Text(surfaceLabel(surface))
-                                .fixedSize(horizontal: false, vertical: true)
-                            Spacer()
-                            Picker("", selection: Binding(
-                                get: { activeSurface[surface] ?? defaultProviderID },
-                                set: { newVal in
-                                    guard let selection = SurfaceProviderPickerPresentation.selection(
-                                        providerID: newVal,
-                                        currentModelID: sync.surfaceModels[surface]?.model,
-                                        providers: selectableProviders
-                                    ) else {
-                                        statusText = "That provider has no selectable model."
-                                        return
-                                    }
-                                    submitSelection(
-                                        surface: surface,
-                                        selection: .init(
-                                            providerID: selection.providerID,
-                                            modelID: selection.modelID
-                                        )
-                                    )
-                                }
-                            )) {
-                                ForEach(selectableProviders) { p in
-                                    Text(p.display_name)
-                                        .tag(p.provider_id)
-                                }
-                            }
-                            .pickerStyle(.menu)
-                        }
-                    }
-                    MobileAdaptiveRow {
-                        Text("\(surfaceLabel(surface)) Model")
-                            .font(.footnote)
-                            .foregroundStyle(.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
-                        Spacer()
-                        if selectableProviders.isEmpty {
-                            Text("No connected provider models.")
-                                .font(.footnote)
-                                .foregroundStyle(.secondary)
-                                .multilineTextAlignment(.trailing)
-                        } else {
-                            Menu {
-                                ForEach(selectableModels(for: activeSurface[surface] ?? defaultProviderID)) { model in
-                                    Button {
-                                        submitSelection(
-                                            surface: surface,
-                                            selection: .init(
-                                                providerID: activeSurface[surface] ?? defaultProviderID,
-                                                modelID: model.id
-                                            )
-                                        )
-                                    } label: {
-                                        Text(model.id)
-                                    }
-                                }
-                            } label: {
-                                MobileAdaptiveRow(spacing: 4) {
-                                    Text(selectedModelLabel(for: surface))
-                                        .fixedSize(horizontal: false, vertical: true)
-                                    Image(systemName: "chevron.up.chevron.down")
-                                        .font(.caption2)
-                                        .foregroundStyle(.secondary)
-                                }
-                            }
-                        }
-                    }
-                }
-                }
-            } header: {
-                Label("Active per Surface", systemImage: "square.3.layers.3d.top.filled")
-            } footer: {
-                Text("Changes are applied on the Mac immediately.")
-                    .font(.caption2)
-            }
-
-            // ── Provider list ─────────────────────────────────────────────
-            Section {
-                if isRefreshing {
-                    MobileAdaptiveRow {
-                        ProgressView()
-                        Text("Refreshing…").font(.callout).foregroundStyle(.secondary)
-                    }
-                } else if MobileDesignSamples.rows(sync.providers).isEmpty {
-                    ContentUnavailableView(
-                        "No Providers",
-                        systemImage: "server.rack",
-                        description: Text("Mac must be running and syncing via iCloud.")
-                    )
-                } else {
-                    ForEach(MobileDesignSamples.rows(sync.providers)) { provider in
-                        Button {
-                            configSheet = provider
-                        } label: {
-                            ProviderRow(provider: provider)
-                        }
-                        .buttonStyle(.plain)
-                    }
-                }
-            } header: {
-                Label("Providers", systemImage: "server.rack")
-            }
-
-            // ── Status feedback ───────────────────────────────────────────
+        AlivePage(title: "Providers", line: "The models I think with.") {
+            if !pairingStore.isPaired { AliveUnpairedReason() }
+            providersSection
+            modelsSection
             if !statusText.isEmpty {
-                Section {
-                    Text(statusText)
-                        .font(.caption).foregroundStyle(.secondary)
-                }
+                AliveFootnote(statusText)
             }
         }
-        .mobileReadingScreen()
-        .navigationTitle("Providers")
         .macSyncErrorBanner()
-        .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .navigationBarTrailing) {
                 Button {
@@ -308,7 +204,9 @@ struct ProviderSettingsView: View {
                 } label: {
                     Image(systemName: "arrow.clockwise")
                 }
+                .foregroundStyle(AlivePalette.text)
                 .disabled(isRefreshing)
+                .accessibilityLabel("Refresh providers")
             }
         }
         .sheet(item: $configSheet) { provider in
@@ -324,6 +222,9 @@ struct ProviderSettingsView: View {
         }
         .onAppear {
             seedActiveSurface()
+            #if DEBUG
+            if ProcessInfo.processInfo.arguments.contains("-designDetail") { configSheet = providers.first }
+            #endif
             if sync.surfaceModels.isEmpty || sync.providers.isEmpty {
                 Task {
                     _ = await iCloudBridge.shared.drainDeviceTransport()
@@ -338,6 +239,116 @@ struct ProviderSettingsView: View {
         .onChange(of: sync.surfaceModels) { _, _ in
             seedActiveSurface()
         }
+    }
+
+    // MARK: - Sections
+
+    @ViewBuilder
+    private var providersSection: some View {
+        if providers.isEmpty && !isRefreshing {
+            AliveCalmState(
+                title: "No providers yet",
+                line: "Keep NativeAgent open on the Mac. Its providers appear here once iCloud catches up."
+            )
+        } else {
+            AliveSection("Connected", trailing: {
+                if isRefreshing { ProgressView().controlSize(.small) }
+            }) {
+                if providers.isEmpty {
+                    AliveRow("Refreshing…")
+                }
+                ForEach(Array(providers.enumerated()), id: \.element.id) { index, provider in
+                    if index > 0 { AliveDivider() }
+                    Button {
+                        configSheet = provider
+                    } label: {
+                        AliveRow(provider.display_name, detail: ProviderWords.statusLine(for: provider)) {
+                            AliveChevron()
+                        }
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+    }
+
+    private var modelsSection: some View {
+        AliveSection("Models by activity", footer: pairingStore.isPaired ? "Changes apply on the Mac right away." : nil) {
+            if selectableProviders.isEmpty {
+                Text("Connect a provider on the Mac to choose models here.")
+                    .font(.subheadline)
+                    .foregroundStyle(AlivePalette.secondary)
+                    .aliveRow()
+            } else {
+                let visible = showsAllSurfaces ? renderedSurfaces : Array(renderedSurfaces.prefix(Self.foldedSurfaceCount))
+                ForEach(Array(visible.enumerated()), id: \.element) { index, surface in
+                    if index > 0 { AliveDivider() }
+                    surfaceRow(surface)
+                }
+                AliveDivider()
+                Button {
+                    withAnimation(AppMotion.snappy) { showsAllSurfaces.toggle() }
+                } label: {
+                    AliveRow(showsAllSurfaces ? "Show fewer" : "Show all \(renderedSurfaces.count) activities") {
+                        Image(systemName: showsAllSurfaces ? "chevron.up" : "chevron.down")
+                            .font(.footnote.weight(.semibold))
+                            .foregroundStyle(AlivePalette.secondary)
+                    }
+                }
+                .buttonStyle(.plain)
+            }
+        }
+    }
+
+    /// One activity: its name, and the provider and model it uses in secondary
+    /// text. Telegram offers only its published route's models when available;
+    /// older Macs and other surfaces offer every ready provider. Picking submits
+    /// that exact provider/model pair.
+    private func surfaceRow(_ surface: String) -> some View {
+        let providerID = activeSurface[surface] ?? defaultProviderID
+        let providerName = selectableProviders.first(where: { $0.provider_id == providerID })?.display_name
+        let routeProviderID = sync.surfaceModels[surface]?.providerId
+        let menuProviders = surface == "telegram" && routeProviderID != nil
+            ? selectableProviders.filter { $0.provider_id == routeProviderID }
+            : selectableProviders
+        return Menu {
+            ForEach(menuProviders) { provider in
+                Section(provider.display_name) {
+                    ForEach(provider.models) { model in
+                        Button {
+                            submitSelection(
+                                surface: surface,
+                                selection: .init(providerID: provider.provider_id, modelID: model.id)
+                            )
+                        } label: {
+                            if provider.provider_id == providerID && model.id == selectedModelLabel(for: surface) {
+                                Label(ProviderWords.modelName(model), systemImage: "checkmark")
+                            } else {
+                                Text(ProviderWords.modelName(model))
+                            }
+                        }
+                    }
+                }
+            }
+        } label: {
+            // The short model name leads; the provider is in the menu's sections.
+            AliveRow(surfaceLabel(surface), detail: modelLabel(for: surface, providerID: providerID), detailLines: 1) {
+                Image(systemName: "chevron.up.chevron.down")
+                    .font(.footnote.weight(.semibold))
+                    .foregroundStyle(AlivePalette.secondary)
+            }
+        }
+        .buttonStyle(.plain)
+        .aliveUnavailable(!pairingStore.isPaired)
+        .accessibilityValue(providerName.map { "\(modelLabel(for: surface, providerID: providerID)), \($0)" } ?? "")
+        .accessibilityHint("Choose the model for \(surfaceLabel(surface)).")
+    }
+
+    /// The published model, by its display name when the provider lists it.
+    private func modelLabel(for surface: String, providerID: String) -> String {
+        let id = selectedModelLabel(for: surface)
+        guard let model = selectableModels(for: providerID).first(where: { $0.id == id }) else { return id }
+        return ProviderWords.modelName(model)
     }
 
     // MARK: - Helpers
@@ -466,6 +477,73 @@ struct ProviderSettingsView: View {
     }
 }
 
+#if DEBUG
+/// Screenshot fixture for `-designScreen providers`: two ready providers with
+/// models, so the activity rows have something to show.
+private enum ProviderDesignSample {
+    static let providers: [ProviderInfo] = [
+        sample("design-writing", "Research and long-form writing", models: [
+            ("writer-large", "Writer Large", true), ("writer-fast", "Writer Fast", false),
+        ]),
+        sample("design-local", "On-device models", models: [("local-small", "Local Small", false)]),
+    ]
+
+    private static func sample(_ id: String, _ name: String, models: [(String, String, Bool)]) -> ProviderInfo {
+        ProviderInfo(
+            provider_id: id, display_name: name, auth_modes: ["api_key"],
+            auth_status: ProviderAuthStatus(provider_id: id, state: "ready", detail: "Connected and answering.",
+                                            user_info: ["plan": "Team"], last_checked_at: nil),
+            models: models.map {
+                ProviderModelInfo(id: $0.0, name: $0.1, context_length: 200_000, supports_streaming: true,
+                                  supports_vision: $0.2, supports_tools: true, supports_json_mode: $0.2)
+            }
+        )
+    }
+}
+#endif
+
+/// Provider ids, states and auth modes as words.
+private enum ProviderWords {
+    static func state(_ raw: String) -> String {
+        switch raw {
+        case "ready": return "Ready"
+        case "needs_key": return "Needs a key"
+        case "needs_oauth": return "Needs sign-in"
+        case "error": return "Error"
+        default: return AliveWords.humanized(raw)
+        }
+    }
+
+    static func authMode(_ raw: String) -> String {
+        switch raw {
+        case "api_key": return "API key"
+        case "oauth": return "account sign-in"
+        default: return AliveWords.humanized(raw).lowercased()
+        }
+    }
+
+    static func statusLine(for provider: ProviderInfo) -> String {
+        let modes = provider.auth_modes.map(authMode).joined(separator: " or ")
+        return [state(provider.auth_status.state), modes].filter { !$0.isEmpty }.joined(separator: " · ")
+    }
+
+    static func modelName(_ model: ProviderModelInfo) -> String {
+        let name = model.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        return name.isEmpty ? model.id : name
+    }
+
+    static func capabilities(_ model: ProviderCapabilityPresentation.Model) -> String {
+        var words: [String] = []
+        if model.supportsStreaming { words.append("streams") }
+        if model.supportsVision { words.append("sees images") }
+        if model.supportsTools { words.append("uses tools") }
+        if model.supportsJSONMode { words.append("JSON mode") }
+        guard let first = words.first else { return "No extra capabilities published" }
+        words[0] = first.prefix(1).uppercased() + first.dropFirst()
+        return words.joined(separator: " · ")
+    }
+}
+
 /// Produces the only provider/model pair the surface picker may submit. A
 /// provider switch retains the current model when possible; otherwise it uses
 /// the provider's first advertised model rather than emitting a mismatched
@@ -499,68 +577,6 @@ enum SurfaceProviderPickerPresentation {
         previousProviderID
     }
 }
-
-// MARK: - Provider row
-
-private struct ProviderRow: View {
-    let provider: ProviderInfo
-
-    var body: some View {
-        MobileAdaptiveRow(alignment: .center, spacing: 12) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text(provider.display_name)
-                    .font(.headline)
-                Text(provider.auth_modes.joined(separator: " / "))
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-            }
-            Spacer()
-            ProviderStatusBadge(state: provider.auth_status.state)
-            Image(systemName: "chevron.right")
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
-        }
-        .padding(.vertical, 2)
-    }
-}
-
-// MARK: - Status badge
-
-private struct ProviderStatusBadge: View {
-    let state: String
-
-    var label: String {
-        switch state {
-        case "ready":       return "Ready"
-        case "needs_key":   return "Needs Key"
-        case "needs_oauth": return "OAuth"
-        case "error":       return "Error"
-        default:            return state.capitalized
-        }
-    }
-
-    var color: Color {
-        switch state {
-        case "ready":       return .green
-        case "error":       return .red
-        default:            return .orange
-        }
-    }
-
-    var body: some View {
-        Text(label)
-            .font(.caption2)
-            .fontWeight(.medium)
-            .padding(.horizontal, 7)
-            .padding(.vertical, 3)
-            .background(NativeAgentMobileTheme.Colors.quietFill)
-            .foregroundStyle(.secondary)
-            .clipShape(Capsule())
-    }
-}
-
-// MARK: - Detail / action sheet
-
 enum ProviderCapabilityPresentation {
     struct Model: Identifiable, Equatable {
         let id: String
@@ -586,10 +602,16 @@ enum ProviderCapabilityPresentation {
     }
 }
 
+
+// MARK: - Detail / action sheet
+
 struct ProviderDetailSheet: View {
     let provider: ProviderInfo
     let onDone: () -> Void
 
+    @ObservedObject private var sync = iCloudSyncEngine.shared
+    @State private var apiKey = ""
+    @State private var signInRequestID: String?
     @State private var isWorking = false
     @State private var workLabel = ""
     @State private var feedbackText = ""
@@ -600,113 +622,103 @@ struct ProviderDetailSheet: View {
     }
 
     var body: some View {
+        let provider = sync.providers.first(where: { $0.provider_id == self.provider.provider_id }) ?? self.provider
         NavigationStack {
-            List {
-                // ── Status section ────────────────────────────────────────
-                Section {
-                    MobileAdaptiveRow {
-                        Text("Status")
-                        Spacer()
-                        ProviderStatusBadge(state: provider.auth_status.state)
-                    }
-                    if !provider.auth_status.detail.isEmpty {
-                        Text(provider.auth_status.detail)
-                            .font(.footnote)
-                            .foregroundStyle(.secondary)
-                    }
-                    if let userInfo = provider.auth_status.user_info, !userInfo.isEmpty {
-                        ForEach(Array(userInfo.prefix(3)), id: \.key) { kv in
-                            MobileAdaptiveRow {
-                                Text(kv.key).foregroundStyle(.secondary).font(.footnote)
-                                Spacer()
-                                Text(kv.value).font(.footnote)
+            AlivePage(title: provider.display_name,
+                     line: ProviderWords.state(provider.auth_status.state)) {
+                // ── Status ────────────────────────────────────────────────
+                let userInfo = Array((provider.auth_status.user_info ?? [:]).sorted { $0.key < $1.key }.prefix(3))
+                if !provider.auth_status.detail.isEmpty || !userInfo.isEmpty {
+                    AliveSection("Status") {
+                        if !provider.auth_status.detail.isEmpty {
+                            AliveRow(provider.auth_status.detail)
+                        }
+                        ForEach(Array(userInfo.enumerated()), id: \.element.key) { index, kv in
+                            if index > 0 || !provider.auth_status.detail.isEmpty { AliveDivider() }
+                            AliveRow(AliveWords.humanized(kv.key)) {
+                                Text(kv.value)
+                                    .font(.body)
+                                    .foregroundStyle(AlivePalette.secondary)
+                                    .multilineTextAlignment(.trailing)
                             }
                         }
                     }
-                } header: {
-                    Label("Status", systemImage: "info.circle")
                 }
 
-                // ── Capabilities ──────────────────────────────────────────
+                // ── Models and what each can do ───────────────────────────
                 let capabilityModels = ProviderCapabilityPresentation.models(from: provider.models)
-                if capabilityModels.isEmpty {
-                    Section {
-                        Label("The Mac has not published model capabilities for this provider yet.", systemImage: "questionmark.circle")
-                            .font(.footnote)
-                            .foregroundStyle(.secondary)
-                    } header: {
-                        Label("Capabilities", systemImage: "cpu")
+                AliveSection("Models") {
+                    if capabilityModels.isEmpty {
+                        AliveRow("Not published yet",
+                                detail: "The Mac hasn’t published this provider’s models and what they can do.")
                     }
-                } else {
-                    ForEach(capabilityModels) { model in
-                        Section {
-                            MobileAdaptiveRow(spacing: 8) {
-                                capPill("Streaming", ok: model.supportsStreaming)
-                                capPill("Vision", ok: model.supportsVision)
-                                capPill("Tools", ok: model.supportsTools)
-                                capPill("JSON", ok: model.supportsJSONMode)
+                    ForEach(Array(capabilityModels.enumerated()), id: \.element.id) { index, model in
+                        if index > 0 { AliveDivider() }
+                        AliveRow(model.name, detail: ProviderWords.capabilities(model))
+                    }
+                }
+
+                // ── Credentials are owned and checked by the Mac ───────────
+                if provider.auth_modes.contains("api_key") || provider.auth_modes.contains("oauth") {
+                    AliveSection("Sign-in") {
+                        if provider.auth_modes.contains("api_key") {
+                            SecureField("API key", text: $apiKey)
+                                .textInputAutocapitalization(.never)
+                                .autocorrectionDisabled()
+                                .disabled(isWorking)
+                            Button(isWorking && workLabel == "save" ? "Saving and checking…" : "Save and verify key") {
+                                sendAction("save")
                             }
-                        } header: {
-                            Label("Capabilities (\(model.name))", systemImage: "cpu")
+                            .disabled(isWorking || apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                            AliveFootnote("Encrypted for your paired Mac and saved in its Keychain. The Mac checks the connection.")
+                        }
+                        if provider.auth_modes.contains("oauth") {
+                            if provider.auth_modes.contains("api_key") { AliveDivider() }
+                            if ["openai_oauth_direct", "anthropic_oauth_direct", "xai_oauth_direct"].contains(provider.provider_id) {
+                                Button("Sign in on Mac") { sendAction("oauth") }
+                                    .disabled(isWorking)
+                                AliveFootnote("Finish sign-in in the browser on your Mac. Its result will appear here.")
+                            } else {
+                                AliveRow("Account sign-in", detail: "This provider’s sign-in must be managed on the Mac.")
+                            }
                         }
                     }
                 }
 
-                // ── API Key section (api_key providers only) ───────────────
-                if provider.auth_modes.contains("api_key") {
-                    Section {
-                        Label("API keys stay on the Mac. Open the Mac Providers view to add or rotate credentials.", systemImage: "macbook.and.iphone")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                    } header: {
-                        Label("API Key", systemImage: "key.fill")
-                    }
-                }
-
-                // ── OAuth section ─────────────────────────────────────────
-                if provider.auth_modes.contains("oauth") {
-                    Section {
-                        Label("OAuth must begin in the Mac Providers view, where the browser callback and recovered credential state can be verified.", systemImage: "macbook.and.iphone")
-                            .font(.footnote)
-                            .foregroundStyle(.secondary)
-                    } header: {
-                        Label("OAuth / Subscription", systemImage: "person.crop.circle.badge.checkmark")
-                    }
-                }
-
-                // ── Actions ───────────────────────────────────────────────
-                Section {
+                // ── The one action ────────────────────────────────────────
+                VStack(alignment: .leading, spacing: 10) {
                     Button {
                         sendAction("test")
                     } label: {
-                        Label(isWorking && workLabel == "test" ? "Testing…" : "Test Connection", systemImage: "network")
+                        Text(isWorking && workLabel == "test" ? "Testing…" : "Test connection")
+                            .font(.body.weight(.semibold))
+                            .frame(maxWidth: .infinity, minHeight: 36)
                     }
+                    .alivePrimaryButton()
+                    .controlSize(.large)
                     .disabled(isWorking)
 
-                } header: {
-                    Label("Actions", systemImage: "bolt")
-                } footer: {
-                    Text("The test runs on the Mac. Results appear here after the signed action completes.")
-                        .font(.caption2)
-                }
-
-                // ── Feedback ──────────────────────────────────────────────
-                if !feedbackText.isEmpty {
-                    Section {
+                    if feedbackText.isEmpty {
+                        AliveFootnote("The test runs on the Mac. The result shows here when it finishes.")
+                    } else {
                         Text(feedbackText)
                             .font(.footnote)
-                            .foregroundStyle(feedbackText.hasPrefix("Error") ? Color.red : .secondary)
+                            .foregroundStyle(feedbackText.hasPrefix("Error")
+                                             ? NativeAgentMobileTheme.Colors.trouble : AlivePalette.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .padding(.horizontal, 4)
                     }
                 }
             }
-            .mobileReadingScreen()
-            .navigationTitle(provider.display_name)
-            .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Button("Done") { onDone() }
+                        .foregroundStyle(AlivePalette.text)
                 }
             }
+            .onDisappear { apiKey = "" }
+            .onChange(of: sync.providerSignIns) { _, _ in applySignInState() }
+            .onAppear { applySignInState() }
         }
     }
 
@@ -715,10 +727,23 @@ struct ProviderDetailSheet: View {
     private func sendAction(_ kind: String) {
         isWorking = true
         workLabel = kind
-        feedbackText = ""
+        feedbackText = kind == "oauth" ? "Waiting for sign-in on your Mac…" : ""
+        let submittedKey = kind == "save" ? apiKey : nil
         Task {
             do {
                 switch kind {
+                case "oauth":
+                    signInRequestID = try await sync.startProviderSignIn(providerId: provider.provider_id)
+                    isWorking = false
+                    applySignInState()
+                case "save":
+                    feedbackText = try await sync.configureProvider(
+                        providerId: provider.provider_id, apiKey: submittedKey,
+                        authMode: "api_key"
+                    )
+                    if apiKey == submittedKey { apiKey = "" }
+                    isWorking = false
+                    _ = await sync.refreshProviderControlsSnapshot()
                 case "test":
                     let status = try await iCloudSyncEngine.shared.testProvider(providerId: provider.provider_id)
                     finish(status: status, successPrefix: "Test complete.")
@@ -733,22 +758,32 @@ struct ProviderDetailSheet: View {
         }
     }
 
+    private func applySignInState() {
+        if signInRequestID == nil, !isWorking {
+            signInRequestID = sync.providerSignIns[provider.provider_id]?["request_id"]
+        }
+        guard let requestID = signInRequestID,
+              let state = sync.providerSignIns[provider.provider_id],
+              state["request_id"] == requestID else { return }
+        switch state["state"] {
+        case "pending":
+            workLabel = "oauth"
+            feedbackText = "Waiting for sign-in on your Mac…"
+        case "signed_in":
+            isWorking = false
+            feedbackText = "Sign-in completed on Mac."
+        case "failed":
+            isWorking = false
+            feedbackText = "Error: Sign-in did not complete on the Mac. It may have been canceled; try again there."
+        default: break
+        }
+    }
+
     private func finish(status: String, successPrefix: String) {
         isWorking = false
         feedbackText = ProviderConnectionTestPresentation.feedback(
             status: status,
             successPrefix: successPrefix
         )
-    }
-
-    @ViewBuilder
-    private func capPill(_ label: String, ok: Bool) -> some View {
-        Text(label)
-            .font(.caption2)
-            .padding(.horizontal, 6)
-            .padding(.vertical, 2)
-            .background(NativeAgentMobileTheme.Colors.quietFill)
-            .foregroundStyle(.secondary)
-            .clipShape(Capsule())
     }
 }

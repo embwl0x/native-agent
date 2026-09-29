@@ -1,4 +1,5 @@
 import SwiftUI
+import ChatOrchestration
 
 enum ChatQueuePresentation {
     struct MenuItem: Identifiable, Equatable {
@@ -38,28 +39,28 @@ struct ChatQueuedTurnsView: View {
     let isBusy: Bool
 
     private var turns: [QueuedChatTurn] {
-        ChatQueuePresentation.visibleTurns(appModel.queuedChatTurns(for: sessionId))
+        ChatQueuePresentation.visibleTurns(appModel.engine.turns.queued(for: sessionId))
     }
 
     private var menuItems: [ChatQueuePresentation.MenuItem] {
-        ChatQueuePresentation.menuItems(appModel.queuedChatTurns(for: sessionId))
+        ChatQueuePresentation.menuItems(appModel.engine.turns.queued(for: sessionId))
     }
 
     var body: some View {
         if let next = turns.first {
             HStack(spacing: 7) {
-                Image(systemName: appModel.isChatQueuePaused(sessionId)
+                Image(systemName: appModel.engine.turns.isQueuePaused(sessionId)
                       ? "pause.fill"
                       : "text.line.last.and.arrowtriangle.forward")
                     .foregroundStyle(NativeAgentBrand.accentDeep)
 
-                Text(appModel.isChatQueuePaused(sessionId) ? "Paused" : "Next")
+                Text(appModel.engine.turns.isQueuePaused(sessionId) ? "Paused" : "Next")
                     .font(.system(size: 10, weight: .bold, design: .rounded))
                     .foregroundStyle(.secondary)
 
                 // 2026-09-06: a queued turn that failed to start paused the
                 // queue and said nothing. The rejection's own words go here.
-                if let reason = appModel.chatQueuePauseReason(sessionId) {
+                if let reason = appModel.engine.turns.queuePauseReason(sessionId) {
                     Text(reason)
                         .font(NativeAgentFont.tag)
                         .foregroundStyle(NativeAgentTheme.fail)
@@ -133,7 +134,7 @@ struct ChatQueuedTurnsView: View {
                 if item.ordinal < menuItems.count { Divider() }
             }
         } label: {
-            Text(ChatQueuePresentation.countLabel(appModel.queuedChatTurns(for: sessionId)))
+            Text(ChatQueuePresentation.countLabel(appModel.engine.turns.queued(for: sessionId)))
                 .font(NativeAgentFont.tag)
                 .foregroundStyle(.secondary)
         }

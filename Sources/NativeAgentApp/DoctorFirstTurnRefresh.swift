@@ -2,6 +2,7 @@ import Foundation
 import BackgroundLoops
 import DoctorChecks
 import PersistenceCore
+import TurnTrace
 import ProviderRouting
 
 /// ONE doctor snapshot refresh after this launch's first completed turn.

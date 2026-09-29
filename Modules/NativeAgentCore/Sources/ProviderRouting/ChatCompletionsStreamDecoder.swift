@@ -521,7 +521,7 @@ extension AsyncThrowingStream where Element == LLMMessageStreamEvent, Failure ==
                             // String streams use an empty delta for activity without
                             // reply text, so the outer idle guard stays informed.
                             continuation.yield("")
-                        case .toolCall:
+                        case .toolCall, .replyTextSettled:
                             continue
                         }
                     }

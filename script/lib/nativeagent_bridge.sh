@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
 
-# Resolve the authenticated local bridge from its atomic descriptor. Explicit
-# environment overrides retain priority; the fixed endpoint/token path remain
-# compatibility fallbacks for an older installed app.
+# Resolve the authenticated local bridge from its atomic descriptor. Each
+# install listens on its own port, so the descriptor is the only source of the
+# address; explicit environment overrides retain priority.
 nativeagent_bridge_resolve() {
   local descriptor="${NATIVE_AGENT_BRIDGE_DESCRIPTOR:-$HOME/.config/claude-bridge/bridge.json}"
-  local legacy_token_path="${NATIVE_AGENT_BRIDGE_TOKEN:-$HOME/.config/claude-bridge/token}"
   local discovered_url=""
   local discovered_token=""
 
@@ -14,23 +13,26 @@ nativeagent_bridge_resolve() {
     discovered_token="$(/usr/bin/plutil -extract token raw -o - "$descriptor" 2>/dev/null || true)"
   fi
 
-  BASE_URL="${NATIVE_AGENT_BRIDGE_URL:-${discovered_url:-http://127.0.0.1:8771}}"
-  TOKEN_PATH="$legacy_token_path"
-  BRIDGE_CREDENTIAL_PATH="$legacy_token_path"
+  BASE_URL="${NATIVE_AGENT_BRIDGE_URL:-$discovered_url}"
+  if [ -z "$BASE_URL" ]; then
+    echo "NativeAgent bridge descriptor $descriptor has no endpoint; is NativeAgent running?" >&2
+    return 1
+  fi
 
   if [ -n "${NATIVE_AGENT_BRIDGE_TOKEN:-}" ]; then
-    [ -r "$legacy_token_path" ] || {
-      echo "bridge token not readable at $legacy_token_path; is NativeAgent running?" >&2
+    TOKEN_PATH="$NATIVE_AGENT_BRIDGE_TOKEN"
+    BRIDGE_CREDENTIAL_PATH="$NATIVE_AGENT_BRIDGE_TOKEN"
+    [ -r "$TOKEN_PATH" ] || {
+      echo "bridge token not readable at $TOKEN_PATH; is NativeAgent running?" >&2
       return 1
     }
-    TOKEN="$(<"$legacy_token_path")"
+    TOKEN="$(<"$TOKEN_PATH")"
   elif [ -n "$discovered_token" ]; then
-    TOKEN="$discovered_token"
+    TOKEN_PATH="$descriptor"
     BRIDGE_CREDENTIAL_PATH="$descriptor"
-  elif [ -r "$legacy_token_path" ]; then
-    TOKEN="$(<"$legacy_token_path")"
+    TOKEN="$discovered_token"
   else
-    echo "NativeAgent bridge descriptor/token is not readable; is NativeAgent running?" >&2
+    echo "NativeAgent bridge descriptor $descriptor has no token; is NativeAgent running?" >&2
     return 1
   fi
 

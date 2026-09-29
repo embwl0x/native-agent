@@ -1,3 +1,4 @@
+import ApprovalTransactions
 import SwiftUI
 import NativeAgentCore
 import ChatOrchestration
@@ -11,6 +12,8 @@ struct AgentContactRow: Identifiable {
     var builtIn = false
     var sharesBuiltInName = false
     var peers: [AgentPeerContact] = []
+    /// The newest retained exchange with this contact, from any chat.
+    var lastExchange: String?
     var readCredential: (String) throws -> String? = { try AgentPeerCredentials.read(peerID: $0) }
 
     var credentialAvailable: Bool {
@@ -132,7 +135,8 @@ struct AgentContactRow: Identifiable {
         switch contact.state {
         case .unavailable: return AgentPeerCredentials.unavailableDetail
         case .listed: return "On this Mac · Not set up"
-        case .setUp: return contact.provenOutboundAt == nil
+        // With history, the last exchange shows in its own note below.
+        case .setUp: return lastExchange != nil ? "Set up · No proven round trip" : contact.provenOutboundAt == nil
             ? "Set up · Nothing has crossed yet" : "Set up · Sent a message, no reply yet"
         case .sendOnly: return "Can send · Replies are not connected"
         case .connected:
@@ -154,18 +158,7 @@ enum AgentContactResult {
     /// A bounded display result on the existing approval receipt, so a long
     /// settings description cannot cut off the test answer's JSON mid-string.
     static func receipt(_ result: JSONValue) -> JSONValue {
-        guard case .object(let value) = result else { return .null }
-        var display: [String: JSONValue] = [:]
-        for key in ["status", "reply", "detail", "reason", "error", "connection_check", "connection_reply_received",
-                    "sent", "completed", "terminal", "needs_input", "needs_authentication", "task_id",
-                    "message_id", "conversation_id", "run_id", "local_request_id", "read_with"] {
-            if case .string(let text)? = value[key] {
-                display[key] = .string(String(text.prefix(4096)) + (text.count > 4096 ? "\nAnswer shortened." : ""))
-            } else if let item = value[key] { display[key] = item }
-        }
-        if let probe = value["probe"] { display["probe"] = receipt(probe) }
-        if let remote = value["remote_evidence"] { display["remote_evidence"] = receipt(remote) }
-        return .object(display)
+        ApprovalTransactionCoordinator.agentContactReceipt(result)
     }
 
     static func text(_ result: JSONValue) -> String {
@@ -257,6 +250,9 @@ struct AgentContactsSection: View {
                         ConnectorsNote(text: row.route)
                         ConnectorsNote(text: row.status,
                             color: row.state == .connected ? NativeAgentShell.calm : NativeAgentShell.secondary)
+                        if let last = row.lastExchange {
+                            ConnectorsNote(text: "Last exchange · " + last)
+                        }
                         if let at = row.contact?.provenInboundAt {
                             ConnectorsNote(text: "Received a message · \(at)")
                         }
@@ -295,7 +291,8 @@ struct AgentContactsSection: View {
         .task(id: refresh + refreshGeneration) {
             guard fixtureRows == nil else { return }
             discovery = await AgentDiscoverySession.shared.candidates(refresh: true)
-            let events = FileChangeEvents(paths: [root.appendingPathComponent("agents/peers.json")], emitInitial: true)
+            let events = FileChangeEvents(paths: [root.appendingPathComponent("agents/peers.json"),
+                                                  root.appendingPathComponent("agents/conversations.json")], emitInitial: true)
             await withTaskCancellationHandler {
                 for await _ in events.stream {
                     guard !Task.isCancelled else { break }
@@ -310,8 +307,18 @@ struct AgentContactsSection: View {
         do {
             let dispatcher = SwiftToolDispatcher(dataRoot: root, allowProcessGlobalTools: false)
             let usable = Set(["codex", "claude", "omp"].filter { dispatcher.builtInAgentLaneUsable($0) })
-            rows = AgentContactRow.rows(peers: try AgentPeerStore(dataRoot: root).list(),
-                candidates: discovery, usable: usable)
+            let peers = try AgentPeerStore(dataRoot: root).list()
+            // The conversations file can be large: read and summarise it off the main actor, once.
+            let root = root
+            let lasts = await Task.detached(priority: .utility) {
+                AgentConversationStore.lastExchanges(peers: peers,
+                    records: (try? AgentConversationStore(dataRoot: root).records()) ?? []).mapValues(\.summary)
+            }.value
+            rows = AgentContactRow.rows(peers: peers, candidates: discovery, usable: usable).map { row in
+                var row = row
+                row.lastExchange = row.contact.flatMap { lasts[$0.id] }
+                return row
+            }
             loadError = nil
         } catch { loadError = "Could not load agent contacts. Refresh Agents to try again." }
     }

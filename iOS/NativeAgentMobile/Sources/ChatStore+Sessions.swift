@@ -87,8 +87,8 @@ extension ChatStore {
 
     /// Start a fresh chat session from iOS. Generates a new client-side session
     /// id; the Mac creates it as a `source: "ios"` session on the first message.
-    /// It becomes the phone's one main session; additional tabs come only from
-    /// the exact Mac-owned pinned snapshot. Mirrors loadSelectedSession's
+    /// It is an explicit conversation; main continues to follow the Mac.
+    /// Mirrors loadSelectedSession's
     /// in-flight reset so no stale stream/poll bleeds into the new session.
     func startNewSession() {
         // A new chat is the human's own choice of session: the chat stops
@@ -140,11 +140,10 @@ extension ChatStore {
         // disabled — the very freeze this escape hatch exists to clear.
         isLoading = false
         // Switch to the fresh id BEFORE clearing messages so the empty
-        // transcript never persists over the previous session. It replaces the
-        // one phone-main slot; only Mac-pinned sessions occupy extra tabs.
+        // transcript never persists over the previous session.
         let freshSessionID = UUID().uuidString
         markLocallyCreatedSession(freshSessionID)
-        replaceMainSessionID(freshSessionID)
+        MobileChatSelectionIntent.noteNotifiedSelection(freshSessionID)
         setSelectedSessionID(freshSessionID)
         suppressMessagePersistence = true
         messages = []

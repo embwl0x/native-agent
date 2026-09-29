@@ -358,6 +358,32 @@ extension TelegramPollLoop {
         }
     }
 
+    /// Import before either shared or Telegram recovery scans the inbox, so
+    /// launch ordering cannot hide an owed delivery behind the history cutoff.
+    public static func importLegacyApprovalContinuations(dataRoot: URL, inbox: SwiftNativeApprovalInbox) async throws {
+        let legacyPath = dataRoot.appendingPathComponent("telegram/approval_continuations.json")
+        guard FileManager.default.fileExists(atPath: legacyPath.path) else { return }
+        let legacy = try JSONDecoder().decode(
+            TelegramLegacyApprovalContinuations.self, from: Data(contentsOf: legacyPath))
+        guard legacy.schemaVersion == 1 else {
+            throw TelegramBotError.underlying("unsupported Telegram approval continuation schema")
+        }
+        for raw in legacy.continuations {
+            let delivery = try JSONDecoder().decode(
+                TelegramPendingApprovalContinuation.self, from: raw.serializedData(pretty: false))
+            guard case .object(let value) = raw, case .bool(let started)? = value["started"] else {
+                throw TelegramBotError.underlying("malformed Telegram approval continuation")
+            }
+            do {
+                _ = try await inbox.queueChatContinuation(delivery.approvalId,
+                    delivery: delivery.toJSON(), alreadyStarted: started, previouslyQueued: true)
+            } catch ApprovalInboxError.notFound(_) {
+                // The legacy file outlives archived approvals; never recreate them.
+                continue
+            }
+        }
+    }
+
     /// 2026-09-06: once per process, answer for the approval continuations the
     /// previous process was holding. One that never started is replayed
     /// verbatim — the tool already ran and its result is inside the prompt, so
@@ -366,27 +392,15 @@ extension TelegramPollLoop {
     /// happened, which is still better than the silence this used to be.
     func replayApprovalContinuationsIfNeeded() async {
         guard await turnCoordinator.claimApprovalRecovery() else { return }
-        let records: [(approval: ApprovalRecord, delivery: TelegramPendingApprovalContinuation)]
         do {
             // 2026-09-18: import the old hand-off without ever resetting a claim.
             // Leave legacy bytes alone; completed approval markers prevent reimport.
-            let legacyPath = dataRoot.appendingPathComponent("telegram/approval_continuations.json")
-            if FileManager.default.fileExists(atPath: legacyPath.path) {
-                let legacy = try JSONDecoder().decode(
-                    TelegramLegacyApprovalContinuations.self, from: Data(contentsOf: legacyPath))
-                guard legacy.schemaVersion == 1 else {
-                    throw TelegramBotError.underlying("unsupported Telegram approval continuation schema")
-                }
-                for raw in legacy.continuations {
-                    let delivery = try JSONDecoder().decode(
-                        TelegramPendingApprovalContinuation.self, from: raw.serializedData(pretty: false))
-                    guard case .object(let value) = raw, case .bool(let started)? = value["started"] else {
-                        throw TelegramBotError.underlying("malformed Telegram approval continuation")
-                    }
-                    _ = try await approvalInbox.queueChatContinuation(delivery.approvalId,
-                        delivery: delivery.toJSON(), alreadyStarted: started)
-                }
-            }
+            try await Self.importLegacyApprovalContinuations(dataRoot: dataRoot, inbox: approvalInbox)
+        } catch {
+            await recordError(context: "approval_continuation_legacy_import", error: String(describing: error))
+        }
+        let records: [(approval: ApprovalRecord, delivery: TelegramPendingApprovalContinuation)]
+        do {
             records = try await approvalInbox.list(filter: .resolved).compactMap { approval in
                 guard case .object(let state)? = approval.chatContinuation,
                       state["done"] != .bool(true), let raw = state["delivery"],
@@ -400,6 +414,13 @@ extension TelegramPollLoop {
             return
         }
         for (approval, record) in records {
+            // The shared approval reconciler now owns generic receipt turns.
+            // Keep old queued evidence, but never race its delivery or
+            // settlement with the shared owner, even for a started claim.
+            if case .object(let payload) = approval.payload,
+               payload["kind"] == .string("chat_tool_approval") || payload["kind"] == .string("telegram_tool_approval") {
+                continue
+            }
             guard Self.inboundAuthorizationDecision(
                 allowedChatIds: allowedChatIds,
                 allowedUserIds: allowedUserIds,

@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import TurnTrace
 
 struct TelegramTurnProgressCardDriverSnapshot: Sendable, Equatable {
     let state: TelegramTurnPresentationState
@@ -54,6 +55,7 @@ actor TelegramTurnProgressCardDriver {
     private let removePersistedCard: RemovePersistedCard
 
     private var state: TelegramTurnPresentationState
+    private var replyTextSettled = false
     private var messageId: Int?
     private var initialSendAttempted = false
     private var transportFailed = false
@@ -133,6 +135,18 @@ actor TelegramTurnProgressCardDriver {
 
     func record(progress event: TelegramChatProgressEvent) async {
         guard !state.isTerminal else { return }
+        if case .replyTextSettled(let settled) = event {
+            guard replyTextSettled != settled else { return }
+            replyTextSettled = settled
+            if !settled {
+                state = TelegramTurnPresentationReducer.reduce(
+                    state, lifecycle: .working(action: nil), at: clock()
+                )
+            }
+            await flushIfDue(force: true, bypassThrottle: true)
+            return
+        }
+        replyTextSettled = false
         let next = TelegramTurnPresentationReducer.reduce(
             state,
             progress: event,
@@ -147,6 +161,7 @@ actor TelegramTurnProgressCardDriver {
 
     func transition(_ event: TelegramTurnPresentationLifecycleEvent) async {
         guard !state.isTerminal else { return }
+        replyTextSettled = false
         let next = TelegramTurnPresentationReducer.reduce(
             state,
             lifecycle: event,
@@ -289,7 +304,8 @@ actor TelegramTurnProgressCardDriver {
         // the state can move to terminal while an earlier edit is in flight,
         // and that edit's text is not the terminal one.
         let renderedIsTerminal = state.isTerminal
-        guard rendered != lastRenderedText else {
+        guard rendered != lastRenderedText
+                || (renderedIsTerminal && state.phase == .completed && deleteCard != nil) else {
             editInFlight = false
             pendingFlush = false
             pendingForcedFlush = false
@@ -316,7 +332,7 @@ actor TelegramTurnProgressCardDriver {
             }
         }
 
-        let markup = state.isTerminal
+        let markup = state.isTerminal || replyTextSettled
             ? TelegramTurnControlCallback.clearedReplyMarkup
             : TelegramTurnControlCallback.replyMarkup(turnId: turnId)
 
@@ -382,6 +398,7 @@ actor TelegramTurnProgressCardDriver {
     }
 
     private func renderedText(at instant: Date) -> String {
+        if replyTextSettled { return "Done." }
         if detailsVisible {
             return TelegramTurnPresentationRenderer.renderDetails(
                 state,

@@ -1,8 +1,14 @@
+import MacAssistantStatus
 import Foundation
 import PersistenceCore
 import NativeAgentShared
+import ChatOrchestration
 import NativeAgentCore
+import ApprovalInbox
+import Cognition
 import ProviderRouting
+import TrustCenter
+import DeviceSync
 
 // R22: thin AppModel passthroughs for view-level NativeClient calls.
 //
@@ -18,15 +24,11 @@ import ProviderRouting
 extension AppModel {
 
     // MARK: Approvals
-    func getApprovals() async throws -> [ApprovalRequest] {
-        try await client.getApprovals()
-    }
-
     /// Overload of the existing `resolveApproval(_:decision:)` for callers that
     /// hold only the approval id (inline cards, sidebar rows). Concurrent
     /// callers share one task because a terminal approval may start a real
     /// executor after its durable decision is written.
-    func resolveApproval(id: String, decision: String) async throws -> ApprovalRequest {
+    func resolveApproval(id: String, decision: String) async throws -> ApprovalRecord {
         let trimmedID = id.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedID.isEmpty else {
             throw NSError(domain: "NativeAgentApproval", code: 400, userInfo: [
@@ -53,7 +55,7 @@ extension AppModel {
 
         let resolverOverride = approvalResolverOverride
         let resolverClient = client
-        let task = Task<ApprovalRequest, Error> { @MainActor in
+        let task = Task<ApprovalRecord, Error> { @MainActor in
             if let resolverOverride {
                 return try await resolverOverride(trimmedID, decision)
             }
@@ -82,19 +84,6 @@ extension AppModel {
         try await client.postRaw(path, body: body, timeout: timeout)
     }
 
-    // MARK: Inbox
-    func getInboxItems(unreadOnly: Bool = false) async throws -> [InboxItemRecord] {
-        if let inboxReaderOverride {
-            return try await inboxReaderOverride(unreadOnly)
-        }
-        return try await client.getInboxItems(unreadOnly: unreadOnly)
-    }
-
-    // MARK: Models
-    func getModelCatalog(refresh: Bool) async throws -> ModelCatalogResponse {
-        try await client.getModelCatalog(refresh: refresh)
-    }
-
     // MARK: Chat context / tools
     func getSessionContext(sessionId: String, model: String? = nil) async throws -> SessionContextStatus {
         try await client.getSessionContext(sessionId: sessionId, model: model)
@@ -105,7 +94,7 @@ extension AppModel {
         model: String? = nil,
         providerID: String? = nil,
         force: Bool = false
-    ) async throws -> CompactionResult {
+    ) async throws -> ChatSessionCompactionOutcome {
         try await client.compactSession(
             sessionId: sessionId,
             model: model,
@@ -180,7 +169,7 @@ extension AppModel {
     }
 
     // MARK: Mac assistant / Mac control
-    func getMacAssistantStatus() async throws -> MacAssistantStatusResponse {
+    func getMacAssistantStatus() async throws -> MacAssistantStatusResult {
         try await client.getMacAssistantStatus()
     }
 
@@ -192,10 +181,6 @@ extension AppModel {
     /// call shape used by the Mac-data probe.
     func runConnectorAction(id: String, dryRun: Bool, input: [String: JSONValue] = [:]) async throws -> ConnectorActionReceipt {
         try await client.runConnectorAction(id: id, dryRun: dryRun, input: input)
-    }
-
-    func getTrustPolicy() async throws -> TrustPolicy {
-        try await client.getTrustPolicy()
     }
 
     func fullMacYoloAuthorityAdmitted(tool: String, surface: String) async -> Bool {
@@ -218,10 +203,6 @@ extension AppModel {
     }
 
     // MARK: Providers
-    func listProviders() async throws -> [ProviderInfo] {
-        try await client.listProviders()
-    }
-
     func clearSurfaceOverride(surface: String) async throws {
         let routing = SwiftNativeProviderRouting(dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot())
         try await routing.clearSurfaceOverride(surface: surface)
@@ -232,9 +213,9 @@ extension AppModel {
             )
         }
         if surface == "cognition_reflection" {
-            await NativeCognitionRuntime.shared.refreshConfiguration()
+            await NativeAgentEngine.liveCognition.refreshConfiguration()
         }
-        Task { _ = await iCloudBridge.shared.publishProviderCatalogStatus() }
+        Task { _ = await NativeAgentEngine.liveDeviceSync.bridge.publishProviderCatalogStatus() }
     }
 
     func setActiveProvider(surface: String, providerId: String) async throws -> EmptyResponse {
@@ -242,9 +223,9 @@ extension AppModel {
         if surface == "chat" {
             chatProvider = providerId
         } else if surface == "cognition_reflection" {
-            await NativeCognitionRuntime.shared.refreshConfiguration()
+            await NativeAgentEngine.liveCognition.refreshConfiguration()
         }
-        Task { _ = await iCloudBridge.shared.publishProviderCatalogStatus() }
+        Task { _ = await NativeAgentEngine.liveDeviceSync.bridge.publishProviderCatalogStatus() }
         return response
     }
 
@@ -254,12 +235,12 @@ extension AppModel {
             model: model,
             inferProvider: inferProvider
         )
-        modelCatalog = response
+        engine.providers.catalog = response
         await refreshSurfacePickerCache()
         if surface == "cognition_reflection" {
-            await NativeCognitionRuntime.shared.refreshConfiguration()
+            await NativeAgentEngine.liveCognition.refreshConfiguration()
         }
-        Task { _ = await iCloudBridge.shared.publishProviderCatalogStatus() }
+        Task { _ = await NativeAgentEngine.liveDeviceSync.bridge.publishProviderCatalogStatus() }
         return response
     }
 
@@ -277,7 +258,7 @@ extension AppModel {
             serviceTier: serviceTier,
             inferProvider: inferProvider
         )
-        modelCatalog = response
+        engine.providers.catalog = response
         applySurfacePickerSelection(
             surface: surface,
             model: model,
@@ -285,9 +266,9 @@ extension AppModel {
             serviceTier: serviceTier
         )
         if surface == "cognition_reflection" {
-            await NativeCognitionRuntime.shared.refreshConfiguration()
+            await NativeAgentEngine.liveCognition.refreshConfiguration()
         }
-        Task { _ = await iCloudBridge.shared.publishProviderCatalogStatus() }
+        Task { _ = await NativeAgentEngine.liveDeviceSync.bridge.publishProviderCatalogStatus() }
         return response
     }
 
@@ -305,7 +286,7 @@ extension AppModel {
             reasoningEffort: reasoningEffort,
             serviceTier: serviceTier
         )
-        modelCatalog = response
+        engine.providers.catalog = response
         applySurfacePickerSelection(
             surface: surface,
             model: model,
@@ -321,9 +302,9 @@ extension AppModel {
                 fastMode: canonical.serviceTier == "priority"
             )
         } else if surface == "cognition_reflection" {
-            await NativeCognitionRuntime.shared.refreshConfiguration()
+            await NativeAgentEngine.liveCognition.refreshConfiguration()
         }
-        Task { _ = await iCloudBridge.shared.publishProviderCatalogStatus() }
+        Task { _ = await NativeAgentEngine.liveDeviceSync.bridge.publishProviderCatalogStatus() }
         return response
     }
 
@@ -353,7 +334,7 @@ extension AppModel {
             authMode: authMode,
             defaultModel: defaultModel
         )
-        Task { _ = await iCloudBridge.shared.publishProviderCatalogStatus() }
+        Task { _ = await NativeAgentEngine.liveDeviceSync.bridge.publishProviderCatalogStatus() }
         return response
     }
 
@@ -366,7 +347,7 @@ extension AppModel {
 
     func clearProvider(_ id: String) async throws -> EmptyResponse {
         let response = try await client.clearProvider(id)
-        Task { _ = await iCloudBridge.shared.publishProviderCatalogStatus() }
+        Task { _ = await NativeAgentEngine.liveDeviceSync.bridge.publishProviderCatalogStatus() }
         return response
     }
 

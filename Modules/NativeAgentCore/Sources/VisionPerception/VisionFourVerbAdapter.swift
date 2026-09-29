@@ -7,8 +7,18 @@ import MacControl
 /// ChatOrchestration about ImageIO.
 public enum VisionImageDecoder {
     public static func decode(_ data: Data) -> CGImage? {
-        guard let source = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
-        return CGImageSourceCreateImageAtIndex(source, 0, nil)
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+              let lazy = CGImageSourceCreateImageAtIndex(source, 0, nil) else { return nil }
+        // Draw into a bitmap we own. A lazily decoded ImageIO image can hand
+        // Vision pixels whose backing was already released (SIGBUS in
+        // CIImage initWithCGImage during OCR, 2026-09-25).
+        guard let context = CGContext(
+            data: nil, width: lazy.width, height: lazy.height, bitsPerComponent: 8, bytesPerRow: 0,
+            space: CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else { return nil }
+        context.draw(lazy, in: CGRect(x: 0, y: 0, width: lazy.width, height: lazy.height))
+        return context.makeImage()
     }
 }
 

@@ -18,6 +18,10 @@
 <dict>
   <key>com.apple.security.app-sandbox</key>
   <false/>
+  <key>com.apple.security.application-groups</key>
+  <array>
+    <string>group.io.github.embwl0x.nativeagent.mac</string>
+  </array>
 
   <!-- TCC rejects Calendar prompts from hardened-runtime builds without this. -->
   <key>com.apple.security.personal-information.calendars</key>

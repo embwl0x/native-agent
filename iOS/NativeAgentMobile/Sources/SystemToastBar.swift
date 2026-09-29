@@ -10,8 +10,8 @@
 //     `iOSSystemToastBar` — so this file can coexist with the shared
 //     Mac type names if either side later gets pulled into a shared
 //     module.
-//   • Bottom-of-screen safe-area-aware overlay (Mac shows under the
-//     title bar; iOS shows above the home indicator).
+//   • Top-of-screen overlay under the status bar (Mac shows under the
+//     title bar; iOS drops in like a system banner).
 //   • Taller hit target on the dismiss X (44 pt minimum).
 //
 // Wired as an overlay on ContentView's TabView root.
@@ -129,11 +129,7 @@ public struct iOSSystemToastBar: View {
         // Liquid Glass pilot (2026-07-02): stacked glass pills must live in
         // a GlassEffectContainer — glass can't sample other glass, the
         // container coordinates the shared sampling region.
-        if #available(iOS 26.0, *) {
-            GlassEffectContainer(spacing: 8) {
-                pillStack(visibleToasts)
-            }
-        } else {
+        GlassEffectContainer(spacing: 8) {
             pillStack(visibleToasts)
         }
     }
@@ -144,17 +140,16 @@ public struct iOSSystemToastBar: View {
                 iOSSystemToastPill(toast: toast) {
                     center.dismiss(toast.id)
                 }
-                .transition(.move(edge: .bottom).combined(with: .opacity))
+                .transition(.move(edge: .top).combined(with: .opacity))
             }
         }
         .padding(.horizontal, 16)
-        .padding(.bottom, 12)
+        .padding(.top, 4)
         .frame(maxWidth: .infinity, alignment: .center)
         .animation(AppMotion.snappy, value: center.queue.map(\.id))
         .allowsHitTesting(!center.queue.isEmpty)
-        // Sit above the TabView and home indicator on iPhone, and the home
-        // indicator on iPad. The overlay caller already applies safe-area
-        // semantics, this is the extra inset for the bar itself.
+        // The overlay caller keeps the status bar's safe area, so the stack
+        // sits just under it on iPhone and iPad alike.
     }
 }
 
@@ -187,9 +182,10 @@ private struct iOSSystemToastPill: View {
             // users can actuate dismiss instead of just hearing the text.
             HStack(spacing: 12) {
                 Image(systemName: icon)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(toast.kind == .error ? Color.red : AlivePalette.secondary)
                 Text(toast.text)
-                    .font(.body)
+                    .font(.subheadline)
+                    .foregroundStyle(AlivePalette.text)
                     .fixedSize(horizontal: false, vertical: true)
                     .textSelection(.enabled)
             }
@@ -201,7 +197,7 @@ private struct iOSSystemToastPill: View {
             Button(action: onDismiss) {
                 Image(systemName: "xmark")
                     .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(AlivePalette.secondary)
                     .frame(minWidth: 44, minHeight: 44) // iOS touch target
                     .contentShape(Rectangle())
             }
@@ -217,14 +213,18 @@ private struct iOSSystemToastPill: View {
 }
 
 /// Toast pill chrome. Toasts are a floating control over content — exactly
-/// the layer the iOS 26 HIG assigns to Liquid Glass — so on iOS 26 they use
-/// the real material (lensing, motion highlights, auto contrast). Pre-26
-/// keeps the hand-rolled ultraThinMaterial approximation.
+/// the layer the iOS 26 HIG assigns to Liquid Glass — using the real material
+/// (lensing, motion highlights, auto contrast).
 private struct ToastPillSurface: ViewModifier {
     let tint: Color
 
     func body(content: Content) -> some View {
-        content.mobileGlassSurface(radius: NativeAgentMobileTheme.Radius.composer, interactive: true)
+        content.aliveGlass(in: RoundedRectangle(cornerRadius: NativeAgentMobileTheme.Radius.composer,
+                                                style: .continuous),
+                           interactive: true,
+                           // A little of the room in the glass so a toast over
+                           // the serif header still reads first.
+                           tint: AlivePalette.room.opacity(0.5))
     }
 }
 
@@ -244,7 +244,11 @@ private struct ToastPillSurface: ViewModifier {
 /// a green dot alone makes a healthy connection look like unexplained chrome,
 /// especially when the user has no reason to know the dot is tappable.
 struct MacStatusChip: View {
+    /// The chat header's status line: the agent says where it is, in its own
+    /// words and the header's type, instead of an icon and a system label.
+    var speaksAsAgent = false
     @EnvironmentObject private var bridgeClient: MacBridgeClient
+    @EnvironmentObject private var pairingStore: PairingStore
     @ObservedObject private var sync = iCloudSyncEngine.shared
     @State private var showDetail = false
 
@@ -255,19 +259,30 @@ struct MacStatusChip: View {
         Button {
             showDetail = true
         } label: {
-            Label(shortLabel, systemImage: isHealthy ? "checkmark.icloud" : "icloud.slash")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
+            Group {
+                if speaksAsAgent {
+                    Text(AliveConnection.line(for: status, paired: pairingStore.isPaired))
+                        .font(.subheadline)
+                        .foregroundStyle(AlivePalette.secondary)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.85)
+                } else {
+                    Label(shortLabel, systemImage: isHealthy ? "checkmark.icloud" : "icloud.slash")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
             // A bare 8pt dot is far under the 44pt minimum target, so pad the
             // hit area without padding the visual.
             .contentShape(Rectangle())
             .frame(minWidth: 44, minHeight: 44)
         }
         .buttonStyle(.plain)
-        .accessibilityLabel("Mac connection: \(status.displayName)")
+        .accessibilityLabel("Mac connection: \(AliveConnection.line(for: status, paired: pairingStore.isPaired))")
         .popover(isPresented: $showDetail) {
-            MacStatusDetail(status: status, lastSeenAt: bridgeClient.lastSeenAt, lastSyncAt: sync.lastSyncAt)
+            MacStatusDetail(status: status, paired: pairingStore.isPaired,
+                            lastSeenAt: bridgeClient.lastSeenAt, lastSyncAt: sync.lastSyncAt)
                 .presentationCompactAdaptation(.popover)
         }
     }
@@ -288,6 +303,7 @@ enum MacStatusChipPresentation {
         case .offline: return "No iCloud"
         case .macUnreachable: return "Mac unavailable"
         case .deviceOffline: return "iPhone offline"
+        case .iCloudAccountAttention: return "iCloud sign-in"
         case .stale(let minutesAgo): return "\(minutesAgo)m ago"
         case .connecting: return "Connecting"
         }
@@ -295,6 +311,8 @@ enum MacStatusChipPresentation {
 
     static func explanation(for status: BridgeStatus) -> String {
         switch status {
+        case .iCloudAccountAttention:
+            return "iCloud sign-in needs attention on this iPhone (Settings → Apple Account); messages can't be sent or received until it's fixed"
         case .online:
             return "The Mac checked in recently through iCloud. If it goes offline, new messages may wait until it returns."
         case .awaitingMacActivity:
@@ -315,6 +333,7 @@ enum MacStatusChipPresentation {
 
 private struct MacStatusDetail: View {
     let status: BridgeStatus
+    let paired: Bool
     let lastSeenAt: Date?
     let lastSyncAt: Date?
 
@@ -322,11 +341,12 @@ private struct MacStatusDetail: View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 7) {
                 Circle().fill(status.color).frame(width: 9, height: 9)
-                Text(status.displayName)
+                Text(AliveConnection.line(for: status, paired: paired))
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
-            Text(MacStatusChipPresentation.explanation(for: status))
+            Text(paired ? MacStatusChipPresentation.explanation(for: status)
+                 : "Pair this iPhone with your Mac and I can reach you here.")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)

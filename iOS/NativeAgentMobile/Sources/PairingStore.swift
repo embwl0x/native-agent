@@ -218,6 +218,8 @@ final class PairingStore: ObservableObject {
             iCloudPairingSecret = data
         } else {
             iCloudPairingSecret = nil
+            // No pairing on this phone: the last agent's name goes with it.
+            if keychainRead.status == errSecItemNotFound { AgentNameCache.forget() }
         }
 
         // AUTO-BOOTSTRAP: attempt to pull pairing material from iCloud KVS

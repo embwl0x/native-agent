@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import Procedures
 
 /// Provider-free invocation adapter for a compiled Workshop plan that has not
 /// yet been admitted to the canonical queue. Queue admission happens *inside*

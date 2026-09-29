@@ -53,8 +53,7 @@ import TrustCenter
 //                          requires_approval=true). Flipping means
 //                          matchedCapabilities reflects the 19+84-entry
 //                          static manifest only, not runtime-registered
-//                          skills/tools/workflows/MCP-servers. See
-//                          CUTOVER_PLAN.md §6.14.
+//                          skills/tools/workflows/MCP-servers.
 //
 //   .systemRebuild       — PORTED-FLIPPABLE (wave 8 closed the gate prereq).
 //                          The Swift impl now runs the trust+autonomy gate
@@ -64,7 +63,7 @@ import TrustCenter
 //                          reconcile/improvements-lock check is intentionally
 //                          not part of this Swift helper; callers should run
 //                          the self-improvement status checks separately when
-//                          needed. See CUTOVER_PLAN.md §6.13.
+//                          needed.
 //
 //   .gitStashRecover     — PORTED-FLIPPABLE (wave 8 closed the gate prereq).
 //                          Same disposition as .systemRebuild — Swift now
@@ -72,7 +71,7 @@ import TrustCenter
 //                          `checkTrustPolicyForAction(.gitStashRecover, ...)`.
 //                          No rebuild lock (stash recovery is idempotent +
 //                          fast). The flag is STILL OFF in launchctl by
-//                          default. See CUTOVER_PLAN.md §6.13.
+//                          default.
 //
 //   .crashReport         — PORTED-FLIPPABLE (full). Storage + redaction + prune
 //                          are byte-accurate against the Python path. The
@@ -96,4 +95,3 @@ import TrustCenter
 //                          (out of wave-9 scope). The closure can be wired to
 //                          SwiftNativeSelfImprovement.startImprovement(...)
 //                          at the AppDelegate composition layer.
-//                          See CUTOVER_PLAN.md §6.10.

@@ -255,82 +255,65 @@ final class SkillLifecycleStore: ObservableObject {
 // MARK: - Top-level view
 
 struct SkillLifecycleView: View {
+    /// Rides under the page header (Skills & Tools puts its page switch here).
+    var accessory: AnyView = AnyView(EmptyView())
     @EnvironmentObject private var pairingStore: PairingStore
     @StateObject private var store = SkillLifecycleStore()
 
     @State private var filter: SkillFilter = .all
     @State private var selectedSkill: SkillManifestEntry?
 
+    private var allSkills: [SkillManifestEntry] { MobileDesignSamples.rows(store.skills) }
+
     private var filtered: [SkillManifestEntry] {
         SkillLifecyclePresentation.filtered(
-            MobileDesignSamples.rows(store.skills),
+            allSkills,
             state: filter == .all ? nil : filter.rawValue.lowercased()
         )
     }
 
     var body: some View {
-        ZStack(alignment: .top) {
-            VStack(spacing: 0) {
-                if !MobileDesignSamples.rows(store.skills).isEmpty {
-                    Picker("Filter", selection: $filter) {
-                        ForEach(SkillFilter.allCases) { f in
-                            Text(f.rawValue).tag(f)
-                        }
+        AlivePage(title: "Skills & Tools", line: "What I can do, and how.",
+                 freshnessGroup: "skills_snapshot", accessory: accessory) {
+            if !store.skills.isEmpty, let err = store.bannerError {
+                AliveFootnote(err, systemImage: "wifi.slash")
+                    .transition(.opacity)
+            }
+
+            if store.isLoading && allSkills.isEmpty {
+                shimmerCard
+            } else if allSkills.isEmpty, let error = store.bannerError {
+                AliveCalmState(title: "Skills aren’t here yet", line: error,
+                               actionTitle: "Try again") {
+                    Task { await store.refresh(pairingStore: pairingStore) }
+                }
+            } else if allSkills.isEmpty {
+                AliveCalmState(title: "No skills yet", line: emptyDescription)
+            } else {
+                AliveSection("Skills", trailing: { filterMenu }) {
+                    if filtered.isEmpty {
+                        Text(emptyDescription)
+                            .font(.subheadline)
+                            .foregroundStyle(AlivePalette.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .aliveRow()
                     }
-                    .pickerStyle(.menu)
-                    .padding(.horizontal)
-                    .padding(.vertical, 8)
-                }
-
-                if store.isLoading && MobileDesignSamples.rows(store.skills).isEmpty {
-                    shimmerRows
-                } else if MobileDesignSamples.rows(store.skills).isEmpty, let error = store.bannerError {
-                    MobileReadingEmptyState(
-                        title: "Skills unavailable",
-                        systemImage: "iphone.and.arrow.forward",
-                        kind: .unavailable,
-                        description: error,
-                        action: (
-                            title: "Try Again",
-                            systemImage: "arrow.clockwise",
-                            handler: {
-                                Task { await store.refresh(pairingStore: pairingStore) }
-                            }
-                        )
-                    )
-                } else if filtered.isEmpty {
-                    MobileReadingEmptyState(
-                        title: "No skills match this filter",
-                        systemImage: "sparkles",
-                        kind: .empty,
-                        description: emptyDescription
-                    )
-                } else {
-                    skillList
-                }
-            }
-
-            // Banners
-            VStack(spacing: 0) {
-                if !store.skills.isEmpty, let err = store.bannerError {
-                    SkillBannerView(message: err, style: .error)
-                        .transition(.move(edge: .top).combined(with: .opacity))
-                }
-            }
-            .animation(AppMotion.snappy, value: store.bannerError)
-        }
-        .toolbar {
-            ToolbarItem(placement: .navigationBarTrailing) {
-                if store.isLoading {
-                    ProgressView().scaleEffect(0.8)
+                    ForEach(Array(filtered.enumerated()), id: \.element.id) { index, skill in
+                        if index > 0 { AliveDivider() }
+                        SkillRow(skill: skill) { selectedSkill = skill }
+                    }
                 }
             }
         }
+        .animation(AppMotion.snappy, value: store.bannerError)
         .refreshable {
             await store.refresh(pairingStore: pairingStore)
         }
         .task {
             await store.refresh(pairingStore: pairingStore)
+            #if DEBUG
+            if ProcessInfo.processInfo.arguments.contains("-designDetail") { selectedSkill = allSkills.first }
+            #endif
         }
         .sheet(item: $selectedSkill) { skill in
             SkillLifecycleDetailSheet(skill: skill)
@@ -339,32 +322,37 @@ struct SkillLifecycleView: View {
 
     // MARK: Subviews
 
-    private var skillList: some View {
-        List {
-            ForEach(filtered) { skill in
-                SkillRow(skill: skill) {
-                    selectedSkill = skill
+    /// The state filter, as quiet words beside the eyebrow.
+    private var filterMenu: some View {
+        Menu {
+            Picker("Filter", selection: $filter) {
+                ForEach(SkillFilter.allCases) { f in
+                    Text(f.rawValue).tag(f)
                 }
-                .listRowBackground(Color.clear)
-                .listRowSeparator(.hidden)
-                .listRowInsets(EdgeInsets(top: 6, leading: 16, bottom: 6, trailing: 16))
             }
+        } label: {
+            HStack(spacing: 4) {
+                Text(filter.rawValue)
+                Image(systemName: "chevron.up.chevron.down").imageScale(.small)
+            }
+            .font(.footnote.weight(.medium))
+            .foregroundStyle(AlivePalette.text)
         }
-        .listStyle(.plain)
+        .accessibilityLabel("Filter: \(filter.rawValue)")
     }
 
-    private var shimmerRows: some View {
-        List {
-            ForEach(0..<4, id: \.self) { _ in
-                RoundedRectangle(cornerRadius: 18, style: .continuous)
-                    .fill(Color.secondary.opacity(0.12))
-                    .frame(height: 100)
-                    .appShimmer()
-                    .listRowBackground(Color.clear)
-                    .listRowSeparator(.hidden)
+    private var shimmerCard: some View {
+        AliveCard {
+            ForEach(0..<3, id: \.self) { index in
+                if index > 0 { AliveDivider() }
+                VStack(alignment: .leading, spacing: 8) {
+                    RoundedRectangle(cornerRadius: 4).fill(AlivePalette.divider).frame(width: 180, height: 14)
+                    RoundedRectangle(cornerRadius: 4).fill(AlivePalette.divider).frame(height: 12)
+                }
+                .appShimmer()
+                .aliveRow()
             }
         }
-        .listStyle(.plain)
     }
 
     private var emptyDescription: String {
@@ -380,92 +368,49 @@ struct SkillLifecycleView: View {
     }
 }
 
-// MARK: - Skill row card
+/// State, where it came from and how often it has run, as one line of words.
+private enum SkillLine {
+    static func status(_ skill: SkillManifestEntry) -> String {
+        var parts = [SkillLifecyclePresentation.stateLabel(for: skill)]
+        parts.append(SkillSourcePresentation.label(for: SkillSourcePresentation.source(for: skill)).lowercased())
+        if let count = skill.use_count { parts.append("used " + AliveWords.count(count, "time")) }
+        return parts.joined(separator: " · ")
+    }
+}
+
+// MARK: - Skill row
 
 struct SkillRow: View {
     let skill: SkillManifestEntry
     let onTap: () -> Void
 
-    private var stateColor: Color {
-        SkillLifecyclePresentation.stateColor(for: skill)
-    }
-
-    private var sourceColor: Color {
-        SkillSourcePresentation.color(for: SkillSourcePresentation.source(for: skill))
-    }
-
-    private var sourceBadgeLabel: String {
-        SkillSourcePresentation.label(for: SkillSourcePresentation.source(for: skill))
-    }
-
     var body: some View {
         Button(action: onTap) {
-            MobileReadingSurface {
-                VStack(alignment: .leading, spacing: 12) {
-                    // Header row
-                    MobileAdaptiveRow(alignment: .top) {
-                        VStack(alignment: .leading, spacing: 4) {
-                            MobileAdaptiveRow(spacing: 6) {
-                                if skill.state == "active" {
-                                    Image(systemName: "circle.fill").font(.caption2).foregroundStyle(.secondary)
-                                }
-                                Text(skill.name)
-                                    .font(.headline)
-                                    .fixedSize(horizontal: false, vertical: true)
-                            }
-                            // State badge
-                            Text(SkillLifecyclePresentation.stateLabel(for: skill))
-                                .font(.callout)
-                                .padding(.horizontal, 8)
-                                .padding(.vertical, 3)
-                                .background(NativeAgentMobileTheme.Colors.quietFill, in: Capsule())
-                                .foregroundStyle(.secondary)
-                        }
-                        Spacer()
-                        // Source badge
-                        Text(sourceBadgeLabel)
-                            .font(.caption)
-                            .padding(.horizontal, 7)
-                            .padding(.vertical, 3)
-                            .background(NativeAgentMobileTheme.Colors.quietFill, in: Capsule())
-                            .foregroundStyle(.secondary)
-                    }
-
-                    // Description
+            HStack(alignment: .center, spacing: 12) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(skill.name)
+                        .font(.body)
+                        .foregroundStyle(AlivePalette.text)
+                        .fixedSize(horizontal: false, vertical: true)
                     if let desc = skill.description, !desc.isEmpty {
                         Text(desc)
-                            .font(.body)
-                            .foregroundStyle(.secondary)
+                            .font(.subheadline)
+                            .foregroundStyle(AlivePalette.secondary)
+                            .lineLimit(2)
                             .fixedSize(horizontal: false, vertical: true)
                     }
-
-                    // Triggers
-                    if let triggers = skill.triggers, !triggers.isEmpty {
-                        ScrollView(.horizontal, showsIndicators: false) {
-                            MobileAdaptiveRow(spacing: 4) {
-                                ForEach(triggers.prefix(5), id: \.self) { trigger in
-                                    Text(trigger)
-                                        .font(.caption)
-                                        .padding(.horizontal, 6)
-                                        .padding(.vertical, 2)
-                                        .background(Color.secondary.opacity(0.12))
-                                        .foregroundStyle(.secondary)
-                                        .clipShape(Capsule())
-                                }
-                            }
-                        }
-                    }
-
-                    // Use count footnote
-                    if let count = skill.use_count {
-                        Text("Used \(count) time\(count == 1 ? "" : "s")")
-                            .font(.callout)
-                            .foregroundStyle(.secondary)
-                    }
+                    Text(SkillLine.status(skill))
+                        .font(.footnote)
+                        .foregroundStyle(AlivePalette.secondary)
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                AliveChevron()
             }
+            .aliveRow()
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .accessibilityElement(children: .combine)
     }
 }
 
@@ -478,133 +423,53 @@ struct SkillLifecycleDetailSheet: View {
 
     var body: some View {
         NavigationStack {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 20) {
-
-                    // Metadata section
-                    VStack(alignment: .leading, spacing: 8) {
-                        if let desc = skill.description, !desc.isEmpty {
-                            Text(desc)
-                                .font(.body)
-                                .foregroundStyle(.secondary)
-                        }
-
-                        MobileAdaptiveRow(spacing: 8) {
-                            if let state = skill.state {
-                                stateChip(state)
-                            }
-                            sourceChip(skill)
-                            if let kind = skill.kind {
-                                Text(kind.capitalized)
-                                    .font(.caption)
-                                    .padding(.horizontal, 7)
-                                    .padding(.vertical, 3)
-                                    .background(Color.secondary.opacity(0.12), in: Capsule())
-                                    .foregroundStyle(.secondary)
-                            }
-                        }
-
-                        if let count = skill.use_count {
-                            Label("Used \(count) time\(count == 1 ? "" : "s")", systemImage: "chart.bar")
-                                .font(.callout)
-                                .foregroundStyle(.secondary)
-                        }
-
-                        if let triggers = skill.triggers, !triggers.isEmpty {
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text("Triggers")
-                                    .font(.callout)
-                                    .foregroundStyle(.secondary)
-                                ScrollView(.horizontal, showsIndicators: false) {
-                                    MobileAdaptiveRow(spacing: 4) {
-                                        ForEach(triggers, id: \.self) { t in
-                                            Text(t)
-                                                .font(.caption)
-                                                .padding(.horizontal, 6)
-                                                .padding(.vertical, 2)
-                                                .background(Color.secondary.opacity(0.12))
-                                                .foregroundStyle(.secondary)
-                                                .clipShape(Capsule())
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    .padding(.horizontal)
-
-                    Label(
-                        "Install, activate, quarantine, and delete skills from the Mac Skills view so OAuth, registry state, and the final result can be verified in one place.",
-                        systemImage: "macbook"
-                    )
+            AlivePage(title: skill.name) {
+                if let desc = skill.description, !desc.isEmpty {
+                    Text(desc)
                         .font(.body)
-                        .foregroundStyle(.secondary)
-                        .padding(.horizontal)
-                        .padding(.bottom, 24)
+                        .lineSpacing(3)
+                        .foregroundStyle(AlivePalette.text)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(.top, -12)
                 }
-                .padding(.top, 12)
+
+                AliveSection("About", footer: "Install, activate, quarantine and delete skills in Skills on the Mac, where the registry and sign-ins can confirm the result.") {
+                    AliveRow("State") { value(SkillLifecyclePresentation.stateLabel(for: skill)) }
+                    AliveDivider()
+                    AliveRow("Source") {
+                        value(AliveWords.humanized(SkillSourcePresentation.label(for: SkillSourcePresentation.source(for: skill)).lowercased()))
+                    }
+                    if let kind = skill.kind, !kind.isEmpty {
+                        AliveDivider()
+                        AliveRow("Kind") { value(AliveWords.humanized(kind)) }
+                    }
+                    if let count = skill.use_count {
+                        AliveDivider()
+                        AliveRow("Used") { value(AliveWords.count(count, "time")) }
+                    }
+                    if let version = skill.version, !version.isEmpty {
+                        AliveDivider()
+                        AliveRow("Version") { value(version) }
+                    }
+                    if let triggers = skill.triggers, !triggers.isEmpty {
+                        AliveDivider()
+                        AliveRow("Wakes on", detail: triggers.joined(separator: ", "))
+                    }
+                }
             }
-            .mobileReadingScreen()
-            .navigationTitle(skill.name)
-            .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    MacStatusChip()
-                }
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Close") { dismiss() }
+                        .foregroundStyle(AlivePalette.text)
                 }
             }
         }
     }
 
-    // MARK: Badge helpers
-
-    private func stateChip(_ state: String) -> some View {
-        let canonical = SkillLifecyclePresentation.canonicalState(raw: state)
-        return Text(SkillLifecyclePresentation.stateLabel(for: canonical))
-            .font(.callout)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 3)
-            .background(NativeAgentMobileTheme.Colors.quietFill, in: Capsule())
-            .foregroundStyle(.secondary)
-    }
-
-    private func sourceChip(_ skill: SkillManifestEntry) -> some View {
-        let source = SkillSourcePresentation.source(for: skill)
-        return Text(SkillSourcePresentation.label(for: source))
-            .font(.caption)
-            .padding(.horizontal, 7)
-            .padding(.vertical, 3)
-            .background(NativeAgentMobileTheme.Colors.quietFill, in: Capsule())
-            .foregroundStyle(.secondary)
-    }
-}
-
-// MARK: - SkillBannerView — local banner (BannerView in ApprovalsView.swift is private)
-
-private struct SkillBannerView: View {
-    enum Style { case error }
-    let message: String
-    let style: Style
-
-    private var bgColor: Color {
-        NativeAgentMobileTheme.Colors.contentSurface
-    }
-    private var icon: String {
-        "wifi.slash"
-    }
-
-    var body: some View {
-        MobileAdaptiveRow(spacing: 8) {
-            Image(systemName: icon).font(.caption.weight(.semibold))
-            Text(message).font(.callout).fixedSize(horizontal: false, vertical: true)
-            Spacer()
-        }
-        .foregroundStyle(.primary)
-        .padding(.horizontal, 16)
-        .padding(.vertical, 10)
-        .background(bgColor)
-        .ignoresSafeArea(edges: .horizontal)
+    private func value(_ text: String) -> some View {
+        Text(text)
+            .font(.body)
+            .foregroundStyle(AlivePalette.secondary)
+            .multilineTextAlignment(.trailing)
     }
 }

@@ -99,7 +99,7 @@ extension ChatStore {
                     pendingId: correlationID,
                     placeholderId: placeholderId,
                     placeholderText: explanation.isEmpty
-                        ? "(NativeAgent hit an error answering that message)"
+                        ? "(I hit an error answering that message)"
                         : String(explanation.prefix(600)),
                     banner: explanation
                 )

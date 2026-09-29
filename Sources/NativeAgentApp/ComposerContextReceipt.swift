@@ -2,6 +2,7 @@ import SwiftUI
 import Foundation
 import ChatOrchestration
 import PersistenceCore
+import TurnTrace
 import ProviderRouting
 
 /// The composer's context receipt: what the last turn of THIS conversation

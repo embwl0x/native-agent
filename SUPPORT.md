@@ -43,7 +43,8 @@ switching to another runtime.
 2. Open the disk image and drag NativeAgent into Applications.
 3. Launch NativeAgent from Applications. Enter your name and the agent's name;
    the overview is optional.
-4. Connect an account during setup, or use **Providers** on the left rail later.
+4. Connect an account during setup, or later: in Simple view ask the agent, or
+   open **Providers** on the Advanced rail.
 5. Choose access in **Trust**; individual services are under **Mac integration**.
 
 If macOS blocks the app, confirm the file came from the official download page
@@ -53,8 +54,8 @@ unknown or modified download.
 ## Pair iPhone or iPad
 
 1. Install and launch NativeAgent on the Mac.
-2. On the Mac, open **Connectors → iPhone** (classic sidebar:
-   **Settings → Pair iPhone / iPad**).
+2. On the Mac, open **Connectors → iPhone** (in Simple view, ask the agent to
+   pair the phone).
 3. Keep both devices signed into the intended Apple account with iCloud enabled.
 4. Launch NativeAgent on iPhone or iPad.
 5. Choose **Connect via iCloud** after the signed pairing material arrives.
@@ -107,7 +108,7 @@ is still pending.
 
 ### A provider or connector does not work
 
-- Reopen the **Providers** or **Connectors** tab in the sidebar on the Mac.
+- Reopen **Providers** or **Connectors** on the Mac's Advanced rail.
 - In Providers, use **Manage** beside the connected account. If browser sign-in
   stalls, use **Cancel** and try signing in again.
 - Confirm the credential belongs to the selected provider and has the required

@@ -19,7 +19,7 @@ const https = require("https");
 const os = require("os");
 const path = require("path");
 const { spawn, spawnSync } = require("child_process");
-const { nowISO: now, jsonOut: out, ensureDir: ensure, claimWakeJob: claim, readWakeJSON: readJSON, postBridgeRequest, missingWakeCompletionOrigin, processTreeOrder, safeFilePart } = require("./wake_worker_common.js");
+const { nowISO: now, jsonOut: out, ensureDir: ensure, claimWakeJob: claim, readWakeJSON: readJSON, postBridgeRequest, missingWakeCompletionOrigin, processTreeOrder, safeFilePart, createWakeLivePoster, processStartIdentity } = require("./wake_worker_common.js");
 
 const ROOT = process.env.NATIVE_AGENT_OMP_BRIDGE_DIR || path.join(os.homedir(), ".config", "omp-bridge");
 const JOBS = path.join(ROOT, "wake-jobs");
@@ -100,9 +100,22 @@ function readPointer(slug) {
   const value = readJSON(pointerPath(slug));
   return value && typeof value.sessionId === "string" && value.sessionId ? value : null;
 }
-function writePointer(slug, sessionId, cwd) {
-  atomicWrite(pointerPath(slug), { schemaVersion: 1, sessionId, cwd, updatedAt: now() });
+function writePointer(slug, sessionId, cwd, model) {
+  atomicWrite(pointerPath(slug), { schemaVersion: 1, sessionId, cwd, ...(model ? { model } : {}), updatedAt: now() });
   return pointerPath(slug);
+}
+/// The newest OMP session this topic ran in, from the delivery receipts, for a
+/// conversation that has no pointer because no turn of it was ever answered.
+function unansweredSession(slug) {
+  let lines;
+  try { lines = fs.readFileSync(DELIVERIES, "utf8").split("\n"); } catch { return null; }
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    let receipt;
+    try { receipt = JSON.parse(lines[i]); } catch { continue; }
+    if (receipt && receipt.topicSlug === slug && receipt.status === "failed"
+        && typeof receipt.sessionId === "string" && receipt.sessionId.trim()) return receipt;
+  }
+  return null;
 }
 function lockPath(slug) { return path.join(SESSIONS, `${slug}.lock`); }
 function acquireLock(slug, messageId) {
@@ -171,7 +184,7 @@ function collectText(value) {
 function parseOMPOutput(stdout) {
   const values = [];
   const trimmed = String(stdout || "").trim();
-  if (!trimmed) return { reply: "", partialReply: "", stopReason: null, errorMessage: null, sessionId: null, parsedEvents: 0 };
+  if (!trimmed) return { reply: "", partialReply: "", stopReason: null, errorMessage: null, sessionId: null, model: null, parsedEvents: 0 };
   try { values.push(JSON.parse(trimmed)); }
   catch {
     for (const line of trimmed.split("\n")) {
@@ -183,6 +196,7 @@ function parseOMPOutput(stdout) {
   let lastNonemptyReply = "";
   let stopReason = null;
   let errorMessage = null;
+  let model = null;
   const visit = (value) => {
     if (!value || typeof value !== "object") return;
     const type = String(value.type || value.event || "").toLowerCase();
@@ -206,6 +220,9 @@ function parseOMPOutput(stdout) {
         stopReason = terminalReason;
         errorMessage = typeof value.errorMessage === "string" ? value.errorMessage : null;
       }
+      if (typeof value.model === "string" && value.model) {
+        model = typeof value.provider === "string" && value.provider ? `${value.provider}/${value.model}` : value.model;
+      }
       if (text) lastNonemptyReply = text;
     }
     for (const child of Object.values(value)) {
@@ -216,14 +233,46 @@ function parseOMPOutput(stdout) {
   };
   values.forEach(visit);
   const failedTerminal = stopReason === "error" || stopReason === "aborted";
-  return { reply, partialReply: failedTerminal && !reply ? lastNonemptyReply : "", stopReason, errorMessage, sessionId, parsedEvents: values.length };
+  return { reply, partialReply: failedTerminal && !reply ? lastNonemptyReply : "", stopReason, errorMessage, sessionId, model, parsedEvents: values.length };
 }
 
-function runOMP({ payload, pointer, cwd, timeout, idle, onActivity }) {
+/// Display-only reading of one `--mode json` event for the live stream: the
+/// assistant message being written (whole text so far) and tool starts.
+function forwardOMPLive(line, live) {
+  let value;
+  try { value = JSON.parse(line); } catch { return; }
+  if (!value || typeof value !== "object") return;
+  const type = String(value.type || "");
+  const message = value.message && typeof value.message === "object" ? value.message : null;
+  if (message && String(message.role || "").toLowerCase() === "assistant" && /^message/.test(type)) {
+    const text = collectText(message.content).trim();
+    if (text) { live.partial(text); return; }
+  }
+  if (type === "tool_execution_start" && typeof value.toolName === "string") { live.note(`Using ${value.toolName}`); return; }
+  live.activity();
+}
+
+/// OMP's own configured default model (`modelRoles.default`), read fresh on
+/// every resume. A new session picks it up by itself; a resumed session keeps
+/// the model it was created on (even one whose provider is gone), so resumes
+/// pass it explicitly. Null when OMP cannot say; OMP then decides as before.
+function ompDefaultModel(bin) {
+  const probe = spawnSync(bin, ["config", "get", "modelRoles", "--json"], { encoding: "utf8", timeout: 5000 });
+  try {
+    const value = JSON.parse(String(probe.stdout || "")).value;
+    return value && typeof value.default === "string" && value.default.trim() ? value.default.trim() : null;
+  } catch { return null; }
+}
+
+function runOMP({ payload, pointer, cwd, timeout, idle, onActivity, live }) {
   return new Promise((resolve) => {
     const bin = process.env.NATIVE_AGENT_OMP_WAKE_BIN || "omp";
-    const args = ["--model", "kimi", "-p", prompt(payload), "--mode", "json", "--max-time", `${timeout}s`];
-    if (pointer) args.push("-r", pointer.sessionId);
+    const args = ["-p", prompt(payload), "--mode", "json", "--max-time", `${timeout}s`];
+    if (pointer) {
+      const model = ompDefaultModel(bin);
+      if (model) args.push("--model", model);
+      args.push("-r", pointer.sessionId);
+    }
     const started = Date.now();
     let stdout = "";
     let stderr = "";
@@ -235,10 +284,11 @@ function runOMP({ payload, pointer, cwd, timeout, idle, onActivity }) {
     let deadlineTimer = null;
     let idleTimer = null;
     let killTimer = null;
+    let heartbeatTimer = null;
     const finish = (extra) => {
       if (settled) return;
       settled = true;
-      clearTimeout(deadlineTimer); clearInterval(idleTimer); clearTimeout(killTimer);
+      clearTimeout(deadlineTimer); clearInterval(idleTimer); clearTimeout(killTimer); clearInterval(heartbeatTimer);
       resolve({ stdout, stderr, timedOut, stalled, durationMs: Date.now() - started, lastActivityAt: new Date(lastActivityAt).toISOString(), ...extra });
     };
     const kill = () => {
@@ -248,12 +298,22 @@ function runOMP({ payload, pointer, cwd, timeout, idle, onActivity }) {
     };
     try { child = spawn(bin, args, { cwd, stdio: ["ignore", "pipe", "pipe"] }); }
     catch (error) { return finish({ exitCode: null, signal: null, spawnError: String(error && error.message || error) }); }
+    let liveLine = "";
     const capture = (kind, chunk) => {
       lastActivityAt = Date.now();
       if (typeof onActivity === "function") onActivity(new Date(lastActivityAt).toISOString());
       const text = chunk.toString("utf8");
       if (kind === "stdout") stdout = (stdout + text).slice(-MAX_OUTPUT);
       else stderr = (stderr + text).slice(-MAX_OUTPUT);
+      if (!live || kind !== "stdout") return;
+      liveLine += text;
+      let newline;
+      while ((newline = liveLine.indexOf("\n")) >= 0) {
+        const line = liveLine.slice(0, newline);
+        liveLine = liveLine.slice(newline + 1);
+        if (line.trim()) forwardOMPLive(line, live);
+      }
+      if (liveLine.length > MAX_OUTPUT) liveLine = "";
     };
     child.stdout.on("data", (chunk) => capture("stdout", chunk));
     child.stderr.on("data", (chunk) => capture("stderr", chunk));
@@ -263,6 +323,14 @@ function runOMP({ payload, pointer, cwd, timeout, idle, onActivity }) {
     idleTimer = setInterval(() => {
       if (idle > 0 && Date.now() - lastActivityAt >= idle * 1000) { stalled = true; kill(); }
     }, Math.max(100, Math.min(5000, idle * 250)));
+    // While OMP is alive but silent (a model thinking before its first token),
+    // say so with timestamps, so a slow OMP never reads like a dead one. The
+    // beat stops when the process ends or this runner dies.
+    if (live) heartbeatTimer = setInterval(() => {
+      if (settled || child.exitCode !== null || child.signalCode !== null) return;
+      if (Date.now() - lastActivityAt < 15_000) return;
+      live.note(`OMP process alive at ${now()}; last output ${new Date(lastActivityAt).toISOString()}.`);
+    }, 15_000);
   });
 }
 
@@ -278,6 +346,7 @@ function classify(run) {
     assistantStopReason: parsed.stopReason,
     assistantError: parsed.errorMessage ? tail(parsed.errorMessage) : null,
     sessionId: parsed.sessionId,
+    model: parsed.model,
     parsedEvents: parsed.parsedEvents,
     stderrTail: tail(run.stderr),
     stdoutTail: tail(run.stdout),
@@ -302,12 +371,14 @@ function completionText(result, payload) {
     `Originating message id: ${payload.messageId}`,
     `Topic: ${payload.topic || DEFAULT_TOPIC}`,
     `Conversation: omp:${topicSlug(payload.topic)}`,
-    "Continue this same work by calling omp_message with conversation_id set to that exact value. Omit conversation_id for new work.",
+    "Continue this same work with agent_message: agent \"omp\" with conversation_id set to that exact value (it goes on in the conversation you named). Omit conversation_id for new work.",
     `Priority: ${payload.priority || "info"}`,
     `Status: ${result.status}`,
     `Duration: ${Math.round((result.durationMs || 0) / 1000)}s`,
-    "",
   ];
+  if (result.model) lines.push(`Model: ${result.model}`);
+  if (result.continuityNote) lines.push(result.continuityNote);
+  lines.push("");
   if (result.status === "completed") lines.push("--- OMP's reply ---", result.reply, "--- end reply ---");
   else {
     lines.push(`OMP wake FAILED: ${result.reason}`);
@@ -325,7 +396,8 @@ function bridgeURL() {
   if (process.env.NATIVE_AGENT_OMP_WAKE_BRIDGE_URL) return process.env.NATIVE_AGENT_OMP_WAKE_BRIDGE_URL;
   const descriptor = readJSON(DESCRIPTOR_PATH);
   if (descriptor && typeof descriptor.url === "string") return new URL("/omp/message", descriptor.url).toString();
-  return "http://127.0.0.1:8771/omp/message";
+  // Each install listens on its own port: no descriptor, no address.
+  return null;
 }
 function missingCompletionOrigin(sessionId) {
   return missingWakeCompletionOrigin(sessionId, AGENT_NAME);
@@ -336,11 +408,14 @@ function postBridge(text, sessionId) {
   if (missingOrigin) return Promise.resolve(missingOrigin);
   sessionId = sessionId.trim();
   if (process.env.NATIVE_AGENT_OMP_WAKE_DRY_RUN === "1") return Promise.resolve({ status: "dry_run", text });
+  let target;
+  try { target = bridgeURL(); } catch { return Promise.resolve({ status: "failed", reason: "bridge_url_invalid" }); }
+  if (!target) return Promise.resolve({ status: "failed", reason: "bridge_descriptor_unavailable", descriptorPath: DESCRIPTOR_PATH });
   let token;
   try { token = fs.readFileSync(TOKEN_PATH, "utf8").trim(); } catch { return Promise.resolve({ status: "failed", reason: "bridge_token_missing" }); }
   if (!token) return Promise.resolve({ status: "failed", reason: "bridge_token_empty" });
   let url;
-  try { url = new URL(bridgeURL()); } catch { return Promise.resolve({ status: "failed", reason: "bridge_url_invalid" }); }
+  try { url = new URL(target); } catch { return Promise.resolve({ status: "failed", reason: "bridge_url_invalid" }); }
   const body = JSON.stringify({ text, sender: "omp", ackMode: "enqueue", ...(sessionId ? { sessionId } : {}) });
   const transport = url.protocol === "https:" ? https : http;
   return postBridgeRequest(transport, {
@@ -375,25 +450,42 @@ async function runJob(payload, file, claimId) {
     return { ...result, delivery: "omp_thread_wakeup", messageId: payload.messageId, topicSlug: slug, bridge, jobPath: file };
   }
   try {
-    const pointer = readPointer(slug);
+    const saved = readPointer(slug);
+    // A conversation whose turns all failed never got a pointer (only an
+    // answered turn writes one), yet OMP kept the session. Continue that
+    // session rather than refusing the explicit follow-up.
+    const unanswered = payload.requireExistingConversation === true && !fs.existsSync(pointerPath(slug))
+      ? unansweredSession(slug) : null;
+    const pointer = saved || (unanswered && { sessionId: unanswered.sessionId });
     const continuationUnavailable = payload.requireExistingConversation === true
       && (!pointer || !pointer.sessionId.trim());
     const cwd = resolveCwd(payload, pointer);
     const timeout = timeoutSeconds(payload);
     const idle = idleSeconds(payload, timeout);
-    if (!continuationUnavailable && !updateJob(file, { state: "running", runnerPid: process.pid, startedAt: now(), cwd, sessionMode: pointer ? "resume" : "new", resumedSessionId: pointer && pointer.sessionId || null, timeoutSeconds: timeout, idleSeconds: idle }, claimId)) {
+    if (!continuationUnavailable && !updateJob(file, { state: "running", runnerPid: process.pid, runnerIdentity: processStartIdentity(process.pid), startedAt: now(), cwd, sessionMode: pointer ? "resume" : "new", resumedSessionId: pointer && pointer.sessionId || null, timeoutSeconds: timeout, idleSeconds: idle }, claimId)) {
       return { status: "failed", reason: "claim_lost", messageId: payload.messageId };
     }
+    // The app's live stream for this message: working, reply so far, finished.
+    let liveURL = null;
+    try { liveURL = new URL("/omp/live", bridgeURL()).toString(); } catch {}
+    const live = createWakeLivePoster({ url: liveURL, tokenPath: TOKEN_PATH, messageIds: [payload.messageId] });
+    if (!continuationUnavailable) live.started();
     const run = continuationUnavailable ? null : await runOMP({
-      payload, pointer, cwd, timeout, idle,
+      payload, pointer, cwd, timeout, idle, live,
       onActivity: (lastActivityAt) => updateJob(file, { lastActivityAt }, claimId),
     });
+    live.finished(!run ? "the conversation to continue is unavailable; OMP was not started" : run.timedOut ? "timed out" : run.stalled ? "stalled" : `exit ${run.exitCode}`);
     const result = continuationUnavailable
       ? { status: "failed", reason: "continuation_unavailable", durationMs: 0, stderrTail: "", reply: "", timedOut: false, stalled: false }
       : classify(run);
     if (result.status === "completed" && !result.sessionId && pointer) result.sessionId = pointer.sessionId;
+    if (unanswered) {
+      result.continuityNote = `Continuity: this conversation's earlier turn never got an answer (${unanswered.reason}${unanswered.assistantError ? `: ${String(unanswered.assistantError).slice(0, 200)}` : ""}), so it had no saved pointer. OMP ${result.status === "completed" ? "continued" : "tried to continue"} that same session on its current default model.`;
+    } else if (saved && result.model && saved.model !== result.model) {
+      result.continuityNote = `Continuity: this conversation was on ${saved.model || "a model this bridge did not record"}; OMP ${result.status === "completed" ? "continued" : "tried to continue"} it on its current default model.`;
+    }
     let pointerFile = null;
-    if (result.status === "completed" && result.sessionId) pointerFile = writePointer(slug, result.sessionId, cwd);
+    if (result.status === "completed" && result.sessionId) pointerFile = writePointer(slug, result.sessionId, cwd, result.model);
     const text = completionText(result, payload);
     const bridge = await postBridge(text, payload.sessionId || "");
     const sessionMode = continuationUnavailable ? "resume_unavailable" : pointer ? "resume" : "new";

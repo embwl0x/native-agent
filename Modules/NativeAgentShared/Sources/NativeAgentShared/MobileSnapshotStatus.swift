@@ -14,6 +14,7 @@ public enum NAMobileSnapshotGroup: String, CaseIterable, Codable, Sendable {
     case catalog
     case chat
     case desk
+    case scheduler
     case activity
     case advanced
 
@@ -37,7 +38,9 @@ public enum NAMobileSnapshotGroup: String, CaseIterable, Codable, Sendable {
                 // phone never sees a pin naming a session it has not received.
                 "chat_anchor.json",
                 "connectors.json",
+                "telegram.json",
                 "providers.json",
+                "provider_sign_ins.json",
                 "model_preferences.json",
                 "approvals.json",
                 // Which groups the Mac could NOT rebuild this pass. Rides in
@@ -60,6 +63,8 @@ public enum NAMobileSnapshotGroup: String, CaseIterable, Codable, Sendable {
             // desk_details.json rides with the board too: the reading copies
             // are only trustworthy beside the rows they belong to.
             ["desk.json", "desk_bounds.json", "desk_details.json"]
+        case .scheduler:
+            ["scheduler.json"]
         case .activity:
             [
                 "workshop_tasks.json",
@@ -76,6 +81,7 @@ public enum NAMobileSnapshotGroup: String, CaseIterable, Codable, Sendable {
                 "turn_summaries.json",
                 "knowledge_graph.json",
                 "runs.json",
+                "helpers_agents.json",
             ]
         }
     }
@@ -94,7 +100,7 @@ public enum NAMobileSnapshotGroup: String, CaseIterable, Codable, Sendable {
     public var trimmableFilenames: [String] {
         switch self {
         case .desk: ["desk_details.json"]
-        case .core, .catalog, .chat, .activity, .advanced: []
+        case .core, .catalog, .chat, .scheduler, .activity, .advanced: []
         }
     }
 

@@ -79,7 +79,7 @@ enum SnapshotHealthLog {
 
     static func viewName(for filename: String) -> String {
         let known = [
-            "desk.json": "Desk", "memories.json": "Memories", "inbox.json": "Inbox",
+            "desk.json": "Desk", "scheduler.json": "Scheduler", "memories.json": "Memories", "inbox.json": "Inbox",
             "approvals.json": "Approvals", "workshop_tasks.json": "Workshop",
             "providers.json": "Providers", "connectors.json": "Connectors",
             "health.json": "Health", "trust_policy.json": "Trust",
@@ -145,6 +145,7 @@ extension iCloudSyncEngine {
     func noteRefreshSucceeded() {
         lastSyncAt = Date()
         syncError = SnapshotHealthLog.damageSentence()
+        PhoneRequestCoordinator.shared.syncDidSucceed()
     }
 
     /// Apply the credential-free CloudKit projection published by the Mac.
@@ -234,7 +235,7 @@ extension iCloudSyncEngine {
     /// 2026-09-12: returns whether this read actually completed. Freshness is
     /// claimed from this value, never inferred from a syncError comparison.
     @discardableResult
-    func refreshSnapshots() async -> Bool {
+    func refreshSnapshots(recordTransportDelivery: Bool = false) async -> Bool {
         guard let snapshotDir else { return false }
         let lifecycle = lifecycleGeneration
         if refreshInFlight {
@@ -269,6 +270,7 @@ extension iCloudSyncEngine {
                 }
             }
         }
+        let schedulerLoaded = await refreshSchedulerSnapshot()
         let bundle = await Self.loadAllSnapshots(snapshotDir: snapshotDir)
         // Resumption of an @MainActor async func is back on the main actor.
         guard generation == snapshotRefreshGeneration,
@@ -303,6 +305,7 @@ extension iCloudSyncEngine {
         if let v = bundle.chatTranscripts { chatTranscripts = Self.transcriptMap(v) }
         if let v = bundle.connectors { connectors = v }
         if let v = bundle.providers { providers = v }
+        if let v = bundle.providerSignIns { providerSignIns = v }
         // gpt-5.5 review finding #2: don't gate on !isEmpty. A valid `{}`
         // snapshot (Mac wiped all surface picks) should still propagate so
         // the in-memory map matches the source of truth.
@@ -316,7 +319,15 @@ extension iCloudSyncEngine {
         await refreshSnapshotStaleness()
         guard generation == snapshotRefreshGeneration,
               lifecycle == lifecycleGeneration else { return false }
+        // Scheduler is an independent, optional projection on older Macs.
+        // Its failure stays on the Scheduler page, not on unrelated groups.
+        if recordTransportDelivery, schedulerLoaded {
+            noteTransportDelivery(groups: [.scheduler])
+        }
         if bundle.loadedAllSnapshots {
+            if recordTransportDelivery {
+                noteTransportDelivery(groups: Set(NAMobileSnapshotGroup.allCases).subtracting([.scheduler]))
+            }
             noteRefreshSucceeded()
             return true
         } else if bundle.loadedAnySnapshot {
@@ -375,6 +386,7 @@ extension iCloudSyncEngine {
         if let v = bundle.chatAnchor { chatAnchor = v }
         if let v = bundle.connectors { connectors = v }
         if let v = bundle.providers { providers = v }
+        if let v = bundle.providerSignIns { providerSignIns = v }
         if let v = bundle.surfaceModels { applyRemoteSurfaceModels(v) }
         if let v = bundle.approvals { approvalsSnapshotLoaded = true; approvals = v }
         if bundle.loadedAllSnapshots {
@@ -796,6 +808,7 @@ extension iCloudSyncEngine {
         var chatTranscripts: [ChatTranscriptSnapshot]?
         var connectors: [ConnectorRecord]?
         var providers: [ProviderInfo]?
+        var providerSignIns: [String: [String: String]]?
         var surfaceModels: [String: SurfaceModelPref]?
         var approvals: [ApprovalRequest]?
         var inboxItems: [InboxItemRecord]?
@@ -871,6 +884,7 @@ extension iCloudSyncEngine {
         var chatAnchor: ConversationAnchorPin?
         var connectors: [ConnectorRecord]?
         var providers: [ProviderInfo]?
+        var providerSignIns: [String: [String: String]]?
         var surfaceModels: [String: SurfaceModelPref]?
         var approvals: [ApprovalRequest]?
 
@@ -915,6 +929,7 @@ extension iCloudSyncEngine {
         async let chatTranscripts: [ChatTranscriptSnapshot]? = loadSnapshotArrayOnly(named: "chat_transcripts.json", in: snapshotDir)
         async let connectors: [ConnectorRecord]? = loadSnapshotArrayOnly(named: "connectors.json", in: snapshotDir)
         async let providers: [ProviderInfo]? = loadSnapshotArrayOnly(named: "providers.json", in: snapshotDir)
+        async let providerSignIns: [String: [String: String]]? = loadSnapshotObjectOnly(named: "provider_sign_ins.json", in: snapshotDir)
         async let surfaceModels: [String: SurfaceModelPref]? = loadSnapshotObjectOnly(named: "model_preferences.json", in: snapshotDir)
         async let approvals: [ApprovalRequest]? = loadSnapshotArrayOnly(named: "approvals.json", in: snapshotDir)
         async let inboxItems: [InboxItemRecord]? = loadSnapshotArrayOnly(named: "inbox.json", in: snapshotDir)
@@ -939,6 +954,7 @@ extension iCloudSyncEngine {
             chatTranscripts: chatTranscripts,
             connectors: connectors,
             providers: providers,
+            providerSignIns: providerSignIns,
             surfaceModels: surfaceModels,
             approvals: approvals,
             inboxItems: inboxItems,
@@ -956,6 +972,7 @@ extension iCloudSyncEngine {
         async let chatAnchor: ConversationAnchorPin? = loadSnapshotObjectOnly(named: "chat_anchor.json", in: snapshotDir)
         async let connectors: [ConnectorRecord]? = loadSnapshotArrayOnly(named: "connectors.json", in: snapshotDir)
         async let providers: [ProviderInfo]? = loadSnapshotArrayOnly(named: "providers.json", in: snapshotDir)
+        async let providerSignIns: [String: [String: String]]? = loadSnapshotObjectOnly(named: "provider_sign_ins.json", in: snapshotDir)
         async let surfaceModels: [String: SurfaceModelPref]? = loadSnapshotObjectOnly(named: "model_preferences.json", in: snapshotDir)
         async let approvals: [ApprovalRequest]? = loadSnapshotArrayOnly(named: "approvals.json", in: snapshotDir)
         return await LightweightSnapshotBundle(
@@ -968,6 +985,7 @@ extension iCloudSyncEngine {
             chatAnchor: chatAnchor,
             connectors: connectors,
             providers: providers,
+            providerSignIns: providerSignIns,
             surfaceModels: surfaceModels,
             approvals: approvals
         )
@@ -1023,7 +1041,7 @@ extension iCloudSyncEngine {
         return Task.isCancelled ? nil : result
     }
 
-    private nonisolated static func loadSnapshotObjectOnly<T: Decodable & Sendable>(named filename: String, in dir: URL) async -> T? {
+    nonisolated static func loadSnapshotObjectOnly<T: Decodable & Sendable>(named filename: String, in dir: URL) async -> T? {
         guard await awaitCurrentVersion(of: dir.appendingPathComponent(filename)), !Task.isCancelled else { return nil }
         let result: T? = await withCheckedContinuation { continuation in
             snapshotIOQueue.async {

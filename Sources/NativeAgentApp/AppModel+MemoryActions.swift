@@ -69,7 +69,7 @@ enum MemoryMenuActionFeedback: Equatable {
     }
 }
 
-/// Maps the consolidation owner's raw envelope to the only outcomes MemoryView
+/// Maps the consolidation owner's raw envelope to the only outcomes the memory upkeep
 /// may present. A deliberately disabled implementation is not a successful
 /// no-op and must not trigger a refresh that can overwrite its warning badge.
 struct MemoryConsolidationPresentation: Equatable {
@@ -116,190 +116,42 @@ struct MemoryConsolidationPresentation: Equatable {
     }
 }
 
-/// Translates the durable memory writer's receipt into the exact claim the row
-/// editor is allowed to make. In particular, an unknown or refused response is
-/// not permission to show a completed pin state.
+/// The row editor's claim about a pin change: made, or failed and why.
 enum MemoryRowEditorPinOutcome: Equatable {
     case applied(pinned: Bool)
-    case pendingApproval(pinned: Bool)
-    case refused(String)
     case failed(String)
 
     var message: String {
         switch self {
         case let .applied(pinned):
             return pinned ? "Memory pinned" : "Memory unpinned"
-        case let .pendingApproval(pinned):
-            return pinned ? "Pin queued for approval" : "Unpin queued for approval"
-        case let .refused(detail):
-            return "Memory pin change refused: \(detail)"
         case let .failed(detail):
             return "Memory update failed: \(detail)"
         }
     }
 
-    var shouldRefresh: Bool {
-        if case .applied = self { return true }
-        return false
-    }
-
     var isAdverse: Bool {
-        switch self {
-        case .refused, .failed: return true
-        case .applied, .pendingApproval: return false
-        }
-    }
-
-    var isPendingApproval: Bool {
-        if case .pendingApproval = self { return true }
+        if case .failed = self { return true }
         return false
     }
 
     var systemImage: String {
         switch self {
         case .applied: return "checkmark.circle"
-        case .pendingApproval: return "clock"
-        case .refused, .failed: return "exclamationmark.triangle.fill"
+        case .failed: return "exclamationmark.triangle.fill"
         }
-    }
-
-    static func resolve(result: [String: Any], pinned: Bool) -> Self {
-        let status = (result["status"] as? String)?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
-        switch status {
-        case "ok":
-            return .applied(pinned: pinned)
-        case "pending_approval":
-            return .pendingApproval(pinned: pinned)
-        case "refused", "denied":
-            return .refused(detail(in: result) ?? "the writer did not authorize this change")
-        default:
-            return .failed(detail(in: result) ?? "the memory writer returned an unrecognized outcome")
-        }
-    }
-
-    private static func detail(in result: [String: Any]) -> String? {
-        for key in ["reason", "message", "error"] {
-            guard let raw = result[key] as? String else { continue }
-            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !trimmed.isEmpty { return trimmed }
-        }
-        return nil
     }
 }
 
 @MainActor
 extension AppModel {
-    /// F2: run a semantic recall via the root-resolved SwiftNativeMemoryV2 and project
-    /// hits onto the UI's MemoryRecord set (matched by id). Empty/trivial
-    /// queries clear the search and revert to `memories`. Falls back to a
-    /// substring filter if the embedder is unavailable (Mock) so callers still
-    /// see something sensible.
     @MainActor
-    func runMemorySemanticSearch(query: String) async {
-        let requestToken = memorySearchGate.begin()
-        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        memorySearchResultQuery = trimmed
-        memorySearchIsLoading = trimmed.count >= 3
-        memorySearchResults = nil
-        memorySearchError = nil
-        if trimmed.count < 3 {
-            memorySearchIsLoading = false
-            return
-        }
-        // Debounce at the request-owner boundary. This lets the view invalidate
-        // a prior result immediately, while the generation gate prevents a
-        // canceled older query from landing after the newest keystroke.
+    func pinMemory(_ memory: MemoryV2.MemoryRecord, pinned: Bool) async -> MemoryRowEditorPinOutcome {
         do {
-            try await Task.sleep(nanoseconds: 150_000_000)
-        } catch {
-            if memorySearchGate.accepts(requestToken) {
-                memorySearchIsLoading = false
-            }
-            return
-        }
-        guard !Task.isCancelled, memorySearchGate.accepts(requestToken) else { return }
-        // Always seed with a substring filter as a safety net — semantic recall
-        // can return zero hits even when an obvious lexical match exists.
-        let lower = trimmed.lowercased()
-        let lexical = memories.filter {
-            $0.text.lowercased().contains(lower) || $0.layer.lowercased().contains(lower)
-        }
-        do {
-            let root = dataRootOverride ?? PersistenceCore.defaultDataRoot()
-            let owner = SwiftNativeMemoryV2.resolvedOwner(dataRoot: root)
-            // User, 2026-09-06: retrieve WITHOUT crediting use_count. This runs
-            // on every keystroke pause and asks for 50 rows, most of which
-            // never reach the list below; crediting them made browsing look
-            // like use and blunted the eviction veto. The rows actually shown
-            // are credited after the mapping.
-            let response = try await owner.recall(
-                MemoryV2RecallRequest(text: trimmed, topK: 50, persona: nil),
-                recordingUsage: false
-            )
-            // Search resolves canonical records independently of the bounded
-            // browsing list. A matching older memory must not disappear just
-            // because it is outside the newest 200 rows.
-            let hitIDs = response.hits.compactMap { hit -> String? in
-                guard case .object(let obj)? = hit.extras,
-                      case .string(let id)? = obj["id"] else { return nil }
-                return id
-            }
-            let records = try await client.getMemories(ids: hitIDs)
-            var seen = Set<String>()
-            var ordered: [MemoryRecord] = []
-            var deliveredIDs: [String] = []
-            for hit in response.hits {
-                var hitId: String? = nil
-                if case .object(let obj)? = hit.extras,
-                   case .string(let s)? = obj["id"] {
-                    hitId = s
-                }
-                guard let id = hitId, !seen.contains(id),
-                      let rec = records.first(where: { $0.id == id })
-                else { continue }
-                seen.insert(id)
-                ordered.append(rec)
-                deliveredIDs.append(id)
-            }
-            // Union with lexical matches (preserving semantic order first) so
-            // pure substring hits don't disappear when the embedder is mock /
-            // returns weak similarity.
-            for rec in lexical where !seen.contains(rec.id) {
-                seen.insert(rec.id)
-                ordered.append(rec)
-            }
-            guard !Task.isCancelled, memorySearchGate.accepts(requestToken) else { return }
-            memorySearchResults = ordered
-            memorySearchError = nil
-            memorySearchIsLoading = false
-            // Credit exactly what the semantic lane delivered into the list.
-            // Fire-and-forget, like recall's own bump: this is a UI path and a
-            // dropped bump self-heals on the next serve.
-            if !deliveredIDs.isEmpty {
-                Task { try? await owner.recordRecallHits(ids: deliveredIDs) }
-            }
-        } catch {
-            guard !Task.isCancelled, memorySearchGate.accepts(requestToken) else { return }
-            memorySearchResults = lexical
-            memorySearchError = "Semantic memory is unavailable; showing text matches only."
-            memorySearchIsLoading = false
-        }
-    }
-
-    @MainActor
-    func pinMemory(_ memory: MemoryRecord, pinned: Bool) async -> MemoryRowEditorPinOutcome {
-        do {
-            let result = try await client.updateMemory(id: memory.id, pinned: pinned)
-            let outcome = MemoryRowEditorPinOutcome.resolve(result: result, pinned: pinned)
+            try await engine.memory.setPinned(pinned, id: memory.id)
+            let outcome = MemoryRowEditorPinOutcome.applied(pinned: pinned)
             statusText = outcome.message
-            if outcome.shouldRefresh {
-                await refreshAll()
-            }
-            if outcome.isAdverse {
-                systemToasts.push(error: outcome.message)
-            }
+            await refreshAll()
             return outcome
         } catch {
             let outcome = MemoryRowEditorPinOutcome.failed(error.localizedDescription)
@@ -310,10 +162,10 @@ extension AppModel {
     }
 
     @MainActor
-    func deleteMemory(_ memory: MemoryRecord) async {
+    func deleteMemory(_ memory: MemoryV2.MemoryRecord) async {
         do {
-            let result = try await client.deleteMemory(id: memory.id)
-            statusText = (result["status"] as? String) == "pending_approval" ? "Delete queued for approval" : "Memory deleted"
+            try await engine.memory.delete(id: memory.id)
+            statusText = "Memory deleted"
             await refreshAll()
         } catch {
             statusText = "Memory delete failed: \(error.localizedDescription)"

@@ -113,7 +113,7 @@ final class MobileDeskNoteOutbox: ObservableObject {
                     handle: note.handle,
                     text: note.text,
                     submission: note.submission,
-                    onReplacement: { [weak self] replacement in
+                    onReplacement: { [weak self = self] replacement in
                         // Signature recovery re-signs under a new identity; the
                         // retained record must name the one actually in flight.
                         Task { @MainActor in self?.replaceSubmission(id: note.id, with: replacement) }

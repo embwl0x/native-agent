@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import ToolRegistry
 
 /// Read-only projection of SecurityCenter's canonical tool profile risk.
 /// Consumers may use this metadata for advisory behavior, but it grants no
@@ -28,6 +29,7 @@ extension SwiftNativeSecurityCenter {
         "bot_create", "bot_update", "bot_pause", "bot_run_once", "bot_list", "shelf_read", "shelf_entry", "bot_ask", "bot_delete",
         "mac.notify",
         "mobile.notify",
+        "phone_request",
         "claude_message",
         "codex_message",
         "omp_message",
@@ -236,7 +238,7 @@ extension SwiftNativeSecurityCenter {
         // `codex exec` as a bounded subprocess. Default sandbox is
         // workspace-write and every run audits to data/from_codex/<uuid>.json.
         "invoke_codex",
-        // agent-builder-tools (2026-06-08): apply_patch/run_tests and the
+        // agent-builder-tools (2026-06-08): apply_patch and the
         // fixed-argv SwiftPM builders are Process-based builder tools.
         // shell/bash/git get critical risk via the `shell` / `exec` keyword
         // catcher below (lower.contains("shell")) — the others don't trip any
@@ -245,7 +247,6 @@ extension SwiftNativeSecurityCenter {
         // Their high-risk classification is enforced by the autonomy gate
         // (default `confirm` in policy.json).
         "apply_patch",
-        "run_tests",
         "swift_build",
         "swift_test",
         // gpt-5.5 review fix (2026-06-08): explicit registration of the
@@ -261,7 +262,7 @@ extension SwiftNativeSecurityCenter {
         // would undersell the process-spawn/system-control shape.
         "restart_app", "install_app",
         // Visible Browser app tools. They are app-owned WKWebView actions
-        // exposed through AppChatToolDispatcher; register them so the security
+        // run by the app's executor (AppToolExecutor); register them so the security
         // evaluator treats them as signed NativeAgent built-ins rather than
         // unknown tool names.
         "browser.status",
@@ -362,7 +363,7 @@ extension SwiftNativeSecurityCenter {
         trustedWorkspaceRoots: [URL] = []
     ) -> CanonicalToolRisk {
         let risk = profile(
-            tool: canonicalToolName(tool),
+            tool: policyToolName(tool),
             input: input,
             dataRoot: dataRoot,
             trustedWorkspaceRoots: trustedWorkspaceRoots
@@ -381,6 +382,13 @@ extension SwiftNativeSecurityCenter {
         dataRoot: URL,
         trustedWorkspaceRoots: [URL] = []
     ) -> ToolProfile {
+        // These mutate the same app-owned jobs as create. In particular,
+        // delete is cancellation, not a filesystem-delete capability.
+        if ["scheduler_cancel_job", "scheduler_delete_job", "scheduler_pause_job",
+            "scheduler_resume_job", "scheduler_update_job"].contains(tool) {
+            return profile(tool: "scheduler_create_job", input: input,
+                           dataRoot: dataRoot, trustedWorkspaceRoots: trustedWorkspaceRoots)
+        }
         var capabilities: Set<String> = ["tool_call"]
         var risk = SecurityRisk.low
         func add(_ capability: String, _ newRisk: SecurityRisk) {
@@ -396,6 +404,12 @@ extension SwiftNativeSecurityCenter {
         }
         if tool == "agent_read" {
             add("network_read", .medium)
+            return ToolProfile(capabilities: capabilities, risk: risk)
+        }
+        // Stops a reply she started: tells the contact to stop, or interrupts
+        // the run this app itself launched. It never sends her words anywhere.
+        if tool == "agent_cancel" {
+            add("network_write", .medium)
             return ToolProfile(capabilities: capabilities, risk: risk)
         }
         if tool == "agent_connect" {
@@ -512,7 +526,7 @@ extension SwiftNativeSecurityCenter {
         // The ones that move authority — a permission grant, a Mac Control
         // category, a Trust flag, a provider key, a connector token — stand
         // behind a second, checked Full Mac read taken immediately before the
-        // write, and are refused in Builder (AppChatToolDispatcher+InteractionAct).
+        // write, and are refused in Builder (AppToolExecutor+InteractionAct).
         if ["app_page_read", "app_page_screenshot", "app_settings_list"].contains(tool) {
             add("safe_read", .low)
             return ToolProfile(capabilities: capabilities, risk: risk)
@@ -613,12 +627,12 @@ extension SwiftNativeSecurityCenter {
         let lower = tool.lowercased()
         // gpt-5.5 review fix (2026-06-08): explicit branch for builder
         // Process-spawn tools. The keyword classifier below catches
-        // `shell`/`exec` but misses `bash`, `git`, `run_tests`, the SwiftPM
+        // `shell`/`exec` but misses `bash`, `git`, the SwiftPM
         // builders, and undersells `apply_patch`. Register the precise
         // capabilities BEFORE the keyword classifier so the policy preview
         // surface gets the right risk shape.
         let builderProcessTools: Set<String> = [
-            "shell", "bash", "git", "apply_patch", "run_tests",
+            "shell", "bash", "git", "apply_patch",
             "swift_build", "swift_test",
         ]
         if builderProcessTools.contains(tool) {
@@ -632,7 +646,7 @@ extension SwiftNativeSecurityCenter {
             if tool == "apply_patch" || tool == "git" || tool == "swift_build" || tool == "swift_test" {
                 add("filesystem_write", .high)
             }
-            if tool == "run_tests" || tool == "swift_test" {
+            if tool == "swift_test" {
                 // Tests are allowed to mutate the workspace (build
                 // artifacts, snapshot files, etc.).
                 add("destructive", .high)
@@ -951,51 +965,28 @@ extension SwiftNativeSecurityCenter {
         return lower.range(of: mutationPattern, options: .regularExpression) != nil
     }
 
-    static func canonicalToolName(_ raw: String) -> String {
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        switch trimmed {
-        case "mobile_notify", "iphone.notify", "iphone_notify", "ios.notify", "ios_notify", "apns.notify", "apns_notify", "push.notify", "push_notify":
-            return "mobile.notify"
-        case "mac_notify", "native.notify", "native_notify":
-            return "mac.notify"
-        case "x_status":
-            return "x.status"
-        case "x_me":
-            return "x.me"
-        case "x_search":
-            return "x.search_recent"
-        case "x_timeline":
-            return "x.timeline_home"
-        case "x_user_tweets":
-            return "x.user_tweets"
-        case "slack_status":
-            return "slack.status"
-        case "slack_list_channels":
-            return "slack.list_channels"
-        case "slack_search_messages":
-            return "slack.search_messages"
-        case "slack_post_message":
-            return "slack.post_message"
-        case "agentmail_send":
-            return "agentmail.send"
-        case "browser_status":
-            return "browser.status"
-        case "browser_chrome_setup":
-            return "browser.chrome_setup"
-        case "browser_chrome_status":
-            return "browser.chrome_status"
-        case "browser_open_url":
-            return "browser.open_url"
-        case "browser_navigate":
-            return "browser.navigate"
-        case "browser_read_text":
-            return "browser.read_text"
-        case "browser_read_links":
-            return "browser.read_links"
-        case "browser_screenshot":
-            return "browser.screenshot"
-        default:
-            return trimmed
-        }
+    /// The name a policy entry, profile and receipt are keyed on. Spellings
+    /// resolve through the one alias table (`ToolNameAliases`); what is left
+    /// here is not aliasing: a chat tool that fronts a connector action is
+    /// judged as that action (`x_search` performs `x.search_recent`), and no
+    /// such action id is ever dispatched as a tool.
+    static func policyToolName(_ raw: String) -> String {
+        let tool = ToolNameAliases.canonical(raw).trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return connectorActionIDs[tool] ?? tool
     }
+
+    static let connectorActionIDs: [String: String] = [
+        "mobile_notify": "mobile.notify",
+        "mac_notify": "mac.notify",
+        "x_status": "x.status",
+        "x_me": "x.me",
+        "x_search": "x.search_recent",
+        "x_timeline": "x.timeline_home",
+        "x_user_tweets": "x.user_tweets",
+        "slack_status": "slack.status",
+        "slack_list_channels": "slack.list_channels",
+        "slack_search_messages": "slack.search_messages",
+        "slack_post_message": "slack.post_message",
+        "agentmail_send": "agentmail.send",
+    ]
 }

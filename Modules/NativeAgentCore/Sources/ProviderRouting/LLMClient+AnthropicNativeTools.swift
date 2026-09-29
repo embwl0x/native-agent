@@ -563,6 +563,13 @@ extension AnthropicAdapter {
 
     // MARK: - Streaming
 
+    /// Mirrors the branch `streamMessages` takes below: only the first-party
+    /// native tool lane parses SSE; kimi-code and every no-tools call are one
+    /// blocking request with a keep-alive heartbeat.
+    public func messagesStreamKind(tools: [LLMToolSchema]?) -> LLMMessagesStreamKind {
+        firstPartyAnthropicToolContract && usesNativeToolLane(tools) ? .incremental : .bufferedKeepAlive
+    }
+
     /// TWO native-lane transports, chosen by `firstPartyAnthropicToolContract`:
     ///
     ///   * FIRST-PARTY (api.anthropic.com, api-key): a REAL SSE parse —
@@ -580,10 +587,9 @@ extension AnthropicAdapter {
     ///     it), its SSE tool framing was never wire-probed, and the K3 surface
     ///     has no live-delta expectation to preserve. Unchanged, deliberately.
     ///
-    /// The non-native branch reproduces the inherited LLMAdapter default
-    /// EXACTLY (completeMessages → one textDelta when non-empty → finish), so
-    /// every provider without tools sees no behavior change from this override
-    /// existing.
+    /// The non-native branch (no tools) is the same blocking shape:
+    /// completeMessages → one textDelta when non-empty → finish, heartbeat
+    /// while it runs.
     public func streamMessages(
         messages: [LLMMessage],
         system: String?,

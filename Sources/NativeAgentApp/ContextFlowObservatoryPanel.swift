@@ -1,6 +1,8 @@
 import Context
+import ContextFlow
 import Foundation
 import PersistenceCore
+import TurnTrace
 import SwiftUI
 
 // MARK: - Per-turn fallback truth (M12 honesty chip)
@@ -13,29 +15,6 @@ import SwiftUI
 // `data/turn_traces/<yyyy-MM-dd>.jsonl`. We READ that same ledger via the
 // canonical TurnTraceRecentReader — we do NOT keep a parallel counter that
 // could drift from the turn engine's truth.
-
-/// Counts derived from the recent turn-trace tail.
-struct ContextFlowFallbackSummary: Equatable, Sendable {
-    /// Distinct recent turns carrying a Context Flow summary in any mode.
-    let observedTurns: Int
-    /// How many observed turns ran in observe-only (shadow) mode.
-    let shadowTurns: Int
-    /// Number of `context.summary` turn events inspected (the recent window).
-    let windowTurns: Int
-    /// How many of those turns fell back to the legacy context path.
-    let fallbackCount: Int
-    /// The `contextFlow.fallbackError` string from the MOST RECENT fallen-back
-    /// turn, bounded. `nil` when no fallback carried an error label.
-    let latestError: String?
-}
-
-/// Honest fallback state for the Observatory chip. `unavailable` is distinct
-/// from a healthy zero: a read that could not complete must never render as
-/// "no fallbacks" (M12 rule — read failures must not look like health).
-enum ContextFlowFallbackState: Equatable, Sendable {
-    case unavailable(String)
-    case summary(ContextFlowFallbackSummary)
-}
 
 /// Reads and counts ContextFlow per-turn fallbacks from the persisted turn
 /// traces. The counting is a pure function over `[TurnTraceEvent]` so it is
@@ -178,14 +157,6 @@ enum ContextFlowFallbackReader {
             return .unavailable(reason)
         }
     }
-}
-
-/// The live runtime's health read has a distinct configured-off result: no
-/// coordinator is expected in that case, unlike an unavailable read.
-enum ContextFlowObservatoryHealthState: Sendable, Equatable {
-    case unavailable
-    case off
-    case health(ContextFlowCoordinatorHealth)
 }
 
 /// The Context Flow health projection deliberately keeps "no health was

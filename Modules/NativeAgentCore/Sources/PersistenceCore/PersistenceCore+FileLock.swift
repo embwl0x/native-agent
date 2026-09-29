@@ -114,7 +114,8 @@ public enum CredentialFileLock {
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         else { return "absent" }
         let nested = (obj["tokens"] as? [String: Any]) ?? [:]
-        let fields = ["access_token", "refresh_token", "id_token", "account_id"]
+        let fields = ["access_token", "refresh_token", "id_token", "account_id",
+                      "oauth_account_identity", "refresh_token_account_identity"]
             .map { key -> String in
                 let value = (obj[key] as? String) ?? (nested[key] as? String) ?? ""
                 return "\(key)=\(value)"

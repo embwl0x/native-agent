@@ -1,3 +1,4 @@
+import Desk
 import Foundation
 import Darwin
 import AppKit
@@ -39,13 +40,6 @@ import WorkflowOrchestration
 import Skills
 import Connectors
 import Browser
-
-private struct SessionProviderUsageReceipt: Decodable {
-    let model: String
-    let lastRequestInputTokens: Int
-    let previousTurnInputTokens: Int?
-    let turnInputDeltaTokens: Int?
-}
 
 extension NativeClient {
     /// Closed executor vocabulary for persisted inbox controls. Heartbeat
@@ -130,7 +124,7 @@ extension NativeClient {
         try fm.createDirectory(at: stageDir, withIntermediateDirectories: true)
 
         try Self.writeCodableJSON(try await getSupportDiagnostics(), to: stageDir.appendingPathComponent("support_diagnostics.json"))
-        try Self.writeCodableJSON(try await getHealth(), to: stageDir.appendingPathComponent("health.json"))
+        try Self.writeCodableJSON(DoctorFacade(dataRoot: root).readHealth(), to: stageDir.appendingPathComponent("health.json"))
 
         let dataDir = stageDir.appendingPathComponent("data", isDirectory: true)
         let copied = try Self.copySelectedDataPaths(
@@ -177,7 +171,7 @@ extension NativeClient {
         title: String,
         objective: String,
         projectSpaceId: String? = nil
-    ) async throws -> WorkshopExecutionRecord {
+    ) async throws -> WorkshopExecution.WorkshopExecutionRecord {
         // Native submit mirrors the daemon's `/v1/missions` queue-bridge:
         // runner.submit(title, objective, "manual", "none") — same defaults
         // as the Python handler. submit()
@@ -199,12 +193,7 @@ extension NativeClient {
             dataRoot: PersistenceCore.defaultDataRoot(),
             runner: runner
         ).submit(spec: spec)
-        // The daemon's create response is a SUMMARY ({id,mission_id,status,
-        // title,plan_steps}); the FULL record is a strict superset that
-        // decodes into the (snake_case-tolerant) app WorkshopExecutionRecord just the
-        // same. Serialize the asdict-faithful record and decode.
-        let data = try result.execution.toJSON().serializedData(pretty: false)
-        return try JSONDecoder.nativeAgent.decode(WorkshopExecutionRecord.self, from: data)
+        return result.execution
     }
 
     func getTriggers() async throws -> [TriggerRecord] {
@@ -217,7 +206,7 @@ extension NativeClient {
 
     // PATCH-2026-05-07: proactive-inbox-1 Inbox action helper (avoids Sendable Any issue at call site)
     func inboxAction(_ id: String, action: String) async throws {
-        // Keep the action writer on the same resolved root as getInboxItems.
+        // Keep the action writer on the same resolved root as the inbox reader.
         // Isolated/recovered app surfaces inject `dataRootOverride`; falling
         // back to the process default here made a visible card's button write
         // a different inbox (or fail) even though its reader was correct.
@@ -228,6 +217,11 @@ extension NativeClient {
         // instead of silently mapping to `act`. (gpt-5.5 review HIGH: act
         // could otherwise recurse into reply → infinite loop.)
         let normalizedAction = action == "deny" ? "reject" : action
+        if id.hasPrefix("interaction:"), !["read", "archive", "dismiss"].contains(normalizedAction) {
+            try await InteractionCardDelivery.act(id: id, action: normalizedAction,
+                dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot())
+            return
+        }
         if normalizedAction == "reply" {
             throw NSError(
                 domain: "NativeAgentSwiftOnly",
@@ -306,7 +300,7 @@ extension NativeClient {
         // construction. Archive/dismiss remain housekeeping moves the user
         // did not mean by "Act"; unresolvable shapes still fail closed -410.
         if endpointAction == "act" {
-            let items = try await getInboxItems(unreadOnly: false)
+            let items = try await InboxFacade(dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()).list()
             guard let item = items.first(where: { $0.id == id }) else {
                 throw NSError(
                     domain: "NativeAgentSwiftOnly",
@@ -551,7 +545,7 @@ extension NativeClient {
             NSLog("[NativeClient] inbox act chat_spoken: no active chat session — falling back to draft")
             return false
         }
-        let client = makeNativeAgentAppChatOrchestrationClient(profile: .background)
+        let client = NativeAgentEngine.live.chatClient(profile: .background)
         do {
             // Keyed on the inbox item, so pressing Act twice on the same card
             // is one message — and so an Act on the card the SCHEDULED brief
@@ -619,135 +613,7 @@ extension NativeClient {
         dataRoot: URL,
         configuredThresholdTokens: Int?
     ) async throws -> SessionContextStatus {
-        // gpt-5.5 review #1 (BLOCKING): The legacy context.json on disk could
-        // be stale, and the Swift compactSession() writer below still recorded
-        // `auto_compact_threshold: 75` (intended as a percent in the old
-        // schema) and a fixed `budget: 200_000`. Honoring that file produced
-        // permanently stale data — wrong budget, percent-as-token-threshold,
-        // and a model field that read "swift-native-compactor". Live values
-        // are now the only source of truth.
-        let root = dataRoot
-
-        // Live estimate from messages on disk.
-        let messagesPath = root
-            .appendingPathComponent("chat", isDirectory: true)
-            .appendingPathComponent("messages", isDirectory: true)
-            .appendingPathComponent("\(sessionId).jsonl")
-        var totalChars = 0
-        var messageCount = 0
-        if let data = try? Data(contentsOf: messagesPath),
-           let text = String(data: data, encoding: .utf8) {
-            for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
-                let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-                if trimmed.isEmpty { continue }
-                // gpt-5.5 review #5 (NIT): only count rows that actually
-                // decode. A partially-flushed row at the tail was previously
-                // inflating messageCount even though its tokens were skipped.
-                if let rowData = trimmed.data(using: .utf8),
-                   let obj = try? JSONSerialization.jsonObject(with: rowData) as? [String: Any] {
-                    messageCount += 1
-                    if let content = obj["content"] as? String {
-                        totalChars += content.count
-                    } else if let content = obj["content"] {
-                        // Tool-result rows store content as a JSON array;
-                        // re-serialize to charge for the bytes.
-                        if let blob = try? JSONSerialization.data(withJSONObject: content) {
-                            totalChars += blob.count
-                        }
-                    }
-                }
-            }
-        }
-
-        let resolvedModel = (model?.isEmpty == false ? model! : "")
-        // gpt-5.5 review #3 (NEEDS_FIX): chars/4 systematically
-        // underestimates Anthropic tokenization by ~10–15%. Use ~3.5 for
-        // claude-* and 4 for everyone else so the displayed percent is closer
-        // to what the provider actually charges. Rounded conservatively
-        // (higher token count → bar fills faster → user compacts sooner).
-        let divisor: Double = resolvedModel.lowercased().contains("claude") ? 3.5 : 4.0
-        let transcriptTokens = max(0, Int((Double(totalChars) / divisor).rounded()))
-
-        // Her window (`effectiveWindowTokens`): 60% of the selected model's,
-        // capped by a Custom size; an injected size is Custom. The ring is of
-        // it, the same window the composer card reads, and she compacts at it.
-        // An unknown model takes the same 60% of the catalog's gauge default.
-        var windowConfig = ChatSessionAutocompactionConfig.productionDefault()
-        if let configuredThresholdTokens, configuredThresholdTokens > 0 {
-            windowConfig.thresholdTokens = configuredThresholdTokens
-            windowConfig.contextWindowMode = .custom
-        }
-        let gaugeWindow = ProviderRouting.contextLength(forModel: resolvedModel)
-        let budget = windowConfig.effectiveWindowTokens(forModel: resolvedModel)
-            ?? windowConfig.effectiveWindowTokens(nativeWindowTokens: gaugeWindow)
-            ?? gaugeWindow
-
-        let providerUsagePath = root
-            .appendingPathComponent("chat", isDirectory: true)
-            .appendingPathComponent("session_state", isDirectory: true)
-            .appendingPathComponent(sessionId, isDirectory: true)
-            .appendingPathComponent("provider_usage.json")
-        let providerReceipt: SessionProviderUsageReceipt? = {
-            guard let data = try? Data(contentsOf: providerUsagePath),
-                  let receipt = try? JSONDecoder().decode(SessionProviderUsageReceipt.self, from: data),
-                  receipt.lastRequestInputTokens >= 0 else {
-                return nil
-            }
-            return receipt
-        }()
-        // What the session has spent does not vanish because the person picked
-        // a different model mid-conversation: the same history is still in the
-        // window. Only the denominator changes (`budget`, keyed to
-        // `resolvedModel` above), so the ring re-scales instead of dropping to
-        // 0%. A new conversation still starts empty — that reset is the absence
-        // of this per-session receipt file, not a model comparison.
-        let receiptMatchesModel = providerReceipt.map {
-            $0.model.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-                == resolvedModel.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        } ?? false
-        // A matching provider receipt is the authority even when selective
-        // history or compaction makes the real request smaller than the full
-        // transcript stored on disk.
-        let usedTokens = providerReceipt?.lastRequestInputTokens ?? transcriptTokens
-        let promptTokens = max(0, usedTokens - transcriptTokens)
-
-        let threshold = windowConfig.effectiveThresholdTokens(forModel: resolvedModel)
-
-        // A carried-over receipt counts tokens against the PREVIOUS model's
-        // window, so an 800k figure over a fresh 128k budget would read 600%.
-        // The used figure stays honest; only the displayed fraction is capped
-        // at full, which is what "the window is full" means on the new model.
-        let rawPercent: Double = budget > 0 ? (Double(usedTokens) / Double(budget)) * 100.0 : 0.0
-        let percent: Double = receiptMatchesModel ? rawPercent : min(rawPercent, 100.0)
-        // gpt-5.5 review #2 (NEEDS_FIX): dropping the `messageCount > 20`
-        // gate. compactSession(force: true) bypasses its own >20 guard, and
-        // short-but-huge transcripts (heavy tool output across <20 turns)
-        // were previously denied the button despite being over budget.
-        let compactable = transcriptTokens >= threshold
-
-        return SessionContextStatus(
-            session_id: sessionId,
-            used_tokens: usedTokens,
-            transcript_tokens: transcriptTokens,
-            prompt_tokens: promptTokens,
-            // Turn-over-turn deltas only mean something within one model's own
-            // accounting, so they drop on a switch even though the used figure
-            // carries. The first turn on the new model restates them.
-            previous_turn_tokens: receiptMatchesModel ? providerReceipt?.previousTurnInputTokens : nil,
-            turn_delta_tokens: receiptMatchesModel ? providerReceipt?.turnInputDeltaTokens : nil,
-            budget: budget,
-            percent: percent,
-            message_count: messageCount,
-            compactable: compactable,
-            auto_compact_threshold: threshold,
-            model: resolvedModel,
-            context_loaded: providerReceipt != nil,
-            context_mode: providerReceipt == nil
-                ? "transcript_estimate"
-                : (receiptMatchesModel ? "provider_receipt" : "provider_receipt_prior_model"),
-            context_fingerprint: nil,
-            context_prompt_chars: totalChars
-        )
+        try await RuntimeReadProjection.getSessionContext(sessionId: sessionId, model: model, dataRoot: dataRoot, configuredThresholdTokens: configuredThresholdTokens)
     }
 
     static func visibleNotificationInboxPath(
@@ -790,67 +656,6 @@ extension NativeClient {
             NSLog("[inbox] updateVisibleNotificationInboxStatus(\(action)) failed for \(id): \(String(describing: error))")
             return false
         }
-    }
-
-    // PATCH-2026-05-07 / DAEMON-DEAD PORT (2026-06-02): read
-    // <dataRoot>/notifications/inbox.jsonl directly. Cross-ref NotificationInbox.
-    // Lossy per-row decode — one malformed record doesn't nuke the list.
-    //
-    // 2026-06-06: sort newest-first by created_at. The file is append-only,
-    // so without this the just-fired card (e.g. tonight's dream) lands at
-    // the BOTTOM of the inbox list and gets buried under older entries —
-    // the user sees the push but can't find the card. Both consumers (Mac
-    // InboxView's List(displayItems) and MacSyncEngine.nativeInboxSnapshotData
-    // → iOS InboxStore) inherit this ordering, so iOS inbox surfaces it
-    // the same way without an extra sort there.
-    func getInboxItems(unreadOnly: Bool = false) async throws -> [InboxItemRecord] {
-        // U5 W-A item 1 (:11647): the read was swallowed into [] — a
-        // corrupt/unreadable inbox file rendered as an EMPTY inbox.
-        // readJSONLHonest propagates I/O errors AND throws on
-        // bytes-but-no-rows; per-row decode stays lossy (one malformed
-        // record doesn't nuke the list) but ALL rows failing to decode
-        // throws too (decodeLossyArray's all-fail rule).
-        let root = dataRootOverride ?? PersistenceCore.defaultDataRoot()
-        let inboxPath = root
-            .appendingPathComponent("notifications", isDirectory: true)
-            .appendingPathComponent("inbox.jsonl")
-        // The default live owner keeps the parsed 1–2 MB JSONL snapshot until
-        // its file identity changes. Constructing a fresh actor here defeated
-        // that cache on every UI/mobile refresh and repeatedly reparsed the
-        // entire inbox during launch. Test/override roots remain isolated.
-        let inbox = dataRootOverride == nil
-            ? LiveNotificationInbox.shared
-            : LiveNotificationInbox(path: inboxPath)
-        let rows = try await inbox.rows()
-        let decoder = JSONDecoder()
-        var items: [InboxItemRecord] = []
-        var decodeFailures = 0
-        for row in rows {
-            guard let data = try? row.serializedData(pretty: false),
-                  let item = try? decoder.decode(InboxItemRecord.self, from: data) else {
-                decodeFailures += 1
-                continue
-            }
-            if unreadOnly && !item.isUnread { continue }
-            items.append(item)
-        }
-        if !rows.isEmpty && decodeFailures == rows.count {
-            throw NSError(domain: "NativeAgent", code: -3, userInfo: [
-                NSLocalizedDescriptionKey:
-                    "getInboxItems: all \(rows.count) inbox row(s) failed to decode — "
-                    + "refusing to render a corrupt inbox as empty"
-            ])
-        }
-        // Newest-first by created_at. ISO-8601 strings sort lexicographically
-        // in chronological order, so a string compare is correct; entries
-        // with missing/blank created_at fall to the bottom.
-        items.sort { lhs, rhs in
-            if lhs.created_at.isEmpty { return false }
-            if rhs.created_at.isEmpty { return true }
-            if lhs.created_at != rhs.created_at { return lhs.created_at > rhs.created_at }
-            return lhs.id > rhs.id
-        }
-        return items
     }
 
     // PATCH-2026-05-07: proactive-inbox-1 Get inbox trigger configs
@@ -1023,7 +828,7 @@ extension NativeClient {
     ) async throws -> WorkshopExecution.WorkshopExecutionRecord {
         let runner = makeWorkshopExecutionRunner()
         // Refused BEFORE any write: an unknown execution now costs one read.
-        guard await runner.getWorkshopExecution(executionId) != nil else {
+        guard try await runner.getWorkshopExecution(executionId) != nil else {
             throw DaemonError.notFound("workshop execution \(executionId)")
         }
         let root = dataRootOverride ?? SwiftNativeApprovalInbox.defaultDataRoot()
@@ -1059,7 +864,7 @@ extension NativeClient {
             decision: decision,
             provenance: provenance
         )
-        guard let record = await runner.getWorkshopExecution(executionId) else {
+        guard let record = try await runner.getWorkshopExecution(executionId) else {
             throw DaemonError.notFound("workshop execution \(executionId)")
         }
         return record

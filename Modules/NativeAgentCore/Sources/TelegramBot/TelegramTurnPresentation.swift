@@ -39,6 +39,8 @@ public enum TelegramTurnPresentationReducer {
         guard !state.isTerminal else { return state }
 
         switch event {
+        case .replyTextSettled:
+            return state
         case .status(let text):
             let lower = text.lowercased()
             if lower.contains("retry") || lower.contains("recover") {

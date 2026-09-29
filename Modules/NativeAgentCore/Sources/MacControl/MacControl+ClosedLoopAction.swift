@@ -85,6 +85,16 @@ extension SwiftNativeMacControl {
             )
         }
         let text = body.stringValue("text")
+        let typeMode: MacTypeMode
+        if let raw = body["mode"], raw != .null, raw != .string("") {
+            guard case .string(let value) = raw, let parsed = MacTypeMode(rawValue: value),
+                  parsed == .replace || verb == .type else {
+                return injectionRefusal(action: "act", error: "invalid_type_mode: use replace or append; append requires type", status: 400)
+            }
+            typeMode = parsed
+        } else {
+            typeMode = .replace
+        }
         if verb == .type, (text ?? "").isEmpty {
             return injectionRefusal(
                 action: "act",
@@ -443,7 +453,7 @@ extension SwiftNativeMacControl {
             app: identityScoped.app,
             windowTitle: identityScoped.rootTitle,
             focusPath: identityScoped.focusPath,
-            maxAffordances: Self.intValue(body, "max_affordances") ?? MacPerceptionCompiler.maxAffordances
+            uncapped: true
         )
         // The live element is looked up in the SAME channels the frame entry
         // could have been minted from — affordances at that path, else the
@@ -551,7 +561,7 @@ extension SwiftNativeMacControl {
 
         // 7. PERFORM.
         let performedAt = now()
-        let performed = performAct(
+        let performed = await performAct(
             verb: verb,
             handle: handle,
             entry: entry,
@@ -560,9 +570,11 @@ extension SwiftNativeMacControl {
             actWindow: actWindow,
             target: target,
             text: text,
+            typeMode: typeMode,
             direction: direction,
             inputRefusal: inputRefusal,
-            background: background
+            background: background,
+            keystrokes: body["keystrokes"] == .bool(true)
         )
         await screenViewStore.invalidate()
 
@@ -745,7 +757,8 @@ var effect: [String: JSONValue] = [
             output["menu_left_open"] = .bool(menuLeftOpen)
         }
 
-        guard let read else {
+        guard let read, seam["window_minimized"] != .bool(true) else {
+            // A minimized window cannot supply a fresh frame either.
             // The window went away under the act (she closed it, or dismissed
             // the last sheet, or the act itself closed it). That is a real
             // outcome and the frame must die with it — a handle from a window
@@ -758,6 +771,14 @@ var effect: [String: JSONValue] = [
             // differently on each.
             await lookFrameStore.invalidate()
             let (percept, note): (String, String) = {
+                if seam["window_minimized"] == .bool(true) {
+                    let name = read?.app?.name ?? "The app"
+                    return (
+                        "window_minimized",
+                        "\(name)'s window is minimized. go name:\"\(name)\" brings it back. "
+                        + "Its menu bar still works: act app:\"\(name)\" target:\"File > New\" makes a new window."
+                    )
+                }
                 switch postAnchor {
                 case .appGone?:
                     return (
@@ -876,6 +897,14 @@ var effect: [String: JSONValue] = [
             effect["reason"] = .string(reason)
         }
         if let note = classification.note { output["status_note"] = .string(note) }
+        if performed.ok, performed.extra["append_verified"] == .bool(true) {
+            // Full editor readback proves an append beyond the percept's value cap too.
+            output["status"] = .string("acted")
+            output["verified"] = .bool(true)
+            output.removeValue(forKey: "status_reason")
+            output.removeValue(forKey: "status_note")
+            effect.removeValue(forKey: "reason")
+        }
         // Agent round 2 — a Finder view switch dropped 222 notifications and
         // showed 10 of 44 additions. A truncated list of a bulk change is not a
         // description of it, so past the cap the payload also carries a
@@ -973,6 +1002,7 @@ var effect: [String: JSONValue] = [
         actWindow: MacAXWindowRef,
         target: MacAXActTarget,
         text: String?,
+        typeMode: MacTypeMode,
         direction: MacActScrollDirection,
         /// Round 7 — non-nil when the frame's window is NOT key, i.e. when any
         /// synthesized event would land somewhere other than the window she
@@ -981,8 +1011,11 @@ var effect: [String: JSONValue] = [
         /// Her-screen Phase 4 — never raise; a site that needs the front
         /// refuses `needs_front` instead, and `type` inserts through AX or
         /// keys addressed to the app's pid.
-        background: Bool = false
-    ) -> MacActPerformed? {
+        background: Bool = false,
+        /// `type` as real keystrokes, never AXSetValue: a search field (or one
+        /// a return is about to submit) runs its action only on real typing.
+        keystrokes: Bool = false
+    ) async -> MacActPerformed? {
         /// Every synthesized-input site calls this FIRST. Non-nil ⇒ return it:
         /// nothing posted, nothing selected, nothing pressed. The AX paths above
         /// each site are untouched — this gates the window server, not the API.
@@ -1313,6 +1346,118 @@ var effect: [String: JSONValue] = [
             case .success(let result):
                 return summarize(result, target: pressTarget, actedHandle: actedHandle, extra: extra)
             }
+        }
+
+        /// Append never enters a whole-value writer, including after a failed insertion.
+        func appendText(_ text: String) async -> MacActPerformed {
+            var method = "none"
+            var posted = 0
+            func result(_ error: String? = nil) -> MacActPerformed {
+                MacActPerformed(
+                    ok: error == nil, method: method, requestedAction: "type",
+                    fallbackReason: nil, error: error, target: target,
+                    postState: accessibilityActSource.reread(target), actedHandle: handle,
+                    extra: [
+                        "mode": .string("append"),
+                        "posted_events": .int(Int64(posted)),
+                        "text_value_verified": .bool(error == nil),
+                        "append_verified": .bool(error == nil),
+                        "guidance": .string(error.map {
+                            "Append stopped: \($0). The whole value was not replaced. Inspect the target before retrying; insertion may be partial if input was delivered."
+                        } ?? "Verified the complete prior text plus the appended text."),
+                    ]
+                )
+            }
+            guard !MacCraftReplacement.required else {
+                return result("append_conflicts_with_required_replacement")
+            }
+            guard let before = accessibilityActSource.textInput(target) else {
+                return result("append_text_or_selection_unreadable")
+            }
+            let end = NSRange(location: before.value.utf16.count, length: 0)
+            let expected = before.value + text
+            func waitForValue(_ value: String, selection: NSRange? = nil) async -> Bool {
+                let deadline = ContinuousClock.now.advanced(by: .milliseconds(750))
+                repeat {
+                    guard !Task.isCancelled else { return false }
+                    if let input = accessibilityActSource.textInput(target), input.value == value,
+                       selection == nil || input.selection == selection { return true }
+                    if ContinuousClock.now >= deadline { break }
+                    do { try await Task.sleep(for: .milliseconds(25)) } catch { return false }
+                } while true
+                return false
+            }
+            func atUnchangedEnd() -> Bool {
+                guard let input = accessibilityActSource.textInput(target) else { return false }
+                return input.value == before.value && input.selection == end
+            }
+            guard !Task.isCancelled else { return result("cancelled") }
+            noteActuation("AXSelectedTextRange")
+            let positioned = accessibilityActSource.setSelectedTextRange(target, range: end)
+            switch positioned {
+            case .performed:
+                guard await waitForValue(before.value, selection: end) else {
+                    return result("append_end_not_verified")
+                }
+                if !keystrokes {
+                    guard !Task.isCancelled, atUnchangedEnd() else { return result("append_target_changed") }
+                    noteActuation("AXSelectedText")
+                    method = "ax_selected_text"
+                    switch accessibilityActSource.setSelectedText(target, text: text) {
+                    case .performed:
+                        return await waitForValue(expected) ? result() : result("append_value_mismatch")
+                    case .unsupported:
+                        guard atUnchangedEnd() else { return result("append_insertion_outcome_unknown") }
+                        method = "none"
+                    case .invalidTarget, .failed:
+                        return result("append_insertion_outcome_unknown")
+                    }
+                }
+            case .unsupported:
+                break
+            case .invalidTarget, .failed:
+                return result("append_end_position_failed")
+            }
+            // Only unsupported AX operations reach the explicit keyboard route.
+            // A background call can be resumed in front before any text was sent.
+            guard accessibilityActSource.textInput(target)?.value == before.value else {
+                return result("append_target_changed")
+            }
+            if background {
+                var refusal = result("needs_front")
+                refusal.extra["ax_delivered"] = .bool(false)
+                refusal.extra["needs_front_reason"] = .string("append needs verified focus and an end-of-document keystroke")
+                return refusal
+            }
+            guard eventSink.isAvailable, !eventSink.secureKeyboardEntryActive else {
+                return result("append_keyboard_unavailable")
+            }
+            if let refusal = refuseInput("type") { return result(refusal.error ?? "append_window_not_key") }
+            _ = ledgeredSetFocused(target)
+            func focusHolds() -> Bool {
+                !Task.isCancelled && !eventSink.secureKeyboardEntryActive
+                    && accessibilitySource.frontmostApp()?.processIdentifier == framePid
+                    && accessibilityActSource.focusedWindow(pid: framePid)?.handle == actWindow.handle
+                    && accessibilityActSource.isFocusedElement(target, pid: framePid)
+            }
+            guard focusHolds() else { return result("append_target_not_focused") }
+            // One end-of-document chord, with a readback before any characters.
+            method = "keystroke_injection"
+            noteActuation("cmd+down")
+            for event in MacEventPlanner.chord(MacKeyChord(modifiers: .command, keyCode: 0x7D, source: "cmd+down")) {
+                eventSink.post(key: event)
+                posted += 1
+            }
+            guard await waitForValue(before.value, selection: end), focusHolds(), atUnchangedEnd() else {
+                return result("append_end_not_verified")
+            }
+            noteActuation("type")
+            for event in MacEventPlanner.typeText(text) {
+                if event.down, !focusHolds() { return result("append_focus_moved") }
+                eventSink.post(key: event)
+                posted += 1
+            }
+            return await waitForValue(expected) ? result() : result("append_value_mismatch")
         }
 
         /// Her-screen Phase 4 — typing into an app that stays in the back.
@@ -1749,14 +1894,23 @@ var effect: [String: JSONValue] = [
                     ]
                 )
             }
+            if typeMode == .append {
+                return await appendText(text)
+            }
+            if MacCraftReplacement.required {
+                guard craftDocumentMatches(pid: framePid),
+                      accessibilityActSource.focusedWindow(pid: framePid)?.handle == actWindow.handle else { return nil }
+                guard case .success(let result) = ledgeredActuatorAct(action: nil, value: text, resolved: target) else { return nil }
+                return summarize(result, target: target, actedHandle: handle)
+            }
             if background {
                 return typeInBackground(text)
             }
             // AXSetValue first: that is how you fill a field without
             // simulating 40 keystrokes, and it cannot be intercepted by
-            // whatever else has focus.
-            let setOutcome = ledgeredActuatorAct(action: nil, value: text, resolved: target)
-            if case .success(let result) = setOutcome, result.ok {
+            // whatever else has focus. Not when real keystrokes were asked for.
+            if !keystrokes, case .success(let result) = ledgeredActuatorAct(action: nil, value: text, resolved: target),
+               result.ok {
                 return summarize(result, target: target, actedHandle: handle)
             }
             // Not settable (a web input, a terminal, a rich-text view). Focus
@@ -1767,7 +1921,7 @@ var effect: [String: JSONValue] = [
             // submit); AXFocused is the attribute that means "the cursor is
             // here" and nothing else.
             let focusOutcome = ledgeredSetFocused(target)
-            let focusMethod = focusOutcome == .performed ? "ax_focus" : "none"
+            var focusMethod = focusOutcome == .performed ? "ax_focus" : "none"
             guard focusOutcome == .performed else {
                 // No focus, no honest keystroke target: typing now would land
                 // wherever the focus already was. Report instead of scattering
@@ -1824,19 +1978,111 @@ var effect: [String: JSONValue] = [
                     ]
                 )
             }
-            if let refusal = refuseInput("type") { return refusal }
+            // AXFocused can answer success and leave the focus where it was
+            // (Maps' search field): keys sent then land in whatever held it.
+            // The field takes the focus from a click, as a person's would, and
+            // the keys go only once it holds the focus.
+            func holdsFocus() -> Bool {
+                for attempt in 0..<12 {
+                    if attempt > 0 { Thread.sleep(forTimeInterval: 0.025) }
+                    if accessibilityActSource.isFocusedElement(target, pid: framePid) { return true }
+                }
+                return false
+            }
+            if !holdsFocus() {
+                if let centre = target.centre {
+                    if let refusal = refuseInput("type") { return refusal }
+                    noteActuation("click")
+                    for event in MacEventPlanner.click(x: centre.x, y: centre.y, button: .left, count: 1) {
+                        eventSink.post(mouse: event)
+                    }
+                    focusMethod = "click"
+                }
+                guard focusMethod == "click", holdsFocus() else {
+                    return MacActPerformed(
+                        ok: false,
+                        method: focusMethod == "click" ? "click" : "none",
+                        requestedAction: "type",
+                        fallbackReason: "value_not_settable",
+                        error: "target_not_focused",
+                        target: target,
+                        postState: accessibilityActSource.reread(target),
+                        actedHandle: handle,
+                        extra: [
+                            "focus_method": .string(focusMethod),
+                            "guidance": .string(
+                                "that field didn't take the keyboard focus, so I typed nothing — keys would have gone somewhere else"
+                            ),
+                        ]
+                    )
+                }
+            }
+            if let refusal = refuseInput("type") {
+                guard focusMethod == "click" else { return refusal }
+                // The click went; the keys don't. Said as it happened, not as
+                // "nothing was posted".
+                return MacActPerformed(
+                    ok: false,
+                    method: "click",
+                    requestedAction: "type",
+                    fallbackReason: "key_window_changed_after_actuation",
+                    error: "key_window_changed_after_actuation",
+                    target: target,
+                    postState: accessibilityActSource.reread(target),
+                    actedHandle: handle,
+                    extra: [
+                        "focus_method": .string(focusMethod),
+                        "guidance": .string(
+                            "I clicked that field to focus it, then another window took the keys, so I typed nothing"
+                        ),
+                    ]
+                )
+            }
             // Replace, as a person does (and as AXSetValue above would have):
             // the field has focus, so select its own text first. A save sheet
             // selects only the base name, which turned "hello.txt" into
             // "hello.txt.txt". Single-line fields only: in a document body
             // (a text area, a web editor) select-all would wipe the document.
-            if ["AXTextField", "AXComboBox"].contains(target.role) {
+            func typingFailure(_ error: String) -> MacActPerformed {
+                MacActPerformed(
+                    ok: false, method: "keystroke_injection", requestedAction: "type",
+                    fallbackReason: "value_not_settable", error: error, target: target,
+                    postState: accessibilityActSource.reread(target), actedHandle: handle,
+                    extra: ["focus_method": .string(focusMethod)]
+                )
+            }
+            guard let input = await waitForTextInput(pid: framePid, target: target) else {
+                return typingFailure("text_editor_not_ready")
+            }
+            if let refusal = refuseInput("type") { return refusal }
+            let replacesField = ["AXTextField", "AXComboBox", "AXSearchField"].contains(target.role)
+            var beforeTyping = input
+            if replacesField, input.selection != NSRange(location: 0, length: input.value.utf16.count) {
+                noteActuation("select_all")
                 for event in MacEventPlanner.chord(MacKeyChord(modifiers: .command, keyCode: 0x00, source: "cmd+a")) {
                     eventSink.post(key: event)
                 }
+                guard let selectedInput = await waitForTextInput(pid: framePid, target: input.target, selectedAll: true) else {
+                    return typingFailure("text_selection_not_ready")
+                }
+                beforeTyping = selectedInput
             }
+            if let refusal = refuseInput("type") { return refusal }
             for event in MacEventPlanner.typeText(text) {
+                if event.down {
+                    guard !Task.isCancelled,
+                          accessibilityActSource.isFocusedElement(input.target, pid: framePid) else {
+                        return typingFailure("focus_moved")
+                    }
+                    if let refusal = refuseInput("type") { return refusal }
+                }
                 eventSink.post(key: event)
+            }
+            let expectedValue = replacesField ? text : input.inserting(text)
+            guard await waitForTextInput(
+                pid: framePid, target: input.target, value: expectedValue, changedFrom: beforeTyping
+            ) != nil else {
+                return typingFailure("typed_value_mismatch")
             }
             return MacActPerformed(
                 ok: true,
@@ -1850,6 +2096,7 @@ var effect: [String: JSONValue] = [
                 extra: [
                     "focus_method": .string(focusMethod),
                     "text_character_count": .int(Int64(text.count)),
+                    "text_value_verified": .bool(true),
                 ]
             )
 

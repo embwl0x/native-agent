@@ -224,6 +224,7 @@ extension ChatStore {
     /// Silence changes the status word. The partial answer, the bubble and the
     /// observation all stay exactly where they are.
     func notePendingExchangeSilent(correlationID: String) {
+        PhoneTurnActivity.shared.silence(correlationID)
         guard var record = pendingExchanges[correlationID] else { return }
         record.isSilent = true
         pendingExchanges[correlationID] = record
@@ -258,6 +259,7 @@ extension ChatStore {
     /// A terminal result — reply, error, cancel or session retirement — closes
     /// the record. Nothing else does.
     func closePendingExchange(_ correlationID: String) {
+        PhoneTurnActivity.shared.finish(correlationID)
         pendingExchanges.removeValue(forKey: correlationID)
     }
 

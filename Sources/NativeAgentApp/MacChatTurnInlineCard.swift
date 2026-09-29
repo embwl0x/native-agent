@@ -1,13 +1,13 @@
+import ChatOrchestration
 import SwiftUI
 import CoreGraphics
 
 /// The working card, in the inline-card grammar, at the transcript position the
 /// interaction belongs to.
 ///
-/// NOT MOUNTED IN THE APP YET. `InlineCardMockups` is its only caller: the
-/// transcript still renders the floating working card, and switching that
-/// mount is the mechanism's job. This is the drawn proposal for when it does,
-/// which is what the mockups are shot from.
+/// NOT MOUNTED IN THE APP YET: the transcript still renders the floating
+/// working card, and switching that mount is the mechanism's job. This is the
+/// drawn proposal for when it does.
 ///
 /// Truth still lives in the lifecycle owner: this is a second pure projection
 /// of the same `MacChatTurnCardModel` the floating card already renders, and it

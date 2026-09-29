@@ -11,17 +11,10 @@ import SwiftUI
 /// RootGeometry measurement.
 ///
 /// Structure and live tail are now separately observed. The parent keeps its
-/// structural snapshot (`chatMessagesStructureVersion`); the tail row's bubble
+/// structural snapshot (`engine.transcripts.structureVersion`); the tail row's bubble
 /// takes the box for its own message id and observes THAT, so a token changes
 /// one leaf's layout instead of the whole tree.
-@MainActor
-@Observable
-final class ChatStreamingTailBox {
-    /// nil means "no live value" — the row renders the content it was handed,
-    /// which is what every settled row does and what this row does again once
-    /// the turn's final write has gone through the structural seam.
-    var content: String?
-}
+
 
 /// The streaming tail row. The ONLY view that observes a live chunk.
 ///
@@ -35,7 +28,7 @@ struct StreamingTailBubble: View {
     var isLastAssistant: Bool
 
     var body: some View {
-        let box = appModel.streamingTailBox(forMessage: message.id)
+        let box = appModel.engine.transcripts.streamingTailBox(forMessage: message.id)
         var live = message
         if let content = box.content { live.content = content }
         return MessageBubble(message: live, isLastAssistant: isLastAssistant)
@@ -58,7 +51,7 @@ struct ChatStreamingTailObserver: View {
 
     var body: some View {
         if enabled {
-            let box = appModel.streamingTailBox(forMessage: messageID ?? "")
+            let box = appModel.engine.transcripts.streamingTailBox(forMessage: messageID ?? "")
             Color.clear
             .frame(width: 0, height: 0)
             .accessibilityHidden(true)

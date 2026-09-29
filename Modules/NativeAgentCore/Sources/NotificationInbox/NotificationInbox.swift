@@ -38,7 +38,7 @@
 //     status-overlay write are safe to serve natively because the overlay write
 //     is a separate file (index.json) and is itself flock-wrapped in Python; we
 //     mirror that with PersistenceCore atomic writes, but the surface() WRITE
-//     stays HTTP (see CUTOVER_PLAN.md §6.55 prereqs).
+//     stays HTTP.
 //   * inbox_act / inbox_reply (POST .../act, .../reply): these are NOT inbox
 //     methods — the daemon runtime intercepts them to queue an LLM autonomy
 //     follow-up turn (inbox_act, the retired daemon) or invoke chat()
@@ -224,7 +224,7 @@ public struct NotificationInboxItem: Sendable, Equatable {
 ///
 /// THE LIVE INBOX IS `<dataRoot>/notifications/inbox.jsonl` — the append-only
 /// event log the macOS/iOS UI reads, written by
-/// `TriggerNotifierBinding.mirrorCardIntoRealInbox`,
+/// `TriggerNotificationInbox.mirrorCardIntoRealInbox`,
 /// `NativeCognitionRuntime+ProviderVitals`, and friends, with status writes via
 /// `NativeClient.updateVisibleNotificationInboxStatus`. Send new work there.
 ///

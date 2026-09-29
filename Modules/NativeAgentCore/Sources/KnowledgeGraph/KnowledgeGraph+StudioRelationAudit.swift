@@ -26,6 +26,7 @@
 import Foundation
 import GRDB
 import PersistenceCore
+import Studio
 
 /// One relation the journal asserts that the graph does not carry back.
 public struct StudioRelationMismatch: Sendable, Equatable {

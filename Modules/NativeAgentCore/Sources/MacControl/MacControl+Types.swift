@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import TrustCenter
 #if canImport(CryptoKit)
 import CryptoKit
 #endif
@@ -704,6 +705,68 @@ public enum MacScreenLock {
         return false
         #endif
     }
+
+    /// What still covers the screen after `wakeIfCovered` gave up.
+    public struct Covered: Error, Sendable { public let detail: String }
+
+    /// Before anything that needs the screen. User's Mac is never
+    /// password-locked, but the flag above is set under its screensaver too,
+    /// and on macOS 26 that saver is drawn by loginwindow itself (no
+    /// ScreenSaverEngine process). Measured live 09-25: `caffeinate -u` and a
+    /// bare pointer move leave it up; a one-point move plus a bare Shift tap
+    /// (types nothing, clicks nothing, can't authenticate) clears it. So: when
+    /// the layer is up, post that (never while the person is at the keys, e.g.
+    /// signing in), wait until a normal app is in front, and throw only when a
+    /// second try still leaves it up, naming what is there. "In front" is read
+    /// from the window list, not NSWorkspace, whose frontmost app only updates
+    /// on the main run loop (a background poll saw loginwindow for 3 s after
+    /// the saver was gone).
+    public static func wakeIfCovered() async throws {
+        #if canImport(CoreGraphics) && canImport(AppKit) && os(macOS)
+        func loginWindowUp() -> Bool {
+            let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] ?? []
+            return windows.contains {
+                $0[kCGWindowOwnerName as String] as? String == "loginwindow"
+                    && ($0[kCGWindowLayer as String] as? Int ?? 0) >= Int(CGWindowLevelForKey(.screenSaverWindow))
+            }
+        }
+        func covered() -> Bool { isLocked() || loginWindowUp() }
+        guard covered() else { return }
+        guard (CGSessionCopyCurrentDictionary() as? [String: Any])?["kCGSSessionOnConsoleKey"] as? Bool == true else {
+            throw Covered(detail: "Another user's login session owns the screen.")
+        }
+        // Checked again right before each key, so a keystroke already under
+        // way never gets our Shift folded into it.
+        let personActive = Covered(detail: "Someone is using the Mac right now, so I didn't nudge the screen.")
+        for _ in 0..<2 {
+            guard MacPersonInput.activeSecondsAgo() == nil else { throw personActive }
+            if let origin = CGEvent(source: nil)?.location {
+                for point in [CGPoint(x: origin.x + 1, y: origin.y), origin] {
+                    guard let move = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: point, mouseButton: .left) else { continue }
+                    NativeAgentMotorEpoch.notePostedHIDEvent()
+                    move.post(tap: .cghidEventTap)
+                }
+            }
+            guard MacPersonInput.activeSecondsAgo() == nil else { throw personActive }
+            for down in [true, false] {
+                guard let key = CGEvent(keyboardEventSource: nil, virtualKey: 56, keyDown: down) else { continue }
+                key.flags = down ? .maskShift : []
+                NativeAgentMotorEpoch.notePostedHIDEvent()
+                key.post(tap: .cghidEventTap)
+            }
+            for _ in 0..<15 {
+                try await Task.sleep(for: .milliseconds(200))
+                if !covered() { wakeFailed = false; return }
+            }
+        }
+        wakeFailed = true
+        throw Covered(detail: CGDisplayIsAsleep(CGMainDisplayID()) != 0
+            ? "The display stayed asleep after two wake nudges."
+            : loginWindowUp()
+            ? "The login window is still in front after two wake nudges, so the Mac is asking for its password."
+            : "The screen is still covered after two wake nudges (macOS still reports the saver/login layer up, with no login window showing).")
+        #endif
+    }
 }
 
 #if canImport(CoreGraphics) && os(macOS)
@@ -912,75 +975,6 @@ public protocol MacControlPolicyProvider: Sendable {
     /// case production callers fail closed before any side effect. Tests can
     /// omit the provider when they need to exercise a handler directly.
     func currentPolicy() async -> MacControlPolicy?
-}
-
-public extension MacControlPolicy {
-    /// Build the gate policy from the normalized TrustCenter policy object.
-    /// This keeps production MacControl fully Swift-native while preserving the
-    /// same macControlPolicy/filePolicy fields the UI already edits.
-    static func fromTrustPolicyObject(_ root: [String: JSONValue]) -> MacControlPolicy {
-        let defaults = MacControlPolicy.default
-        let mac: [String: JSONValue] = {
-            if case .object(let obj)? = root["macControlPolicy"] { return obj }
-            return [:]
-        }()
-        let filePolicy: [String: JSONValue] = {
-            if case .object(let obj)? = root["filePolicy"] { return obj }
-            return [:]
-        }()
-
-        func bool(_ obj: [String: JSONValue], _ key: String, default def: Bool) -> Bool {
-            if case .bool(let value)? = obj[key] { return value }
-            return def
-        }
-        func string(_ obj: [String: JSONValue], _ key: String, default def: String = "") -> String {
-            if case .string(let value)? = obj[key] { return value }
-            return def
-        }
-        func double(_ obj: [String: JSONValue], _ key: String, default def: Double) -> Double {
-            switch obj[key] {
-            case .double(let value): return value
-            case .int(let value): return Double(value)
-            default: return def
-            }
-        }
-        func stringArray(_ obj: [String: JSONValue], _ key: String) -> [String]? {
-            guard case .array(let values)? = obj[key] else { return nil }
-            return values.compactMap { value in
-                if case .string(let s) = value { return s }
-                return nil
-            }
-        }
-
-        var categoryAllowed = defaults.categoryAllowed
-        for key in categoryAllowed.keys {
-            categoryAllowed[key] = bool(mac, key, default: categoryAllowed[key] ?? false)
-        }
-
-        let approvalRequiredFor = stringArray(mac, "approval_required_for") ?? defaults.approvalRequiredFor
-        let workspaceRoots =
-            stringArray(root, "workspaceRoots")
-            ?? stringArray(root, "workspace_roots")
-            ?? stringArray(filePolicy, "workspaceRoots")
-            ?? []
-
-        let trustPolicy = MacControlTrustPolicy(
-            outsideWorkspaceDefault: string(filePolicy, "outsideWorkspaceDefault", default: "deny"),
-            permissionLevel: string(root, "permissionLevel", default: "balanced"),
-            developerMode: bool(root, "developerMode", default: false),
-            allowDestructiveActions: bool(filePolicy, "allowDestructiveActions", default: false)
-        )
-
-        return MacControlPolicy(
-            enabled: bool(mac, "enabled", default: defaults.enabled),
-            remoteFromIOSAllowed: bool(mac, "remote_from_ios_allowed", default: defaults.remoteFromIOSAllowed),
-            requireAppBridgeForTCC: bool(mac, "require_app_bridge_for_tcc", default: defaults.requireAppBridgeForTCC),
-            categoryAllowed: categoryAllowed,
-            trustPolicy: trustPolicy,
-            workspaceRoots: workspaceRoots,
-            approvalRequiredFor: approvalRequiredFor
-        )
-    }
 }
 
 // MARK: - Shell whitelist

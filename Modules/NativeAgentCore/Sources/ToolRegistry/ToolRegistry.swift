@@ -220,6 +220,101 @@ extension ToolRecord {
     }
 }
 
+extension ToolRecord: Identifiable {}
+
+/// The authored-tool fields the registry keeps in `extras`, read as the Tools
+/// page shows them (S10). Reads only: writes still go through `extras`.
+extension ToolRecord {
+    private func extra(_ key: String) -> JSONValue? {
+        guard case .object(let obj)? = extras else { return nil }
+        return obj[key]
+    }
+
+    private func extraString(_ key: String) -> String? {
+        if case .string(let value)? = extra(key) { return value }
+        return nil
+    }
+
+    private func extraBool(_ key: String) -> Bool? {
+        if case .bool(let value)? = extra(key) { return value }
+        return nil
+    }
+
+    private func extraStrings(_ key: String) -> [String]? {
+        guard case .array(let values)? = extra(key) else { return nil }
+        return values.compactMap { value in
+            if case .string(let string) = value { return string }
+            return nil
+        }
+    }
+
+    public var description: String { extraString("description") ?? "" }
+
+    public var triggers: [String] { extraStrings("triggers") ?? [] }
+    public var permissions: [String]? { extraStrings("permissions") }
+    public var validationErrors: [String]? { extraStrings("validationErrors") }
+    public var autoCreated: Bool? { extraBool("autoCreated") }
+    public var autoRun: Bool? { extraBool("autoRun") }
+
+    public var quarantinePath: String? { extraString("quarantinePath") }
+    public var language: String? { extraString("language") }
+
+    public var useCount: Int? {
+        switch extra("useCount") {
+        case .int(let value)?: return Int(exactly: value)
+        case .double(let value)?: return Int(exactly: value)
+        default: return nil
+        }
+    }
+
+    /// The first registry string field of a raw record that is present but
+    /// not a string. `init(json:)` reads such a field as absent, so a caller
+    /// holding the raw record checks it first.
+    public static func stringFieldProblem(in json: JSONValue) -> String? {
+        guard case .object(let obj) = json else { return "record" }
+        for key in ["id", "name", "status", "phase", "validationStatus", "proposalPath", "activePath",
+                    "sourceRunId", "createdAt", "updatedAt", "lastUsedAt"] {
+            switch obj[key] {
+            case nil, .null?, .string?: continue
+            default: return key
+            }
+        }
+        return nil
+    }
+
+    /// The first authored field that does not read as the Tools page reads
+    /// it, or nil when every one does: `description` and `triggers` are
+    /// required, the rest may be absent or null but never of another type. A
+    /// record naming one is damaged authority, not a row to render.
+    public var authoredFieldProblem: String? {
+        func isString(_ value: JSONValue) -> Bool { if case .string = value { return true }; return false }
+        func isStrings(_ value: JSONValue) -> Bool {
+            guard case .array(let values) = value else { return false }
+            return values.allSatisfy(isString)
+        }
+        func isBool(_ value: JSONValue) -> Bool { if case .bool = value { return true }; return false }
+        func isCount(_ value: JSONValue) -> Bool {
+            switch value {
+            case .int(let n): return Int(exactly: n) != nil
+            case .double(let d): return Int(exactly: d) != nil
+            default: return false
+            }
+        }
+        guard let description = extra("description"), isString(description) else { return "description" }
+        guard let triggers = extra("triggers"), isStrings(triggers) else { return "triggers" }
+        let optional: [(String, (JSONValue) -> Bool)] = [
+            ("language", isString), ("entrypoint", isString), ("permissions", isStrings),
+            ("autoCreated", isBool), ("autoPromote", isBool), ("autoRun", isBool), ("autoPromotable", isBool),
+            ("validationErrors", isStrings), ("quarantinePath", isString), ("quarantineReason", isString),
+            ("sourceRunId", isString), ("useCount", isCount),
+        ]
+        for (key, reads) in optional {
+            if let value = extra(key), value != .null, !reads(value) { return key }
+        }
+        return nil
+    }
+}
+
 // MARK: - Filter
 
 public enum ToolFilter: Sendable, Equatable {
@@ -283,7 +378,7 @@ public actor SwiftNativeToolRegistry: ToolRegistryProtocol {
     // MARK: list / get
 
     public func listTools(filter: ToolFilter) async throws -> [ToolRecord] {
-        let raw = await persistence.readJSON(registryPath, defaultValue: .array([]))
+        let raw = try await persistence.readJSON(registryPath, ifMissing: .array([]))
         guard case .array(let items) = raw else { return [] }
         let records = items.compactMap(ToolRecord.init(json:))
         // Newest effective timestamp first; ties retain their on-disk order.
@@ -348,7 +443,7 @@ public actor SwiftNativeToolRegistry: ToolRegistryProtocol {
     private static func editableRecord(
         id: String, persistence: any PersistenceCoreProtocol, registryPath: URL
     ) async throws -> ([JSONValue], Int, [String: JSONValue]) {
-        let raw = await persistence.readJSON(registryPath, defaultValue: .array([]))
+        let raw = try await persistence.readJSON(registryPath, ifMissing: .array([]))
         guard case .array(let items) = raw else {
             throw ToolRegistryError.toolNotFound(id)
         }

@@ -1,3 +1,5 @@
+import FeedPolicy
+import Privacy
 import Foundation
 import NativeAgentCore
 import PersistenceCore

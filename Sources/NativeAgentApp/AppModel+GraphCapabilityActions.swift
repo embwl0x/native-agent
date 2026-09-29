@@ -1,3 +1,4 @@
+import SelfImprovement
 import Foundation
 import Observation
 import Darwin
@@ -89,8 +90,8 @@ extension AppModel {
         }
         do {
             let run = try await client.runResearchLab(objective: trimmed)
-            researchLabRuns.removeAll { $0.id == run.id }
-            researchLabRuns.insert(run, at: 0)
+            engine.desk.researchRuns.removeAll { $0.id == run.id }
+            engine.desk.researchRuns.insert(run, at: 0)
             let outcome = ResearchLabActionOutcome.recorded(run)
             statusText = CapabilitiesResearchLabPresentation.message(for: outcome).text
             return outcome
@@ -106,13 +107,13 @@ extension AppModel {
     /// history, so a panel can distinguish "no runs" from "could not read".
     func refreshResearchLabRunsForCapabilities() async -> CapabilitiesResearchLabPresentation.RunList {
         do {
-            let rows = try await client.getResearchLabRuns()
-            researchLabRuns = rows
+            let rows = try await engine.desk.listResearchRuns()
+            engine.desk.researchRuns = rows
             return CapabilitiesResearchLabPresentation.list(rows: rows)
         } catch {
             return CapabilitiesResearchLabPresentation.unavailableList(
                 detail: error.localizedDescription,
-                retained: researchLabRuns
+                retained: engine.desk.researchRuns
             )
         }
     }
@@ -198,8 +199,8 @@ extension AppModel {
     @MainActor
     func evaluateCapabilityTrust(_ capability: CapabilityRecord) async {
         do {
-            latestCapabilityTrustEvaluation = try await client.evaluateCapabilityTrust(id: capability.id)
-            capabilityTrust = try? await client.getCapabilityTrust()
+            latestCapabilityTrustEvaluation = try await engine.trust.evaluateCapability(id: capability.id)
+            engine.trust.capabilityNetwork = try? await engine.trust.loadCapabilityNetwork()
             statusText = "Capability trust evaluated"
         } catch {
             statusText = "Trust evaluate failed: \(error.localizedDescription)"
@@ -211,7 +212,7 @@ extension AppModel {
         do {
             _ = try await client.runNativeAction(id: action.id, dryRun: dryRun)
             nativeActionReceipts = (try? await client.getNativeActionReceipts()) ?? nativeActionReceipts
-            approvals = (try? await client.getApprovals()) ?? approvals
+            engine.approvals.records = (try? await engine.approvals.list()) ?? engine.approvals.records
             statusText = "Native action recorded"
         } catch {
             statusText = "Native action failed: \(error.localizedDescription)"
@@ -450,7 +451,7 @@ extension AppModel {
     }
 
     @MainActor
-    func promoteImprovement(runId: String) async throws -> ImprovementPromoteResult {
+    func promoteImprovement(runId: String) async throws -> PromoteOpResult {
         let result = try await client.promoteImprovement(runId: runId)
         if result.ok {
             statusText = "Promoted run \(runId.prefix(8)) — commit \(result.commitSha?.prefix(8) ?? "?")"
@@ -463,7 +464,7 @@ extension AppModel {
     }
 
     @MainActor
-    func discardImprovement(runId: String) async throws -> ImprovementRevertResult {
+    func discardImprovement(runId: String) async throws -> RevertOpResult {
         let result = try await client.discardImprovement(runId: runId)
         if result.ok {
             statusText = "Run \(runId.prefix(8)) discarded"
@@ -476,10 +477,10 @@ extension AppModel {
     }
 
     @MainActor
-    func revertImprovement(runId: String) async throws -> ImprovementRevertResult {
+    func revertImprovement(runId: String) async throws -> RevertOpResult {
         let result = try await client.revertImprovement(runId: runId)
         if result.ok {
-            statusText = "Reverted run \(runId.prefix(8)) — revert commit \(result.revertCommitSha?.prefix(8) ?? "?")"
+            statusText = "Reverted run \(runId.prefix(8)) — revert commit ?"
         } else {
             statusText = "Revert failed: \(result.error ?? "unknown error")"
         }

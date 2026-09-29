@@ -1,3 +1,4 @@
+import ChatOrchestration
 // DetachedChatPanelView — the focused chat surface hosted inside a
 // DetachedChatPanel (free-floating window for a single session).
 //
@@ -10,7 +11,7 @@
 // styling stays consistent across surfaces.
 //
 // Binds to AppModel's per-session storage (Phase 0): reads
-// `appModel.chatMessages(for: sessionId)` and sends via
+// `appModel.engine.transcripts.messages(for: sessionId)` and sends via
 // `appModel.sendChat(_, sessionId:)`. Because that storage is a tracked
 // @Observable dict, deltas streamed into this session's slot — even while
 // the main window shows a different session — re-render here live.
@@ -149,7 +150,7 @@ struct DetachedChatPanelView: View {
     }
 
     private var messages: [ChatMessage] {
-        appModel.chatMessages(for: sessionId)
+        appModel.engine.transcripts.messages(for: sessionId)
     }
 
     private var loadStatus: AppModel.PanelRefreshStatus? {
@@ -165,17 +166,17 @@ struct DetachedChatPanelView: View {
     }
 
     private var isBusy: Bool {
-        appModel.isSessionBusy(sessionId)
+        appModel.engine.turns.isBusy(sessionId)
     }
 
     private var screenCaptureAllowed: Bool {
-        appModel.trustPolicy?.multimodalPolicy?.screen_capture == true
+        appModel.engine.trust.policy?.multimodalPolicy?.screen_capture == true
     }
 
     private var sessionPresentation: DetachedChatSessionPresentation {
         DetachedChatSessionPresentation.resolve(
             sessionId: sessionId,
-            sessions: appModel.chatSessions
+            sessions: appModel.engine.transcripts.sessions
         )
     }
 
@@ -238,6 +239,7 @@ struct DetachedChatPanelView: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            InboxStripContainer()
             messageScrollback
             Divider()
             inputBar
@@ -547,7 +549,7 @@ struct DetachedChatPanelView: View {
             // after — changes no count and no end id, so open search kept
             // showing results for text that is no longer there. The
             // transcript's own mutation counter catches every such write.
-            .onChange(of: appModel.chatMessagesStructureVersion) {
+            .onChange(of: appModel.engine.transcripts.structureVersion) {
                 refreshTranscriptSearchIfPresented()
             }
             .onChange(of: transcriptSearch.selectionRevision) { _, _ in
@@ -724,9 +726,9 @@ struct DetachedChatPanelView: View {
             // Keyed on THIS window's session, so a concurrent turn in another
             // session (detached or main) can never render here.
             if MacChatTurnCardProjection.isVisible(
-                appModel.chatTurnLifecycle(for: sessionId),
+                appModel.engine.turns.lifecycle(for: sessionId),
                 sessionId: sessionId,
-                approvals: appModel.approvals
+                approvals: appModel.engine.approvals.records
             ) {
                 MacChatTurnCardHost(
                     sessionId: sessionId,
@@ -752,8 +754,8 @@ struct DetachedChatPanelView: View {
                 screenCaptureDisabled: !sessionIsAvailable || isBusy || isCapturing || !screenCaptureAllowed,
                 pendingAttachmentCount: pendingAttachments.count,
                 isRunning: isBusy,
-                hasQueuedTurns: !appModel.queuedChatTurns(for: sessionId).isEmpty,
-                isQueuePaused: appModel.isChatQueuePaused(sessionId),
+                hasQueuedTurns: !appModel.engine.turns.queued(for: sessionId).isEmpty,
+                isQueuePaused: appModel.engine.turns.isQueuePaused(sessionId),
                 sendAllowed: sessionIsAvailable && !isCapturing && !appModel.isSavingChatBrain,
                 inputFocused: $inputFocused,
                 onToggleVoice: toggleVoice,

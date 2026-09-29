@@ -1,4 +1,5 @@
 import Foundation
+import KnowledgeGraph
 
 enum KnowledgeGraphFilterCatalog {
     static let entityTypes = [
@@ -130,13 +131,13 @@ enum KnowledgeGraphPresentation {
         case partial(visibleCount: Int, omittedUnrelatedCount: Int)
     }
 
-    static func filteredEntities(_ entities: [KGEntity], filterType: String, selectedKinds: Set<String>, cutoff: Date?, query: String) -> [KGEntity] {
+    static func filteredEntities(_ entities: [KnowledgeGraphEntity], filterType: String, selectedKinds: Set<String>, cutoff: Date?, query: String) -> [KnowledgeGraphEntity] {
         entities.filter { entity in
             guard (filterType == "all" || entity.type == filterType),
                   (selectedKinds.isEmpty || selectedKinds.contains(entity.type)) else { return false }
             if let cutoff {
-                guard let stamp = KnowledgeGraphView.parseKGDate(entity.last_seen)
-                    ?? KnowledgeGraphView.parseKGDate(entity.first_seen), stamp >= cutoff else { return false }
+                guard let stamp = KnowledgeGraphView.parseKGDate(entity.lastSeen)
+                    ?? KnowledgeGraphView.parseKGDate(entity.firstSeen), stamp >= cutoff else { return false }
             }
             return query.isEmpty || entity.name.localizedCaseInsensitiveContains(query)
                 || (entity.summary ?? "").localizedCaseInsensitiveContains(query)
@@ -228,7 +229,7 @@ enum KnowledgeGraphPresentation {
     /// Relationship navigation uses the same filtered selection boundary as
     /// the list and canvas; it never silently clears filters to reveal a node.
     static func relationshipNavigationDestination(
-        edge: KGEdge,
+        edge: KnowledgeGraphEdge,
         rootID: String,
         visibleIDs: Set<String>
     ) -> String? {
@@ -250,8 +251,8 @@ enum KnowledgeGraphPresentation {
     /// incomplete response, never a relationship of the selected entity.
     static func visibleRelationshipEdges(
         rootID: String,
-        response: KGNeighborsResponse?
-    ) -> [KGEdge] {
+        response: KnowledgeGraphNeighborhood?
+    ) -> [KnowledgeGraphEdge] {
         (response?.edges ?? []).filter { $0.from == rootID || $0.to == rootID }
     }
 
@@ -259,7 +260,7 @@ enum KnowledgeGraphPresentation {
         isLoading: Bool,
         error: String?,
         rootID: String,
-        response: KGNeighborsResponse?
+        response: KnowledgeGraphNeighborhood?
     ) -> EntityDetailRelationships {
         if isLoading { return .loading }
         if let error {

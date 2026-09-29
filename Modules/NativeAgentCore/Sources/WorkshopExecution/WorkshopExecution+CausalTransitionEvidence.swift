@@ -70,7 +70,7 @@ public extension SwiftNativeWorkshopRunner {
     /// Workshop currently proves executor completion, not generic real-world
     /// verification of every declared output.
     func motorActionReadModel(actionId: String) async throws -> MotorActionReadModel? {
-        guard let record = await getWorkshopExecution(actionId) else { return nil }
+        guard let record = try await getWorkshopExecution(actionId) else { return nil }
         return Self.motorActionReadModel(record: record)
     }
 

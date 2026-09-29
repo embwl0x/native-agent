@@ -1,0 +1,1175 @@
+import Context
+import DreamREMCycle
+import Foundation
+import MemoryV2
+import NativeAgentCore
+import PersonaEngine
+import PersistenceCore
+import TurnTrace
+import WorkshopExecution
+
+public struct SendableUserDefaults: @unchecked Sendable {
+    let value: UserDefaults
+}
+
+private struct NativeContextEmbeddingProvider: ContextMarkdownEmbeddingProvider {
+    let memory: SwiftNativeMemoryV2
+    let modelFingerprint: String
+
+    func embed(_ texts: [String]) async throws -> [[Float]] {
+        let batch = try await memory.embedForDerivedContextWithEpoch(texts)
+        guard batch.epoch.rawValue == modelFingerprint else {
+            throw MemoryV2Error.underlying("Context embedding provider epoch changed during compilation")
+        }
+        return batch.vectors
+    }
+}
+
+actor PersonaContextFlowProvider:
+    ContextRequiredDocumentMirrorProviding,
+    ContextSourceRegistrationRefreshing
+{
+    private struct Build: Sendable {
+        let mirrors: [RequiredDocumentMirror]
+        let registrations: [ContextSourceRegistration]
+        let allowedRoots: [URL]
+    }
+
+    private static let owner = ContextPersonaSourceNaming.owner
+    private static let surfaces: [ContextSurface] = [
+        .chat, .telegram, .ios, .slack, .workshop, .bridge, .bot,
+    ]
+
+    private let compiler: PersonaCompiler
+    private let mode: ContextFlowMode
+    private let personaOverride: @Sendable () -> String?
+    private let dataRoot: URL
+    private var cachedBuild: Build?
+
+    init(
+        compiler: PersonaCompiler? = nil,
+        dataRoot: URL = PersistenceCore.defaultDataRoot(),
+        mode: ContextFlowMode = .shadow,
+        personaOverride: @escaping @Sendable () -> String? = {
+            UserDefaults.standard.string(forKey: "chatPersona").flatMap {
+                let value = $0.trimmingCharacters(in: .whitespacesAndNewlines)
+                return value.isEmpty ? nil : value
+            }
+        }
+    ) {
+        let standardizedRoot = dataRoot.standardizedFileURL
+        let persona = standardizedRoot
+            == PersistenceCore.defaultDataRoot().standardizedFileURL
+            ? SwiftNativePersonaEngine(dataRoot: standardizedRoot)
+            : SwiftNativePersonaEngine.isolated(dataRoot: standardizedRoot)
+        self.compiler = compiler ?? PersonaCompiler(engine: persona)
+        self.mode = mode
+        self.personaOverride = personaOverride
+        self.dataRoot = standardizedRoot
+    }
+
+    func refreshContextSources(in registry: ContextSourceRegistry) async throws {
+        let build = try await makeBuild()
+        for root in build.allowedRoots {
+            try await registry.addAllowedRoot(root)
+        }
+        let owners = Set(build.registrations.map(\.descriptor.owner)).union([
+            Self.owner,
+            "nativeagent.markdown.skill-bodies",
+        ])
+        for owner in owners.sorted() {
+            try await registry.replaceOwned(owner: owner, with: build.registrations)
+        }
+        cachedBuild = build
+    }
+
+    func requiredDocumentMirrors() async throws -> [RequiredDocumentMirror] {
+        if let cachedBuild { return cachedBuild.mirrors }
+        let build = try await makeBuild()
+        cachedBuild = build
+        return build.mirrors
+    }
+
+    /// The chat persona picker is a process-local selection edge rather than a
+    /// filesystem event. Drop the derived snapshot before ContextFlow asks us
+    /// to refresh registrations and publish the replacement generation.
+    func invalidateCachedBuild() {
+        cachedBuild = nil
+    }
+
+    private func makeBuild() async throws -> Build {
+        let requestedOverride = personaOverride()?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let selectedOverride = requestedOverride?.isEmpty == false ? requestedOverride : nil
+        var snapshots: [PersonaContextSourceSnapshot] = []
+        for surface in Self.surfaces {
+            // The Mac chat picker is a per-turn override. Remote and autonomous
+            // surfaces retain PersonaCompiler's active-persona resolution.
+            let override = surface == .chat ? selectedOverride : nil
+            snapshots.append(try await compiler.contextSourceSnapshot(
+                surface: surface.rawValue,
+                personaOverride: override
+            ))
+        }
+
+        var registrations: [ContextSourceID: ContextSourceRegistration] = [:]
+        var allowedRoots = Set<URL>()
+        for snapshot in snapshots {
+            allowedRoots.insert(snapshot.personaRoot)
+            for document in snapshot.documents {
+                let locator = Self.locator(
+                    personaID: snapshot.packet.personaId,
+                    document: document
+                )
+                let sourceID = ContextStableID.source(owner: Self.owner, locator: locator)
+                let surface = document.surfaceOverride
+                    ? ContextSurface(rawValue: String(document.id.dropFirst("surface:".count)))
+                    : nil
+                let descriptor = ContextSourceDescriptor(
+                    id: sourceID,
+                    owner: Self.owner,
+                    kind: .persona,
+                    canonicalLocator: locator,
+                    authority: Self.authority(for: document.id),
+                    privacy: .localPrivate,
+                    permittedSurfaces: surface.map { [$0] } ?? Set(Self.surfaces),
+                    injectionPolicy: Self.injectionPolicy(for: document.id)
+                )
+                let registration = ContextSourceRegistration(
+                    descriptor: descriptor,
+                    fileURL: document.fileURL,
+                    allowedRoot: snapshot.personaRoot,
+                    requiredPersonaDocument: Self.requiredKind(for: document.id),
+                    personaID: ContextPersonaID(rawValue: snapshot.packet.personaId)
+                )
+                registrations[sourceID] = registration
+            }
+        }
+
+        for root in allowedRoots.sorted(by: { $0.path < $1.path }) {
+            // A complete owner inventory may retire prior sources. An unreadable
+            // or rejected catalog is not an empty inventory: fail before replacing
+            // any registrations or cached mirrors so reconciliation keeps its last
+            // good generation. A valid missing/empty directory still returns [].
+            let catalog = try NativeMarkdownContextSourceCatalog(personaRoot: root)
+            for catalogRoot in catalog.allowedRoots { allowedRoots.insert(catalogRoot) }
+            for registration in catalog.registrations {
+                registrations[registration.descriptor.id] = registration
+            }
+        }
+        // 2026-09-22: skills she saves live in data/skills/bodies, which was
+        // never scanned, so they never entered context flow.
+        let runtimeCatalog = try NativeMarkdownContextSourceCatalog.runtime(dataRoot: dataRoot)
+        for catalogRoot in runtimeCatalog.allowedRoots { allowedRoots.insert(catalogRoot) }
+        for registration in runtimeCatalog.registrations {
+            registrations[registration.descriptor.id] = registration
+        }
+
+        let grouped = Dictionary(grouping: snapshots, by: { $0.packet.personaId })
+        let mirrors = try grouped.keys.sorted().map { personaID in
+            try Self.makeMirror(
+                personaID: personaID,
+                snapshots: grouped[personaID] ?? [],
+                mode: mode,
+                requestedPersonaOverride: selectedOverride
+            )
+        }
+        return Build(
+            mirrors: mirrors,
+            registrations: registrations.values.sorted { $0.descriptor.id < $1.descriptor.id },
+            allowedRoots: allowedRoots.sorted { $0.path < $1.path }
+        )
+    }
+
+    static func makeMirror(
+        personaID: String,
+        snapshots: [PersonaContextSourceSnapshot],
+        mode: ContextFlowMode,
+        requestedPersonaOverride: String? = nil
+    ) throws -> RequiredDocumentMirror {
+        guard let canonical = snapshots.first else {
+            throw CocoaError(.fileReadNoSuchFile)
+        }
+        let canonicalDocuments = canonical.documents
+            .filter { !$0.surfaceOverride }
+            .sorted { $0.canonicalOrder < $1.canonicalOrder }
+        let documents = try canonicalDocuments.map { source in
+            // PROVENANCE, derived from the SAME descriptor inputs `makeBuild`
+            // registers this document's context source with — the locator and
+            // the permitted-surface set. Carrying it on the mirror is what lets
+            // the stable-prefix renderer prove a surface permission instead of
+            // re-deriving one from a locator string. A canonical (non-override)
+            // document permits every surface; a surface override is not a
+            // required document and never reaches this map.
+            let locator = Self.locator(personaID: personaID, document: source)
+            return try RequiredDocument(
+                id: RequiredDocumentID(rawValue: "\(source.id).md"),
+                canonicalOrder: source.canonicalOrder,
+                sourceHash: ContextStableID.digest(parts: [source.content]),
+                text: source.content,
+                tokenCount: estimatedTokenCount(source.content),
+                sourceID: ContextStableID.source(owner: Self.owner, locator: locator),
+                permittedSurfaces: Set(Self.surfaces)
+            )
+        }
+        let fingerprint = ContextStableID.digest(parts: documents.flatMap {
+            [$0.id.rawValue, $0.sourceHash]
+        })
+        let contextPersonaID = ContextPersonaID(rawValue: personaID)
+        let kernels = try snapshots.sorted { $0.packet.surface < $1.packet.surface }.map { snapshot in
+            let activeKernelDocuments = snapshot.documents.filter {
+                !$0.surfaceOverride && ($0.id == "SOUL" || $0.id == "VOICE")
+            }.sorted { $0.canonicalOrder < $1.canonicalOrder }
+            let includedIDs = mode == .active
+                ? activeKernelDocuments.map { RequiredDocumentID(rawValue: "\($0.id).md") }
+                : documents.map(\.id)
+            let renderedPrompt: String
+            if mode == .active {
+                renderedPrompt = PersonaCompiler.renderPrompt(
+                    documents: snapshot.packet.activeDocs.filter {
+                        $0.key == "SOUL" || $0.key == "VOICE"
+                    },
+                    surface: snapshot.packet.surface
+                )
+            } else {
+                renderedPrompt = snapshot.packet.compiledSystemPrompt
+            }
+            let surfaceGuidance = mode == .active ? PersonaCompiler.renderPrompt(
+                documents: snapshot.packet.activeDocs.filter { $0.key == "surface:\(snapshot.packet.surface)" },
+                surface: snapshot.packet.surface
+            ) : ""
+            let key = try StablePromptKernelKey(
+                personaID: contextPersonaID,
+                surfaceVariant: ContextSurfaceVariant(rawValue: snapshot.packet.surface),
+                sourceFingerprint: fingerprint
+            )
+            return try StablePromptKernel(
+                key: key,
+                renderedPrompt: renderedPrompt,
+                includedDocumentIDs: includedIDs,
+                tokenCount: estimatedTokenCount(renderedPrompt + surfaceGuidance),
+                requestedPersonaOverride: snapshot.packet.surface == ContextSurface.chat.rawValue
+                    ? requestedPersonaOverride : nil,
+                surfaceGuidance: surfaceGuidance
+            )
+        }
+        return try RequiredDocumentMirror(
+            personaID: contextPersonaID,
+            sourceFingerprint: fingerprint,
+            documents: documents,
+            kernels: kernels
+        )
+    }
+
+    private static func locator(
+        personaID: String,
+        document: PersonaContextDocumentSource
+    ) -> String {
+        let component = document.surfaceOverride
+            ? "surfaces/\(document.id.dropFirst("surface:".count)).md"
+            : "\(document.id).md"
+        return "persona/\(personaID)/\(component)"
+    }
+
+    private static func authority(for documentID: String) -> ContextAuthority {
+        switch documentID {
+        case "SOUL", "VOICE": .identity
+        case "USER": .explicitCorrection
+        case "MEMORY": .approved
+        default: .canonical
+        }
+    }
+
+    static func injectionPolicy(for documentID: String) -> ContextInjectionPolicy {
+        switch documentID {
+        case "SOUL", "VOICE": .always
+        case let value where value.hasPrefix("surface:"): .always
+        default: .adaptive
+        }
+    }
+
+    private static func requiredKind(for documentID: String) -> RequiredPersonaDocumentKind? {
+        guard !documentID.hasPrefix("surface:") else { return nil }
+        return RequiredPersonaDocumentKind(rawValue: "\(documentID).md")
+    }
+
+    private static func estimatedTokenCount(_ text: String) -> Int {
+        guard !text.isEmpty else { return 0 }
+        return max(1, (text.utf8.count + 3) / 4)
+    }
+}
+
+public struct NativeContextFlowConfiguration: Sendable, Equatable {
+    public static let modeEnvironmentKey = "NATIVE_AGENT_CONTEXT_FLOW_MODE"
+    public static let modeDefaultsKey = "contextFlowMode"
+    static let budgetDefaultsKey = "contextFlowRAMMiB"
+
+    let mode: ContextFlowMode
+    let budget: ContextArenaBudget
+
+    public static func initializeMissingInnerLifeMode(defaults: UserDefaults) {
+        guard defaults.object(forKey: modeDefaultsKey) == nil else { return }
+        defaults.set(ContextFlowMode.active.rawValue, forKey: modeDefaultsKey)
+    }
+
+    static func resolve(
+        dataRoot: URL,
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        defaults: UserDefaults = .standard,
+        publicSafeMode: Bool? = nil
+    ) -> Self {
+        let isPublicSafe = publicSafeMode ?? NativeAgentPublicSafety.isPublicSafeMode(
+            environment: environment
+        )
+        let preOnboarding = isPublicSafe
+            && !NativeAgentPublicSafety.hasCompletedOnboarding(dataRoot: dataRoot)
+        let explicitMode = environment[modeEnvironmentKey]
+            .flatMap { ContextFlowMode(rawValue: $0.lowercased()) }
+            ?? defaults.string(forKey: modeDefaultsKey)
+                .flatMap { ContextFlowMode(rawValue: $0.lowercased()) }
+        let mode: ContextFlowMode = preOnboarding ? .off : (explicitMode ?? .shadow)
+        let budget = ContextArenaBudget(
+            rawValue: defaults.integer(forKey: budgetDefaultsKey)
+        ) ?? .default
+        return Self(mode: mode, budget: budget)
+    }
+}
+
+public struct NativeContextFlowModeStatus: Sendable, Equatable {
+    public let effectiveMode: ContextFlowMode
+    public let environmentManaged: Bool
+    public let setupForcedOff: Bool
+}
+
+/// The live runtime's health read has a distinct configured-off result: no
+/// coordinator is expected in that case, unlike an unavailable read.
+public enum ContextFlowObservatoryHealthState: Sendable, Equatable {
+    case unavailable
+    case off
+    case health(ContextFlowCoordinatorHealth)
+}
+
+struct NativeResidentWorkObservationStatus: Equatable, Sendable {
+    let isWatching: Bool
+    let watchedPaths: [String]
+    let missingPaths: [String]
+    let invalidationCount: Int
+}
+
+public actor NativeContextFlowRuntime: ContextTurnPreparing {
+    private let dataRoot: URL
+    private let configurationOverride: NativeContextFlowConfiguration?
+    private let memoryOverride: SwiftNativeMemoryV2?
+    private let environmentOverride: [String: String]?
+    private let defaultsOverride: SendableUserDefaults?
+    private let publicSafeModeOverride: Bool?
+    private let personaOverride: @Sendable () -> String?
+    private var coordinator: ContextFlowCoordinator?
+    private var personaProvider: PersonaContextFlowProvider?
+    private var memoryRuntime: SwiftNativeMemoryV2?
+    private let memoryPressureObserver: (any NativeContextMemoryPressureObserving)?
+    /// One kqueue-backed invalidation reader over the canonical Desk feed and
+    /// Workshop execution records. It carries no payload and owns no work state;
+    /// every edge makes the existing ContextFlow coordinator reread the stores.
+    private var residentWorkObservationTask: Task<Void, Never>?
+    private var residentWorkObservationPathsSnapshot: [URL] = []
+    private var residentWorkInvalidationCount = 0
+    private var terminalResidentWorkRecordPaths: Set<String> = []
+    private var starting = false
+    private var startupWaiters: [CheckedContinuation<Void, Never>] = []
+    private var semanticQueryCache: [String: ContextQueryEmbeddingValue] = [:]
+    private var semanticQueryCacheOrder: [String] = []
+    static let maximumConcurrentSemanticQueries = 8
+    private var semanticQueryTickets: [String: ContextQueryEmbeddingTicket] = [:]
+    private var semanticQueryTasks: [String: Task<Void, Never>] = [:]
+    private var semanticQueryEpoch: UInt64 = 0
+    private var startupFailedClosed = false
+    /// Packet provenance: filled by the memory projection on every compile,
+    /// read at prepare time to resolve selected memory atoms → record IDs.
+    private let memoryProvenanceIndex: MemoryAtomRecordIndex
+    private var lastMemoryProvenanceResolution: NativeContextMemoryProvenanceResolution?
+    private var lastMemoryPressureReceipt: ContextArenaTrimReceipt?
+
+    public init(
+        dataRoot: URL = PersistenceCore.defaultDataRoot(),
+        configurationOverride: NativeContextFlowConfiguration? = nil,
+        memoryOverride: SwiftNativeMemoryV2? = nil,
+        environmentOverride: [String: String]? = nil,
+        defaultsOverride: SendableUserDefaults? = nil,
+        publicSafeModeOverride: Bool? = nil,
+        personaOverride: (@Sendable () -> String?)? = nil,
+        memoryPressureObserver: (any NativeContextMemoryPressureObserving)? = nil,
+        memoryProvenanceIndex: MemoryAtomRecordIndex? = nil
+    ) {
+        self.dataRoot = dataRoot.standardizedFileURL
+        self.configurationOverride = configurationOverride
+        self.memoryOverride = memoryOverride
+        self.environmentOverride = environmentOverride
+        self.defaultsOverride = defaultsOverride
+        self.publicSafeModeOverride = publicSafeModeOverride
+        self.memoryPressureObserver = memoryPressureObserver
+            ?? (dataRoot.standardizedFileURL
+                == PersistenceCore.defaultDataRoot().standardizedFileURL
+                ? DispatchContextMemoryPressureObserver()
+                : nil)
+        self.memoryProvenanceIndex = memoryProvenanceIndex ?? MemoryAtomRecordIndex()
+        let pickerDefaults = defaultsOverride ?? SendableUserDefaults(value: .standard)
+        self.personaOverride = personaOverride ?? {
+            let value = pickerDefaults.value.string(forKey: "chatPersona")?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            return value.isEmpty ? nil : value
+        }
+    }
+
+    private var usesLiveAppBody: Bool {
+        dataRoot == PersistenceCore.defaultDataRoot().standardizedFileURL
+    }
+
+    public func start() async {
+        if starting {
+            await waitForStartup()
+            return
+        }
+        guard coordinator == nil else { return }
+        starting = true
+        startupFailedClosed = false
+        lastMemoryPressureReceipt = nil
+        let configuration = resolvedConfiguration()
+        guard configuration.mode != .off else {
+            NSLog("[context-flow] disabled until onboarding or explicit enablement")
+            finishStartup()
+            return
+        }
+
+        if let warning = ContextHintsFeed.inspect(dataRoot: dataRoot).warning {
+            NSLog("[context-hints] %@", warning)
+        }
+
+        do {
+            let memory: SwiftNativeMemoryV2
+            if let memoryOverride {
+                memory = memoryOverride
+            } else {
+                memory = SwiftNativeMemoryV2.resolvedOwner(dataRoot: dataRoot)
+            }
+            guard let embeddingEpoch = await memory.embeddingEpoch()?.rawValue else {
+                throw MemoryV2Error.storageUnavailable
+            }
+            let embeddingProvider = NativeContextEmbeddingProvider(
+                memory: memory,
+                modelFingerprint: embeddingEpoch
+            )
+            let store = try ContextSQLiteStore(dataRoot: dataRoot)
+            let arena = try ContextArena(budget: configuration.budget)
+            let registry = try ContextSourceRegistry()
+            let provider = PersonaContextFlowProvider(
+                dataRoot: dataRoot,
+                mode: configuration.mode,
+                personaOverride: personaOverride
+            )
+            let coordinator = ContextFlowCoordinator(
+                mode: configuration.mode,
+                store: store,
+                arena: arena,
+                registry: registry,
+                compiler: ContextMarkdownCompiler(embeddingProvider: embeddingProvider),
+                mirrorProvider: provider,
+                compiledProjectionProviders: [NativeMemoryContextProjection(
+                    memory: memory,
+                    provenanceIndex: memoryProvenanceIndex,
+                    dataRoot: dataRoot
+                ),
+                NativeResidentWorkContextProjection(dataRoot: dataRoot),
+                NativeKnowledgeGraphContextProjection(dataRoot: dataRoot),
+                NativeStudioContextProjection(dataRoot: dataRoot)]
+            )
+            memoryRuntime = memory
+            personaProvider = provider
+            self.coordinator = coordinator
+            startResidentWorkObservationIfNeeded()
+            if usesLiveAppBody {
+                // 2026-09-06: the installed sink is the pin sink, put in place
+                // at app launch and independent of this runtime. Context Flow
+                // subscribes to it here instead of owning it, so a GROWTH.md
+                // write retires its pins with Context Flow off too.
+                await ContextFlowInvalidationRelay.shared.set(coordinator)
+            }
+            installMemoryPressureSource()
+            await coordinator.start()
+            let health = await coordinator.health()
+            NSLog(
+                "[context-flow] started mode=%@ generation=%lld sources=%d arena_bytes=%d",
+                configuration.mode.rawValue,
+                health.activeArenaGenerationID ?? 0,
+                health.registeredSourceCount,
+                health.arenaMetrics.currentLogicalBytes
+            )
+        } catch {
+            if usesLiveAppBody {
+                // Only Context Flow's subscription goes; the pin sink stays
+                // installed, so pins still rebuild after a failed startup.
+                await ContextFlowInvalidationRelay.shared.set(nil)
+            }
+            coordinator = nil
+            personaProvider = nil
+            memoryRuntime = nil
+            startupFailedClosed = true
+            await memoryPressureObserver?.stop()
+            residentWorkObservationTask?.cancel()
+            residentWorkObservationTask = nil
+            NSLog("[context-flow] start failed closed: %@", String(describing: error))
+        }
+        finishStartup()
+    }
+
+    public func stop() async {
+        if starting { await waitForStartup() }
+        semanticQueryEpoch &+= 1
+        semanticQueryTasks.values.forEach { $0.cancel() }
+        semanticQueryTasks.removeAll()
+        semanticQueryTickets.removeAll()
+        semanticQueryCache.removeAll()
+        semanticQueryCacheOrder.removeAll()
+        await memoryPressureObserver?.stop()
+        residentWorkObservationTask?.cancel()
+        residentWorkObservationTask = nil
+        if usesLiveAppBody {
+            await ContextFlowInvalidationRelay.shared.set(nil)
+        }
+        await coordinator?.stop()
+        coordinator = nil
+        personaProvider = nil
+        memoryRuntime = nil
+    }
+
+    public func reloadConfiguration() async {
+        await stop()
+        await start()
+    }
+
+    /// Persist and hot-apply the single production Context Flow mode. Public
+    /// pre-onboarding safety is still resolved inside `start()` and can force
+    /// the effective mode off regardless of the requested preference.
+    @discardableResult
+    public func setMode(_ mode: ContextFlowMode) async -> NativeContextFlowModeStatus {
+        UserDefaults.standard.set(
+            mode.rawValue,
+            forKey: NativeContextFlowConfiguration.modeDefaultsKey
+        )
+        await reloadConfiguration()
+        return await modeStatus()
+    }
+
+    public func modeStatus() async -> NativeContextFlowModeStatus {
+        let environment = environmentOverride ?? ProcessInfo.processInfo.environment
+        let environmentManaged = environment[NativeContextFlowConfiguration.modeEnvironmentKey]
+            .flatMap { ContextFlowMode(rawValue: $0.lowercased()) } != nil
+        let setupForcedOff = (publicSafeModeOverride
+            ?? NativeAgentPublicSafety.isPublicSafeMode(environment: environment))
+            && !NativeAgentPublicSafety.hasCompletedOnboarding(dataRoot: dataRoot)
+        return NativeContextFlowModeStatus(
+            effectiveMode: await contextFlowMode(),
+            environmentManaged: environmentManaged,
+            setupForcedOff: setupForcedOff
+        )
+    }
+
+    public func prepareForSleep() async {
+        guard let coordinator else { return }
+        _ = try? await coordinator.applyMemoryPressure(.warning)
+    }
+
+    public func reconcileAfterWake() async {
+        if coordinator == nil {
+            await start()
+        }
+        await coordinator?.reconcileAfterWake()
+    }
+
+    /// Eagerly rebuild after the Mac picker changes. `prepareContextTurn` also
+    /// calls this fence, so an unstructured UI notification can never let the
+    /// next real chat turn consume the prior persona generation.
+    public func personaPickerDidChange() async {
+        await reconcilePersonaPickerIfNeeded()
+    }
+
+    private func normalizedPersonaOverride() -> String? {
+        let value = personaOverride()?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return value.isEmpty ? nil : value
+    }
+
+    private func reconcilePersonaPickerIfNeeded() async {
+        guard let coordinator, let personaProvider else { return }
+        // Only the immutable published kernel can acknowledge a selection.
+        // Sampling preferences before/after an awaited build loses changes
+        // (including ABA); a cached provider build may not have published yet.
+        let lease = try? await coordinator.acquireSnapshot()
+        let chatKernels = lease?.snapshot.requiredDocumentMirrors.compactMap {
+            $0.kernel(for: ContextSurfaceVariant(rawValue: ContextSurface.chat.rawValue))
+        } ?? []
+        let selectionPublished = chatKernels.count == 1
+            && chatKernels[0].requestedPersonaOverride == normalizedPersonaOverride()
+        lease?.release()
+        // Missing publication is not an acknowledged default/nil selection.
+        guard !selectionPublished else { return }
+        await personaProvider.invalidateCachedBuild()
+        _ = await coordinator.reconcileSourceChanges([DerivedSourceChange(
+            namespace: "persona-picker",
+            stableID: "chat",
+            operation: .reconcile,
+            reason: "chat_persona_picker_changed"
+        )])
+        // Failure retains the old kernel receipt, so the next ordinary turn
+        // or picker edge retries without a separate acknowledgment to undo.
+    }
+
+    public func health() async -> ContextFlowCoordinatorHealth? {
+        if starting { await waitForStartup() }
+        return await coordinator?.health()
+    }
+
+    /// Observatory reads must distinguish an intentionally disabled runtime
+    /// from one whose health cannot be obtained. Both have no coordinator, but
+    /// only the former is a healthy configuration state.
+    public func observatoryHealthState() async -> ContextFlowObservatoryHealthState {
+        if starting { await waitForStartup() }
+        if let coordinator {
+            return .health(await coordinator.health())
+        }
+        if startupFailedClosed { return .unavailable }
+        return resolvedConfiguration().mode == .off ? .off : .unavailable
+    }
+
+    public func contextFlowMode() async -> ContextFlowMode {
+        if starting { await waitForStartup() }
+        if let coordinator { return await coordinator.mode }
+        if startupFailedClosed { return .off }
+        return resolvedConfiguration().mode
+    }
+
+    /// Lifecycle evidence for the OS pressure edge. This reports the actual
+    /// bridge state rather than inferring installation from runtime mode.
+    func memoryPressureSourceIsInstalled() -> Bool {
+        memoryPressureObserver?.isRunning ?? false
+    }
+
+    /// The latest typed trim evidence remains available after shutdown so
+    /// diagnostics can distinguish a registered source from a delivered edge.
+    func memoryPressureReceipt() -> ContextArenaTrimReceipt? {
+        lastMemoryPressureReceipt
+    }
+
+    /// The latest prepared turn's provenance resolution is intentionally
+    /// payload-free. It makes a partial reverse-index miss visible to runtime
+    /// diagnostics without putting record identities into Context receipts.
+    func memoryProvenanceResolution() -> NativeContextMemoryProvenanceResolution? {
+        lastMemoryProvenanceResolution
+    }
+
+    private func resolvedConfiguration() -> NativeContextFlowConfiguration {
+        configurationOverride ?? NativeContextFlowConfiguration.resolve(
+            dataRoot: dataRoot,
+            environment: environmentOverride ?? ProcessInfo.processInfo.environment,
+            defaults: defaultsOverride?.value ?? .standard,
+            publicSafeMode: publicSafeModeOverride
+        )
+    }
+
+    public func beginQueryEmbedding(_ text: String) async -> ContextQueryEmbeddingTicket? {
+        let epoch = semanticQueryEpoch
+        guard let coordinator, await coordinator.mode == .active,
+              let memory = memoryRuntime else { return nil }
+        let query = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty, query.utf8.count <= 8 * 1_024 else { return nil }
+        guard let runtime = await memory.embeddingRuntimeSnapshot(),
+              runtime.effectiveBackend != ManagedEmbeddingProvider.failClosedBackend,
+              runtime.coreMLLoaded
+                || runtime.effectiveBackend == ManagedEmbeddingProvider.mockBackend else {
+            return nil
+        }
+        // Backend inspection suspends. A stop/reload during that await must
+        // not admit a task against the retired runtime after its drain.
+        guard epoch == semanticQueryEpoch, self.coordinator != nil,
+              !Task.isCancelled else { return nil }
+        let normalized = query.split(whereSeparator: \.isWhitespace)
+            .joined(separator: " ")
+            .lowercased()
+        // User, 2026-09-06: the same question in the other voice ("me" → the
+        // agent's name, "you" → the user's). The legacy recall lane has always
+        // asked both and kept the better score per row; the packet lane
+        // embedded the raw question only, so an atom written in the third
+        // person never surfaced for a question asked in the first. Both
+        // voices go through ONE embed call, so the second vector costs no
+        // extra round trip and lands in the same space. Part of the cache key
+        // as well: a changed agent/user name changes the rewrite.
+        let alternateQuery = MemoryRecallQueryExpansion.rewrite(
+            query,
+            names: MemoryRecallQueryExpansion.names(
+                storeDirectory: dataRoot.appendingPathComponent("memory", isDirectory: true)
+            )
+        )
+        // The runtime snapshot already carries the exact usable vector-space
+        // identity. A second MemoryV2 getter would make ManagedEmbeddingProvider
+        // reread the same backend/mode JSON files on every active turn.
+        guard let embeddingEpoch = runtime.embeddingEpoch else { return nil }
+        let key = ContextStableID.digest(parts: [
+            "semantic-query-v2",
+            embeddingEpoch,
+            normalized,
+            alternateQuery ?? "",
+        ])
+        if let cached = semanticQueryCache[key] {
+            touchSemanticQueryCacheKey(key)
+            let ticket = ContextQueryEmbeddingTicket()
+            ticket.publish(
+                cached.values,
+                alternate: cached.alternateValues,
+                modelFingerprint: cached.modelFingerprint
+            )
+            return ticket
+        }
+        if let pending = semanticQueryTickets[key] { return pending }
+
+        // Semantic query vectors are optional. Keep a wedged provider or burst
+        // of turns from building an unbounded task/ticket backlog; overflow
+        // follows the existing lexical-only path without delaying the turn.
+        guard semanticQueryTickets.count < Self.maximumConcurrentSemanticQueries else { return nil }
+        let ticket = ContextQueryEmbeddingTicket()
+        semanticQueryTickets[key] = ticket
+        semanticQueryTasks[key] = Task(priority: .utility) { [weak self, memory] in
+            let value: ContextQueryEmbeddingValue?
+            do {
+                let texts = alternateQuery.map { [query, $0] } ?? [query]
+                let batch = try await memory.embedForDerivedContextWithEpoch(texts)
+                value = batch.vectors.first.map {
+                    ContextQueryEmbeddingValue(
+                        values: $0,
+                        alternateValues: batch.vectors.count > 1 ? batch.vectors[1] : nil,
+                        modelFingerprint: batch.epoch.rawValue
+                    )
+                }
+            } catch {
+                value = nil
+            }
+            await self?.completeSemanticQuery(
+                key: key, epoch: epoch, expectedEmbeddingEpoch: embeddingEpoch, value: value
+            )
+        }
+        return ticket
+    }
+
+    private func completeSemanticQuery(
+        key: String,
+        epoch: UInt64,
+        expectedEmbeddingEpoch: String,
+        value: ContextQueryEmbeddingValue?
+    ) {
+        guard epoch == semanticQueryEpoch else { return }
+        semanticQueryTasks[key] = nil
+        let ticket = semanticQueryTickets.removeValue(forKey: key)
+        guard let value,
+              !value.values.isEmpty,
+              value.values.allSatisfy(\.isFinite),
+              value.modelFingerprint == expectedEmbeddingEpoch else { return }
+        // The embedder can change while prediction is suspended. Never bind
+        // a vector from the new space to the old snapshot's cache key: after
+        // a switch back, that poisoned hit would keep disabling semantic
+        // relevance for this query. Failure retains the bounded nil fallback;
+        // removing the in-flight ticket above permits a fresh exact-epoch retry.
+        semanticQueryCache[key] = value
+        touchSemanticQueryCacheKey(key)
+        while semanticQueryCacheOrder.count > 32 {
+            let evicted = semanticQueryCacheOrder.removeFirst()
+            semanticQueryCache[evicted] = nil
+        }
+        // User, 2026-09-06: the FIRST request for a query is the one holding
+        // this ticket, and publishing only the primary vector dropped the
+        // other voice for it — every later turn hit the cache path above,
+        // which does carry both, so automatic recall asked in both voices
+        // everywhere except the turn that computed them.
+        ticket?.publish(
+            value.values,
+            alternate: value.alternateValues,
+            modelFingerprint: value.modelFingerprint
+        )
+    }
+
+    private func touchSemanticQueryCacheKey(_ key: String) {
+        semanticQueryCacheOrder.removeAll { $0 == key }
+        semanticQueryCacheOrder.append(key)
+    }
+
+    public func prepareContextTurn(_ request: ContextTurnRequest) async throws -> ContextPreparedTurn {
+        await start()
+        await reconcilePersonaPickerIfNeeded()
+        guard let coordinator else {
+            throw ContextTurnPreparationError.coordinatorNotStarted
+        }
+        let prepared = try await coordinator.prepareTurn(request)
+        attachMemoryProvenance(to: prepared, surface: request.surface.rawValue)
+        return prepared
+    }
+
+    private func attachMemoryProvenance(
+        to prepared: ContextPreparedTurn,
+        surface: String
+    ) {
+        // Packet provenance: resolve this turn's selected memory/correction
+        // atoms back to record identity (the digest is one-way; only this
+        // layer holds the reverse index). Attached to the SAME instance —
+        // never re-wrap a prepared turn, its deinit releases the generation
+        // lease. Empty resolution attaches nothing and stays byte-identical.
+        let resolution = NativeContextMemoryProvenance.attach(
+            to: prepared,
+            index: memoryProvenanceIndex
+        )
+        lastMemoryProvenanceResolution = resolution
+        if resolution.unresolvedMemoryAtomCount > 0 {
+            // Invariant breach: the packet carries memory atoms the owner
+            // index cannot name. Every miss (total or partial) means those
+            // records' use_count/activation loop silently starves. Preserve a
+            // payload-free diagnostic for observability and log the counts.
+            NSLog(
+                "[context-flow] memory provenance MISS: resolved %d of %d packet memory atoms, index size %d",
+                resolution.resolvedMemoryAtomCount,
+                resolution.requestedMemoryAtomCount,
+                memoryProvenanceIndex.count
+            )
+            // The system log is not a turn-observable evidence boundary. This
+            // additive, payload-free receipt joins the exact chat turn when
+            // one is bound, so a ranked provenance lead can name the turn that
+            // would otherwise silently starve its memory activation feedback.
+            TurnTraceBus.fireFromContext(
+                kind: "context.memory_provenance_miss",
+                surface: surface,
+                payload: .object([
+                    "schema": .string("context.memory_provenance_miss.v1"),
+                    "requestedMemoryAtomCount": .int(Int64(resolution.requestedMemoryAtomCount)),
+                    "resolvedMemoryAtomCount": .int(Int64(resolution.resolvedMemoryAtomCount)),
+                    "unresolvedMemoryAtomCount": .int(Int64(resolution.unresolvedMemoryAtomCount)),
+                    "provenanceIndexCount": .int(Int64(memoryProvenanceIndex.count)),
+                ])
+            )
+        }
+    }
+
+    func prepareFrozenContextTurn(_ request: ContextTurnRequest) async throws -> ContextPreparedTurn {
+        // Frozen reads pin the already-published generation. Picker changes
+        // belong to the explicit picker edge or the next ordinary turn, never
+        // a read that promises not to recover or publish derived state.
+        guard let coordinator else {
+            throw ContextTurnPreparationError.coordinatorNotStarted
+        }
+        let prepared = try await coordinator.prepareFrozenTurn(request)
+        attachMemoryProvenance(to: prepared, surface: request.surface.rawValue)
+        return prepared
+    }
+
+    func frozenContextRevision() async -> ContextFrozenRevision? {
+        guard let coordinator else { return nil }
+        return await coordinator.frozenRevision()
+    }
+
+    public func prewarm(kind: ContextPrewarmHintKind, id: String, terms: [String]) async {
+        guard let coordinator else { return }
+        _ = await coordinator.submitPrewarm(kind: kind, id: id, terms: terms)
+    }
+
+    private func installMemoryPressureSource() {
+        memoryPressureObserver?.start { [weak self] pressure in
+            await self?.applyObservedMemoryPressure(pressure)
+        }
+    }
+
+    private func applyObservedMemoryPressure(_ pressure: ContextArenaPressure) async {
+        guard let coordinator else { return }
+        lastMemoryPressureReceipt = try? await coordinator.applyMemoryPressure(pressure)
+    }
+
+    /// This decision runs on the memory-pressure queue, never on the runtime
+    /// actor. Keep it value-only so the queue boundary is both auditable and
+    /// executable without synthesizing a system memory-pressure event.
+    nonisolated static func memoryPressureLevel(
+        hasCritical: Bool,
+        hasWarning: Bool
+    ) -> ContextArenaPressure {
+        if hasCritical { return .critical }
+        if hasWarning { return .warning }
+        return .normal
+    }
+
+    /// Register before the first projection replay so a canonical write cannot
+    /// land in a read/subscription gap. Each observed edge re-arms the complete
+    /// path set before reconciliation; a Desk close that follows a Workshop
+    /// terminal write is therefore buffered instead of being lost.
+    private func startResidentWorkObservationIfNeeded() {
+        guard residentWorkObservationTask == nil else { return }
+        residentWorkObservationTask = Task { [weak self] in
+            await self?.observeResidentWorkChanges()
+        }
+    }
+
+    private func observeResidentWorkChanges() async {
+        var observation = makeResidentWorkObservation()
+        defer { observation.cancel() }
+        while !Task.isCancelled {
+            let changed = await waitForResidentWorkChange(observation)
+            observation.cancel()
+            guard changed, !Task.isCancelled else { return }
+
+            // Re-arm first. The projection read below can suspend on Desk or
+            // Workshop I/O while the canonical owner commits a related edge.
+            observation = makeResidentWorkObservation()
+            guard let coordinator else { return }
+            await coordinator.sourceDidChange(DerivedSourceChange(
+                namespace: "resident-work",
+                stableID: "canonical",
+                operation: .reconcile,
+                reason: "resident_work_file_changed"
+            ))
+            residentWorkInvalidationCount += 1
+        }
+    }
+
+    private func waitForResidentWorkChange(_ observation: FileChangeEvents) async -> Bool {
+        await withTaskCancellationHandler {
+            for await _ in observation.stream {
+                return !Task.isCancelled
+            }
+            return false
+        } onCancel: {
+            observation.cancel()
+        }
+    }
+
+    private func residentWorkObservationPaths() -> [URL] {
+        let deskOps = dataRoot
+            .appendingPathComponent("desk", isDirectory: true)
+            .appendingPathComponent("desk_ops.jsonl")
+        let executionRoot = dataRoot
+            .appendingPathComponent("workshop", isDirectory: true)
+            .appendingPathComponent(
+            "executions",
+            isDirectory: true
+        )
+        // FileChangeWatcher falls back to the nearest existing parent for a
+        // missing target. Watching the exact feed/root avoids duplicate wakes
+        // from their parent directories while still detecting first creation.
+        var paths = [deskOps, executionRoot]
+        var discoveredRecordPaths: Set<String> = []
+        if let directories = try? FileManager.default.contentsOfDirectory(
+            at: executionRoot,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) {
+            for directory in directories {
+                let isDirectory = (try? directory.resourceValues(
+                    forKeys: [.isDirectoryKey]
+                ).isDirectory) ?? false
+                if isDirectory {
+                    // RESOLVED AT ARM TIME (P2-1): watch the record name this
+                    // directory actually has right now — `execution.json`, or a
+                    // legacy `mission.json` the rename pass hasn't reached.
+                    // Watching both names would double the kqueue fd count
+                    // across EVERY execution directory to cover a rename that
+                    // cannot happen while this runtime is armed: the migrator
+                    // renames only in applicationDidFinishLaunching, before
+                    // this runtime starts. For a directory with neither file,
+                    // resolve() yields the canonical name and
+                    // FileChangeWatcher falls back to the directory itself, so
+                    // first creation still wakes us.
+                    let record = ExecutionRecordFile.resolve(in: directory)
+                    discoveredRecordPaths.insert(record.path)
+                    if terminalResidentWorkRecordPaths.contains(record.path) {
+                        continue
+                    }
+                    if Self.shouldObserveResidentWorkExecutionRecord(at: record) {
+                        paths.append(record)
+                    } else {
+                        terminalResidentWorkRecordPaths.insert(record.path)
+                    }
+                }
+            }
+        }
+        terminalResidentWorkRecordPaths.formIntersection(discoveredRecordPaths)
+        return paths
+    }
+
+    /// Canonical Workshop executors commit verification and terminal status in
+    /// the same locked write. Once that record is terminal, keeping an EVTONLY
+    /// descriptor open forever only watches immutable history. Missing,
+    /// malformed, and active records remain observed fail-safe; the execution
+    /// root watcher discovers newly-created directories.
+    nonisolated static func shouldObserveResidentWorkExecutionRecord(at url: URL) -> Bool {
+        guard let data = try? Data(contentsOf: url),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let status = object["status"] as? String
+        else {
+            return true
+        }
+        return !WorkshopOutcomeScoreboard.terminalStatuses.contains(status.lowercased())
+    }
+
+    func residentWorkObservationStatus() -> NativeResidentWorkObservationStatus {
+        NativeResidentWorkObservationStatus(
+            isWatching: residentWorkObservationTask != nil,
+            watchedPaths: residentWorkObservationPathsSnapshot.map(\.path),
+            missingPaths: residentWorkObservationPathsSnapshot
+                .filter { !FileManager.default.fileExists(atPath: $0.path) }
+                .map(\.path),
+            invalidationCount: residentWorkInvalidationCount
+        )
+    }
+
+    private func makeResidentWorkObservation() -> FileChangeEvents {
+        // Resolve once per arm: status describes the exact subscribed paths,
+        // and every canonical edge pays for only one execution-directory scan.
+        let paths = residentWorkObservationPaths()
+        residentWorkObservationPathsSnapshot = paths
+        return FileChangeEvents(paths: paths, emitInitial: false)
+    }
+
+    private func waitForStartup() async {
+        guard starting else { return }
+        await withCheckedContinuation { continuation in
+            startupWaiters.append(continuation)
+        }
+    }
+
+    private func finishStartup() {
+        starting = false
+        let waiters = startupWaiters
+        startupWaiters.removeAll(keepingCapacity: true)
+        for waiter in waiters { waiter.resume() }
+    }
+}
+
+extension NativeContextFlowRuntime {
+    /// Mind-into-circulation (2026-07-10): translation of a MEMORY RECORD id →
+    /// the ContextAtomID the memory projection assigns that record. This lives
+    /// beside the projection on purpose — its owner string
+    /// (`NativeMemoryContextProjection.owner`) must never be hardcoded in
+    /// Context or ChatOrchestration. The derivation MIRRORS `NativeMemoryContextProjection.prepare`
+    /// exactly (locatorDigest → locator → source → atom) so an activation weight
+    /// keyed here lands on the same atom Fluid Context selects.
+    ///
+    /// Kind is fixed to `.memory`: the substrate hands us record ids without the
+    /// correction flag, and correction atoms are already mandatory-included, so
+    /// an activation miss on a correction record is benign (it's injected anyway).
+    /// Reusable as a `@Sendable (String) -> ContextAtomID?` — no captured state.
+    public static func memoryRecordAtomID(forRecordID recordID: String) -> ContextAtomID? {
+        // Mirror the projection's EXACT id pipeline (gpt-5.5 MED, 2026-07-10):
+        // `normalizedID` precomposes Unicode before trimming — a decomposed
+        // record id hashed raw would derive a locator the projection never
+        // creates. Same validity gates (≤512 UTF-8 bytes, no control chars):
+        // an id the projection would reject translates to nil, never to a
+        // phantom atom id.
+        let normalized = NativeMemoryContextProjection.normalizedRecordID(recordID)
+        guard !normalized.isEmpty,
+              normalized.utf8.count <= 512,
+              !NativeMemoryContextProjection.recordIDContainsDisallowedControl(normalized) else {
+            return nil
+        }
+        let locatorDigest = ContextStableID.digest(parts: [normalized])
+        let locator = "memory-v2/records/\(locatorDigest)"
+        let sourceID = ContextStableID.source(
+            owner: NativeMemoryContextProjection.owner,
+            locator: locator
+        )
+        return ContextStableID.atom(
+            sourceID: sourceID,
+            kind: .memory,
+            headingPath: [],
+            blockAnchor: "memory-record"
+        )
+    }
+}
+
+/// 2026-09-06 — REM PIN RETRACTION LATENCY.
+///
+/// `rem_pins.json` reconciles every approved lesson against the live persona
+/// document, so removing or rewording a lesson in GROWTH.md is supposed to
+/// retire its pin. But the index was only rebuilt on approve/deny and on a REM
+/// tick, so a retracted lesson kept riding into every chat turn until the next
+/// weekly cycle. Saving GROWTH.md already publishes a persona invalidation;
+/// this sink is what turns that into a rebuild.
+///
+/// A FAN-OUT rather than a second center: `DerivedStateInvalidationCenter`
+/// holds one sink, and this is it — installed once at app launch and never
+/// removed. Context Flow's coordinator is forwarded first, exactly as before,
+/// but it is now a SUBSCRIBER (through `ContextFlowInvalidationRelay`) rather
+/// than the owner of the installation.
+///
+/// 2026-09-06: this sink used to be installed only when Context Flow built a
+/// coordinator, so with Context Flow off — or after a failed startup — a
+/// GROWTH.md edit left retracted pins riding into every turn until the next
+/// weekly REM cycle, which is the very latency the sink exists to remove.
+public struct DerivedPersonaPinInvalidationSink: DerivedStateInvalidationSink {
+    let dataRoot: URL
+
+    public init(dataRoot: URL) {
+        self.dataRoot = dataRoot
+    }
+
+    public func sourceDidChange(_ changes: [DerivedSourceChange]) async {
+        if let primary = await ContextFlowInvalidationRelay.shared.current() {
+            await primary.sourceDidChange(changes)
+        }
+        // Only the document REM can pin into. `stableID` is a filename from
+        // the persona doc writers and a bare doc id from the scaffolder;
+        // `supportsProposalTarget` normalises both.
+        guard changes.contains(where: {
+            $0.namespace == "persona"
+                && REMProposalStore.supportsProposalTarget($0.stableID)
+        }) else { return }
+        await REMPinRebuildCoalescer.shared.requestRebuild(dataRoot: dataRoot)
+    }
+}
+
+/// The Context Flow coordinator's subscription to the invalidation center,
+/// held apart from the installation itself (2026-09-06). `current()` hands the
+/// sink back rather than forwarding through this actor, so a slow coordinator
+/// delivery never serialises behind the relay's isolation.
+actor ContextFlowInvalidationRelay {
+    static let shared = ContextFlowInvalidationRelay()
+
+    private var coordinator: (any DerivedStateInvalidationSink)?
+
+    func set(_ sink: (any DerivedStateInvalidationSink)?) {
+        coordinator = sink
+    }
+
+    func current() -> (any DerivedStateInvalidationSink)? {
+        coordinator
+    }
+}
+
+/// Collapses a burst of GROWTH.md writes into one rebuild, and a write that
+/// arrives DURING a rebuild into exactly one more afterwards. No timer: the
+/// invalidation center already coalesces its deliveries, and a rebuild that is
+/// already running is the debounce window.
+actor REMPinRebuildCoalescer {
+    static let shared = REMPinRebuildCoalescer()
+
+    private var rebuilding = false
+    private var changedAgain = false
+
+    func requestRebuild(dataRoot: URL) async {
+        guard !rebuilding else {
+            changedAgain = true
+            return
+        }
+        rebuilding = true
+        defer { rebuilding = false }
+        repeat {
+            changedAgain = false
+            await Task.detached(priority: .utility) { [dataRoot] in
+                do {
+                    try REMConsolidator.emitREMPinsIndex(dataRoot: dataRoot)
+                } catch {
+                    NSLog("[rem-pins] rebuild after a persona write failed: %@",
+                          String(describing: error))
+                }
+            }.value
+        } while changedAgain
+    }
+}

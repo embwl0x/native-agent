@@ -213,9 +213,10 @@ extension MacAppleScriptBridge {
         "message_not_in_inbox": "That message is no longer in the inbox; list it again with mail_list_recent and use the new message_id.",
         "message_changed_or_moved_refresh_inbox": "That message moved or changed; list the inbox again with mail_list_recent and use the new message_id.",
         "message_changed_or_ambiguous_refresh_inbox": "That message moved, changed, or its subject matches several; list the inbox again and reply by message_id.",
-        "no_matching_message": "No inbox message matches; list the inbox with mail_list_recent and pass its message_id.",
+        "no_matching_message": "No inbox message matches; list the inbox with mail_list_recent and pass its message_id. An archived message is no longer in the inbox, so delete or mark it before archiving.",
         "mail_refused_send": "Mail refused to send it (no account can send, or it is offline); nothing went out.",
         "no_archive_mailbox": "Mail has no Archive mailbox, so nothing moved; leave it or use mail_delete.",
+        "mail_index_unavailable": "Mail's message index could not be read (NativeAgent may need macOS Full Disk Access); nothing was listed or changed.",
         "thread_not_found": "That conversation is not in Messages now; list threads again with messages_recent_threads.",
         "invalid_history_cursor": "before_message_id works only with the same thread_id, using older_before_message_id from the last read.",
         "choose_recipient_or_thread": "Give one of to (a phone number or email) or thread_id, not both.",
@@ -476,13 +477,13 @@ extension MacAppleScriptBridge {
             let parts = e.components(separatedBy: "|||")
             let index = Int(parts.indices.contains(0) ? parts[0] : "") ?? (offset + playlists.count + 1)
             let name = parts.indices.contains(1) ? parts[1] : ""
-            let trackCount = Int(parts.indices.contains(2) ? parts[2] : "") ?? 0
+            let trackCount = Int64(parts.indices.contains(2) ? parts[2] : "").flatMap { $0 >= 0 ? $0 : nil }
             let persistentID = parts.indices.contains(3) ? parts[3] : ""
             let specialKind = parts.indices.contains(4) ? parts[4] : ""
             playlists.append(.object([
                 "index": .int(Int64(index)),
                 "name": .string(name),
-                "track_count": .int(Int64(trackCount)),
+                "track_count": trackCount.map(JSONValue.int) ?? .string("unknown"),
                 "persistent_id": .string(persistentID),
                 "special_kind": .string(specialKind),
             ]))

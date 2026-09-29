@@ -7,6 +7,7 @@
 
 import SwiftUI
 import PersistenceCore
+import Desk
 
 struct DeskDebugPanels: View {
     let dataRoot: URL

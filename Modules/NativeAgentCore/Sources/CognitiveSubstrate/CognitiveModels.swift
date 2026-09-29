@@ -227,6 +227,9 @@ public struct CognitiveCapsulePresentationState: Sendable, Equatable {
     /// Accepted live capsules since the rut nudge last spoke. Counted rather
     /// than timed so a burst of turns inside one minute cannot re-fire it.
     public var soundRutTurnsSinceSurfaced: Int
+    /// The one early repeat (she fed the rut again after it was named) has
+    /// been spent for the current signature; a new signature re-arms it.
+    public var soundRutEarlyRepeatSpent: Bool
     /// Per-inner-line cadence ledger, keyed by the line's stable key.
     /// A non-negative value counts capsules this line has LED; a negative value
     /// counts the capsules of rest it still owes. Bounded by
@@ -271,6 +274,7 @@ public struct CognitiveCapsulePresentationState: Sendable, Equatable {
         soundRutSignature: String? = nil,
         soundRutLastSurfacedAt: Date? = nil,
         soundRutTurnsSinceSurfaced: Int = 0,
+        soundRutEarlyRepeatSpent: Bool = false,
         innerLineRuns: [String: Int] = [:],
         feltObjectCount: Int = 0,
         ambivalenceCount: Int = 0,
@@ -289,6 +293,7 @@ public struct CognitiveCapsulePresentationState: Sendable, Equatable {
         self.soundRutSignature = soundRutSignature
         self.soundRutLastSurfacedAt = soundRutLastSurfacedAt
         self.soundRutTurnsSinceSurfaced = max(0, soundRutTurnsSinceSurfaced)
+        self.soundRutEarlyRepeatSpent = soundRutEarlyRepeatSpent
         self.innerLineRuns = innerLineRuns
         self.feltObjectCount = max(0, feltObjectCount)
         self.ambivalenceCount = max(0, ambivalenceCount)

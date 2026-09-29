@@ -61,6 +61,14 @@ extension ChatStore {
         emitHaptic: Bool = true,
         queuedSendID: UUID? = nil
     ) -> ChatSendDisposition {
+        if !MobileChatSelectionIntent.userChoseThisLaunch {
+            // The composer may retain the adopted main while a newer Mac
+            // anchor waits for its draft to be sent or cleared.
+            guard let mainSessionID, mainSessionID == selectedSessionID else {
+                errorBanner = "Waiting for the Mac's current chat to sync."
+                return .rejected
+            }
+        }
         guard (!text.isEmpty || !attachments.isEmpty), !isSwitchingSession else { return .rejected }
         if isLoading {
             guard appendUser else { return .rejected }
@@ -167,6 +175,7 @@ extension ChatStore {
             appendedUserId: appendedUserId
         )
         pendingICloudPlaceholders[correlationID] = placeholderId
+        PhoneTurnActivity.shared.sent(correlationID)
         pendingSendArgs[correlationID] = pendingArgs
         // Durable from the moment it leaves the composer: an app closed here
         // must come back to the same unfinished exchange, not a blank chat.

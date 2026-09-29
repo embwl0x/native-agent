@@ -1,5 +1,6 @@
 import Foundation
 import PersistenceCore
+import Research
 
 
 extension NativeClient {
@@ -55,7 +56,7 @@ extension NativeClient {
         )
         let persistence = SwiftNativePersistenceCore()
         try await persistence.withFileLock(path) {
-            let current = await persistence.readJSON(path, defaultValue: .object([:]))
+            let current = try await persistence.readJSON(path, ifMissing: .object([:]))
             var root: [String: JSONValue]
             if case .object(let obj) = current { root = obj } else { root = [:] }
             root["searxng_base_url"] = .string(normalized)
@@ -71,7 +72,7 @@ extension NativeClient {
         return try await swiftAutodetectSearXNG()
     }
 
-    func search(query: String) async throws -> [ResearchResult] {
+    func search(query: String) async throws -> [ResearchSearchResult] {
         // Subsystem #17 (cluster C7): when .research is on, the in-process
         // SwiftNativeResearchClient queries SearXNG directly using the same
         // /search?format=json call the daemon uses, writes a receipt JSON

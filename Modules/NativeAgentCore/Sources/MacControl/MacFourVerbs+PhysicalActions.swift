@@ -9,6 +9,8 @@ extension MacFourVerbs {
         case hold
         case key
         case move
+        /// A real double-click (click count 2 on both events) at the named thing.
+        case doubleClick = "double_click"
     }
 
     static let physicalScrollKinds: Set<String> = [
@@ -39,9 +41,13 @@ extension MacFourVerbs {
             guard !spec.isEmpty else {
                 return MacFourVerbsReply(ok: false, text: "Which key or chord should I use?")
             }
-            let before: Sighting
+            let before: Sighting?
             switch await sight(part: nil) {
-            case .blind(let reply): return reply
+            case .blind(let reply):
+                // The front app with every window closed still takes keys
+                // (cmd+n is how a window comes back).
+                guard Self.string(reply.detail["error"]) == "no_frontmost_window" else { return reply }
+                before = nil
             case .seen(let seen): before = seen
             }
             var body: [String: JSONValue] = [
@@ -214,6 +220,7 @@ extension MacFourVerbs {
             case .hover: description = "Hovered over \(spokenSource)."
             case .hold: description = button == "right" ? "Held the right button on \(spokenSource)." : "Held \(spokenSource)."
             case .move: description = "Moved to \(spokenSource)."
+            case .doubleClick: description = (button == "right" ? "Double-right-clicked " : "Double-clicked ") + spokenSource + "."
             case .drag, .key: description = "Used \(spokenSource)."
             }
         }
@@ -283,6 +290,17 @@ extension MacFourVerbs {
         }
         let destinationAppName = anchored.appName ?? destinationApp
 
+        // The window itself is a drop target: by its title (resolve already
+        // names windows), or by the app's name / "window" when nothing inside
+        // is called that.
+        func resolveDrop(_ targets: [ActTarget]) -> Resolution {
+            let resolved = Self.resolve(destination, among: targets)
+            guard case .none = resolved,
+                  [destinationApp, anchored.appName ?? destinationApp, "window", "front window"].map(Self.normalize)
+                      .contains(Self.normalize(destination)),
+                  let window = targets.first(where: { $0.kind == "window" }) else { return resolved }
+            return .hit(window)
+        }
         // gpt-5.5 review — EVERY refusal below is about a window User did not
         // bring forward. None of them may print `anchored.render`: that is the
         // whole background window — its rows, its readouts, its values — and
@@ -291,7 +309,7 @@ extension MacFourVerbs {
         // `MacCrossAppDrag` owns the bound; these say the app, the window, and
         // at most a capped list of names.
         let endTarget: ActTarget
-        switch Self.resolve(destination, among: anchored.targets) {
+        switch resolveDrop(anchored.targets) {
         case .hit(let hit): endTarget = hit
         case .none(let nearest):
             return MacFourVerbsReply(
@@ -493,7 +511,7 @@ extension MacFourVerbs {
                 )
             }
 
-            guard case .hit(let rereadTarget) = Self.resolve(destination, among: reread.targets) else {
+            guard case .hit(let rereadTarget) = resolveDrop(reread.targets) else {
                 return movedRefusal()
             }
             guard let rereadFrame = Self.visiblePortion(
@@ -590,13 +608,26 @@ extension MacFourVerbs {
         // after the raise when there was one: the post-act look lands on that
         // same window, so the comparison is drop evidence rather than the noise
         // of the window order having changed underneath it.
-        let reply = await performHand(
-            body: body,
-            description: description,
-            attention: attention,
-            before: anchoredAfterRaise,
-            allowGenericScreenChangeVerification: !dropTarget.physicalOnly
-        )
+        // The destination coming forward is part of this drag: once it was
+        // raised, IT is the app that must stay in front while the drag posts
+        // (any third app taking the front stops the hand).
+        let dragFront = raise.needed ? anchoredAfterRaise.pid : Self.requiredFrontPid
+        if raise.needed, dragFront == nil {
+            return MacFourVerbsReply(
+                ok: false,
+                text: "I can't tell which process \(destinationAppName) is after bringing it forward, so I didn't drag.",
+                detail: raiseDetail.merging(["raised": .bool(true), "error": .string("front_unknown")]) { current, _ in current }
+            )
+        }
+        let reply = await Self.$requiredFrontPid.withValue(dragFront) {
+            await performHand(
+                body: body,
+                description: description,
+                attention: attention,
+                before: anchoredAfterRaise,
+                allowGenericScreenChangeVerification: !dropTarget.physicalOnly
+            )
+        }
         var detail = reply.detail
         for (key, value) in raiseDetail { detail[key] = value }
         if let button { detail["button"] = .string(button) }

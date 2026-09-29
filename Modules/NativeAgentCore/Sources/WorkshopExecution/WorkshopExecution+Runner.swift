@@ -1,3 +1,5 @@
+import Privacy
+import SwarmRuns
 import Foundation
 import os
 import NativeAgentCore
@@ -241,7 +243,11 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
     /// guard at the TOP of submit().
     private func assertSlotAvailable() async throws {
         let cap = effectiveWorkshopExecutionSlotsCap()
-        let activeCount = await listActive().count + liveReservationCount()
+        let active = await listActive()
+        if let corrupt = active.first(where: { $0.status == "corrupt" }) {
+            throw WorkshopExecutionError.persistenceFailure(String(describing: corrupt.result))
+        }
+        let activeCount = active.count + liveReservationCount()
         if activeCount >= cap {
             // Same message MissionsBusyError ships by default.
             throw WorkshopExecutionError.workshopExecutionsBusy("missions_busy: too many active or pending Workshop executions")
@@ -787,7 +793,7 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
         // timeline event needs appending. A stale cancellation must not
         // rewrite an outcome that settled before this lock was acquired.
         let work: @Sendable () async throws -> (record: WorkshopExecutionRecord, didCancel: Bool) = { [persistence] in
-            let raw = await persistence.readJSON(executionRecordJSON, defaultValue: .null)
+            let raw = try await persistence.readJSON(executionRecordJSON, ifMissing: .null)
             guard case .object(let obj) = raw,
                   case .string(let gotId)? = obj["id"], gotId == trimmed else {
                 // Mirror Python's `if execution is None: raise ValueError(...)`.
@@ -910,7 +916,7 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
         // Activity row only when a real patch landed (matching the daemon's
         // `if changed:` save gate). nil record == not a queue execution.
         let work: @Sendable () async throws -> (record: WorkshopExecutionRecord, changed: Bool)? = { [persistence] in
-            let raw = await persistence.readJSON(executionRecordJSON, defaultValue: .null)
+            let raw = try await persistence.readJSON(executionRecordJSON, ifMissing: .null)
             guard case .object(let obj) = raw,
                   case .string(let gotId)? = obj["id"], gotId == id else {
                 // Not a queue execution → nil, daemon falls through to legacy.
@@ -1073,10 +1079,10 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
     /// `TaskQueue.get`. Reads
     /// <queue>/<id>/mission.json, returns nil when absent, malformed, or
     /// carrying an id that does not match its containing directory.
-    public func getWorkshopExecution(_ executionId: String) async -> WorkshopExecutionRecord? {
+    public func getWorkshopExecution(_ executionId: String) async throws -> WorkshopExecutionRecord? {
         guard (try? await WorkshopStorageMigrator.prepareForReading(dataRoot: root)) != nil else { return nil }
         guard Self.isSafeExecutionID(executionId) else { return nil }
-        let raw = await persistence.readJSON(executionRecordPath(executionId), defaultValue: .null)
+        let raw = try await persistence.readJSON(executionRecordPath(executionId), ifMissing: .null)
         guard case .object(let obj) = raw,
               case .string(let gotId)? = obj["id"], gotId == executionId else {
             return nil
@@ -1089,10 +1095,10 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
     /// WITHOUT the `timeline` key (the caller attaches it); nil when absent.
     /// gpt-5.5 finding #1: use this (not getMission(...)?.toJSON()) so `plan`
     /// is emitted verbatim.
-    public func getWorkshopExecutionWireJSON(_ executionId: String) async -> JSONValue? {
+    public func getWorkshopExecutionWireJSON(_ executionId: String) async throws -> JSONValue? {
         guard (try? await WorkshopStorageMigrator.prepareForReading(dataRoot: root)) != nil else { return nil }
         guard Self.isSafeExecutionID(executionId) else { return nil }
-        let raw = await persistence.readJSON(executionRecordPath(executionId), defaultValue: .null)
+        let raw = try await persistence.readJSON(executionRecordPath(executionId), ifMissing: .null)
         guard case .object(let obj) = raw,
               case .string(let gotId)? = obj["id"], gotId == executionId else {
             return nil
@@ -1114,8 +1120,7 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
 
     /// `TaskQueue._scan_all`: every <queue>/<id>/
     /// subdir with a parseable mission.json whose `id` matches the directory.
-    /// Malformed / mismatched mission.json entries are skipped (Python's broad
-    /// `except` at L428).
+    /// Failed reads and invalid records remain visible as corrupt and block queue admission.
     private func scanAllQueueWorkshopExecutions() async -> [(record: WorkshopExecutionRecord, raw: [String: JSONValue])] {
         guard (try? await WorkshopStorageMigrator.prepareForReading(dataRoot: root)) != nil else { return [] }
         let fm = FileManager.default
@@ -1130,7 +1135,7 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
             let isDir = (try? sub.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
             guard isDir else { continue }
             let mp = ExecutionRecordFile.resolve(in: sub, fileManager: fm)
-            let raw = await persistence.readJSON(mp, defaultValue: .null)
+            let raw = await Self.readQueueRecord(mp, id: sub.lastPathComponent, persistence: persistence)
             guard case .object(let obj) = raw,
                   case .string(let gotId)? = obj["id"], gotId == sub.lastPathComponent else {
                 continue
@@ -1138,6 +1143,30 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
             out.append((Self.recordFromJSON(obj), obj))
         }
         return out
+    }
+
+    /// A read-only projection: never persist invented execution state over bad bytes.
+    static func readQueueRecord(
+        _ path: URL, id: String, persistence: any PersistenceCoreProtocol
+    ) async -> JSONValue {
+        do {
+            let raw = try await persistence.readJSON(path, ifMissing: .null)
+            if raw == .null, !FileManager.default.fileExists(atPath: path.path) { return raw }
+            guard case .object(let obj) = raw else {
+                throw WorkshopExecutionError.persistenceFailure("Execution record must be an object")
+            }
+            guard case .string(let gotId)? = obj["id"], gotId == id else {
+                throw WorkshopExecutionError.persistenceFailure("Execution record id must match its directory: \(id)")
+            }
+            return raw
+        } catch {
+            return .object([
+                "id": .string(id),
+                "title": .string(id),
+                "status": .string("corrupt"),
+                "result": .object(["error": .string(error.localizedDescription)]),
+            ])
+        }
     }
 
     /// `TaskQueue.list_all`: all queue Workshop executions sorted
@@ -1171,7 +1200,7 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
     }
 
     private nonisolated static func activeRecords(_ records: [WorkshopExecutionRecord]) -> [WorkshopExecutionRecord] {
-        let live: Set<String> = ["queued", "running", "blocked_on_approval"]
+        let live: Set<String> = ["queued", "running", "blocked_on_approval", "corrupt"]
         return records.filter { live.contains($0.status) }
     }
 
@@ -1187,8 +1216,8 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
     /// `phase`/`priority`/`receiptCount` and camelCase keys the queue record
     /// type doesn't model). The Mac decode models accept either casing, so
     /// passing these through verbatim is byte-faithful.
-    public func listLegacyWorkshopExecutions() async -> [JSONValue] {
-        let raw = await persistence.readJSON(legacyWorkshopExecutionsPath, defaultValue: .array([]))
+    public func listLegacyWorkshopExecutions() async throws -> [JSONValue] {
+        let raw = try await persistence.readJSON(legacyWorkshopExecutionsPath, ifMissing: .array([]))
         guard case .array(let items) = raw else { return [] }
         let dicts = items.compactMap { item -> [String: JSONValue]? in
             if case .object(let o) = item { return o }
@@ -1208,7 +1237,7 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
     /// the legacy flat list, preserving the daemon's `new_missions +
     /// old_missions` order. Returns a JSONValue array so the NativeClient seam
     /// can decode it into whichever Mac model the caller asked for.
-    public func listWorkshopExecutionsMerged() async -> [JSONValue] {
+    public func listWorkshopExecutionsMerged() async throws -> [JSONValue] {
         // Queue first (created_at DESC), faithful asdict bytes; then legacy
         // verbatim. Matches the retired daemon `new_missions +
         // old_missions`. gpt-5.5 finding #1: emit via readJSONForWorkshopExecution so the
@@ -1216,7 +1245,7 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
         let queue = await scanAllQueueWorkshopExecutions()
             .sorted { $0.record.createdAt > $1.record.createdAt }
             .map { Self.readJSONForWorkshopExecution($0.raw) }
-        let legacy = await listLegacyWorkshopExecutions()
+        let legacy = try await listLegacyWorkshopExecutions()
         return queue + legacy
     }
 

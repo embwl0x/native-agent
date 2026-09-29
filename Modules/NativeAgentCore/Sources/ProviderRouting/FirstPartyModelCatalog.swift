@@ -142,6 +142,9 @@ public enum FirstPartyModelCatalog {
         // cannot be disabled and forced tool_choice any/tool is a 400; neither
         // is sent on any Anthropic lane. Its own effort default is medium.
         // 2026-09-22: first row = a new account's default (saved on connect).
+        // 2026-09-28: Sonnet 5.5 (docs: 1M window, 128K out, adaptive thinking,
+        // default effort high); capability flags as Sonnet 5 until proven.
+        .init(id: "claude-sonnet-5-5", name: "Claude Sonnet 5.5", contextLength: 1_000_000, defaultReasoningEffort: "high", supportedReasoningEfforts: fullClaudeEfforts),
         .init(id: "claude-opus-5-5", name: "Claude Opus 5.5", contextLength: 1_000_000, defaultReasoningEffort: "medium", supportedReasoningEfforts: fullClaudeEfforts, supportsMidConversationSystem: true, supportsMidConversationToolChanges: true),
         .init(id: "claude-opus-4-8", name: "Claude Opus 4.8", contextLength: 1_000_000, defaultReasoningEffort: "high", supportedReasoningEfforts: fullClaudeEfforts, supportsMidConversationSystem: true, supportsMidConversationToolChanges: true),
         // Fable 5.1 (added 2026-09-01, verified against the live catalog): 1M
@@ -286,7 +289,7 @@ public enum FirstPartyModelCatalog {
     /// The read-aloud (speech) model a provider serves, or nil for a provider
     /// with no speech API. Only the billed platform route has one: a
     /// subscription account does not sell speech, so cloud voice on such a
-    /// route refuses and the on-device voice reads instead.
+    /// route refuses and read-aloud says so.
     public static func speechModel(forProviderID providerID: String) -> String? {
         switch providerID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
         case "openai": return "tts-1"

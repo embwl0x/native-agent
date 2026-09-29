@@ -1,3 +1,4 @@
+import FeedPolicy
 import Foundation
 import NativeAgentCore
 import PersistenceCore
@@ -122,10 +123,10 @@ extension SwiftNativeSelfImprovement {
     /// `TrainingLoop._find_proposal_file`: `sorted(glob)`,
     /// first file whose dict carries the matching `proposal_id`. Returns the
     /// URL plus the already-parsed dict so callers avoid a second read.
-    private func findProposalFile(_ proposalId: String) async -> (url: URL, data: [String: JSONValue])? {
+    private func findProposalFile(_ proposalId: String) async throws -> (url: URL, data: [String: JSONValue])? {
         let files = Self.sortedJSONFiles(in: trainingProposalsDir(), reversedName: false)
         for f in files {
-            guard let obj = await readJSONObject(f) else { continue }
+            guard let obj = try await readJSONObject(f) else { continue }
             if case .string(let pid)? = obj["proposal_id"], pid == proposalId {
                 return (f, obj)
             }
@@ -193,7 +194,7 @@ extension SwiftNativeSelfImprovement {
         proposalId: String,
         reason: String
     ) async throws -> JSONValue {
-        guard let found = await findProposalFile(proposalId) else {
+        guard let found = try await findProposalFile(proposalId) else {
             throw TrainingProposalWriteError.proposalNotFound(proposalId)
         }
         // Python `body.get("reason") or "No reason given"`: empty string is the
@@ -205,7 +206,7 @@ extension SwiftNativeSelfImprovement {
         try await withTrainingFileLock(url) {
             // Re-read INSIDE the lock so a concurrent daemon write that landed
             // between findProposalFile and lock acquisition is not clobbered.
-            let raw = await p.readJSON(url, defaultValue: .object([:]))
+            let raw = try await p.readJSON(url, ifMissing: .object([:]))
             var data: [String: JSONValue]
             if case .object(let o) = raw { data = o } else { data = fallbackData }
             data["status"] = .string("rejected")
@@ -240,7 +241,7 @@ extension SwiftNativeSelfImprovement {
     /// Returns `{"status":"approved","backup":<path>, ...ledgerEntry}`.
     public func approveTrainingProposalLocal(proposalId: String) async throws -> JSONValue {
         let routeThroughPromotion = try await routeThroughPromotionEnabled()
-        guard let found = await findProposalFile(proposalId) else {
+        guard let found = try await findProposalFile(proposalId) else {
             throw TrainingProposalWriteError.proposalNotFound(proposalId)
         }
         let proposalURL = found.url
@@ -298,7 +299,7 @@ extension SwiftNativeSelfImprovement {
             // first will have flipped status off "pending" — bail to avoid a
             // double-apply. ALL downstream fields (status, target_doc, content)
             // are read off THIS one snapshot, matching the daemon's single read.
-            let freshRaw = await p.readJSON(proposalURL, defaultValue: .object([:]))
+            let freshRaw = try await p.readJSON(proposalURL, ifMissing: .object([:]))
             var freshData: [String: JSONValue] = data
             if case .object(let o) = freshRaw { freshData = o }
             let freshStatus: String = {
@@ -522,10 +523,10 @@ extension SwiftNativeSelfImprovement {
         return "training_\(trimmed.isEmpty ? "proposal" : String(trimmed.prefix(80)))"
     }
 
-    private func findPromotionStage(_ candidateId: String) async -> (url: URL, data: [String: JSONValue])? {
+    private func findPromotionStage(_ candidateId: String) async throws -> (url: URL, data: [String: JSONValue])? {
         let files = Self.sortedJSONFiles(in: promotionStagesDir(), reversedName: false)
         for f in files {
-            guard let obj = await readJSONObject(f) else { continue }
+            guard let obj = try await readJSONObject(f) else { continue }
             if case .string(let cid)? = obj["candidate_id"], cid == candidateId {
                 return (f, obj)
             }
@@ -536,7 +537,7 @@ extension SwiftNativeSelfImprovement {
     /// Apply a Swift-native promotion stage produced by
     /// `approveTrainingProposalLocal(route_through_promotion=true)`.
     public func approvePromotionStageLocal(candidateId: String) async throws -> JSONValue {
-        guard let found = await findPromotionStage(candidateId) else {
+        guard let found = try await findPromotionStage(candidateId) else {
             throw TrainingProposalWriteError.promotionStageNotFound(candidateId)
         }
         let stageURL = found.url
@@ -547,7 +548,7 @@ extension SwiftNativeSelfImprovement {
         let candidatePath = promotionCandidatesDir().appendingPathComponent("\(candidateId).json")
 
         let out: [String: JSONValue] = try await withTrainingFileLock(stageURL) {
-            let raw = await p.readJSON(stageURL, defaultValue: .object([:]))
+            let raw = try await p.readJSON(stageURL, ifMissing: .object([:]))
             var stage: [String: JSONValue] = found.data
             if case .object(let o) = raw { stage = o }
             let status = Self.pythonStr(stage["status"], defaultWhenAbsent: "")
@@ -614,7 +615,7 @@ extension SwiftNativeSelfImprovement {
             stage["resolution_reason"] = .string("approved")
             try await p.writeJSON(.object(stage), to: stageURL)
 
-            let candidateRaw = await p.readJSON(candidatePath, defaultValue: .object([:]))
+            let candidateRaw = try await p.readJSON(candidatePath, ifMissing: .object([:]))
             var candidate: [String: JSONValue] = [:]
             if case .object(let existing) = candidateRaw { candidate = existing }
             candidate["candidate_id"] = .string(candidateId)
@@ -626,7 +627,7 @@ extension SwiftNativeSelfImprovement {
 
             if case .string(let proposalPath)? = delta["proposal_path"] {
                 let proposalURL = URL(fileURLWithPath: proposalPath)
-                let proposalRaw = await p.readJSON(proposalURL, defaultValue: .object([:]))
+                let proposalRaw = try await p.readJSON(proposalURL, ifMissing: .object([:]))
                 if case .object(var proposal) = proposalRaw {
                     proposal["status"] = .string("approved")
                     proposal["approved_at"] = .string(resolvedAt)
@@ -665,7 +666,7 @@ extension SwiftNativeSelfImprovement {
     }
 
     public func rejectPromotionStageLocal(candidateId: String, reason: String) async throws -> JSONValue {
-        guard let found = await findPromotionStage(candidateId) else {
+        guard let found = try await findPromotionStage(candidateId) else {
             throw TrainingProposalWriteError.promotionStageNotFound(candidateId)
         }
         let stageURL = found.url
@@ -674,7 +675,7 @@ extension SwiftNativeSelfImprovement {
         let candidatePath = promotionCandidatesDir().appendingPathComponent("\(candidateId).json")
 
         let out: [String: JSONValue] = try await withTrainingFileLock(stageURL) {
-            let raw = await p.readJSON(stageURL, defaultValue: .object([:]))
+            let raw = try await p.readJSON(stageURL, ifMissing: .object([:]))
             var stage: [String: JSONValue] = found.data
             if case .object(let o) = raw { stage = o }
             let status = Self.pythonStr(stage["status"], defaultWhenAbsent: "")
@@ -687,7 +688,7 @@ extension SwiftNativeSelfImprovement {
             stage["resolution_reason"] = .string(effectiveReason)
             try await p.writeJSON(.object(stage), to: stageURL)
 
-            let candidateRaw = await p.readJSON(candidatePath, defaultValue: .object([:]))
+            let candidateRaw = try await p.readJSON(candidatePath, ifMissing: .object([:]))
             var candidate: [String: JSONValue] = [:]
             if case .object(let existing) = candidateRaw { candidate = existing }
             candidate["candidate_id"] = .string(candidateId)
@@ -700,7 +701,7 @@ extension SwiftNativeSelfImprovement {
             if case .object(let delta)? = stage["delta"],
                case .string(let proposalPath)? = delta["proposal_path"] {
                 let proposalURL = URL(fileURLWithPath: proposalPath)
-                let proposalRaw = await p.readJSON(proposalURL, defaultValue: .object([:]))
+                let proposalRaw = try await p.readJSON(proposalURL, ifMissing: .object([:]))
                 if case .object(var proposal) = proposalRaw {
                     proposal["status"] = .string("rejected")
                     proposal["rejection_reason"] = .string(effectiveReason)

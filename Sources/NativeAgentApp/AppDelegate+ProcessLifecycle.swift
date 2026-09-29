@@ -1,6 +1,7 @@
 import Foundation
 import AppKit
 import ServiceManagement
+import DeviceSync
 
 private final class SingleInstanceActivationBox: @unchecked Sendable {
     private let lock = NSLock()
@@ -106,6 +107,25 @@ extension AppDelegate {
         alert.alertStyle = .critical
         alert.runModal()
         NSApp.terminate(nil)
+    }
+
+    /// Missing data/ or SOUL.md at launch. Continuing starts on the root the
+    /// alert names, so the person chooses that rather than finding an empty
+    /// agent. Returns true to continue.
+    @MainActor
+    static func confirmLaunchWithMissingRoots(_ missing: [String]) -> Bool {
+        NSLog("[paths] launch roots missing: %@", missing.joined(separator: " | "))
+        NSApp.setActivationPolicy(.regular)
+        let alert = NSAlert()
+        alert.alertStyle = .critical
+        alert.messageText = "NativeAgent cannot find its data."
+        alert.informativeText = missing.joined(separator: "\n\n")
+            + "\n\nContinuing starts with what is named above, and anything missing is created empty."
+        alert.addButton(withTitle: "Quit")
+        alert.addButton(withTitle: "Continue Anyway")
+        let continued = alert.runModal() == .alertSecondButtonReturn
+        if !continued { NSApp.terminate(nil) }
+        return continued
     }
 
     // MARK: - Login item

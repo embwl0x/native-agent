@@ -31,7 +31,7 @@ const {
   createProcessStartIdentityReader, safeFilePart: sharedSafeFilePart,
   postWakeCompletion, dirLockOwnerAlive: sharedDirLockOwnerAlive, ensureDir, fsyncDirectorySync: syncDirectory, writeSyncedAndClose,
   copyWakeProducerIdentity, copyWakeCompletionOrigin, claimWakeJob: claimJob, readWakeJSON, missingWakeCompletionOrigin,
-  appendSyncedWakeLine, readWakeJSONLines, sleep, readWakeBridgeToken, processTreeOrder,
+  appendSyncedWakeLine, readWakeJSONLines, sleep, readWakeBridgeToken, processTreeOrder, createWakeLivePoster,
 } = require("./wake_worker_common.js");
 
 const crypto = require("crypto");
@@ -47,12 +47,10 @@ const WAKE_SESSIONS_DIR = path.join(BRIDGE_DIR, "wake-sessions");
 const DELIVERIES_PATH = path.join(BRIDGE_DIR, "wake-deliveries.jsonl");
 const TOKEN_PATH = process.env.NATIVE_AGENT_CLAUDE_WAKE_TOKEN_PATH ||
   path.join(BRIDGE_DIR, "token");
-// The bridge publishes its REAL endpoint (it advances from 8771 on collision)
-// in bridge.json; the fixed port is only the last-resort fallback.
+// The bridge publishes its endpoint (each install has its own port) in
+// bridge.json; it is the only source of the address.
 const BRIDGE_DESCRIPTOR_PATH = path.join(BRIDGE_DIR, "bridge.json");
 const BRIDGE_MESSAGE_PATH = "/claude/message";
-const DEFAULT_BRIDGE_ORIGIN = "http://127.0.0.1:8771";
-const DEFAULT_BRIDGE_URL = `${DEFAULT_BRIDGE_ORIGIN}${BRIDGE_MESSAGE_PATH}`;
 // The ceiling is deliberately generous: it is the "this cannot possibly still
 // be real work" backstop, NOT the normal way a job ends. A wedged job is meant
 // to be caught in minutes by the stall watchdog below, so the ceiling no longer
@@ -623,9 +621,13 @@ function resolveTimeoutSeconds(payload) {
 }
 
 function resolveCwd(payload, pointer) {
+  // defaultCwd is the wake's own worktree, assigned when the caller named no
+  // directory: it must not move a pinned session (which exists only under
+  // the directory it was created in), so it ranks below the pointer.
   const candidates = [
     payload && payload.cwd,
     pointer && pointer.cwd,
+    payload && payload.defaultCwd,
     process.env.NATIVE_AGENT_CLAUDE_WAKE_CWD,
     path.join(os.homedir(), "Projects", "NativeAgent"),
     process.cwd(),
@@ -748,7 +750,7 @@ async function runWakeJobInner(payload, jobPath, claimId) {
   if (!["claimed", "dispatching", "queued"].includes(original.state)) {
     return { status: "skipped", reason: "execution_already_admitted", messageId: payload.messageId, jobPath };
   }
-  if (!updateJob(jobPath, { state: "queued", pid: process.pid, runnerPid: process.pid }, claimId)) {
+  if (!updateJob(jobPath, { state: "queued", pid: process.pid, runnerPid: process.pid, runnerIdentity: currentProcessStartIdentity() }, claimId)) {
     return recordOrphanedClaim({ jobPath, claimId, payload, stage: "queue_admission" });
   }
   const heartbeat = startHeartbeat(jobPath, claimId);
@@ -878,11 +880,16 @@ async function rejectWakeTopicBusy(payload, jobPath, slug, claimId, lock) {
 }
 
 async function performWake(payload, jobPath, slug, claimId, timeoutSeconds, stallSeconds) {
-  const prompt = formatPrompt(payload, jobPath);
-
   const attempts = [];
+  // The app's live stream for this message: working, reply so far, finished.
+  let liveURL = null;
+  try { liveURL = new URL("/claude/live", bridgeURL()).toString(); } catch {}
+  const live = createWakeLivePoster({ url: liveURL, tokenPath: TOKEN_PATH, messageIds: [payload.messageId] });
   const pointer = readSessionPointer(slug);
   const requireExistingConversation = payload.requireExistingConversation === true;
+  // Only an explicit expectsReply=false (an FYI) may wait in the inbox for an
+  // open interactive session's next turn; everything else gets answered now.
+  const expectsReply = payload.expectsReply !== false;
   // 2026-09-07: a continuation with no pinned wake session is still deliverable
   // when an interactive Claude is open on this Mac: that live session IS the
   // conversation (the previous message on the topic settled delivered_live into
@@ -891,27 +898,70 @@ async function performWake(payload, jobPath, slug, claimId, timeoutSeconds, stal
   const interactiveForContinuation = requireExistingConversation && !pointer ? liveInteractiveClaudePid() : null;
   const liveContinuationPid = interactiveForContinuation && interactiveForContinuation !== "unavailable" ? interactiveForContinuation : null;
   const continuationUnavailable = requireExistingConversation && !pointer && !liveContinuationPid;
+  // 2026-09-25: that open session only reads the inbox when someone types in
+  // it, so a continuation that expects a reply starts the topic's first
+  // headless session instead, told plainly where the earlier messages are.
+  const inboxContinuation = Boolean(liveContinuationPid) && expectsReply;
+  const prompt = formatPrompt(payload, jobPath) + (inboxContinuation
+    ? `\n\nThis continues topic "${payload.topic || DEFAULT_TOPIC}". Its earlier messages were left in the durable inbox for an interactive session and never ran in a session of their own, so there is none to resume: read that topic's earlier rows in the inbox for context before answering.`
+    : "");
   const hadPointerAtStart = pointer !== null;
   let activePointer = pointer;
   let selfHeal = null;
 
   const attempt = async (attemptPointer) => {
     const isNewSession = !attemptPointer;
-    const sessionId = attemptPointer ? attemptPointer.sessionId : crypto.randomUUID();
-    const sessionArgs = isNewSession ? ["--session-id", sessionId] : ["--resume", sessionId];
-    const cwd = resolveCwd(payload, attemptPointer);
+    let sessionId = attemptPointer ? attemptPointer.sessionId : crypto.randomUUID();
+    let sessionArgs = isNewSession ? ["--session-id", sessionId] : ["--resume", sessionId];
+    let cwd = resolveCwd(payload, attemptPointer);
+    let sessionMode = isNewSession ? "new" : "resume";
     // LIVE-SESSION GUARD. Before ANY externally visible act (no "running"
     // admission, no spawn): if this resumed session is already open on this
     // Mac, hand the message over by leaving it in the durable inbox that the
     // Swift caller already wrote, and say so honestly. A second `claude
     // --resume` of a session a human is sitting in acts unattended in that
     // session's own working tree — the damage this guard exists to prevent.
-    const interactiveProbe = liveInteractiveClaudePid();
+    //
+    // 2026-09-25: an interactive Claude open ELSEWHERE no longer holds a
+    // reply-expecting message. Her inbox hook only runs when someone types in
+    // that session, so "delivered live" meant waiting for the person's next
+    // prompt (181 of 363 wakes). Such a message now runs here in its own
+    // session; only an FYI is left for the open session's next turn.
+    const sessionProbe = isNewSession ? null : liveClaudeSessionPid(sessionId);
+    const sessionPid = sessionProbe === "unavailable" ? null : sessionProbe;
+    const interactiveProbe = sessionPid || expectsReply ? null : liveInteractiveClaudePid();
     const interactivePid = interactiveProbe === "unavailable" ? null : interactiveProbe;
-    const sessionProbe = interactivePid || isNewSession ? null : liveClaudeSessionPid(sessionId);
     const scanUnavailable = interactiveProbe === "unavailable" || sessionProbe === "unavailable";
-    const livePid = interactivePid || (sessionProbe === "unavailable" ? null : sessionProbe);
-    if (livePid || scanUnavailable) {
+    const livePid = sessionPid || interactivePid;
+    // 2026-09-25 (A2A walk 2): a question on a thread whose session is open
+    // (or may be) is answered now from a FORK: `--resume <id> --fork-session`
+    // copies the whole history into a new session id and never touches the
+    // live one. It runs in the lane's own worktree, not the open session's,
+    // and becomes the thread's continuation so later messages keep this
+    // answer in context. Only an FYI is still left for the open session.
+    // Resume-by-id is project-scoped, so the source transcript (under the
+    // cwd the pointer recorded) is copied into the lane worktree's project
+    // first; the copy is removed after the run, and the thread moves to the
+    // fork only once the fork's own transcript exists.
+    let forkSource = null;
+    if (expectsReply && (sessionPid || sessionProbe === "unavailable")) {
+      const forkId = crypto.randomUUID();
+      const forkCwd = resolveCwd({ ...payload, cwd: payload.cwd || payload.defaultCwd }, null);
+      const from = claudeTranscriptPath(attemptPointer.cwd || cwd, sessionId);
+      const to = claudeTranscriptPath(forkCwd, sessionId);
+      forkSource = { present: Boolean(from) && fs.existsSync(from), copy: null };
+      if (forkSource.present && to && to !== from && !fs.existsSync(to)) {
+        try {
+          ensureDir(path.dirname(to));
+          fs.copyFileSync(from, to, fs.constants.COPYFILE_EXCL);
+          forkSource.copy = to;
+        } catch {}
+      }
+      sessionArgs = ["--resume", sessionId, "--fork-session", "--session-id", forkId];
+      sessionId = forkId;
+      sessionMode = "fork";
+      cwd = forkCwd;
+    } else if (livePid || scanUnavailable) {
       // 2026-09-06: an unscannable process table is NOT evidence of a live
       // session. The no-spawn behaviour is deliberate and unchanged, but the
       // receipt must not claim a live delivery it never observed: the message
@@ -921,12 +971,12 @@ async function performWake(payload, jobPath, slug, claimId, timeoutSeconds, stal
         status: presenceUnknown ? "delivered_inbox" : "delivered_live",
         reason: presenceUnknown
           ? "process_scan_unavailable"
-          : interactivePid ? "interactive_claude_live" : "session_open_interactively",
+          : sessionPid ? "session_open_interactively" : "interactive_claude_live",
         detail: presenceUnknown
           ? "Could not scan this Mac for an open Claude session; the message is in the durable inbox and no wake was spawned, so whether a live session will read it is unknown"
-          : interactivePid
-          ? `An interactive Claude is open (pid ${interactivePid}); message left in the inbox for it, no wake spawned`
-          : `Session ${sessionId} is open interactively (pid ${livePid}); message left in the inbox for it, no wake spawned`,
+          : sessionPid
+          ? `Session ${sessionId} is open interactively (pid ${livePid}); the message waits in Claude's inbox until that session's next turn, and no one is answering it yet`
+          : `An interactive Claude is open (pid ${interactivePid}); this FYI waits in her inbox until her next turn, and no wake was spawned`,
         livePid,
         exitCode: null,
         signal: null,
@@ -958,18 +1008,20 @@ async function performWake(payload, jobPath, slug, claimId, timeoutSeconds, stal
       progressTranscriptBytes: null,
       progressTranscriptMtimeMs: null,
       attemptSessionId: sessionId,
-      attemptSessionMode: isNewSession ? "new" : "resume",
+      attemptSessionMode: sessionMode,
     }, claimId);
     if (!admission) {
       return {
         status: "failed", reason: "execution_admission_unrecorded", exitCode: null,
         durationMs: 0, timedOut: false, stalled: false, reply: "", stderrTail: "",
-        sessionId, sessionMode: isNewSession ? "new" : "resume", cwd,
+        sessionId, sessionMode, cwd,
       };
     }
+    live.started();
     // progressAt is the CHILD's liveness, deliberately distinct from
     // heartbeatAt (which only proves the runner is alive).
     const onProgress = ({ at, transcriptBytes, transcriptMtimeMs }) => {
+      live.activity();
       updateJob(jobPath, {
         progressAt: at,
         progressSource: "claude_transcript",
@@ -978,15 +1030,29 @@ async function performWake(payload, jobPath, slug, claimId, timeoutSeconds, stal
       }, claimId);
     };
     const run = await runClaude({
-      prompt, sessionArgs, sessionId, cwd, timeoutSeconds, stallSeconds, onProgress,
+      prompt: sessionMode === "fork"
+        ? `${prompt}\n\nThis runs in a fork of your conversation: the original session is (or may be) open elsewhere, so it was copied, not resumed. Answer here; this fork is where the thread continues.`
+        : prompt,
+      sessionArgs, sessionId, cwd, timeoutSeconds, stallSeconds, onProgress, live,
+      messageId: payload.messageId,
     });
-    const result = classify(run, timeoutSeconds, stallSeconds);
-    return { ...result, sessionId, sessionMode: isNewSession ? "new" : "resume", cwd };
+    let result = classify(run, timeoutSeconds, stallSeconds);
+    if (forkSource) {
+      if (forkSource.copy) { try { fs.rmSync(forkSource.copy, { force: true }); } catch {} }
+      const forked = claudeTranscriptPath(cwd, sessionId);
+      if (result.status !== "failed" && !(forked && fs.existsSync(forked))) {
+        result = { ...result, status: "failed", reason: "fork_transcript_missing" };
+      }
+      // The source is there, so a "no conversation" error is the fork's, not
+      // a lost thread: never rename the pointer aside for it.
+      if (forkSource.present) result = { ...result, forkSourcePresent: true };
+    }
+    return { ...result, sessionId, sessionMode, cwd };
   };
 
-  let outcome = liveContinuationPid ? {
+  let outcome = liveContinuationPid && !inboxContinuation ? {
     status: "delivered_live", reason: "interactive_claude_live",
-    detail: `An interactive Claude is open (pid ${liveContinuationPid}); continuation left in the inbox for it, no wake spawned`,
+    detail: `An interactive Claude is open (pid ${liveContinuationPid}); this FYI continuation waits in her inbox until her next turn, and no wake was spawned`,
     livePid: liveContinuationPid, exitCode: null, signal: null,
     durationMs: 0, timedOut: false, stalled: false, reply: "", stderrTail: "",
     sessionId: null, sessionMode: "live", cwd: null,
@@ -1017,7 +1083,7 @@ async function performWake(payload, jobPath, slug, claimId, timeoutSeconds, stal
     // because the watchdog killed it.
     !outcome.stalled &&
     outcome.reason !== `timeout_after_${timeoutSeconds}s` &&
-    sessionGone(outcome.stderrTail)
+    sessionGone(outcome.stderrTail) && !outcome.forkSourcePresent
   ) {
     const stalePath = renameSessionPointerAside(slug);
     selfHeal = {
@@ -1085,7 +1151,7 @@ async function performWake(payload, jobPath, slug, claimId, timeoutSeconds, stal
   // An explicit continuation may not silently become a fresh conversation,
   // even when the provider proves that its old session no longer exists.
   if (requireExistingConversation && activePointer && outcome.status === "failed"
-      && !outcome.timedOut && !outcome.stalled && sessionGone(outcome.stderrTail)) {
+      && !outcome.timedOut && !outcome.stalled && sessionGone(outcome.stderrTail) && !outcome.forkSourcePresent) {
     outcome = { ...outcome, reason: "continuation_unavailable" };
   }
 
@@ -1100,9 +1166,9 @@ async function performWake(payload, jobPath, slug, claimId, timeoutSeconds, stal
   }
 
   let pointerPath = null;
-  if (outcome.sessionMode === "new" && outcome.status !== "failed") {
+  if ((outcome.sessionMode === "new" || outcome.sessionMode === "fork") && outcome.status !== "failed") {
     pointerPath = writeSessionPointer(slug, outcome.sessionId, outcome.cwd);
-  } else if (outcome.sessionMode === "resume") {
+  } else if (outcome.sessionMode === "resume" || outcome.sessionMode === "fork") {
     pointerPath = sessionPointerPath(slug);
   }
   // Pointer-integrity check (the agent's correction): a wake on a topic that HAD
@@ -1114,6 +1180,9 @@ async function performWake(payload, jobPath, slug, claimId, timeoutSeconds, stal
     : "ok";
 
   const completionText = formatCompletionForAgent(outcome, payload);
+  // An FYI left in the inbox is not "working": end the live stream with where it is.
+  if (outcome.status === "delivered_live") live.finished("waiting in Claude's inbox until her next turn");
+  else if (outcome.sessionMode !== "live") live.finished(outcome.status);
   // The run is terminal from here on; only delivery + settlement remain. Say
   // so on the job file BEFORE the POST, so a mid-delivery observer reads the
   // truth ("run ended at X, delivering") instead of a bare "claimed" with a
@@ -1612,7 +1681,6 @@ const {
   AGENT_NAME,
   BRIDGE_DESCRIPTOR_PATH,
   BRIDGE_MESSAGE_PATH,
-  DEFAULT_BRIDGE_URL,
   DEFAULT_TOPIC,
   TOKEN_PATH,
   missingWakeCompletionOrigin,

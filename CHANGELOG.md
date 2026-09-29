@@ -4,6 +4,50 @@ Reverse-chronological. Each phase: 1–2 lines.
 
 ---
 
+## Unreleased
+
+## 0.4.19 — native everywhere (2026-09-28)
+
+### Native
+- Chat box words are real Mac menus (model cascade by provider/company, think, trust; context popover); segmented view switch; Conversations and Simple sidebar are system lists; system search fields, folds, grouped lists, right-click menus and colours; clear glass; Simple new-chat button.
+
+### Chat
+- No end-of-reply freeze; the reply settles when it is done; `/` menu keeps typing; Command-F uses the system search field.
+
+### Telegram
+- Replies grow in one message (edits every second); the transcribing note clears.
+
+### Agents
+- Replies come back on their own (including sends made while talking with another agent); approval-held conversations and restart-cut agents heal themselves; desktop-app agents time out at three minutes; bridge notes hidden from chat; Full Mac covers card-resumed turns and agent-to-agent messages (coding agents still ask).
+
+### iPhone
+- The iPhone app wears the Mac's look: the drifting haze behind every screen (same seven colours, picker in Settings), chat that reads like Simple view with one menu, and every tab and settings page rebuilt in one calm style with plain first-person words; an unpaired phone says so once.
+- Every page on iPhone's own lists; one row per item in Inbox/Approvals/Desk with swipe to dismiss; detail and new-item sheets native; follows the Mac's open chat; drafts stay with their chat.
+
+### Doctor
+- One Repair button: runs every check, fixes what is broken, opens the page when a sign-in or model choice needs you; no false warnings.
+
+### Self-healing
+- A reply cut off by a quit leaves one "say continue" line; setup cards don't stop the turn and show in chat, Activity and the phone; approvals report their result; errors say how to fix them.
+
+### iPhone remote
+- Trust level, scheduled jobs, connectors, helpers, Telegram and providers from the phone; every approval card pushes to the phone and can be decided there.
+
+### Speed
+- Most-used tools always ready and Claude's cache lasts an hour, so requests are mostly served from the prompt cache on every provider.
+
+### Smaller
+- Claude Sonnet 5.5; Clawd icon for Claude rows; guarded deletes for reminders and shared tasks; scheduler pause vs cancel, edits, one-off dates; list totals; newest-first memories; clipboard cap; inbox mail always opens; old GitHub sign-ins self-repair; daily off-disk backup check.
+
+### Fixes
+- Providers and Trust pages no longer crash under accessibility reads. Engine split into sealed Core modules (no behaviour change).
+
+
+### The agent's hands
+- Uses the Mac like a person: an app comes forward when a menu, key, drag or real click needs it (never while you're using the Mac), menus work in apps with no window, shortcuts reach an open sheet, and controls deep inside Electron and Chrome apps are found by name first try.
+- A message written in the same step as the actions it reports on waits for their results, so a "done" can't go out before the work did.
+- Fixed a crash when reading text off a screenshot.
+
 ## 0.4.18 — a desktop of its own, and a simpler way in (2026-09-25)
 
 - First run: opens in Simple view; the agent asks what it should be and how it should sound (energetic, calm, playful, blunt, or like someone you name) and saves both; its first hello offers card-led setup by talking. The agent's name holds across relaunch; a failed first hello retries.

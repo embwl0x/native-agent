@@ -10,7 +10,7 @@ import PersistenceCore
 // entry. When the registry is absent (the production default) or doesn't know
 // the tool, dispatch falls back to the existing DORMANT-PROXY HTTP path.
 //
-// This is the per-action migration seam CUTOVER_PLAN §6.11 promised: each
+// This is the per-action migration seam: each
 // connector action ports independently without re-touching the dispatcher
 // infrastructure. NOTHING wires this into a production caller — the default
 // `makeDispatcher` factory passes `localActions: nil`. A later wave flips it on.

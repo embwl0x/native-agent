@@ -78,8 +78,8 @@ extension NativeClient {
         if migratedModel?.isEmpty == false || migratedEffort?.isEmpty == false {
             var body: [String: JSONValue] = ["surface": .string("telegram")]
             if let migratedModel, !migratedModel.isEmpty {
+                // S12a: the model only; Telegram keeps its chosen route.
                 body["model"] = .string(migratedModel)
-                body["inferProvider"] = .bool(true)
             }
             if let migratedEffort, !migratedEffort.isEmpty {
                 body["reasoningEffort"] = .string(migratedEffort)
@@ -133,6 +133,7 @@ extension NativeClient {
     /// returns nil for both absent and invalid files, so distinguish those
     /// cases before inheriting a saved token or replacing the configuration.
     private static func validateExistingTelegramConfiguration(at root: URL) throws {
+        try TelegramBot.TelegramConfig.validateSavedConfiguration(dataRoot: root)
         let url = root
             .appendingPathComponent("telegram", isDirectory: true)
             .appendingPathComponent("config.json")
@@ -194,8 +195,7 @@ extension NativeClient {
             throw error
         }
         try await recordTelegramTestSuccess(root: root)
-        let data = try JSONEncoder().encode(result.rawResponse)
-        var response = try JSONDecoder().decode(TelegramTestResponse.self, from: data)
+        var response = try TelegramTestResponse(result: result)
         let loopStatus = await backgroundLoopsManager.status()
             .first { $0.loopId == "telegram_poll" }
         response.tokenConfigured = !configuration.botToken.isEmpty
@@ -220,9 +220,10 @@ extension NativeClient {
         try await impl.clearLogs()
         let clearedAt = try await recordTelegramDiagnosticsCleared(root: root)
         // Read the same complete mounted-root status the settings panel uses.
-        // TelegramBot's transport status is intentionally compact and cannot
-        // be decoded as this app's diagnostic-rich TelegramStatus.
-        var status = try await getTelegramStatus()
+        // The facade combines core transport status with the bounded feeds.
+        var status = try await TelegramFacade(
+            dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        ).load(manager: backgroundLoopsManager.coreManager)
         status.lastDiagnosticsClearedAt = clearedAt
         return TelegramDiagnosticsClearReceipt(
             clearedAt: clearedAt,

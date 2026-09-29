@@ -6,7 +6,7 @@ extension MacFourVerbs {
     /// resolve its display label again: the canonical action owner checks the
     /// frame, app, window and handle for drift before injecting anything.
     public func actSelection(verb: String, handle: String, frameID: String,
-                             text: String? = nil, direction: String? = nil) async -> MacFourVerbsReply {
+                             text: String? = nil, mode: MacTypeMode = .replace, direction: String? = nil) async -> MacFourVerbsReply {
         guard ["click", "open", "type", "select", "toggle", "scroll"].contains(verb),
               !handle.isEmpty, !frameID.isEmpty else {
             return .init(ok: false, text: "That selection is incomplete. Look again and select a current control.",
@@ -14,6 +14,7 @@ extension MacFourVerbs {
         }
         var body: [String: JSONValue] = ["verb": .string(verb), "handle": .string(handle), "frame_id": .string(frameID)]
         if let text { body["text"] = .string(text) }
+        body["mode"] = .string(mode.rawValue)
         if let direction { body["direction"] = .string(direction) }
         do {
             let result = try await host.dispatch(action: "act", body: body)

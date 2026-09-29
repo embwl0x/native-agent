@@ -32,6 +32,14 @@ extension SwiftNativeMacControl {
                 viaSwift: true
             )
         }
+        // Her-screen 09-25 — the app an act just brought forward, by pid: if
+        // the person has switched apps since, nothing lands in theirs.
+        if let pid = Self.intValue(body, "require_front_pid") {
+            guard let front = accessibilitySource.frontmostApp(), Int(front.processIdentifier) == pid else {
+                return .refused(refuse("front_changed", "That app is no longer in front, so nothing was pressed."))
+            }
+            return .app(front)
+        }
         guard let requested = body.stringValue("app")?
             .trimmingCharacters(in: .whitespacesAndNewlines), !requested.isEmpty else {
             guard let front = accessibilitySource.frontmostApp() else {
@@ -290,6 +298,13 @@ extension SwiftNativeMacControl {
                 )
             }
         }
+        // Again right before the press: the revalidation above takes ~150 ms.
+        if requireFront, accessibilitySource.frontmostApp()?.processIdentifier != app.processIdentifier {
+            return refuse("front_changed", "\(app.name) is no longer in front, so nothing was pressed.")
+        }
+        guard craftDocumentMatches(pid: app.processIdentifier) else {
+            return refuse("craft_document_changed", "The craft document changed; Save was not pressed.")
+        }
         let outcome = accessibilityActSource.perform(target, action: "AXPress")
         guard outcome == .performed else {
             return refuse(
@@ -352,7 +367,14 @@ extension SwiftNativeMacControl {
             "types": MacClipboardRead.typesJSON(contents.types),
             "has_non_text": .bool(MacClipboardRead.hasNonTextTypes(contents.types)),
         ]
-        if let raw = contents.text {
+        if maxChars == 0 {
+            output["has_text"] = .bool(contents.text != nil)
+            output["text"] = .null
+            output["chars"] = .int(Int64(contents.text?.count ?? 0))
+            output["returned_chars"] = .int(0)
+            output["truncated"] = .bool(!(contents.text?.isEmpty ?? true))
+            output["metadata_only"] = .bool(true)
+        } else if let raw = contents.text {
             let redaction = MacClipboardRead.redacted(raw)
             let cut = MacClipboardRead.truncated(redaction.text, maxChars: maxChars)
             output["has_text"] = .bool(true)

@@ -52,132 +52,20 @@ enum AppRelauncher {
             return
         }
         // The helper is now waiting on our PID; quitting triggers the relaunch.
-        NSApplication.shared.terminate(nil)
+        // From the run loop, not this call's stack: callers include MainActor
+        // tasks, and a quit held for in-flight turns must not sit inside a
+        // main-queue block (the main queue could not drain until it ended).
+        RunLoop.main.perform(inModes: [.common]) { MainActor.assumeIsolated { NSApplication.shared.terminate(nil) } }
     }
 }
 
-enum MainWindowRestartToolbarPresentation: Equatable {
-    case ready
-    case confirming
-    case relaunching
-    case failedToStart
-
-    var showsConfirmation: Bool {
-        self == .confirming
-    }
-
-    var isActionEnabled: Bool {
-        self != .relaunching
-    }
-
-    var failureMessage: String? {
-        guard self == .failedToStart else { return nil }
-        return "Restart couldn't start. NativeAgent is still running — try again."
-    }
-
-    mutating func requestConfirmation() {
-        guard isActionEnabled else { return }
-        self = .confirming
-    }
-
-    mutating func cancelConfirmation() {
-        guard self == .confirming else { return }
-        self = .ready
-    }
-
-    mutating func beginRelaunch() {
-        guard self == .confirming else { return }
-        self = .relaunching
-    }
-
-    mutating func markStartFailure() {
-        guard self == .relaunching else { return }
-        self = .failedToStart
-    }
-}
-
-struct MainWindowRestartToolbarButton: View {
-    let presentation: MainWindowRestartToolbarPresentation
-    let requestConfirmation: () -> Void
-
-    var body: some View {
-        VStack(alignment: .trailing, spacing: 3) {
-            Button(action: requestConfirmation) {
-                Label(
-                    presentation == .relaunching ? "Restarting NativeAgent…" : "Restart App",
-                    systemImage: "arrow.triangle.2.circlepath"
-                )
-            }
-            .accessibilityIdentifier("mainWindow.restartToolbarButton")
-            .help("Relaunch NativeAgent")
-            .disabled(!presentation.isActionEnabled)
-
-            if let failureMessage = presentation.failureMessage {
-                Text(failureMessage)
-                    .font(.caption2)
-                    .foregroundStyle(.red)
-                    .accessibilityIdentifier("mainWindow.restartToolbarButton.failure")
-            }
-        }
-    }
-}
-
-// PATCH-2026-05-29: restart-controls — wraps ContentView so the main Window
-// gets an ever-present top toolbar (health dot + Restart App).
-// The toolbar state (runtime health poll, restart-app confirmation) lives here because
-// the controller is intentionally NOT ObservableObject — we poll isRunning on a
-// timer instead. ContentView itself lives in another file and is left untouched.
+// Wraps ContentView so the main window draws the shell's chrome behind it.
+// Restart App is a worded item in the menu bar's NativeAgent menu
+// (NativeAgentApp.swift), reachable even when this window is closed.
 struct MainWindowContent: View {
-    // The Mac app process is the runtime now; the only restart control is
-    // "Restart App".
-    @State private var restartPresentation: MainWindowRestartToolbarPresentation = .ready
-    @AppStorage(NativeAgentShellPreference.classicShellKey) private var classicShell = false
-
     var body: some View {
         ContentView()
-            .background {
-                if !classicShell { ShellWindowChrome() }
-            }
-            // Agent, 2026-09-02, glyph diet: in the new shell the window title
-            // bar showed a bare circular-arrows glyph and the » that AppKit
-            // adds when the item behind it will not fit — two marks, no words,
-            // for an action nobody is looking for in a title bar. Restart App
-            // is not lost: it is a worded item in the menu bar's NativeAgent
-            // menu (NativeAgentApp.swift), which is reachable even when this
-            // window is closed. The classic shell keeps the button here.
-            .toolbar {
-                if classicShell {
-                    ToolbarItemGroup(placement: .primaryAction) {
-                        MainWindowRestartToolbarButton(presentation: restartPresentation) {
-                            restartPresentation.requestConfirmation()
-                        }
-                    }
-                }
-            }
-            .alert("Restart NativeAgent?", isPresented: restartConfirmationBinding) {
-                Button("Cancel", role: .cancel) {
-                    restartPresentation.cancelConfirmation()
-                }
-                Button("Restart", role: .destructive) {
-                    restartPresentation.beginRelaunch()
-                    AppRelauncher.relaunchApp(onSpawnFailure: {
-                        restartPresentation.markStartFailure()
-                    })
-                }
-            } message: {
-                Text("This relaunches the app.")
-            }
-    }
-
-    private var restartConfirmationBinding: Binding<Bool> {
-        Binding(
-            get: { restartPresentation.showsConfirmation },
-            // The alert's explicit Cancel action owns dismissal. Keeping this
-            // setter inert prevents SwiftUI's automatic `false` write from
-            // racing the destructive action and clearing `.confirming`
-            // before it can transition to `.relaunching`.
-            set: { _ in }
-        )
+            .background { ShellWindowChrome() }
     }
 }
 

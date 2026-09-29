@@ -1,6 +1,8 @@
 import Foundation
 import SwiftUI
 import PersistenceCore
+import Desk
+import GitHubConnector
 
 // MARK: - DeskInteraction — the pure half of the desk's interaction tier
 //

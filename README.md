@@ -4,8 +4,10 @@
   <img src="Resources/AppIcon.iconset/icon_128@2x.png" width="128" alt="NativeAgent app icon">
 </p>
 
-NativeAgent is a personal agent for Mac, with conversation, memory, and tools
-for getting things done. An iPhone companion connects to the same agent.
+NativeAgent is a personal agent for Mac: one persistent agent with
+conversation, memory, and tools for getting things done. An iPhone companion,
+Telegram, Slack, a Chrome extension and local coding-agent bridges all reach the
+same agent.
 
 ## First run
 
@@ -14,327 +16,142 @@ account.
 
 1. Download the latest DMG from the
    [releases page](https://github.com/embwl0x/native-agent/releases), open it,
-   and drag NativeAgent to Applications. Open NativeAgent.
-2. Enter your name and the agent's name. **What the agent can help with · Optional**
-   expands an overview if you want one.
-3. Connect one AI account during setup, then finish onboarding. If you skip
-   connecting, open **Providers** on the left rail before chatting.
-4. On a fresh public install, the agent opens **Chat** and asks what it should be
-   for you; your answer can become one saved line shown beside the conversation.
-5. Skip that question to start your own task. If no account is connected,
-   **Open Providers** takes you to setup; a stalled browser sign-in offers **Cancel**.
+   drag NativeAgent to Applications, and open it.
+2. Enter your name and the agent's name. **What the agent can help with ·
+   Optional** expands an overview.
+3. Connect one AI account, or skip and connect later.
+4. The app opens in **Simple** view. The agent asks what it should be for you
+   and how it should sound, then offers to set things up by talking: anything it
+   needs (a provider, a connector, Chrome, iPhone, a macOS permission) arrives as
+   a card in the chat and settles once the grant is really in place.
 
-Connect one AI account to start chatting. **Work** and **Memory and mind** follow
-**Chat** unless you choose otherwise in **Providers**. Manage access in **Trust**;
-individual Mac permissions are under **Trust → Mac integration**.
+## Three views
 
-The composer has three words for model, thinking and Trust; each opens its own
-card. Choose a provider to browse its models; Fast lives in the model card.
-The context ring shows percent used and token counts on hover.
+The switch at the window's top right picks one:
 
-For Chrome, use **Trust → Set up Chrome** to load the extension bundled with
-the app. There is no second download; follow the [setup steps](Extensions/NativeAgentChrome/README.md).
+- **Simple** — the agent, the other agents it talks to, and its helpers on one
+  panel beside the chat. There are no settings pages here; ask the agent, or
+  use the gear at the foot of the panel for the colour of the light, warmth in
+  the glass (in dark mode), and **More settings**, which opens Settings in
+  Advanced.
+- **Advanced** — the full app. A rail on the left holds Chat, Today, Memories,
+  Desk, Notifications and Helpers, then Personality, Providers, Trust,
+  Connectors, Capabilities and Diagnostics, with Settings at the foot. Related
+  controls are tabs inside those pages (for example **Trust → Mac integration**
+  and **Connectors → iPhone**). **Command-K** reaches any page.
+- **Agent** — a read-only window onto the agent's own desktop: what it sees
+  when it works.
 
-See the [User Guide](docs/USER_GUIDE.md) for the default rail routes, optional
-settings, and the classic sidebar. Architecture and contributor details follow
-below.
+A fresh install starts in Simple; an install that already has chats starts in
+Advanced. The [User and Agent Guide](docs/USER_GUIDE.md) walks through every
+page.
 
-The same agent can continue through Mac chat, detached conversations, iPhone,
-Telegram, Slack, and authenticated local bridges. Provider, context, tool,
-trust, transcript, and receipt rules converge on the same orchestration path.
-
-> NativeAgent is an advanced single-operator project. The source, tests,
-> personal install flow, public-export gate, Developer ID/notarization pipeline,
-> and signed-update machinery are real. The public source repository and a
-> notarized binary GitHub Release are live; connector depth varies, so see
-> [Project Status](PROJECT_STATUS.md) for the honest capability ledger.
-> Current change ledger: [Changelog](CHANGELOG.md).
+In the composer, the words for model, thinking and Trust each open their own
+card. The context ring shows how much of the context window is in use, with
+token counts on hover.
 
 ## What exists today
 
 | System | Current behavior |
 |---|---|
-| Native runtime | `NativeAgent.app` owns the complete Swift runtime in-process. There is no Python agent daemon, launchd-owned brain, or LAN fallback. |
-| Fluid Context | Registered persona/skill sources and canonical MemoryV2/Desk projections compile into immutable SQLite generations and a bounded in-memory arena. Cognition supplies bounded turn-time attention and posture separately; this is not a repository-wide document crawl or a second memory store. Settings exposes Active, Observe Only, and Off without changing the selected conversation model. |
-| Memory | MemoryV2 provides SQLite-backed durable memory, lexical and semantic recall, a knowledge graph, reviewed proposals, hygiene, consolidation, and a generated user-profile projection. |
-| Cognitive substrate | Optional bounded continuity, affect, mood, thought seeds, standing views, self-exemplar voice, reflection receipts, and felt context. |
-| Organism Kernel | Optional body state derived from real runtime events and health: chemistry, body schema, predictions, dream repair, review-gated reflexes, and pressure-aware background posture. |
-| Desk | One durable work system for user-directed tasks and the agent's own pursuits, with large-project breakdowns, dependencies, bridge references, schedules, research, multi-step execution, checkpoints, approvals, receipts, and verified completion. |
-| Tools and skills | Lazy, policy-aware tools cover files, shell, Mac apps, browser, memory, research, GitHub, workflows, notifications, images, MCP, and more. A compact skill manifest is always visible; one relevant procedure body is loaded only when needed, and the agent creates or updates procedures through the canonical skill writer rather than private files. Swarm workers default to read-only reasoning and may inherit the same gated tool path for real work without gaining new authority. Skills can guide behavior but never grant tools, permissions, approval bypasses, or safety authority. |
-| Mac computer control | `screen`, `act`, `go`, and `wait` expose named, bounded computer use over fused accessibility and pixel evidence. Native input supports clicks, typing, four-direction scrolling, paced drags, explicit mouse buttons, and coordinated key holds. Fresh target resolution, redaction, user takeover, balanced input release, and truthful outcome receipts remain in force under the selected trust mode. Limited visual/motion evidence is not perfect perception or game-play proof. |
-| Chrome control | An optional, default-off extension operates exact leased Chrome tabs, including inactive tabs, through structured snapshots and snapshot-scoped actions. The Swift relay is transport only; the app owns authority, and user interaction yields the tab lease. NativeAgent's visible WebKit browser remains a separate surface. |
-| Activity watcher | Optional, off by default: a local, metadata-only record of the frontmost app and redacted window title (no screenshots, no OCR, no model calls, event-driven ~0% CPU). Enabling is structural consent through Trust Center only; the store is excluded from every export, backup, and support bundle; `activity_query` answers "what was I working on" on allowlisted surfaces, and results never enter the agent's long-term memory. |
-| Surfaces | Mac chat, detached chat windows, iPhone/iPad, Telegram, Slack, local Codex/Claude Code bridges, and background work share the same agent factory and policy boundaries. |
-| Agent conversations | One lazy interface finds, messages and reads coding agents, bots and connected peers; A2A, MCP and nativeagent-link support persistent inbound conversations. |
-| Providers | ChatGPT OAuth, Codex CLI, OpenAI API, Anthropic OAuth/API, xAI OAuth, Moonshot API, and OpenRouter have distinct model/capability contracts. Current verified catalogs include GPT-5.6 variants, Claude 5/Fable/Opus, Grok 4.5, and Kimi K3. Moonshot keys stay Mac-local and refresh the account-visible Kimi model list. Swarms default to the provider/model selected for the Swarms surface; the agent may choose explicit worker models when useful. |
-| Connectors | Telegram, Slack, GitHub, X, Gmail, Google Calendar, Notion, local workspaces, Mac apps, and the visible browser have explicit setup and proof boundaries. Gmail, Calendar, and Notion reads are bounded and lazy-loaded; public users provide their own OAuth app or integration token locally. |
-| Trust | TrustCenter, SecurityCenter, Full Mac gates, connector proof, approval replay, exact receipts, signed iOS actions, and fail-closed persistence boundaries remain authoritative. |
+| Native runtime | `NativeAgent.app` owns the complete Swift runtime in-process. There is no agent daemon, launchd-owned brain, or LAN fallback. |
+| Memory | MemoryV2: SQLite-backed durable memory, lexical and semantic recall, a knowledge graph, reviewed proposals, hygiene and consolidation. The embedding model ships inside the app. |
+| Fluid Context | Persona, skill, memory and Desk sources compile into rebuildable context generations; **Settings → Memory in every reply** chooses Active, Observe Only or Off. |
+| Desk | One durable work system for user tasks and the agent's own pursuits: breakdowns, dependencies, schedules, checkpoints, approvals, receipts and verified completion. |
+| Tools and skills | A short always-on tool set rides every request; everything else loads lazily and leaves when unused ([Tool loading](docs/TOOL_LOADING.md)). Skills guide behavior but never grant tools or permissions. |
+| Mac computer control | `screen`, `act`, `go` and `wait` operate the Mac through accessibility and pixel evidence, under the selected Trust mode, with user takeover and truthful receipts. |
+| Chrome control | An optional extension, bundled with the app, operates leased Chrome tabs through structured page snapshots. **Trust → Set up Chrome** installs it. |
+| Helpers | Standing helpers (bots) with their own brief, model and conversation, run on a schedule, on a GitHub or Slack event, or on demand. |
+| Agent conversations | One interface finds, messages and reads coding agents, helpers and connected peers; A2A, MCP and nativeagent-link peers get persistent conversations. See [Agent conversations](docs/agent-communication.md). |
+| Providers | ChatGPT/Codex, OpenAI API, Anthropic, xAI, Moonshot and OpenRouter. Each group (Chat, Work, Memory and mind) runs on one choice; nothing silently falls back to another model. |
+| Connectors | Telegram, Slack, GitHub, X, Gmail, Google Calendar, Notion, shared folders and Mac apps, each with explicit setup and proof. Public users bring their own OAuth app or token. |
+| Trust | Four presets (Safe, Work mode, Builder, Full Mac), per-feature permissions, approvals and receipts. macOS privacy permissions stay separate. |
+| Inner life | Optional, bounded cognition and Organism Kernel layers that shape attention and tone; they never grant permissions. **Settings → An inner life** switches them. |
 
-Local bridge clients should read `~/.config/claude-bridge/bridge.json`. NativeAgent prefers port 8771, advances when it is occupied, and publishes the actual loopback URL and bearer token together rather than requiring clients to assume a fixed port.
-The authenticated return listener is normal app infrastructure and starts on
-every launch; it is not hidden behind Developer Mode. Loopback-only binding,
-the private per-launch bearer, TrustCenter, approvals, and effect-time checks
-remain the authority boundaries.
+For how the pieces fit, read [NativeAgent Internal Workings](docs/INTERNAL_WORKINGS.md)
+and [Anatomy of a NativeAgent Turn](docs/ANATOMY_OF_A_TURN.md). The product
+philosophy is [docs/NORTHSTAR.md](docs/NORTHSTAR.md); where things stand is in
+[Project Status](PROJECT_STATUS.md).
 
-Inbound peers use separate conversations with the agent's memory and context.
-Requests that change things ask for approval unless that peer has explicit
-elevation in **Trust → Connected agents**; approval cards name the requester.
-See [Agent conversations](docs/agent-communication.md) for supported protocols,
-connection setup and recovery limits.
+## Codex and Claude Code as specialist builders
 
-For serious repository work, the Codex and Claude Code bridges wake real,
-context-bearing coding sessions—not raw one-shot model calls—then return the
-builder's result to the originating NativeAgent session for canonical
-verification. The [builder bridge guide](docs/USER_GUIDE.md#codex-and-claude-code-as-specialist-builders)
-explains the division of labor, session continuity, permissions, and receipts.
-NativeAgent ships the bridge workers themselves. Each user installs and signs
-into Codex CLI and/or Claude Code on that Mac; Node.js is the small local
-runtime those bundled workers use. NativeAgent discovers common user-local
-install locations even when a Finder-launched app receives a minimal shell
-`PATH`. The catalog reports execution prerequisites and the live return path
-separately, so an installed CLI is never mistaken for a working round trip. It
-never copies another computer's builder history or credentials.
+For serious repository work, the agent can hand a bounded work order to a real,
+context-bearing Codex or Claude Code session and get the result back in the
+conversation that asked. NativeAgent ships the bridge workers; each user
+installs and signs into Codex CLI and/or Claude Code on that Mac, plus Node.js.
+Local bridge clients read `~/.config/claude-bridge/bridge.json` for the actual
+loopback URL and bearer token rather than assuming a port. The
+[builder guide](docs/USER_GUIDE.md#codex-and-claude-code-as-specialist-builders)
+covers sessions, permissions and receipts.
 
-With Full Mac YOLO active, the agent can explicitly place native tools, Codex,
-or Claude Code in an existing project outside NativeAgent's default workspace.
-This removes NativeAgent's workspace confinement; it does not bypass Apple's
-separate privacy controls. Projects under Documents, Desktop, Downloads, or
-other protected locations may first require approval in macOS **Privacy &
-Security → Files & Folders** or **Full Disk Access**.
+With Full Mac access the agent may target an existing project outside its
+default workspace. That does not bypass Apple's privacy controls: projects under
+Documents, Desktop or Downloads may still need **Privacy & Security → Files &
+Folders** or **Full Disk Access**.
 
-The detailed, evidence-backed inventory lives in
-[docs/CAPABILITIES.md](docs/CAPABILITIES.md).
-For a compact operational map—including every main page, trust modes, mobile
-pairing, connectors, lazy skills/tools, and how to enable the Subconscious and
-Organism—read the [User and Agent Guide](docs/USER_GUIDE.md).
+## iPhone and iPad
 
-## One runtime, one mind
+The companion is a remote cockpit for the same agent: signed chat and actions,
+streamed progress, Desk, approvals, activity, memory, provider controls and
+lock-screen notifications. On the Mac open **Connectors → iPhone** (in Simple
+view, ask the agent); on the phone choose **Connect via iCloud**. Transport is
+Apple-native (iCloud/CloudKit, signed envelopes) with no LAN HTTP fallback. See
+[docs/mobile_companion.md](docs/mobile_companion.md).
 
-```text
-Mac / iPhone / Telegram / Slack / local bridge
-  -> shared chat and provider orchestration
-  -> Fluid Context packet + bounded continuity
-  -> model + lazy tool loop
-  -> TrustCenter / approvals / file and Mac gates
-  -> transcript, receipts, memory, cognition, organism feedback
-  -> Desk, notifications, and cross-surface delivery
-```
+## Install
 
-The architectural rule is simple: durable identity stays in persona and
-MemoryV2; Fluid Context is rebuildable circulation; cognition and organism
-state are bounded advisory layers; all actions still cross trust and approval
-boundaries. No subsystem becomes a second hidden agent.
+Download the notarized DMG from the
+[releases page](https://github.com/embwl0x/native-agent/releases). Installed
+copies update in place through **Check for Updates…** (Sparkle, EdDSA-signed
+feed). The [Changelog](CHANGELOG.md) lists what each release contains.
 
-For one connected explanation of context, memory, safe action, growth,
-specialist delegation, and cross-surface continuity, read
-[NativeAgent Internal Workings](docs/INTERNAL_WORKINGS.md). For the exact path
-of one message, read
-[Anatomy of a NativeAgent Turn](docs/ANATOMY_OF_A_TURN.md).
+### From source
 
-Read [docs/NORTHSTAR.md](docs/NORTHSTAR.md) for the product philosophy and
-[docs/ARCHITECTURE_BLUEPRINT.md](docs/ARCHITECTURE_BLUEPRINT.md) for the source
-ownership map.
-
-## One causal language for the outside world
-
-NativeAgent gives the configured agent one stable way to understand actions and outcomes even
-when the wire protocol changes:
-
-```text
-native tool / MCP / webhook / connector
-  -> transport evidence + bounded action identity
-  -> canonical domain owner
-  -> shared phase and verification readout
-  -> receipt + replay-safe resident consequence
-```
-
-This is a translation contract, not a universal integration owner. A received
-MCP response or HTTP `200` proves that a protocol exchange occurred; it does
-not by itself prove that a message was delivered, a file changed, or an
-external action settled. Desk execution, Browser, Mac Control, messaging, GitHub, and
-other domains retain authority over their own state and verification.
-Completion callbacks are correlation evidence, not settlement: for example,
-GitHub Command binds work to the observed actionable event and accepts only a
-later authoritative GitHub read that clears that event.
-
-The result is one causal vocabulary across Mac, iPhone, messaging surfaces,
-tools, and future external adapters without creating another agent, event
-store, scheduler, approval path, or shadow source of truth. For integrated
-actions, the agent can interpret `proposed`, `running`, `waiting_external`,
-`verifying`, `succeeded`, `failed`,
-and the separate verification state consistently, while TrustCenter,
-approvals, effect-time validation, receipts, and domain verification keep their
-existing authority.
-
-## Requirements
-
-- Apple-silicon Mac
-- macOS 26 (Tahoe) or newer
-- An AI provider account; ChatGPT OAuth can use an existing subscription
-- For source builds: Git and Xcode or the matching Swift 6 command-line toolchain
-- For iOS builds/tests: Xcode and an available iPhone simulator
-- Optional: `gitleaks` for the repository privacy guard
-- Optional: Xcode signing, iCloud, and APNS configuration for the iPhone app
-
-## Install the app (recommended)
-
-Download the latest notarized DMG from the
-[releases page](https://github.com/embwl0x/native-agent/releases), open it,
-and drag NativeAgent to Applications. The app is Developer ID signed and
-notarized; installed copies update in place via **Check for Updates…**
-(Sparkle, EdDSA-signed feed). See the [Changelog](CHANGELOG.md) for
-what each release contains.
-
-## Install from source
+Requirements: an Apple-silicon Mac on macOS 26+, Git, and Xcode or the matching
+Swift 6 toolchain. Optional: `gitleaks` for the privacy hook; Xcode signing,
+iCloud and APNS configuration for the iPhone app.
 
 ```bash
 git clone https://github.com/embwl0x/native-agent.git
 cd native-agent
-
-# Recommended for contributors: installs the staged-secret/privacy hook.
-bash script/hooks/install.sh
-
-# Builds, signs with the available local configuration, installs to
-# ~/Applications/NativeAgent.app, and launches the Swift runtime.
-./script/install_app.sh
-```
-
-The installer creates blank-slate local persona/data/workspace roots when
-needed. An app-only/public install keeps all agent work under
-`~/Library/Application Support/NativeAgent/workspace`; a verified source-backed
-development install uses the checkout's `workspace/`. Runtime state,
-credentials, generated images, private persona material, and work products are
-ignored by Git and must never be committed.
-
-After launch, follow [First run](#first-run) above. Optional background and
-memory settings are described in the [User Guide](docs/USER_GUIDE.md#optional-background-and-memory-settings).
-
-The personal installer is not the public distribution pipeline. Signed and
-notarized DMG work is documented in
-[docs/release_setup.md](docs/release_setup.md).
-
-## Public releases and updates
-
-NativeAgent's permanent Apple distribution family is
-`io.github.embwl0x.nativeagent.mac` for Mac,
-`io.github.embwl0x.nativeagent.ios` for iPhone/iPad, and
-`iCloud.io.github.embwl0x.nativeagent` for their shared CloudKit continuity.
-The visible product and configured agent names remain independent of these
-internal identifiers.
-
-Public installs use Sparkle 2 with an EdDSA-signed appcast. The application menu
-and Settings → About expose the same update controller. A published release
-checks automatically and offers **Check for Updates…**; a local or feedless
-build says **About Software Updates…** and explains why it cannot update instead
-of contacting a placeholder URL.
-
-Updating GitHub source does not silently replace installed applications. After
-committing the intended `VERSION` with the reviewed changes, the maintainer
-creates and publishes the scrubbed public export, then runs the production
-release command from that clean export:
-
-```bash
-NATIVEAGENT_GITHUB_REPOSITORY=embwl0x/native-agent \
-NATIVEAGENT_NOTARY_KEYCHAIN_PROFILE=NativeAgent-notarytool \
-./script/release_github.sh
-```
-
-That command builds and Developer-ID signs the app, notarizes and staples it,
-signs the update with the offline Sparkle key, uploads the exact DMG, appcast,
-test receipt, and release attestation to a draft GitHub Release, reads all four
-assets back, publishes the release, and
-verifies the unauthenticated URLs installed clients will use. It refuses a
-private repository, unpushed source, dirty tree, missing notarization identity,
-or mismatched update bytes. `./script/release_github.sh --preflight` reports
-what remains before doing any release work.
-
-The receipt identifies the exact-source test result or an authorized
-artifact-only run with iOS tests not run. The attestation binds its digest to
-the source, DMG, and notarization/stapling proof.
-
-Mac Integration keeps NativeAgent's read/write gates separate from macOS
-privacy consent. Calendar, Reminders, and Contacts are granted explicitly in
-the app; Calendar-capable hardened builds carry Apple's required Calendar
-entitlement, and the release verifier checks the signed artifact so a fresh
-install can appear in Privacy & Security and request the correct access level.
-
-## iPhone and iPad
-
-The companion is a real remote cockpit rather than a web wrapper. It supports
-signed chat and actions, streamed progress, session continuity, Desk,
-approvals, activity, memory, skills, provider controls, agent status, and
-lock-screen notifications. Open **Connectors → iPhone** on the Mac and the
-phone app with the same Apple Account. Pairing details arrive through iCloud;
-choose **Connect via iCloud** on the phone. **Check for Mac** precedes manual
-key correction if pairing needs help.
-
-Device communication is Apple-native and has no LAN HTTP fallback:
-
-- personal builds can use iCloud KVS plus iCloud Drive;
-- entitled builds can select the CloudKit transport;
-- public lock-screen alerts use a dedicated CloudKit notification record and
-  the user's own iCloud account—no NativeAgent-hosted APNS service or bundled
-  provider credential is required;
-- HMAC-signed envelopes, durable transaction receipts, and entitlement-aware
-  APNS keep remote actions explicit and auditable.
-
-See [docs/mobile_companion.md](docs/mobile_companion.md) for setup and the exact
-transport model.
-
-## Build and test
-
-Assemble the complete change, build it, then run the relevant finished-workflow
-check. These are separate entry points, not a per-edit checklist. See the
-[validation map](docs/README.md#validation-boundaries) for exact coverage.
-
-```bash
-# Compile the Mac app and its dependency graph, preserving pinned dependencies.
+bash script/hooks/install.sh      # staged-secret/privacy hook
 swift build --jobs 4 --force-resolved-versions --skip-update
-
-# Focused or package-level tests.
-swift test --filter '<suite-or-test>'
-swift test --package-path Modules/NativeAgentCore --no-parallel
-
-# Canonical whole-repository gate (Core, Shared, Mac, script guards, iOS).
-./script/test.sh
-
-# Require iOS proof instead of accepting an unavailable-simulator skip.
-./script/test.sh --require-ios
-
-# Optional isolated and installed-runtime sweeps.
-./script/smoke_all.sh
-./script/smoke_all.sh --live
-
-# Signed personal install and live health proof.
-./script/install_app.sh
-./script/organism_doctor.sh --strict
+./script/install_app.sh           # build, sign, install to ~/Applications, launch
 ```
 
-The test suite covers provider routing, chat/session transactions, memory,
-context generations, tools, approvals, Desk execution, cognitive and
-organism bounds, iCloud/CloudKit transport, release privacy, and architectural
-drift.
+The installer creates blank persona/data/workspace roots when needed. An
+app-only install keeps agent work under
+`~/Library/Application Support/NativeAgent/workspace`; a source install uses the
+checkout's `workspace/`. See [Contributing](CONTRIBUTING.md) for the development
+workflow.
+
+### Releases
+
+Public releases are built from the scrubbed public export by
+`./script/release_github.sh`, which signs, notarizes, staples, signs the update,
+uploads the DMG, appcast, test receipt and attestation to a draft GitHub
+Release, reads them back and publishes. `--preflight` reports what is missing.
+Signing and notarization setup: [docs/release_setup.md](docs/release_setup.md).
+
+The Apple identifiers are `io.github.embwl0x.nativeagent.mac`,
+`io.github.embwl0x.nativeagent.ios` and `iCloud.io.github.embwl0x.nativeagent`;
+the visible product and agent names are independent of them.
 
 ## Local data and privacy
 
 | Path | Purpose |
 |---|---|
 | `persona/` | Private identity, voice, growth, and generated user profile |
-| `data/` | Chat, MemoryV2, context generations, cognition, Desk/execution state, receipts, provider state, and local runtime ledgers |
-| `workspace/` (source install) or `~/Library/Application Support/NativeAgent/workspace` (app-only install) | Canonical safe default for drafts, projects, exports, and agent work product shared by every chat surface and the Desk. Full Mac YOLO may explicitly target another existing project directory for native shell/build or Codex/Claude Code work; ordinary modes remain workspace-scoped. |
-| `.runtime/` | Build, evaluation, and transient runtime artifacts |
+| `data/` | Chat, MemoryV2, context generations, cognition, Desk state, receipts, provider state |
+| `workspace/` (source install) or `~/Library/Application Support/NativeAgent/workspace` (app-only) | Default place for agent work product, shared by every surface |
+| `.runtime/` | Build and transient runtime artifacts |
 
-NativeAgent is local-first, but local does not mean unguarded. OAuth tokens,
-pairing secrets, connector credentials, and Mac permissions remain sensitive.
-The GitHub connector stores its PAT in the macOS Keychain; other sensitive
-file-backed stores use owner-only permissions. External content is untrusted
-input, and external sends or protected mutations remain gated.
-
-Read [SECURITY.md](SECURITY.md) and
-[docs/threat-model.md](docs/threat-model.md) before granting broad Mac access.
-The public-facing [Privacy Policy](PRIVACY.md) and [Support Guide](SUPPORT.md)
-explain external-provider processing, iCloud continuity, permissions, deletion,
-and support boundaries.
+None of these are committed. NativeAgent is local-first, but OAuth tokens,
+pairing secrets, connector credentials and Mac permissions remain sensitive, and
+provider requests send selected data to those providers. Read
+[SECURITY.md](SECURITY.md), [docs/threat-model.md](docs/threat-model.md), the
+[Privacy Policy](PRIVACY.md) and the [Support Guide](SUPPORT.md) before granting
+broad Mac access.
 
 ## Repository map
 
@@ -345,38 +162,12 @@ Modules/NativeAgentShared/        Mac/iOS wire models and device transport
 iOS/NativeAgentMobile/            iPhone and iPad companion
 Extensions/NativeAgentChrome/     optional tab-scoped Chrome extension
 Sources/NativeAgentChromeRelay*/  Swift native-messaging transport
-tests/                           root app/relay tests and script guards
-Resources/                        app resources
-distribution/                     signing and Apple distribution configuration
-docs/                             product, architecture, security, and operations
-script/                           build, test, install, evaluation, and release gates
+Resources/, distribution/         app resources, signing and distribution config
+docs/                             product, architecture, security, operations
+script/                           build, install, release and check entry points
 ```
 
-The [documentation and repository guide](docs/README.md) maps each directory to
-its owner, separates current guides from historical evidence, and shows where
-Core, Shared, Mac, iOS, bridge, and Chrome validation live.
-
-## Documentation
-
-- [Documentation and Repository Guide](docs/README.md) — start here to choose a reading path or find an implementation owner
-- [NativeAgent Internal Workings](docs/INTERNAL_WORKINGS.md) — the connected lifecycle from context and memory through action, growth, delegation, and every surface
-- [Anatomy of a NativeAgent Turn](docs/ANATOMY_OF_A_TURN.md) — from message acceptance through resident context, model/tool execution, and durable settlement
-- [User and Agent Guide](docs/USER_GUIDE.md) — compact setup and complete operating map
-- [Capabilities](docs/CAPABILITIES.md) — readable current system tour
-- [North Star](docs/NORTHSTAR.md) — one mind, no theater, fluid digital processes, as simple as possible for people
-- [Project Status](PROJECT_STATUS.md) — honest shipped/partial/experimental ledger
-- [Architecture Blueprint](docs/ARCHITECTURE_BLUEPRINT.md) — source and ownership map
-- [Project Direction](docs/PROJECT_DIRECTION.md) — durable product and safety rules
-- [Fluid Context](docs/INTERNAL_WORKINGS.md#1-anatomy-of-resident-context-and-a-turn) — resident sources, context selection, and ownership
-- [Organism Kernel](docs/ORGANISM.md) — bounded app-body behavior and safeguards
-- [Mobile Companion](docs/mobile_companion.md) — iCloud/CloudKit/APNS architecture
-- [Data Bounds](docs/data-bounds.md) — caps and retention behavior
-- [Threat Model](docs/threat-model.md) — defended and non-defended boundaries
-- [Privacy Policy](PRIVACY.md) — local data, external services, permissions, and deletion
-- [Support](SUPPORT.md) — installation, pairing, updates, troubleshooting, and safe reporting
-- [Contributing](CONTRIBUTING.md) — development and privacy workflow
-- [Release Setup](docs/release_setup.md) — signing, notarization, GitHub Releases, and in-app updates
-- [App Store Submission Kit](docs/app_store_submission.md) — metadata drafts, review notes, screenshots, and release gates
+The [documentation guide](docs/README.md) lists every current document.
 
 ## License
 

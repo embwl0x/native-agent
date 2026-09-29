@@ -1,3 +1,4 @@
+import Cognition
 import CognitiveSubstrate
 import Observation
 
@@ -16,7 +17,7 @@ final class ActivityCognitionSubscription {
         case stopped
     }
 
-    private let runtime: NativeCognitionRuntime
+    private let cognition: CognitionViewFacade
     @ObservationIgnored private var consumeTask: Task<Void, Never>?
     @ObservationIgnored private var generation: UInt64 = 0
     @ObservationIgnored private var activeRefreshes = 0
@@ -27,8 +28,8 @@ final class ActivityCognitionSubscription {
     private(set) var refreshCount = 0
     private(set) var peakConcurrentRefreshes = 0
 
-    init(runtime: NativeCognitionRuntime = .shared) {
-        self.runtime = runtime
+    init(cognition: CognitionViewFacade = NativeAgentEngine.live.cognitionView) {
+        self.cognition = cognition
     }
 
     func start() {
@@ -36,8 +37,8 @@ final class ActivityCognitionSubscription {
         generation &+= 1
         let currentGeneration = generation
         state = .idle
-        consumeTask = Task { [weak self, runtime] in
-            let changes = await runtime.changes()
+        consumeTask = Task { [weak self, cognition] in
+            let changes = await cognition.changes()
             guard let self, !Task.isCancelled, self.isCurrent(currentGeneration) else { return }
             await self.refresh(currentGeneration)
 
@@ -82,7 +83,7 @@ final class ActivityCognitionSubscription {
         peakConcurrentRefreshes = max(peakConcurrentRefreshes, activeRefreshes)
         defer { activeRefreshes -= 1 }
 
-        let read = await CognitionProposalsFeed.read(runtime: runtime)
+        let read = await cognition.pendingProposals()
         guard allowStopped || isCurrent(currentGeneration) else { return }
         refreshCount += 1
         switch read {

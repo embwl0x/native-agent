@@ -257,7 +257,16 @@ final class NativeAgentRemotePushCompletionGate: @unchecked Sendable {
         completed = true
         let finalResult: UIBackgroundFetchResult = appliedData ? .newData : result
         lock.unlock()
-        completionHandler(finalResult)
+        // UIKit updates the app snapshot inside this callback and asserts it is
+        // on the main thread; the timeout lane fires from a background task
+        // (crash 2026-09-25: "Call must be made on main thread").
+        if Thread.isMainThread {
+            completionHandler(finalResult)
+        } else {
+            // UIKit hands this over from the main thread and only asks it back there.
+            nonisolated(unsafe) let handler = completionHandler
+            DispatchQueue.main.async { handler(finalResult) }
+        }
     }
 }
 
@@ -406,26 +415,45 @@ final class NativeAgentMobilePushDelegate: NSObject, UIApplicationDelegate {
 }
 
 final class NativeAgentNotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
+    // Completion-handler forms, answered on the main thread. UIKit updates the
+    // app snapshot inside these callbacks and traps off the main thread; the
+    // async forms returned on a background thread, so tapping a notification
+    // crashed the app (2026-09-25: "Call must be made on main thread").
     func userNotificationCenter(
         _ center: UNUserNotificationCenter,
-        willPresent notification: UNNotification
-    ) async -> UNNotificationPresentationOptions {
+        willPresent notification: UNNotification,
+        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
+    ) {
         // 2026-09-06: the reply this alert announces may already be rendered in
         // the chat the user is looking at. Alerting on top of it is noise.
         let keys = ChatReplyNotificationKeys(userInfo: notification.request.content.userInfo)
-        if await ChatReplyNotificationPresentation.isAlreadyDisplayed(keys: keys) {
-            return []
+        nonisolated(unsafe) let done = completionHandler
+        Task { @MainActor in
+            let shown = ChatReplyNotificationPresentation.isAlreadyDisplayed(keys: keys)
+            done(shown ? [] : NativeAgentNotificationDelegatePresentation.foregroundPresentationOptions)
         }
-        return NativeAgentNotificationDelegatePresentation.foregroundPresentationOptions
     }
 
     func userNotificationCenter(
         _ center: UNUserNotificationCenter,
-        didReceive response: UNNotificationResponse
-    ) async {
+        didReceive response: UNNotificationResponse,
+        withCompletionHandler completionHandler: @escaping () -> Void
+    ) {
+        nonisolated(unsafe) let done = completionHandler
+        let action = MobileNotificationActions.Response(response)
+        if action.isAction {
+            Task { @MainActor in
+                Task { await MobileNotificationActions.handle(action) }
+                done()
+            }
+            return
+        }
         guard NativeAgentNotificationDelegatePresentation.shouldRouteUserResponse(
             actionIdentifier: response.actionIdentifier
-        ) else { return }
+        ) else {
+            DispatchQueue.main.async { done() }
+            return
+        }
         // F7: route per notification payload's `screen` field instead of always
         // landing on Activity. Allowed values: activity, chat, memories, desk, skills, more.
         let userInfo = response.notification.request.content.userInfo
@@ -442,16 +470,17 @@ final class NativeAgentNotificationDelegate: NSObject, UNUserNotificationCenterD
             cloudKitRecordKey: "notificationSessionId",
             in: userInfo
         )
-        await MainActor.run {
+        let taskID = NativeAgentRemoteNotificationPayload.string(
+            directKey: "taskId", cloudKitRecordKey: "notificationTaskId", in: userInfo
+        )
+        DispatchQueue.main.async {
             // Persist before posting. ContentView consumes this intent from
             // UserDefaults on appearance, so a cold-launch view tree that has
             // not installed its ephemeral observer yet still receives the tap.
             MobileNotifiedChatSessionIntent.stage(screen == "chat" ? sessionID : nil)
             MobileDeskTaskNotificationIntent.stage(
                 screen: screen,
-                taskID: NativeAgentRemoteNotificationPayload.string(
-                    directKey: "taskId", cloudKitRecordKey: "notificationTaskId", in: userInfo
-                )
+                taskID: taskID
             )
             NativeAgentNotificationLaunchIntent.markOpenActivityPending(screen: screen)
             NotificationCenter.default.post(
@@ -459,6 +488,7 @@ final class NativeAgentNotificationDelegate: NSObject, UNUserNotificationCenterD
                 object: nil,
                 userInfo: ["screen": screen ?? "activity"]
             )
+            done()
         }
     }
 }
@@ -499,32 +529,6 @@ enum NativeAgentNotificationDelegatePresentation {
     }
 }
 
-enum NativeAgentRemoteNotificationPayload {
-    static func string(
-        directKey: String,
-        cloudKitRecordKey: String,
-        in userInfo: [AnyHashable: Any]
-    ) -> String? {
-        if let direct = nonEmpty(userInfo[directKey] as? String) {
-            return direct
-        }
-        #if canImport(CloudKit)
-        if let query = CKNotification(
-            fromRemoteNotificationDictionary: userInfo
-        ) as? CKQueryNotification,
-           let value = nonEmpty(query.recordFields?[cloudKitRecordKey] as? String) {
-            return value
-        }
-        #endif
-        return nil
-    }
-
-    private static func nonEmpty(_ value: String?) -> String? {
-        let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed?.isEmpty == false ? trimmed : nil
-    }
-}
-
 enum NativeAgentNotificationEventGate {
     static func add(
         content: UNNotificationContent,
@@ -532,7 +536,8 @@ enum NativeAgentNotificationEventGate {
         trigger: UNNotificationTrigger?,
         center: UNUserNotificationCenter = .current()
     ) async throws -> Bool {
-        let identifier = "nativeagent.event.\(eventID)"
+        // Avoid reposting an already pending or delivered local event.
+        // Remote/local route selection happens before this gate.
         // UserNotifications reference types are not Sendable. Keep the center
         // and returned request objects on this task instead of moving them into
         // `async let` child tasks. These reads are local and bounded, and the
@@ -541,29 +546,27 @@ enum NativeAgentNotificationEventGate {
         let delivered = await center.deliveredNotifications()
         let existingRequests = pending + delivered.map(\.request)
         if existingRequests.contains(where: { request in
-            request.identifier == identifier
-                || Self.eventID(in: request.content.userInfo) == eventID
+            NativeAgentRemoteNotificationPayload.matches(request, eventID: eventID)
         }) {
             return false
         }
+        let categorized = MobileNotificationRouting.categorized(content)
+        let alert: UNNotificationContent
+        do { alert = try await CommunicationNotification.decorate(categorized) }
+        catch {
+            NSLog("[NativeAgentMobile] Communication notification unavailable: %@", error.localizedDescription)
+            alert = categorized
+        }
         try await center.add(UNNotificationRequest(
-            identifier: identifier,
-            content: content,
+            identifier: eventID,
+            content: alert,
             trigger: trigger
         ))
         return true
     }
 
     static func eventID(in userInfo: [AnyHashable: Any]) -> String? {
-        let direct = NativeAgentRemoteNotificationPayload.string(
-            directKey: "eventId",
-            cloudKitRecordKey: "notificationEventId",
-            in: userInfo
-        )
-        let nested = (userInfo["nativeagent"] as? [String: Any])?["eventId"] as? String
-        return [direct, nested]
-            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .first { NativeAgentDeviceEventIdentity.isCanonical($0) }
+        NativeAgentRemoteNotificationPayload.eventID(in: userInfo)
     }
 }
 
@@ -571,7 +574,15 @@ enum NativeAgentBridgeNotificationScheduler {
     static func schedule(_ msg: BridgeMessage) {
         Task {
             let metadata = msg.metadata ?? [:]
-            let title = nonEmpty(metadata["title"]) ?? "NativeAgent"
+            let deviceID = await MainActor.run {
+                UIDevice.current.identifierForVendor?.uuidString ?? UIDevice.current.name
+            }
+            let acceptedDeviceIDs = metadata["directAlertDeviceIDs"].flatMap {
+                try? JSONDecoder().decode([String].self, from: Data($0.utf8))
+            } ?? []
+            guard !acceptedDeviceIDs.contains(deviceID) else { return }
+            let agentName = await MainActor.run { iCloudSyncEngine.shared.agentDisplayName }
+            let title = nonEmpty(metadata["title"]) ?? agentName
             let body = nonEmpty(metadata["body"])
                 ?? nonEmpty(msg.text)
                 ?? "New activity from Mac."

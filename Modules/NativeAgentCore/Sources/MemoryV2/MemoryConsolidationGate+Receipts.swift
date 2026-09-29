@@ -225,7 +225,7 @@ extension MemoryConsolidationGate {
                     "archived": .int(Int64(diff.archived)),
                 ]),
             ]),
-            "payloadPreview": .string("[\(payloadKind)] \(diff.summary)"),
+            "payloadPreview": .string(diff.summary),
         ])
         let record = try await inbox.create(body)
         do {

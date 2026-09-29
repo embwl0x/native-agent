@@ -10,7 +10,7 @@ public final class SwiftNativeGitStashRecoverClient: GitStashRecoverClient {
     private let runner: any SubprocessRunner
     private let gitExecutable: String
     private let daemonAutonomy: Bool
-    private let policyProvider: @Sendable () async -> AutonomyTrustPolicyView
+    private let policyProvider: @Sendable () async throws -> AutonomyTrustPolicyView
 
     /// - Parameters:
     ///   - repoRoot:        Local NativeAgent checkout root.
@@ -28,13 +28,13 @@ public final class SwiftNativeGitStashRecoverClient: GitStashRecoverClient {
         runner: any SubprocessRunner = SystemSubprocessRunner(),
         gitExecutable: String = "/usr/bin/git",
         daemonAutonomy: Bool = false,
-        policyProvider: (@Sendable () async -> AutonomyTrustPolicyView)? = nil
+        policyProvider: (@Sendable () async throws -> AutonomyTrustPolicyView)? = nil
     ) {
         self.repoRoot = repoRoot ?? PersistenceCore.defaultDataRoot().deletingLastPathComponent()
         self.runner = runner
         self.gitExecutable = gitExecutable
         self.daemonAutonomy = daemonAutonomy
-        self.policyProvider = policyProvider ?? { await readAutonomyTrustPolicy() }
+        self.policyProvider = policyProvider ?? { try await readAutonomyTrustPolicy() }
     }
 
     public func gitStashRecover(label: String) async throws -> GitStashRecoverOpResult {
@@ -44,7 +44,7 @@ public final class SwiftNativeGitStashRecoverClient: GitStashRecoverClient {
         // `gitStashRecover.enabled` flag is the Swift hardening added in
         // wave 8 + matches the daemon's growing per-action enabled
         // convention started by `systemRebuild.enabled` at L45120).
-        let policy = await policyProvider()
+        let policy = try await policyProvider()
         switch try await autonomyApprovalGate(
             action: .gitStashRecover,
             daemonAutonomy: daemonAutonomy,

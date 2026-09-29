@@ -33,6 +33,7 @@ struct SettingsViewFull: View {
     @EnvironmentObject private var pairingStore: PairingStore
     @EnvironmentObject private var bridgeClient: MacBridgeClient
     @StateObject private var store = SettingsStore()
+    @ObservedObject private var turnActivity = PhoneTurnActivity.shared
     @State private var showRePairSheet = false
     @State private var repairResult: String?
     @State private var isForceRefreshing = false
@@ -40,178 +41,101 @@ struct SettingsViewFull: View {
     @AppStorage(NativeAgentAppearance.storageKey) private var appearanceRawValue = NativeAgentAppearance.system.rawValue
 
     var body: some View {
-        List {
-            Section("Appearance") {
-                Picker("Color scheme", selection: $appearanceRawValue) {
-                    ForEach(NativeAgentAppearance.allCases) { appearance in
-                        Text(appearance.title).tag(appearance.rawValue)
-                    }
-                }
-                .pickerStyle(.menu)
-                Text("System follows your iPhone or iPad appearance automatically.")
-                    .font(.footnote)
-                    .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
-            }
-
-            Section("Mac") {
-                if let health = store.health {
-                    LabeledContent("Health snapshot") {
-                        Text(health.ok ? "Reported healthy" : "Reported issue")
-                            .foregroundStyle(health.ok ? Color.secondary : Color.red)
-                    }
-                    LabeledContent("App", value: health.app)
-                    LabeledContent("Version", value: health.version)
-                    LabeledContent("Uptime", value: SettingsMacHealthPresentation.uptimeText(health.uptimeSeconds))
-                    if !store.availableFields.contains(.health) {
-                        Text("The latest health snapshot could not be read. Showing the last known report.")
-                            .font(.footnote)
-                            .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
-                    }
-                    Text("Current reachability is shown in Connection below.")
-                        .font(.footnote)
-                        .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
-                } else if store.isLoading {
-                    ProgressView("Loading health snapshot…")
-                } else {
-                    Text("No health report has reached this iPhone. Connection below shows the next step.")
-                        .font(.footnote)
-                        .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
-                }
-            }
-
-            Section("Connection") {
-                LabeledContent("Mode") {
-                    Text(pairingStore.usesICloudTransport ? "iCloud" : "Unpaired")
-                        .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
-                }
-                LabeledContent("State") {
-                    Text(pairingStore.isICloudSigned ? bridgeClient.bridgeStatus.displayName : "Not paired")
-                        .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
-                }
-                // Connection-wide, so the newest delivery across groups is the
-                // honest value here — but still a DELIVERY, not a cache read.
-                let snapshotState = StatusConnectionPresentation.syncState(
-                    lastSyncedAt: iCloudSyncEngine.shared.lastTransportDeliveryAt
-                )
-                LabeledContent("Last synced") {
-                    Text(StatusConnectionPresentation.cardValue(for: snapshotState))
-                        .fontWeight(StatusConnectionPresentation.needsAttention(snapshotState) ? .medium : .regular)
-                        .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
-                }
-                if pairingStore.isICloudSigned,
-                   let detail = StatusConnectionPresentation.detail(for: snapshotState) {
-                    Text(detail)
-                        .font(.footnote)
-                        .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
-                }
-                if !pairingStore.isICloudSigned {
-                    Text("This iPhone has no pairing key for the Mac. Setup checks iCloud and connects both devices using the same Apple Account.")
-                        .font(.footnote)
-                        .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
-                    Button("Set up Mac connection") { showRePairSheet = true }
-                } else if bridgeClient.bridgeStatus == .offline || bridgeClient.bridgeStatus == .deviceOffline {
-                    Text(bridgeClient.bridgeStatus == .deviceOffline
-                         ? "This iPhone has no network connection. Reconnect to Wi-Fi or cellular data, then return here."
-                         : "The iCloud connection is unavailable. Check the Apple Account and iCloud Drive settings on this iPhone.")
-                        .font(.footnote)
-                        .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
-                    Button("Connection setup help") { showRePairSheet = true }
-                } else {
-                if let repairResult {
-                    Text(repairResult)
-                        .font(.footnote)
-                        .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
-                }
-                Button {
-                    // KVS synchronization runs under PairingStore's timeout, so
-                    // this never blocks the MainActor. Reload the settings
-                    // snapshots afterward: the control promises an iCloud
-                    // refresh, not merely a secret-rotation check.
-                    Task {
-                        guard !isForceRefreshing else { return }
-                        isForceRefreshing = true
-                        defer { isForceRefreshing = false }
-
-                        let pairingMaterialChanged = await pairingStore.refreshFromKVS()
-                        let settingsOutcome = await store.refresh()
-                        repairResult = SettingsICloudRefreshPresentation.statusText(
-                            pairingMaterialChanged: pairingMaterialChanged,
-                            snapshotError: settingsOutcome.feedbackMessage
-                        )
-                    }
-                } label: {
-                    Label(
-                        isForceRefreshing ? "Checking for Mac updates…" : "Check for Mac updates",
-                        systemImage: "arrow.clockwise.icloud"
-                    )
-                }
-                .disabled(isForceRefreshing)
-                Text("Keep NativeAgent open on the Mac so a current report can reach this iPhone.")
-                    .font(.footnote)
-                    .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
-                }
-                DisclosureGroup("Connection diagnostics") {
-                    LabeledContent("Pairing version", value: "\(pairingStore.knownSecretVersion)")
-                }
-            }
-
-            Section {
-                if pushReceipts.isEmpty {
-                    Text("No pushes received yet")
-                        .font(.callout)
-                        .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
-                } else {
-                    ForEach(pushReceipts.prefix(8)) { entry in
-                        MobileAdaptiveRow {
-                            Text(entry.source)
-                                .font(.callout)
-                            Spacer()
-                            Text(entry.receivedAt, style: .relative)
-                                .font(.callout)
-                                .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
+        AlivePage(title: "Settings", line: "This iPhone and its link to the Mac.") {
+            AliveSection("Appearance") {
+                MobileAdaptiveRow(spacing: 12) {
+                    Text("Color scheme").foregroundStyle(AlivePalette.text)
+                    Spacer(minLength: 8)
+                    Picker("Color scheme", selection: $appearanceRawValue) {
+                        ForEach(NativeAgentAppearance.allCases) { appearance in
+                            Text(appearance.title).tag(appearance.rawValue)
                         }
                     }
+                    .pickerStyle(.menu)
+                    .labelsHidden()
+                    .hazeTinted()
                 }
-            } header: {
-                Label("Push deliveries", systemImage: "bell.badge")
-                    .font(.headline)
+                .padding(.horizontal, AliveMetrics.rowInsetH)
+                .padding(.top, 6)
+                Text("System follows your iPhone or iPad appearance automatically.")
+                    .font(.footnote)
+                    .foregroundStyle(AlivePalette.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.horizontal, AliveMetrics.rowInsetH)
+                    .padding(.bottom, AliveMetrics.rowInsetV)
+                AliveDivider()
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Haze").foregroundStyle(AlivePalette.text)
+                    HazeSwatches()
+                    Text("The light that drifts behind every screen. Same colors as on the Mac.")
+                        .font(.footnote)
+                        .foregroundStyle(AlivePalette.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .aliveRow()
             }
 
-            Section("About") {
-                if let privacyURL = Self.configuredHTTPSURL(key: "NativeAgentPrivacyPolicyURL") {
-                    Link("Privacy Policy", destination: privacyURL)
+            AliveSection("Mac") {
+                if let health = store.health {
+                    AliveValueRow(label: "Health", value: health.ok ? "Reported healthy" : "Reported issue",
+                                 valueColor: health.ok ? AlivePalette.secondary : NativeAgentMobileTheme.Colors.trouble)
+                    AliveDivider()
+                    AliveValueRow(label: "App", value: health.app)
+                    AliveDivider()
+                    AliveValueRow(label: "Version", value: health.version)
+                    AliveDivider()
+                    AliveValueRow(label: "Uptime", value: SettingsMacHealthPresentation.uptimeText(health.uptimeSeconds))
+                    if !store.availableFields.contains(.health) {
+                        AliveDivider()
+                        AliveNote("The latest health snapshot could not be read. Showing the last known report.")
+                    }
+                } else if store.isLoading {
+                    ProgressView("Loading health snapshot…")
+                        .tint(AlivePalette.secondary)
+                        .foregroundStyle(AlivePalette.secondary)
+                        .aliveRow()
                 } else {
-                    Label(
-                        SettingsLegalLinksPresentation.unavailableText(for: "Privacy Policy"),
-                        systemImage: "exclamationmark.triangle"
-                    )
-                    .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
+                    AliveNote("No health report has reached this iPhone yet. Connection below shows the next step.")
                 }
-                if let supportURL = Self.configuredHTTPSURL(key: "NativeAgentSupportURL") {
-                    Link("Support", destination: supportURL)
+            }
+
+            connectionGroup
+            PhonePlacesSettings()
+            if let error = turnActivity.errorMessage {
+                AliveSection("Live Activity") { AliveNote(error) }
+            }
+
+            AliveSection("Recent pushes") {
+                if pushReceipts.isEmpty {
+                    AliveNote("No pushes received yet.")
                 } else {
-                    Label(
-                        SettingsLegalLinksPresentation.unavailableText(for: "Support"),
-                        systemImage: "exclamationmark.triangle"
-                    )
-                    .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
+                    ForEach(Array(pushReceipts.prefix(8).enumerated()), id: \.element.id) { index, entry in
+                        if index > 0 { AliveDivider() }
+                        MobileAdaptiveRow {
+                            Text(entry.source).foregroundStyle(AlivePalette.text)
+                            Spacer()
+                            Text(entry.receivedAt, style: .relative)
+                                .foregroundStyle(AlivePalette.secondary)
+                        }
+                        .font(.callout)
+                        .aliveRow()
+                    }
                 }
-                LabeledContent(
-                    "Version",
+            }
+
+            AliveSection("About") {
+                aboutLink("Privacy Policy", key: "NativeAgentPrivacyPolicyURL")
+                AliveDivider()
+                aboutLink("Support", key: "NativeAgentSupportURL")
+                AliveDivider()
+                AliveValueRow(
+                    label: "Version",
                     value: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString")
                         as? String ?? "—"
                 )
             }
         }
-        .mobileReadingScreen()
-        .navigationTitle("Settings")
         .macSyncErrorBanner()
-        .navigationBarTitleDisplayMode(.inline)
-        .safeAreaInset(edge: .top, spacing: 0) {
-            if pairingStore.isICloudSigned {
-                MacStatusChip().frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 16)
-            }
-            }
         .task {
             pushReceipts = PushReceiptLedger.load()
             await store.refresh()
@@ -247,6 +171,92 @@ struct SettingsViewFull: View {
             .safeAreaInset(edge: .bottom) {
                 iOSSystemToastBar(center: iOSSystemToastCenter.shared)
             }
+        }
+    }
+
+    private var connectionGroup: some View {
+        // Connection-wide, so the newest delivery across groups is the
+        // honest value here — but still a DELIVERY, not a cache read.
+        let snapshotState = StatusConnectionPresentation.syncState(
+            lastSyncedAt: iCloudSyncEngine.shared.lastTransportDeliveryAt
+        )
+        return AliveSection("Connection") {
+            AliveValueRow(label: "State",
+                         value: AliveConnection.line(for: bridgeClient.bridgeStatus, paired: pairingStore.isICloudSigned))
+            AliveDivider()
+            AliveValueRow(label: "Last synced", value: StatusConnectionPresentation.cardValue(for: snapshotState),
+                         emphasized: StatusConnectionPresentation.needsAttention(snapshotState))
+            if pairingStore.isICloudSigned,
+               let detail = StatusConnectionPresentation.detail(for: snapshotState) {
+                AliveNote(detail)
+            }
+            AliveDivider()
+            if !pairingStore.isICloudSigned {
+                AliveNote("This iPhone has no pairing key for the Mac. Setup checks iCloud and connects both devices using the same Apple Account.")
+                AliveTapRow(title: "Set up Mac connection") { showRePairSheet = true }
+            } else if bridgeClient.bridgeStatus == .offline || bridgeClient.bridgeStatus == .deviceOffline {
+                AliveNote(bridgeClient.bridgeStatus == .deviceOffline
+                         ? "This iPhone has no network connection. Reconnect to Wi-Fi or cellular data, then return here."
+                         : "The iCloud connection is unavailable. Check the Apple Account and iCloud Drive settings on this iPhone.")
+                AliveTapRow(title: "Connection setup help") { showRePairSheet = true }
+            } else {
+                if let repairResult { AliveNote(repairResult) }
+                AliveTapRow(title: isForceRefreshing ? "Checking for Mac updates…" : "Check for Mac updates") {
+                    // KVS synchronization runs under PairingStore's timeout, so
+                    // this never blocks the MainActor. Reload the settings
+                    // snapshots afterward: the control promises an iCloud
+                    // refresh, not merely a secret-rotation check.
+                    Task {
+                        guard !isForceRefreshing else { return }
+                        isForceRefreshing = true
+                        defer { isForceRefreshing = false }
+
+                        let pairingMaterialChanged = await pairingStore.refreshFromKVS()
+                        let settingsOutcome = await store.refresh()
+                        repairResult = SettingsICloudRefreshPresentation.statusText(
+                            pairingMaterialChanged: pairingMaterialChanged,
+                            snapshotError: settingsOutcome.feedbackMessage
+                        )
+                    }
+                }
+                .disabled(isForceRefreshing)
+                AliveNote("Keep NativeAgent open on the Mac so a current report can reach this iPhone.")
+            }
+            AliveDivider()
+            DisclosureGroup {
+                HStack {
+                    Text("Pairing version").foregroundStyle(AlivePalette.text)
+                    Spacer()
+                    Text("\(pairingStore.knownSecretVersion)").foregroundStyle(AlivePalette.secondary)
+                }
+                .padding(.top, 10)
+                .accessibilityElement(children: .combine)
+            } label: {
+                Text("Diagnostics").foregroundStyle(AlivePalette.text)
+            }
+            .tint(AlivePalette.secondary)
+            .aliveRow()
+        }
+    }
+
+    @ViewBuilder
+    private func aboutLink(_ title: String, key: String) -> some View {
+        if let url = Self.configuredHTTPSURL(key: key) {
+            Link(destination: url) {
+                HStack {
+                    Text(title).foregroundStyle(AlivePalette.text)
+                    Spacer()
+                    Image(systemName: "arrow.up.right")
+                        .font(.footnote.weight(.semibold))
+                        .foregroundStyle(AlivePalette.secondary)
+                        .accessibilityHidden(true)
+                }
+                .aliveRow()
+                .contentShape(Rectangle())
+            }
+            .aliveRowButtonStyle()
+        } else {
+            AliveNote(SettingsLegalLinksPresentation.unavailableText(for: title))
         }
     }
 
@@ -380,71 +390,78 @@ struct PersonalityDetailView: View {
     @ObservedObject var store: SettingsStore
 
     var body: some View {
-        List {
+        AlivePage(title: "Personality", line: "How I think and sound.") {
             if let p = store.personality {
-                if store.hasCompletedRefresh, !store.availableFields.contains(.personality) {
-                    Label("Personality could not be refreshed. Showing the last known profile.", systemImage: "exclamationmark.triangle")
-                        .font(.footnote)
-                        .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
-                }
                 let snapshotState = PersonalitySnapshotPresentation.state(
                     lastSyncedAt: store.personalitySnapshotSyncedAt
                 )
-                Section("Identity") {
-                    LabeledContent("Name", value: p.name)
-                    LabeledContent("Kind", value: p.personaKind)
-                    LabeledContent("Snapshot") {
-                        Text(PersonalitySnapshotPresentation.value(for: snapshotState))
-                            .foregroundStyle(
-                                PersonalitySnapshotPresentation.needsAttention(snapshotState)
-                                    ? Color.secondary
-                                    : Color.secondary
-                            )
+                AliveSection("Identity") {
+                    if store.hasCompletedRefresh, !store.availableFields.contains(.personality) {
+                        AliveNote("Personality could not be refreshed. Showing the last known profile.")
+                        AliveDivider()
                     }
+                    AliveValueRow(label: "Name", value: p.name)
+                    AliveDivider()
+                    AliveValueRow(label: "Kind", value: p.personaKind)
+                    AliveDivider()
+                    AliveValueRow(label: "Snapshot", value: PersonalitySnapshotPresentation.value(for: snapshotState),
+                                 emphasized: PersonalitySnapshotPresentation.needsAttention(snapshotState))
                     if let detail = PersonalitySnapshotPresentation.detail(for: snapshotState) {
-                        Text(detail)
-                            .font(.callout)
-                            .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
+                        AliveNote(detail)
                     }
                 }
-                Section("Essence") {
-                    Text(p.essence).font(.body)
+                AliveSection("Essence") {
+                    MorePassage(text: p.essence)
                 }
-                Section("Voice") {
-                    Text(p.voice).font(.body)
+                AliveSection("Voice") {
+                    MorePassage(text: p.voice)
                 }
-                Section {
-                    TraitRow(label: "Warmth", value: p.traits.warmth)
-                    TraitRow(label: "Directness", value: p.traits.directness)
-                    TraitRow(label: "Humor", value: p.traits.humor)
-                    TraitRow(label: "Proactivity", value: p.traits.proactivity)
-                    TraitRow(label: "Rigor", value: p.traits.rigor)
-                    TraitRow(label: "Autonomy", value: p.traits.autonomy)
-                    TraitRow(label: "Creativity", value: p.traits.creativity)
-                    TraitRow(label: "Brevity", value: p.traits.brevity)
-                } header: {
-                    Text("Traits")
-                } footer: {
-                    // Answer "can I change these?" where the question arises —
-                    // not in a detached section below.
-                    Text("Mirrored from the Mac. Edit in the Mac app's Personality view.")
+                // Answer "can I change these?" where the question arises —
+                // not in a detached section below.
+                AliveSection("Traits", footer: "Mirrored from the Mac. Edit in the Mac app's Personality view.") {
+                    let traits: [(String, Double)] = [
+                        ("Warmth", p.traits.warmth), ("Directness", p.traits.directness),
+                        ("Humor", p.traits.humor), ("Proactivity", p.traits.proactivity),
+                        ("Rigor", p.traits.rigor), ("Autonomy", p.traits.autonomy),
+                        ("Creativity", p.traits.creativity), ("Brevity", p.traits.brevity),
+                    ]
+                    VStack(spacing: 14) {
+                        ForEach(traits, id: \.0) { trait in
+                            TraitRow(label: trait.0, value: trait.1)
+                        }
+                    }
+                    .aliveRow()
                 }
             } else if store.isLoading || !store.hasCompletedRefresh {
                 ProgressView("Loading Personality…")
+                    .tint(AlivePalette.secondary)
+                    .foregroundStyle(AlivePalette.secondary)
+                    .frame(maxWidth: .infinity)
+                    .padding(.top, 40)
             } else {
-                MobileReadingEmptyState(
-                    title: "Personality unavailable",
-                    systemImage: "person.crop.circle",
-                    kind: .unavailable,
-                    description: "The personality snapshot could not be read. Keep the Mac app open and try again.",
-                    action: ("Try Again", "arrow.clockwise", { Task { await store.refresh() } })
+                AliveCalmState(
+                    title: "Not here yet",
+                    line: "My personality comes over from the Mac. Keep the Mac app open and try again.",
+                    actionTitle: "Try again",
+                    action: { Task { await store.refresh() } }
                 )
             }
         }
-        .mobileReadingScreen()
-        .navigationTitle("Personality")
-        .navigationBarTitleDisplayMode(.inline)
         .refreshable { await store.refresh() }
+    }
+}
+
+/// A paragraph inside a card, at reading size.
+private struct MorePassage: View {
+    let text: String
+
+    var body: some View {
+        Text(text)
+            .font(.body)
+            .lineSpacing(3)
+            .foregroundStyle(AlivePalette.text)
+            .fixedSize(horizontal: false, vertical: true)
+            .aliveRow()
     }
 }
 
@@ -489,22 +506,29 @@ struct TraitRow: View {
 
     var body: some View {
         let projection = TraitValuePresentation.project(value)
-        MobileAdaptiveRow {
-            Text(label).fixedSize(horizontal: false, vertical: true)
-            // One identity tint for every trait: the value is information,
-            // the color is not. Traffic-light tints made low traits (a
-            // personality fact) read as warnings (a health problem).
-            ProgressView(value: projection.normalizedValue)
-                .tint(.secondary)
-            Text(projection.percentageText)
-                .font(.caption)
-                .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
+        MobileAdaptiveRow(spacing: 12) {
+            Text(label)
+                .foregroundStyle(AlivePalette.text)
+                .frame(minWidth: 96, alignment: .leading)
                 .fixedSize(horizontal: false, vertical: true)
-            if projection.wasClamped {
-                Text("Clamped")
-                    .font(.caption)
-                    .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
-            }
+            // One ink for every trait: the value is information, the color
+            // is not. Traffic-light tints made low traits (a personality
+            // fact) read as warnings (a health problem).
+            Capsule()
+                .fill(AlivePalette.divider)
+                .frame(height: 4)
+                .overlay(alignment: .leading) {
+                    GeometryReader { geo in
+                        Capsule()
+                            .fill(AlivePalette.secondary)
+                            .frame(width: geo.size.width * projection.normalizedValue)
+                    }
+                }
+            Text(projection.wasClamped ? "\(projection.percentageText) clamped" : projection.percentageText)
+                .font(.subheadline.monospacedDigit())
+                .foregroundStyle(AlivePalette.secondary)
+                .frame(minWidth: 40, alignment: .trailing)
+                .fixedSize(horizontal: true, vertical: true)
         }
         .accessibilityElement(children: .combine)
         .accessibilityLabel(
@@ -603,56 +627,19 @@ struct TrustPolicyView: View {
     @ObservedObject var store: SettingsStore
 
     var body: some View {
-        List {
+        AlivePage(title: "Trust", line: "What I may do on my own.") {
             if let policy = store.trustPolicy {
-                let booleanSettings = TrustPolicyDetailPresentation.booleanSettings(for: policy)
-                Section("Permission Level") {
-                    LabeledContent(
-                        "Level",
-                        value: TrustPolicySummaryPresentation.textValue(policy.permissionLevel)
-                    )
-                    LabeledContent(
-                        "Autonomy Default",
-                        value: TrustPolicySummaryPresentation.textValue(policy.autonomyDefault)
-                    )
-                    LabeledContent(
-                        "Outside Default",
-                        value: TrustPolicySummaryPresentation.textValue(policy.effectiveOutsideDefault)
-                    )
-                    ForEach(booleanSettings.filter { $0.section == .permission }) { setting in
-                        LabeledContent(setting.title, value: setting.value)
-                    }
-                }
-                if policy.workshopPolicy != nil {
-                    Section("Desk Policy") {
-                        ForEach(booleanSettings.filter { $0.section == .workshop }) { setting in
-                            LabeledContent(setting.title, value: setting.value)
-                        }
-                    }
-                }
-                if policy.trainingPolicy != nil {
-                    Section("Training Policy") {
-                        ForEach(booleanSettings.filter { $0.section == .training }) { setting in
-                            LabeledContent(setting.title, value: setting.value)
-                        }
-                    }
-                }
-                Section {
-                    Text("To change trust policy, open the Mac app's Trust view.")
-                        .font(.footnote).foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
-                }
+                MobileTrustEditor(policy: policy, store: store)
             } else {
-                ContentUnavailableView(
-                    "Trust Policy Not Synced",
-                    systemImage: "lock.shield",
-                    description: Text("Trust policy will appear after iCloud sync with Mac.")
+                AliveCalmState(
+                    title: "Not here yet",
+                    line: "My trust policy comes over from the Mac and appears after the next iCloud sync."
                 )
             }
         }
-        .mobileReadingScreen()
-        .navigationTitle("Trust Policy")
-        .navigationBarTitleDisplayMode(.inline)
+        .refreshable { await store.refresh() }
     }
+
 }
 
 // MARK: - Connectors
@@ -697,13 +684,28 @@ enum ConnectorHealthPresentation: Equatable {
     var displayText: String {
         switch self {
         case .disabled:
-            return "Disabled"
+            return "Off"
         case .healthy(let health), .needsAttention(let health):
-            return health.replacingOccurrences(of: "_", with: " ").capitalized
+            return Self.word(health)
         case .reportedStatus(let status):
-            return "Status: \(status.replacingOccurrences(of: "_", with: " ").capitalized)"
+            return "Status: \(Self.word(status))"
         case .unknown:
             return "Health unknown"
+        }
+    }
+
+    /// The Mac's words for the same states (Connectors on the Mac).
+    static func word(_ raw: String) -> String {
+        switch raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "needs_auth", "auth_required", "needs_sign_in": return "Needs sign-in"
+        case "connected", "live", "ok", "healthy", "active": return "Connected"
+        case "ready": return "Ready"
+        case "connecting", "starting": return "Connecting"
+        case "disconnected", "offline": return "Disconnected"
+        case "disabled": return "Off"
+        case "failed", "error", "unavailable": return "Unavailable"
+        case "unverified": return "Not checked"
+        case let other: return AliveWords.humanized(other)
         }
     }
 
@@ -732,68 +734,39 @@ struct ConnectorsView: View {
     }
 
     var body: some View {
-        List {
+        AlivePage(title: "Connectors", line: "The services I can reach.") {
             switch presentation {
             case .loading:
                 ProgressView("Loading connectors…")
+                    .tint(AlivePalette.secondary)
+                    .foregroundStyle(AlivePalette.secondary)
+                    .frame(maxWidth: .infinity)
+                    .padding(.top, 40)
             case .unavailable:
-                MobileReadingEmptyState(
-                    title: "Connectors unavailable",
-                    systemImage: "point.3.connected.trianglepath.dotted",
-                    kind: .unavailable,
-                    description: "The connector snapshot could not be read. Keep the Mac app open and try again.",
-                    action: ("Try Again", "arrow.clockwise", { Task { await store.refresh() } })
+                AliveCalmState(
+                    title: "Not here yet",
+                    line: "My connectors come over from the Mac. Keep the Mac app open and try again.",
+                    actionTitle: "Try again",
+                    action: { Task { await store.refresh() } }
                 )
-                .listRowBackground(Color.clear)
-                .listRowSeparator(.hidden)
             case .empty:
-                MobileReadingEmptyState(
-                    title: "No connectors",
-                    systemImage: "point.3.connected.trianglepath.dotted",
-                    kind: .empty,
-                    description: "The Mac has not published any connectors. Configure them in the Mac app's Connectors view."
+                AliveCalmState(
+                    title: "No connectors yet",
+                    line: "Connect services in the Mac app's Connectors view and they show up here."
                 )
-                .listRowBackground(Color.clear)
-                .listRowSeparator(.hidden)
             case .content, .stale:
-                if presentation == .stale {
-                    Label("Connectors could not be refreshed. Showing the last known rows.", systemImage: "exclamationmark.triangle")
-                        .font(.footnote)
-                        .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
-                }
-                ForEach(store.connectors) { connector in
-                    let health = ConnectorHealthPresentation.resolve(
-                        enabled: connector.enabled,
-                        status: connector.status,
-                        healthStatus: connector.healthStatus
-                    )
-                    MobileReadingSurface {
-                        MobileAdaptiveRow {
-                            VStack(alignment: .leading) {
-                                Text(connector.name).font(.headline)
-                                if let kind = connector.kind { Text(kind).font(.callout).foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary) }
-                            }
-                            Spacer()
-                            Image(systemName: "circle.fill").font(.caption2).foregroundStyle(.secondary)
-                                .opacity(health == .disabled ? 0.5 : 1)
-                                .accessibilityLabel(health.displayText)
-                            Text(health.displayText)
-                                .font(.callout)
-                                .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
-                        }
+                AliveSection(nil) {
+                    if presentation == .stale {
+                        AliveNote("Connectors could not be refreshed. Showing the last known rows.")
+                        AliveDivider()
                     }
-                    .listRowBackground(Color.clear)
-                    .listRowSeparator(.hidden)
-                }
-                Section {
-                    Text("To enable or configure connectors, open the Mac app's Connectors view.")
-                        .font(.footnote).foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
+                    ForEach(Array(store.connectors.enumerated()), id: \.element.id) { index, connector in
+                        if index > 0 { AliveDivider() }
+                        MobileConnectorRow(connector: connector)
+                    }
                 }
             }
         }
-        .mobileReadingScreen()
-        .navigationTitle("Connectors")
-        .navigationBarTitleDisplayMode(.inline)
         .refreshable { await store.refresh() }
     }
 }

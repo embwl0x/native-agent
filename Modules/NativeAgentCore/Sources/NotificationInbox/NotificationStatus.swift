@@ -55,7 +55,7 @@ import PersistenceCore
 public protocol NotificationStatusReader: Sendable {
     /// GET /v1/notifications/status — the full status envelope, or nil when no
     /// native status is available.
-    func notificationStatus() async -> JSONValue?
+    func notificationStatus() async throws -> JSONValue?
 }
 
 // MARK: - SwiftNative impl
@@ -103,7 +103,7 @@ public struct SwiftNativeNotificationStatus: NotificationStatusReader {
         )
     }
 
-    public func notificationStatus() async -> JSONValue? {
+    public func notificationStatus() async throws -> JSONValue? {
         // receipts = list(reversed(tail_jsonl(self.notification_actions_path, 20)))
         // -> last 20 receipt lines, NEWEST FIRST. tail_jsonl returns oldest-first
         // (file order); reversed() makes newest-first. Match Python's tail_jsonl
@@ -123,7 +123,7 @@ public struct SwiftNativeNotificationStatus: NotificationStatusReader {
         // We only need the COUNT of pending items; the sort order is irrelevant to
         // a length, so we skip the sort the daemon applies (a non-pending sort is
         // a no-op for a count). read_json defaults to [] on missing/torn/non-list.
-        let approvalsRaw = await persistence.readJSON(approvalsPath, defaultValue: .array([]))
+        let approvalsRaw = try await persistence.readJSON(approvalsPath, ifMissing: .array([]))
         var pendingApprovals = 0
         if case .array(let arr) = approvalsRaw {
             for item in arr {

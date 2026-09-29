@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import TurnTrace
 
 // MARK: - LLMAdapter
 
@@ -13,10 +14,9 @@ public protocol LLMAdapter: Sendable {
     func complete(prompt: String, system: String?, model: String) async throws -> String
 
     /// Tool-aware variant. When `tools` is nil/empty, the adapter MUST emit a
-    /// byte-identical wire request to the no-tools overload. Default impl
-    /// forwards to the no-tools `complete`. Adapters declare whether native
-    /// schemas or the existing text tool protocol can reach the provider;
-    /// Codex CLI does not carry NativeAgent tools.
+    /// byte-identical wire request to the no-tools overload. Adapters declare
+    /// whether native schemas or the existing text tool protocol can reach
+    /// the provider; Codex CLI does not carry NativeAgent tools.
     func complete(
         prompt: String,
         system: String?,
@@ -24,11 +24,8 @@ public protocol LLMAdapter: Sendable {
         tools: [LLMToolSchema]?
     ) async throws -> String
 
-    /// Structured multi-turn variant. Default impl flattens to a single prompt
-    /// string and calls `complete(...tools:)` so non-tool-aware adapters keep
-    /// compiling unchanged. The two OAuth-direct adapters override this to
-    /// send proper tool_use / tool_result message arrays (their providers'
-    /// canonical contract for the tool-loop).
+    /// Structured multi-turn variant. `messages` is the conversation; the
+    /// system prompt stays in `system:`.
     func completeMessages(
         messages: [LLMMessage],
         system: String?,
@@ -36,10 +33,11 @@ public protocol LLMAdapter: Sendable {
         tools: [LLMToolSchema]?
     ) async throws -> String
 
-    /// Structured streaming variant. OAuth-direct adapters can surface
-    /// provider text deltas and function/tool-call events directly. The
-    /// default implementation falls back to completeMessages and yields the
-    /// completed text as a single delta.
+    /// How `streamMessages` delivers a reply for this call's `tools`.
+    /// Required, with no default, so a new adapter has to say how it streams.
+    func messagesStreamKind(tools: [LLMToolSchema]?) -> LLMMessagesStreamKind
+
+    /// Structured streaming variant, delivered as `messagesStreamKind` says.
     func streamMessages(
         messages: [LLMMessage],
         system: String?,
@@ -58,119 +56,26 @@ public protocol LLMAdapter: Sendable {
     ) -> AsyncThrowingStream<String, Error>
 }
 
+/// How an adapter's `streamMessages` delivers a reply. Recorded on the
+/// `llm.call` row as `streamKind`.
+public enum LLMMessagesStreamKind: String, Sendable {
+    /// Provider text deltas and tool calls are yielded as they arrive.
+    case incremental
+    /// One blocking request; `.keepAlive` heartbeats while it runs, then the
+    /// whole reply (and any tool calls) is yielded at once.
+    case bufferedKeepAlive = "buffered_keepalive"
+    /// One blocking text-only request; `.keepAlive` heartbeats while it runs,
+    /// the whole reply is one text delta, and no tool call can come back.
+    case bufferedText = "buffered_text"
+
+    /// Bound by SwiftNativeLLMClient around the adapter's `streamMessages`
+    /// so the adapter's `llm.call` row carries the kind.
+    @TaskLocal public static var current: LLMMessagesStreamKind?
+}
+
 extension LLMAdapter {
     public static var supportsTools: Bool { false }
     public var supportsTools: Bool { Self.supportsTools }
-    /// Default tools-aware complete forwards to the no-tools complete so any
-    /// adapter that doesn't override stays back-compat.
-    public func complete(
-        prompt: String,
-        system: String?,
-        model: String,
-        tools: [LLMToolSchema]?
-    ) async throws -> String {
-        try await complete(prompt: prompt, system: system, model: model)
-    }
-
-    /// Default completeMessages flattens the structured conversation into a
-    /// single prompt string (role-prefixed text, tool blocks rendered as
-    /// inline annotations) and delegates to `complete(...tools:)`. Non-tool-
-    /// loop callers see no change. Tool-loop callers using a non-overriding
-    /// adapter degrade to text-append behavior — but at least nothing breaks.
-    public func completeMessages(
-        messages: [LLMMessage],
-        system: String?,
-        model: String,
-        tools: [LLMToolSchema]?
-    ) async throws -> String {
-        let flattened = llmCompatibilityPrompt(messages: messages) { role in
-            role == .user ? "USER:" : "ASSISTANT:"
-        }
-        var combined = flattened.text
-        let imageCount = flattened.imageCount
-        if imageCount > 0 {
-            let note = "[NOTE TO ASSISTANT: \(imageCount) image(s) reached this turn — attached by the user, or produced by a tool you just ran — but the active provider/model cannot see images. Tell the user honestly that you could not view the attached image(s) or the image(s) a tool produced — do NOT guess or pretend to describe them.]"
-            combined = combined.isEmpty ? note : note + "\n" + combined
-            // Emit a single-chokepoint trace row so every non-vision adapter
-            // is covered by one site, not N. Non-fatal: stderr on failure.
-            await Self.emitVisionUnsupportedTrace(
-                provider: self.providerId,
-                model: model,
-                imageCount: imageCount
-            )
-        }
-        return try await complete(prompt: combined, system: system, model: model, tools: tools)
-    }
-
-    /// Tripwire row: an image attachment hit a non-vision adapter and got
-    /// dropped at the default-flatten chokepoint. Mirrors `memory.commit`
-    /// trace shape (id/kind/title/status/payload/createdAt) and writes via
-    /// the path-owned appender to `<dataRoot>/traces/events.jsonl`.
-    private static func emitVisionUnsupportedTrace(
-        provider: String,
-        model: String,
-        imageCount: Int
-    ) async {
-        // Destination resolution mirrors LLMCallTraceRecorder.tracesPath: a
-        // non-nil override (test-only injection via LLMCallContext) wins,
-        // otherwise resolve the live default root at append time. This keeps
-        // hermetic suites from dribbling test rows into the LIVE
-        // traces/events.jsonl while staying byte-identical in production.
-        let dataRoot = LLMCallContext.traceDataRootOverride ?? PersistenceCore.defaultDataRoot()
-        let tracesPath = dataRoot
-            .appendingPathComponent("traces", isDirectory: true)
-            .appendingPathComponent("events.jsonl")
-        let row: JSONValue = .object([
-            "id": .string(UUID().uuidString.lowercased()),
-            "kind": .string("vision.attachment_unsupported"),
-            "title": .string("vision_attachment_unsupported"),
-            "status": .string("ok"),
-            "payload": .object([
-                "provider": .string(provider),
-                "model": .string(model),
-                "imageCount": .int(Int64(imageCount)),
-            ]),
-            "createdAt": .string(ISO8601DateFormatter().string(from: Date())),
-        ])
-        let persistence = SwiftNativePersistenceCore()
-        do {
-            try await appendPathOwnedJSONL(
-                row, to: tracesPath, using: persistence,
-                logLabel: "LLMAdapter.visionUnsupported"
-            )
-        } catch {
-            FileHandle.standardError.write(
-                Data("LLMAdapter: vision.attachment_unsupported trace append failed: \(error)\n".utf8)
-            )
-        }
-    }
-
-    public func streamMessages(
-        messages: [LLMMessage],
-        system: String?,
-        model: String,
-        tools: [LLMToolSchema]?
-    ) -> AsyncThrowingStream<LLMMessageStreamEvent, Error> {
-        AsyncThrowingStream { continuation in
-            let task = Task {
-                do {
-                    let reply = try await completeMessages(
-                        messages: messages,
-                        system: system,
-                        model: model,
-                        tools: tools
-                    )
-                    if !reply.isEmpty {
-                        continuation.yield(.textDelta(reply))
-                    }
-                    continuation.finish()
-                } catch {
-                    continuation.finish(throwing: ProviderFailure.normalize(error))
-                }
-            }
-            continuation.onTermination = { _ in task.cancel() }
-        }
-    }
 
     public func stream(
         prompt: String,
@@ -331,8 +236,8 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
     private let kimiCode: (any LLMAdapter)?
     /// OpenRouter adapter for slash-namespaced model ids (`anthropic/claude-...`,
     /// `openai/...`, `meta-llama/...`, etc). Optional so existing tests and
-    /// non-production wirings keep compiling — when nil, slash-prefixed ids
-    /// fall through to codex.
+    /// non-production wirings keep compiling — when nil, an `openrouter` route
+    /// fails `notConfigured(provider: "openrouter")`.
     private let openRouter: (any LLMAdapter)?
     private let streamGuardConfig: ProviderStreamGuardConfig
     private let lifecycleObserver: (any LLMCallLifecycleObserving)?
@@ -400,6 +305,11 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
         if let explicit = LLMCallContext.providerId, adapterChoice(forProviderId: explicit) == nil {
             throw LLMError.notConfigured(provider: explicit)
         }
+        if resolution.unrouted {
+            throw LLMError.notConfigured(
+                provider: resolution.providerId.isEmpty ? "router" : resolution.providerId
+            )
+        }
         if resolution.familyMismatch {
             throw LLMError.modelUnavailable(
                 provider: resolution.providerId,
@@ -462,7 +372,7 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
         await lifecycleObserver?.observeProviderCall(started.terminal(phase))
     }
 
-    /// Adapter choice produced by `resolveAdapter(model:surface:)`. Used by
+    /// Adapter choice produced by `resolveAdapterAndModel`. Used by
     /// both `complete()` and `stream()` so the dispatch logic stays in one
     /// place — prior round had a bug where the streaming path skipped the
     /// active-provider tiebreaker and went straight to Codex on ambiguous
@@ -485,128 +395,73 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
         /// (User, 2026-08-21 — fail loud, the user picks models); the
         /// validation gate throws on this before any dispatch or spend.
         var familyMismatch: Bool = false
+        /// S12a: no explicit route exists for this call (or it names a
+        /// provider no adapter serves); the validation gate throws before any
+        /// dispatch rather than guessing one from the model name.
+        var unrouted: Bool = false
     }
 
-    /// Single source of truth for routing. Explicit active provider wins for
-    /// a surface; model prefix is used only when no active provider is set.
-    private func resolveAdapter(
-        model: String,
-        surface: String,
-        routingSnapshot: ProviderRoutingSnapshot
-    ) async -> AdapterChoice {
-        (await resolveAdapterAndModel(
-            model: model,
-            surface: surface,
-            routingSnapshot: routingSnapshot
-        )).choice
-    }
-
+    /// Single source of truth for routing: the explicit provider pick for the
+    /// call. A model name is checked against it, never used to choose it.
     private func resolveAdapterAndModel(
         model: String,
         surface: String,
         routingSnapshot: ProviderRoutingSnapshot
     ) async -> AdapterResolution {
-        let lower = model.lowercased()
         let active = routingSnapshot.activeProviders
         let turnProvider = LLMCallContext.providerId?
             .trimmingCharacters(in: .whitespacesAndNewlines)
+        // S12a: the route is the explicit pick — the turn's bound provider,
+        // else the surface's own, else Chat's for a surface that inherits
+        // Chat's model (`resolveRequestedModel` falls back the same way). A
+        // model name alone never picks one: the model-prefix fallthrough that
+        // used to sit below routed an unpinned `claude-*` / `gpt-*` / `grok-*`
+        // / `kimi-*` / `vendor/model` id to whichever provider its name
+        // suggested. No route now fails loud before dispatch.
         let requestedProvider = turnProvider?.isEmpty == false
             ? turnProvider
-            : ProviderRoutingSurfaceLookup.value(active, surface)
-        if let activeProvider = requestedProvider,
-           let activeChoice = adapterChoice(forProviderId: activeProvider) {
-            if let inferred = inferredProviderId(forModel: model),
-               !SwiftNativeProviderRouting.providerCanServeModel(activeProvider, inferredProvider: inferred) {
-                // Swarms deliberately support explicit per-worker model
-                // choices. The checked surface tuple already reconciles the
-                // omitted/default model with its active provider, so a family
-                // mismatch here means the caller intentionally selected a
-                // different worker model. Route that model by its own family.
-                // For every other surface a mismatch used to silently swap in
-                // the provider default; since 2026-08-21 (User-directed) it is
-                // marked here and validateCatalogAvailability throws
-                // modelUnavailable BEFORE dispatch — the last silent-swap
-                // path, closed to match the adapter-level coercion throws.
-                if surface.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() != "swarms" {
-                    return AdapterResolution(
-                        choice: activeChoice,
-                        model: model,
-                        providerId: activeProvider,
-                        familyMismatch: true
-                    )
-                }
-            } else {
-                return AdapterResolution(choice: activeChoice, model: model, providerId: activeProvider)
-            }
-        }
-        if lower.contains("/"), openRouter != nil {
-            return AdapterResolution(choice: .openRouter, model: model, providerId: "openrouter")
-        }
-        // User, 2026-09-06: this UNPINNED fallback used to pick OAuth on adapter
-        // EXISTENCE, and production builds every OAuth adapter unconditionally
-        // — so a user whose only credential was an API key had `claude-*` /
-        // `gpt-*` routed to the OAuth provider and got `notConfigured` from a
-        // provider they never connected. Choose OAuth only when its credential
-        // is actually on disk; otherwise the api-key adapter, which fails with
-        // its own honest shape when it too is unconfigured.
-        if lower.hasPrefix("claude") {
+            : ProviderRoutingSurfaceLookup.value(active, surface) ?? active["chat"]
+        guard let activeProvider = requestedProvider,
+              let activeChoice = adapterChoice(forProviderId: activeProvider) else {
             return AdapterResolution(
-                choice: .anthropic,
+                choice: .codex,
                 model: model,
-                providerId: Self.oauthCredentialPresent(anthropicOAuthDirect)
-                    ? "anthropic_oauth_direct"
-                    : "anthropic"
+                providerId: requestedProvider ?? "",
+                unrouted: true
             )
         }
-        if lower.hasPrefix("gpt") {
+        if let inferred = inferredProviderId(forModel: model),
+           !SwiftNativeProviderRouting.providerCanServeModel(activeProvider, inferredProvider: inferred) {
+            // A mismatch used to silently swap in the provider default; since
+            // 2026-08-21 (User-directed) it is marked here and
+            // validateCatalogAvailability throws modelUnavailable BEFORE
+            // dispatch. S12a: swarms no longer re-route a mismatched worker
+            // model by its own family — a swarm runs on the Work group's model
+            // only (SwarmExecutor.requireBoundModel), so there is nothing left
+            // to route by name.
             return AdapterResolution(
-                choice: .openAI,
+                choice: activeChoice,
                 model: model,
-                providerId: Self.oauthCredentialPresent(openAIOAuthDirect)
-                    ? "openai_oauth_direct"
-                    : "openai"
+                providerId: activeProvider,
+                familyMismatch: true
             )
         }
-        if lower.hasPrefix("grok") {
-            return AdapterResolution(choice: .xai, model: model, providerId: "xai_oauth_direct")
-        }
-        // Kimi Code subscription ids ride the Anthropic wire path (distinct
-        // endpoint + key), selected via anthropicAdapter(for:"kimi-code").
-        // Checked BEFORE the moonshot `kimi-` prefix branch below.
-        if FirstPartyModelCatalog.kimiCodeModelIDSet.contains(lower) {
-            return AdapterResolution(choice: .anthropic, model: model, providerId: "kimi-code")
-        }
-        if lower.hasPrefix("kimi-") || lower.hasPrefix("moonshot-") {
-            return AdapterResolution(choice: .moonshot, model: model, providerId: "moonshot")
-        }
-        // M-F3: a PINNED Moonshot catalog id that doesn't carry the kimi-/
-        // moonshot- prefix (all current static ids do, but the live /v1/models
-        // catalog can carry account-visible rows without it) must still route
-        // to moonshot — not silently fall through to codex, which would run
-        // the wrong backend for a first-party Kimi model. Route by catalog
-        // membership: static first-party rows + live disk cache.
-        if isMoonshotCatalogModel(lower) {
-            return AdapterResolution(choice: .moonshot, model: model, providerId: "moonshot")
-        }
-        // A namespaced `vendor/model` id is the OpenRouter form, and by here no
-        // first-party rule has claimed it. Resolve it to `.openRouter` EVEN IF
-        // OpenRouter is unconfigured, so the adapter guard throws
-        // `notConfigured(provider: "openrouter")` — the same fail-loud shape the
-        // pinned-provider path already produces. Previously this fell through to
-        // Codex, so a swarms worker asking for `anthropic/claude-3.5-sonnet`
-        // with OpenRouter unconfigured silently ran on the Codex CLI with a
-        // model string Codex has never heard of (gpt-5.5 BLOCKING, 2026-08-02).
-        if lower.contains("/") {
-            return AdapterResolution(choice: .openRouter, model: model, providerId: "openrouter")
-        }
-        return AdapterResolution(choice: .codex, model: model, providerId: "codex")
+        return AdapterResolution(choice: activeChoice, model: model, providerId: activeProvider)
     }
 
-    /// True only when `adapter` exists AND its own credential file is present.
-    /// An adapter that cannot answer (a test double) reports absent, which
-    /// keeps the api-key branch — the same shape as no adapter at all.
-    private static func oauthCredentialPresent(_ adapter: (any LLMAdapter)?) -> Bool {
-        (adapter as? OAuthCredentialPresence)?.hasStoredOAuthCredential ?? false
+    /// The provider `streamMessages` resolves for this call — the same
+    /// snapshot, requested-model and adapter resolution, under the caller's
+    /// bound `LLMCallContext`. Nil when the call itself would fail there first.
+    public func servingProviderID(model: String?, surface: String) async -> String? {
+        guard let routingSnapshot = try? await checkedRoutingSnapshot(),
+              let resolvedModel = try? resolveRequestedModel(
+                model, surface: surface, routingSnapshot: routingSnapshot
+              )
+        else { return nil }
+        let resolution = await resolveAdapterAndModel(
+            model: resolvedModel, surface: surface, routingSnapshot: routingSnapshot
+        )
+        return resolution.unrouted ? nil : resolution.providerId
     }
 
     private func openAIAdapter(for providerId: String) throws -> any LLMAdapter {
@@ -1001,7 +856,7 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
                 case .toolCall(let call):
                     let args = String(decoding: call.inputJSON, as: UTF8.self)
                     result += "\n<tool_use id=\"\(call.id)\" name=\"\(call.name)\">\(args)</tool_use>"
-                case .keepAlive: break
+                case .keepAlive, .replyTextSettled: break
                 }
             }
             return result
@@ -1058,7 +913,7 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
     ) -> AsyncThrowingStream<LLMMessageStreamEvent, Error> {
         ProviderRecoveryPolicy.retryOverloadStream(hasOutput: {
             switch $0 {
-            case .keepAlive: return false
+            case .keepAlive, .replyTextSettled: return false
             case .textDelta(let text): return !text.isEmpty
             case .toolCall: return true
             }
@@ -1114,7 +969,7 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
                                 case .toolCall(let call):
                                     _ = budget.take(call.name + String(decoding: call.inputJSON, as: UTF8.self), visible: false)
                                     if !budget.exhausted { continuation.yield(event) }
-                                case .keepAlive: continuation.yield(event)
+                                case .keepAlive, .replyTextSettled: continuation.yield(event)
                                 }
                                 if budget.exhausted { throw LLMError.outputLengthLimit(partial: budget.partialReply) }
                             } else { continuation.yield(event) }
@@ -1153,9 +1008,11 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
                     try await LLMCallContext.$reasoningEffort.withValue(controls.effort) {
                     try await LLMCallContext.$serviceTier.withValue(controls.serviceTier) {
                     let (adapter, providerLabel) = try self.adapter(for: resolution, tools: tools)
+                    try await LLMMessagesStreamKind.$current.withValue(adapter.messagesStreamKind(tools: tools)) {
                     try await forward(adapter.streamMessages(
                         messages: messages, system: system, model: effectiveModel, tools: tools
                     ), providerLabel: providerLabel)
+                    }
                     }
                     }
                     // User, 2026-09-06: cancellation can resume the iteration's
@@ -1328,71 +1185,19 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
 
 // MARK: - Credentials resolver
 
-/// Three-source credential resolver mirroring Python's daemon precedence:
-///   1. ProcessInfo env var (e.g. OPENAI_API_KEY)
-///   2. <providers>/<providerConfigFile> with top-level `api_key`
-///   3. <codex_home>/auth.json with top-level `OPENAI_API_KEY`
-///      (ChatGPT OAuth path — ONLY consulted when the caller is asking for
-///      OPENAI_API_KEY; anthropic / other providers must not pick up an OAuth
-///      OpenAI key from the codex home, since the key is endpoint-specific.)
-/// Each step is best-effort: malformed/missing files fall through to the next.
+/// One credential source per API-key provider: the Keychain reference Settings
+/// saves into `<dataRoot>/providers/<providerConfigFile>` (or a legacy api_key). No environment
+/// variable and no other provider's file (the Codex CLI's `auth.json`) is
+/// consulted — a key that is not there is `nil`, and the caller fails with
+/// `notConfigured` naming the provider.
 public enum LLMCredentialResolver {
-    /// CWD-relative resolution (legacy default). Resolves the two file sources
-    /// under `<cwd>/data/providers` and `<cwd>/data/codex_home`. This is correct
-    /// in a dev checkout (the daemon is launched with the repo root as CWD) but
-    /// WRONG for an installed `.app` bundle, whose CWD is `/` — there the files
-    /// live under the daemon's resolved data root (stamped REPO_PATH /
-    /// NATIVE_AGENT_DATA_ROOT / AppSupport), not under the process CWD. Callers
-    /// running in an installed build MUST use the `dataRoot:` overload below so
-    /// they resolve the SAME `<dataRoot>/providers` + `<dataRoot>/codex_home`
-    /// directories the daemon's `_VisionClient` is constructed with
-    /// (the retired daemon `provider_config_dir=self.root / "providers"`,
-    /// `codex_home=self.app_codex_home()` == `self.root / "codex_home"`).
-    public static func resolveAPIKey(envVar: String, providerConfigFile: String) -> String? {
-        // Legacy CWD-relative base: <cwd>/data. defaultDataRoot()'s dev branch
-        // returns <repo>/data, so the dataRoot overload omits the extra "data"
-        // segment — only this CWD path appends it.
+    public static func resolveAPIKey(providerConfigFile: String, dataRoot: URL) -> String? {
+        let path = dataRoot
+            .appendingPathComponent("providers", isDirectory: true)
+            .appendingPathComponent(providerConfigFile)
+        guard let data = try? Data(contentsOf: path) else { return nil }
         return resolveAPIKey(
-            envVar: envVar,
-            providerConfigFile: providerConfigFile,
-            currentDirectory: URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-        )
-    }
-
-    static func resolveAPIKey(
-        envVar: String,
-        providerConfigFile: String,
-        currentDirectory: URL
-    ) -> String? {
-        let base = currentDirectory
-            .appendingPathComponent("data", isDirectory: true)
-        return resolveAPIKey(
-            envVar: envVar,
-            providerConfigFile: providerConfigFile,
-            providersDir: base.appendingPathComponent("providers", isDirectory: true),
-            codexHomeDir: base.appendingPathComponent("codex_home", isDirectory: true)
-        )
-    }
-
-    /// Data-root-relative resolution for installed builds. `dataRoot` is the
-    /// daemon's resolved data root (e.g. from `PersistenceCore.defaultDataRoot()`),
-    /// which ALREADY includes the `data` segment in the dev branch and points at
-    /// the stamped/AppSupport root in an installed bundle. The file sources are
-    /// `<dataRoot>/providers/<providerConfigFile>` and
-    /// `<dataRoot>/codex_home/auth.json` — NO extra `data` segment is appended,
-    /// matching the daemon's `self.root / "providers"` / `self.root / "codex_home"`.
-    public static func resolveAPIKey(
-        envVar: String,
-        providerConfigFile: String,
-        dataRoot: URL,
-        includeEnvironment: Bool = true
-    ) -> String? {
-        return resolveAPIKey(
-            envVar: envVar,
-            providerConfigFile: providerConfigFile,
-            providersDir: dataRoot.appendingPathComponent("providers", isDirectory: true),
-            codexHomeDir: dataRoot.appendingPathComponent("codex_home", isDirectory: true),
-            includeEnvironment: includeEnvironment
+            providerConfigObject: try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         )
     }
 
@@ -1402,94 +1207,18 @@ public enum LLMCredentialResolver {
     /// `configureProvider` writes under. Reading the file a second time here,
     /// unlocked, is exactly what let one snapshot decide "which provider is
     /// connected" from one set of bytes and "what that provider defaults to"
-    /// from another. Precedence is the file resolver's, because it IS the file
-    /// resolver — only the config-object step is pre-supplied.
-    static func resolveAPIKey(
-        envVar: String,
-        providerConfigObject: [String: Any]?,
-        dataRoot: URL,
-        includeEnvironment: Bool = true
-    ) -> String? {
-        return resolveAPIKey(
-            envVar: envVar,
-            providerConfig: { providerConfigObject },
-            codexHomeDir: dataRoot.appendingPathComponent("codex_home", isDirectory: true),
-            includeEnvironment: includeEnvironment
-        )
-    }
-
-    /// Core resolver: env var → `<providersDir>/<providerConfigFile>` `api_key`
-    /// → (OpenAI only) `<codexHomeDir>/auth.json` `OPENAI_API_KEY`. Both public
-    /// entry points funnel here so the precedence/parsing semantics stay in one
-    /// place and remain tested identically regardless of how the directories
-    /// were resolved.
-    private static func resolveAPIKey(
-        envVar: String,
-        providerConfigFile: String,
-        providersDir: URL,
-        codexHomeDir: URL,
-        includeEnvironment: Bool = true
-    ) -> String? {
-        let providerPath = providersDir.appendingPathComponent(providerConfigFile)
-        return resolveAPIKey(
-            envVar: envVar,
-            providerConfig: {
-                guard let data = try? Data(contentsOf: providerPath) else { return nil }
-                return try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-            },
-            codexHomeDir: codexHomeDir,
-            includeEnvironment: includeEnvironment
-        )
-    }
-
-    /// The precedence itself, with the provider config object supplied by the
-    /// caller (read from disk, or handed over already-read). One copy so a
-    /// pre-read caller cannot drift from a file-reading one.
-    private static func resolveAPIKey(
-        envVar: String,
-        providerConfig: () -> [String: Any]?,
-        codexHomeDir: URL,
-        includeEnvironment: Bool
-    ) -> String? {
-        if includeEnvironment, let v = ProcessInfo.processInfo.environment[envVar] {
-            let trimmed = v.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !trimmed.isEmpty {
-                // Return the TRIMMED key: a trailing newline from `cat
-                // keyfile`-style exports flows into the auth header and
-                // produces a persistent 401 misreported as not-configured
-                // (audit 2026-06-09).
-                return trimmed
-            }
+    /// from another.
+    public static func resolveAPIKey(providerConfigObject: [String: Any]?) -> String? {
+        guard let providerConfigObject else { return nil }
+        if let storedReference = providerConfigObject[ProviderAPIKeyStore.referenceField] {
+            // An unavailable referenced credential must never revive a legacy key.
+            guard let reference = storedReference as? String else { return nil }
+            return try? ProviderAPIKeyStore.read(reference)
         }
-
-        if let obj = providerConfig(),
-           let key = obj["api_key"] as? String {
-            // Return the TRIMMED key, mirroring the env-var branch above —
-            // stray whitespace in the config file flows into the auth header
-            // and produces a persistent 401 (audit 2026-06-09).
-            let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !trimmed.isEmpty {
-                return trimmed
-            }
-        }
-
-        // codex_home/auth.json holds an `OPENAI_API_KEY` field (Python's
-        // ChatGPT-OAuth flow stashes it there). Only the OpenAI resolver
-        // should look here — using it for an Anthropic call would point a
-        // Bearer at the wrong endpoint and 401 silently.
-        if envVar == "OPENAI_API_KEY" {
-            let codexAuthPath = codexHomeDir.appendingPathComponent("auth.json")
-            if let data = try? Data(contentsOf: codexAuthPath),
-               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let key = obj["OPENAI_API_KEY"] as? String {
-                // Trimmed for the same reason as the branches above.
-                let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !trimmed.isEmpty {
-                    return trimmed
-                }
-            }
-        }
-
-        return nil
+        guard let key = providerConfigObject["api_key"] as? String else { return nil }
+        // Return the TRIMMED key: stray whitespace in the config file flows
+        // into the auth header and produces a persistent 401 (audit 2026-06-09).
+        let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 }

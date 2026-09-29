@@ -3,13 +3,13 @@ import SwiftUI
 // PATCH-2026-05-08: wave2-chat-ux — slash command menu popover
 // PATCH-Phase6b: extraTools — dynamic tool entries from CapabilitiesStore appended after hardcoded ones.
 struct SlashCommandMenu: View {
+    @State private var hoveredCommand: String?
     var filter: String
     var onSelect: (String) -> Void
     // S.8: called when user presses Escape to dismiss the popover
     var onDismiss: (() -> Void)? = nil
     // PATCH-Phase6b: read-only tools to show as dynamic slash-command entries
     var extraTools: [ToolCapability] = []
-    @AppStorage("showDeveloperSurfaces") private var showDeveloperSurfaces = false
 
     private struct SlashCmd: Identifiable {
         var id: String { command }
@@ -20,9 +20,7 @@ struct SlashCommandMenu: View {
     }
 
     private var hardcodedCommands: [SlashCmd] {
-        ChatSlashCommandRegistry.visible(
-            showDeveloperSurfaces: NativeAgentShellPreference.developerSurfacesShown(showDeveloperSurfaces)
-        ).map {
+        ChatSlashCommandRegistry.all.map {
             SlashCmd(command: $0.command, description: $0.description, placeholder: $0.placeholder)
         }
     }
@@ -52,11 +50,11 @@ struct SlashCommandMenu: View {
                     } label: {
                         HStack(spacing: 8) {
                             Text("/" + (cmd.placeholder.isEmpty ? cmd.command : cmd.placeholder))
-                                .font(.system(.caption, design: .monospaced))
-                                .foregroundStyle(.primary)
+                                .font(.system(.callout, design: .monospaced))
+                                .foregroundStyle(NativeAgentShell.text)
                             Text(cmd.description)
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
+                                .font(.caption)
+                                .foregroundStyle(NativeAgentShell.secondary)
                             Spacer()
                             // PATCH-Phase6b: tool badge for dynamically injected tool entries
                             if cmd.isToolEntry {
@@ -70,9 +68,17 @@ struct SlashCommandMenu: View {
                         }
                         .padding(.horizontal, 10)
                         .padding(.vertical, 5)
+                        .background {
+                            if hoveredCommand == cmd.id {
+                                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                    .fill(NativeAgentShell.softFill)
+                            }
+                        }
                         .contentShape(Rectangle())
                     }
-                    .buttonStyle(.borderless)
+                    // Plain, not borderless: borderless drew the rows dim on glass.
+                    .buttonStyle(.plain)
+                    .onHover { hoveredCommand = $0 ? cmd.id : (hoveredCommand == cmd.id ? nil : hoveredCommand) }
                 }
             }
         }

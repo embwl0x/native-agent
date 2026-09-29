@@ -24,6 +24,12 @@ public enum GitHubOAuthDeviceFlow {
         public var refreshToken: String?
         public var expiresAt: Date?
         public var refreshTokenExpiresAt: Date?
+        public var accountID: Int64?
+        public var refreshTokenAccountID: Int64?
+
+        public var hasRefreshBinding: Bool {
+            accountID != nil && accountID == refreshTokenAccountID
+        }
 
         /// Due for refresh inside five minutes of expiry.
         public func needsRefresh(now: Date = Date()) -> Bool {

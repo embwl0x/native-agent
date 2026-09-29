@@ -53,11 +53,80 @@ public final class SystemDockerPSExecutor: DockerPSExecutor {
     public init() {}
 
     public func runJSONLines() async -> String? {
+        await run(arguments: ["ps", "--format", "{{json .}}"])
+    }
+
+    /// Ownership requires the explicitly configured container name as well as
+    /// the local daemon, official image and configured loopback port.
+    public func stoppedLocalSearXNG(base: String, containerName: String) async -> String? {
+        guard !containerName.isEmpty,
+              let url = URL(string: base), url.scheme == "http",
+              ["localhost", "127.0.0.1", "[::1]", "::1"].contains(url.host ?? ""),
+              url.user == nil, url.password == nil, url.query == nil, url.fragment == nil,
+              url.path.isEmpty || url.path == "/" else { return nil }
+        let environment = ProcessInfo.processInfo.environment
+        let host: String?
+        if let explicitHost = environment["DOCKER_HOST"], !explicitHost.isEmpty,
+           environment["DOCKER_CONTEXT", default: ""].isEmpty {
+            host = explicitHost
+        } else {
+            host = await run(arguments: ["context", "inspect", "--format", "{{.Endpoints.docker.Host}}"])
+        }
+        guard host?.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("unix://") == true,
+              let ids = await run(arguments: ["ps", "--all", "--quiet", "--filter", "status=exited"])
+        else { return nil }
+        let candidates = ids.split(whereSeparator: \.isWhitespace).map(String.init)
+        guard !candidates.isEmpty, candidates.count <= 32,
+              candidates.allSatisfy({ $0.allSatisfy(\.isHexDigit) }),
+              let json = await run(arguments: ["inspect"] + candidates),
+              let rows = try? JSONSerialization.jsonObject(with: Data(json.utf8)) as? [[String: Any]]
+        else { return nil }
+        let matches = rows.filter { row in
+            guard row["Name"] as? String == "/" + containerName,
+                  let config = row["Config"] as? [String: Any],
+                  let image = config["Image"] as? String,
+                  let state = row["State"] as? [String: Any], state["Status"] as? String == "exited",
+                  let hostConfig = row["HostConfig"] as? [String: Any],
+                  let bindings = hostConfig["PortBindings"] as? [String: [[String: String]]],
+                  let ports = bindings["8080/tcp"] else { return false }
+            let repository = image.split(separator: "@").first.map(String.init)?
+                .split(separator: ":").first.map(String.init)
+            guard repository == "searxng/searxng" || repository == "docker.io/searxng/searxng",
+                  ports.contains(where: {
+                      $0["HostPort"] == String(url.port ?? 80)
+                          && ["", "0.0.0.0", "127.0.0.1", "::", "::1"].contains($0["HostIp"] ?? "")
+                  }) else { return false }
+            return true
+        }
+        guard matches.count == 1, let row = matches.first,
+              let imageID = row["Image"] as? String,
+              let json = await run(arguments: ["image", "inspect", imageID]),
+              let images = try? JSONSerialization.jsonObject(with: Data(json.utf8)) as? [[String: Any]],
+              let image = images.first,
+              let defaults = image["Config"] as? [String: Any],
+              let config = row["Config"] as? [String: Any],
+              let digests = image["RepoDigests"] as? [String],
+              digests.contains(where: {
+                  $0.hasPrefix("searxng/searxng@sha256:") || $0.hasPrefix("docker.io/searxng/searxng@sha256:")
+              }),
+              config["Entrypoint"] as? [String] == defaults["Entrypoint"] as? [String],
+              config["Cmd"] as? [String] == defaults["Cmd"] as? [String] else { return nil }
+        return row["Id"] as? String
+    }
+
+    public func restartLocalSearXNG(base: String, containerName: String, containerID: String) async throws {
+        guard await stoppedLocalSearXNG(base: base, containerName: containerName) == containerID,
+              await run(arguments: ["start", containerID]) != nil else {
+            throw ResearchClientError.transport("The identified local SearXNG container could not be restarted; its identity or state may have changed.")
+        }
+    }
+
+    private func run(arguments: [String]) async -> String? {
         // Locate `docker` on PATH (matches Python's shutil.which).
         guard let dockerPath = Self.whichDocker() else { return nil }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: dockerPath)
-        process.arguments = ["ps", "--format", "{{json .}}"]
+        process.arguments = arguments
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()
         process.standardOutput = stdoutPipe

@@ -1,4 +1,5 @@
 import Foundation
+import AppToolRuntime
 import Observation
 import Darwin
 import AppKit
@@ -38,13 +39,7 @@ import Skills
 import Connectors
 import Browser
 
-enum SkillMutationRecallReconciliationError: Error, LocalizedError {
-    case canonicalMutationCommitted
-
-    var errorDescription: String? {
-        "The skill change was saved, but its recall pointers could not be refreshed. Recall may still reflect the earlier skill state; the saved change was not rolled back."
-    }
-}
+typealias SkillMutationRecallReconciliationError = AppToolRuntime.SkillMutationRecallReconciliationError
 
 extension NativeClient {
     func updateSkill(id: String, status: String) async throws -> SkillRecord {
@@ -57,13 +52,7 @@ extension NativeClient {
     static func updateSkill(
         id: String, status: String, dataRoot: URL, memory: SwiftNativeMemoryV2, personaRoot: URL
     ) async throws -> SkillRecord {
-        // wave 32 W15: gate to SwiftNativeSkillsClient.updateSkill when .skills
-        // is ON. The Swift impl wraps the registry R-M-W in withFileLock and
-        // fires the record_activity emission. Decode the returned skill object
-        // with the shared native decoder.
-        let impl = makeSkillsClient(root: dataRoot)
-        let result = try await impl.updateSkill(body: .object(["id": .string(id), "status": .string(status)]))
-        try await reconcileSkillEvolutionRecall(memory: memory, dataRoot: dataRoot, personaRoot: personaRoot)
+        let result = try await NativeSkillRegistryActions.updateSkill(id: id, status: status, dataRoot: dataRoot, memory: memory, personaRoot: personaRoot)
         return try Self.decodeJSONValue(result, as: SkillRecord.self, context: "updateSkill(swiftNative)")
     }
 
@@ -77,14 +66,7 @@ extension NativeClient {
     static func deleteSkill(
         id: String, dataRoot: URL, memory: SwiftNativeMemoryV2, personaRoot: URL
     ) async throws -> EmptyResponse {
-        // wave 32 W15: gate to SwiftNativeSkillsClient.deleteSkill (registry
-        // delete + body-file cleanup + manifest fallback + record_activity, all
-        // flocked). The daemon route returns `{id, deleted:true[, source]}`;
-        // the Mac caller discards the body (EmptyResponse), so we just run the
-        // mutation and ignore the returned object.
-        let impl = makeSkillsClient(root: dataRoot)
-        _ = try await impl.deleteSkill(id: id)
-        try await reconcileSkillEvolutionRecall(memory: memory, dataRoot: dataRoot, personaRoot: personaRoot)
+        try await NativeSkillRegistryActions.deleteSkill(id: id, dataRoot: dataRoot, memory: memory, personaRoot: personaRoot)
         return EmptyResponse()
     }
 
@@ -98,9 +80,7 @@ extension NativeClient {
     static func archiveSkill(
         id: String, dataRoot: URL, memory: SwiftNativeMemoryV2, personaRoot: URL
     ) async throws -> SkillRecord {
-        let impl = makeSkillsClient(root: dataRoot)
-        let result = try await impl.archiveSkill(id: id)
-        try await reconcileSkillEvolutionRecall(memory: memory, dataRoot: dataRoot, personaRoot: personaRoot)
+        let result = try await NativeSkillRegistryActions.archiveSkill(id: id, dataRoot: dataRoot, memory: memory, personaRoot: personaRoot)
         return try Self.decodeJSONValue(result, as: SkillRecord.self, context: "archiveSkill(swiftNative)")
     }
 
@@ -114,32 +94,14 @@ extension NativeClient {
     static func restoreSkill(
         id: String, versionId: String, dataRoot: URL, memory: SwiftNativeMemoryV2, personaRoot: URL
     ) async throws -> SkillRecord {
-        let impl = makeSkillsClient(root: dataRoot)
-        let result = try await impl.restoreSkill(id: id, versionId: versionId)
-        try await reconcileSkillEvolutionRecall(memory: memory, dataRoot: dataRoot, personaRoot: personaRoot)
+        let result = try await NativeSkillRegistryActions.restoreSkill(id: id, versionId: versionId, dataRoot: dataRoot, memory: memory, personaRoot: personaRoot)
         return try Self.decodeJSONValue(result, as: SkillRecord.self, context: "restoreSkill(swiftNative)")
     }
 
     static func reconcileSkillEvolutionRecall(
         memory: SwiftNativeMemoryV2, dataRoot: URL, personaRoot: URL
     ) async throws {
-        do {
-            // Reuse the same serialized pointer owner and receipt as launch
-            // and save_skill. A successful mutation return includes this
-            // derived reconciliation, not merely a refreshed Skills screen.
-            _ = try await memory.syncSkillPointersRecordingReceipt(
-                bodiesDirs: [
-                    dataRoot.appendingPathComponent("skills/bodies", isDirectory: true),
-                    personaRoot.appendingPathComponent("skills/bodies", isDirectory: true),
-                ],
-                runtimeRegistryURL: dataRoot.appendingPathComponent("skills/registry.json"),
-                receiptURL: dataRoot.appendingPathComponent("skills/.pointer_sync_receipt.json")
-            )
-        } catch {
-            // The canonical mutation already committed. Never label this as
-            // a failed archive/restore or silently claim recall is current.
-            throw SkillMutationRecallReconciliationError.canonicalMutationCommitted
-        }
+        try await NativeSkillRegistryActions.reconcileSkillEvolutionRecall(memory: memory, dataRoot: dataRoot, personaRoot: personaRoot)
     }
 
     func updateTool(id: String, autoRun: Bool) async throws -> ToolRecord {
@@ -159,43 +121,7 @@ extension NativeClient {
     /// toggle. Keeping this next to the production entry point makes the
     /// temp-root evaluation exercise the same flocked read-modify-write path.
     static func updateTool(id: String, autoRun: Bool, dataRoot root: URL) async throws -> ToolRecord {
-        let regPath = root.appendingPathComponent("tools/registry.json")
-        let core = SwiftNativePersistenceCore()
-        return try await core.withFileLock(regPath) {
-            let fm = FileManager.default
-            try fm.createDirectory(at: regPath.deletingLastPathComponent(), withIntermediateDirectories: true)
-            var rows: [[String: Any]] = []
-            if fm.fileExists(atPath: regPath.path) {
-                let data = try Data(contentsOf: regPath)
-                let raw: Any
-                do {
-                    raw = try JSONSerialization.jsonObject(with: data, options: [])
-                } catch {
-                    throw NSError(domain: "NativeAgentSwiftOnly", code: -422, userInfo: [
-                        NSLocalizedDescriptionKey: "updateTool: tools registry is malformed"
-                    ])
-                }
-                if let arr = raw as? [[String: Any]] {
-                    rows = arr
-                } else if let dict = raw as? [String: Any], let arr = dict["tools"] as? [[String: Any]] {
-                    rows = arr
-                } else {
-                    throw NSError(domain: "NativeAgentSwiftOnly", code: -422, userInfo: [
-                        NSLocalizedDescriptionKey: "updateTool: tools registry must contain an array of records"
-                    ])
-                }
-            }
-            guard let idx = rows.firstIndex(where: { ($0["id"] as? String) == id }) else {
-                throw NSError(domain: "NativeAgentSwiftOnly", code: -404, userInfo: [
-                    NSLocalizedDescriptionKey: "updateTool: tool id \(id) not found in \(regPath.path)"
-                ])
-            }
-            rows[idx]["autoRun"] = autoRun
-            let out = try JSONSerialization.data(withJSONObject: rows, options: [.sortedKeys, .prettyPrinted])
-            try out.write(to: regPath, options: .atomic)
-            let recordData = try JSONSerialization.data(withJSONObject: rows[idx], options: [])
-            return try JSONDecoder().decode(ToolRecord.self, from: recordData)
-        }
+        try await ToolRegistryActions.updateTool(id: id, autoRun: autoRun, dataRoot: root, validate: ToolsFacade.checkAuthored)
     }
 
     func promoteTool(id: String, allowRisky: Bool, userRequested: Bool) async throws -> ToolRecord {
@@ -207,94 +133,18 @@ extension NativeClient {
     }
 
     func runEval(name: String) async throws -> EvalRun {
-        // DAEMON-DEAD PORT (2026-06-03): manual eval runs a bounded Swift-native
-        // harness and persists the result to evals/runs.json.
-        let started = Date()
-        let repoRoot = PersistenceCore.defaultDataRoot().deletingLastPathComponent()
-        let smokeScript = repoRoot
-            .appendingPathComponent("script", isDirectory: true)
-            .appendingPathComponent("smoke_all.sh")
-        let checks: [JSONValue] = [
-            try await Self.evalProcessCheck(
-                id: "swift_build",
-                title: "Swift package builds",
-                executable: "/usr/bin/swift",
-                arguments: ["build"],
-                currentDirectory: repoRoot,
-                timeout: 180
-            ),
-            try await Self.evalProcessCheck(
-                id: "native_smoke",
-                title: "Native smoke sweep passes",
-                executable: "/bin/zsh",
-                arguments: [smokeScript.path],
-                currentDirectory: repoRoot,
-                timeout: 240
-            ),
-        ]
-        let passed = checks.allSatisfy { check in
-            guard case .object(let obj) = check, case .bool(let ok)? = obj["passed"] else { return false }
-            return ok
+        let row = try await NativeRegistryEvaluation.runEval(name: name) { executable, arguments, directory, timeout in
+            let result = try await Self.runProcess(
+                executable: executable, arguments: arguments, currentDirectory: directory, timeout: timeout
+            )
+            return (result.status, Self.processDetail(result))
         }
-        let duration = Date().timeIntervalSince(started)
-        let row: JSONValue = .object([
-            "id": .string("eval-\(UUID().uuidString.lowercased())"),
-            "name": .string(name),
-            "status": .string(passed ? "passed" : "failed"),
-            "checks": .array(checks),
-            "createdAt": .string(SwiftNativeManifestSigner.isoTimestamp(started)),
-            "durationSeconds": .double(duration),
-        ])
-        try await Self.appendEvalRun(row)
         let data = try row.serializedData(pretty: false)
         return try JSONDecoder.nativeAgent.decode(EvalRun.self, from: data)
     }
 
-    private static func evalProcessCheck(
-        id: String,
-        title: String,
-        executable: String,
-        arguments: [String],
-        currentDirectory: URL,
-        timeout: TimeInterval
-    ) async throws -> JSONValue {
-        let result = try await runProcess(
-            executable: executable,
-            arguments: arguments,
-            currentDirectory: currentDirectory,
-            timeout: timeout
-        )
-        return .object([
-            "id": .string(id),
-            "title": .string(title),
-            "passed": .bool(result.status == 0),
-            "detail": .string(processDetail(result)),
-        ])
-    }
-
-    private static func appendEvalRun(_ row: JSONValue) async throws {
-        let path = PersistenceCore.defaultDataRoot()
-            .appendingPathComponent("evals", isDirectory: true)
-            .appendingPathComponent("runs.json")
-        try await appendBoundedRun(row, to: path)
-    }
-
     static func appendBoundedRun(_ row: JSONValue, to path: URL) async throws {
-        let persistence = SwiftNativePersistenceCore()
-        try await persistence.withFileLock(path) {
-            let raw = await persistence.readJSON(path, defaultValue: .array([]))
-            var rows: [JSONValue]
-            if case .array(let existing) = raw {
-                rows = existing
-            } else {
-                rows = []
-            }
-            rows.append(row)
-            if rows.count > 200 {
-                rows = Array(rows.suffix(200))
-            }
-            try await persistence.writeJSON(.array(rows), to: path)
-        }
+        try await NativeRegistryEvaluation.appendBoundedRun(row, to: path)
     }
 
     func updateConnector(id: String, enabled: Bool) async throws -> ConnectorRecord {
@@ -305,71 +155,15 @@ extension NativeClient {
         )
     }
 
-    func updateConnector(
-        id: String,
-        enabled: Bool,
-        root: URL
-    ) async throws -> ConnectorRecord {
-        // DAEMON-DEAD PORT (2026-06-03): registry.json is canonically an array
-        // of connector rows. Preserve that shape and update the matching row
-        // under flock; older object-shaped files are still supported.
-        let normalizedID = Self.normalizedConnectorID(id)
-        guard let currentEntry = try await Self.readConnectorRegistryEntry(
-            root: root,
-            provider: normalizedID
-        ) else {
-            throw NSError(domain: "NativeAgentConnectorMutation", code: -404, userInfo: [
-                NSLocalizedDescriptionKey: "Connector \(normalizedID) is not registered."
-            ])
-        }
-        let registryToggleOwners: Set<String> = [
-            "local_files", "github", "slack", "notion", "gmail", "gcal", "x",
-        ]
-        guard registryToggleOwners.contains(normalizedID) else {
-            throw NSError(domain: "NativeAgentConnectorMutation", code: -409, userInfo: [
-                NSLocalizedDescriptionKey:
-                    "\(Self.defaultConnectorName(normalizedID)) is controlled by its canonical setup surface."
-            ])
-        }
-        if enabled {
-            let runtime = Self.connectorRowWithRuntimeOverlay(currentEntry, root: root)
-            let auth = Self.connectorString(runtime["authState"])?.lowercased()
-            let health = Self.connectorString(runtime["healthStatus"])?.lowercased()
-            let hasVerifiedReadiness = auth == "connected"
-                || auth == "configured"
-                || health == "ok"
-                || normalizedID == "local_files"
-            guard hasVerifiedReadiness else {
-                throw NSError(domain: "NativeAgentConnectorMutation", code: -409, userInfo: [
-                    NSLocalizedDescriptionKey:
-                        "Configure and verify \(Self.defaultConnectorName(normalizedID)) before enabling it."
-                ])
-            }
-        }
-        let resultEntry = try await Self.mutateConnectorRegistryEntry(
-            root: root,
-            provider: normalizedID,
-            createIfMissing: false
-        ) { entry in
-            entry["enabled"] = .bool(enabled)
-            entry["updatedAt"] = .string(SwiftNativeManifestSigner.isoTimestamp(Date()))
-        }
-        if normalizedID == "telegram",
-           let cfg = TelegramBot.TelegramConfig.loadFromDisk(dataRoot: root) {
-            let updated = TelegramBot.TelegramConfig(
-                botToken: cfg.botToken,
-                allowedChatIds: cfg.allowedChatIds,
-                allowedUserIds: cfg.allowedUserIds,
-                requireMention: cfg.requireMention,
-                enabled: enabled,
-                model: cfg.model,
-                reasoningEffort: cfg.reasoningEffort
+    func updateConnector(id: String, enabled: Bool, root: URL) async throws -> ConnectorRecord {
+        let row = try await ConnectorRegistryActions.updateConnector(
+            id: id, enabled: enabled, root: root,
+            projection: ConnectorRegistryProjectionPort(
+                defaultName: Self.defaultConnectorName,
+                overlay: { Self.connectorRowWithRuntimeOverlay($0, root: $1) }
             )
-            try TelegramBot.TelegramConfig.saveToDisk(updated, dataRoot: root)
-        }
-        let overlay = Self.connectorRowWithRuntimeOverlay(resultEntry, root: root)
-        let data = try JSONValue.object(overlay).serializedData(pretty: false)
-        return try JSONDecoder().decode(ConnectorRecord.self, from: data)
+        )
+        return try JSONDecoder().decode(ConnectorRecord.self, from: row.serializedData(pretty: false))
     }
 
     func addWorkspace(name: String, path: String, permissions: [String]) async throws -> WorkspaceRecord {
@@ -385,65 +179,7 @@ extension NativeClient {
     /// isolated callers exercise the same flocked store rather than a copy of
     /// the mutation rules.
     func addWorkspace(name: String, path: String, permissions: [String], root: URL) async throws -> WorkspaceRecord {
-        // DAEMON-DEAD PORT P4: append a new row to <dataRoot>/connectors/
-        // workspaces.json under flock. Matches the reader path in
-        // Connectors.swift L132.
-        let cleanedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !cleanedName.isEmpty else {
-            throw workspaceValidationError("Enter a workspace name.")
-        }
-        let requestedURL = URL(fileURLWithPath: path).standardizedFileURL
-        var isDirectory: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: requestedURL.path, isDirectory: &isDirectory), isDirectory.boolValue else {
-            throw workspaceValidationError("Workspace path must be an existing folder.")
-        }
-        let resolvedURL = requestedURL.resolvingSymlinksInPath().standardizedFileURL
-        guard resolvedURL.path == requestedURL.path else {
-            throw workspaceValidationError("Workspace paths cannot use symlinks.")
-        }
-
-        let wsPath = root.appendingPathComponent("connectors/workspaces.json")
-        let core = SwiftNativePersistenceCore()
-        let now = ISO8601DateFormatter().string(from: Date())
-        let record = WorkspaceRecord(
-            id: UUID().uuidString,
-            name: cleanedName,
-            path: requestedURL.path,
-            permissions: permissions,
-            createdAt: now,
-            lastUsedAt: nil
-        )
-        return try await core.withFileLock(wsPath) {
-            let fm = FileManager.default
-            try? fm.createDirectory(at: wsPath.deletingLastPathComponent(), withIntermediateDirectories: true)
-            var rows: [[String: Any]] = []
-            if let data = try? Data(contentsOf: wsPath),
-               let arr = try? JSONSerialization.jsonObject(with: data, options: []) as? [[String: Any]] {
-                rows = arr
-            }
-            for existing in rows {
-                guard let existingPath = existing["path"] as? String, !existingPath.isEmpty else { continue }
-                let existingURL = URL(fileURLWithPath: existingPath).standardizedFileURL
-                let candidate = requestedURL.path
-                let prior = existingURL.path
-                if candidate == prior {
-                    throw workspaceValidationError("That workspace is already registered.")
-                }
-                if candidate.hasPrefix(prior + "/") || prior.hasPrefix(candidate + "/") {
-                    throw workspaceValidationError("Workspace folders cannot overlap.")
-                }
-            }
-            let rowData = try JSONEncoder().encode(record)
-            let row = try JSONSerialization.jsonObject(with: rowData, options: []) as? [String: Any] ?? [:]
-            rows.append(row)
-            let out = try JSONSerialization.data(withJSONObject: rows, options: [.sortedKeys, .prettyPrinted])
-            try out.write(to: wsPath, options: .atomic)
-            return record
-        }
-    }
-
-    private func workspaceValidationError(_ message: String) -> NSError {
-        NSError(domain: "NativeAgentWorkspace", code: 422, userInfo: [NSLocalizedDescriptionKey: message])
+        try await ConnectorRegistryActions.addWorkspace(name: name, path: path, permissions: permissions, root: root)
     }
 
     func searchWorkspace(query: String) async throws -> WorkspaceSearchResponse {
@@ -456,26 +192,8 @@ extension NativeClient {
     /// Uses the same in-process workspace search and activity receipt as the
     /// Settings action; the injected root is solely for hermetic callers.
     func searchWorkspace(query: String, root: URL) async throws -> WorkspaceSearchResponse {
-        // Subsystem #24 wave 31 (W14): when .connectors is on, run the workspace
-        // file search in-process (workspaces.json read + local directory walk +
-        // content match), matching Runtime.search_workspaces. The SwiftNative
-        // path returns nil for an empty query so the HTTP path produces the
-        // daemon's real ValueError; a non-empty query is served natively.
-        // wave 32 (W20): the FLIP PREREQ is now CLOSED — the native search path
-        // appends the SAME redacted activity row (kind="connector",
-        // "Workspace search", payload={resultCount}) the daemon does, with an
-        // envelope + secret redaction that are byte-identical modulo the
-        // createdAt precision divergence (millis vs micros; see Connectors.swift).
-        // .connectors is now a flip CANDIDATE (still default-OFF until cutover).
-        let impl = makeConnectorsClient(root: root)
-        if let envelope = try await impl.searchWorkspaces(query: query) {
-            let data = try envelope.serializedData(pretty: false)
-            return try JSONDecoder().decode(WorkspaceSearchResponse.self, from: data)
-        }
-        // Swift-native cutover sweep s4: native impl declined (empty query / missing
-        // index). Surface an empty response instead of throwing so the UI just
-        // shows "no results" rather than an error toast.
-        return WorkspaceSearchResponse(query: query, results: [])
+        let row = try await ConnectorRegistryActions.searchWorkspace(query: query, root: root)
+        return try JSONDecoder().decode(WorkspaceSearchResponse.self, from: row.serializedData(pretty: false))
     }
 
     func savePersonality(_ profile: PersonalityProfile) async throws -> PersonalityProfile {
@@ -546,10 +264,7 @@ extension NativeClient {
     /// identically to one decoded off the wire — `merged.update(body)` sees the
     /// same leaf types JSONSerialization would have produced.
     static func jsonValueBody(_ body: [String: Any]) throws -> [String: JSONValue] {
-        let data = try JSONSerialization.data(withJSONObject: body, options: [])
-        let parsed = try JSONValue.parse(data)
-        guard case .object(let obj) = parsed else { return [:] }
-        return obj
+        try NativeActionRouteSupport.jsonValueBody(body)
     }
 
     /// Map Core `CompiledPersonalityProfile` (the persisted, normalized profile

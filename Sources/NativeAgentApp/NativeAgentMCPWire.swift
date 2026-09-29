@@ -1,4 +1,5 @@
 import Foundation
+import Agents
 import CoreFoundation
 
 /// Stateless MCP transport projection only. Chat admission, context and receipts
@@ -13,8 +14,14 @@ enum NativeAgentMCPWire {
     }
 
     static let versions = ["2025-11-25", "2025-06-18", "2025-03-26"]
+    /// How long `agent_message` holds the call open for the reply when the
+    /// caller does not say. Below the 60 s per-call default most MCP clients
+    /// use (TypeScript SDK, Codex), and below the 30 s HTTP limit of relays
+    /// spawned before this change, which hosts keep running until restarted.
+    static let defaultWaitSeconds = 25
+    static let maximumWaitSeconds = 300
 
-    private enum ID: Sendable {
+    enum ID: Sendable {
         case string(String), number(Int64), null
         var value: Any {
             switch self {
@@ -59,7 +66,7 @@ enum NativeAgentMCPWire {
                 "protocolVersion": versions.contains(requested) ? requested : versions[0],
                 "capabilities": ["tools": [:]],
                 "serverInfo": ["name": "NativeAgent", "version": "1.0"],
-                "instructions": "Talk with \(PeerFacingIdentity.agentName) through persistent full chat sessions. Keep the returned session and request IDs. A message acknowledgement means queued, not finished. Read the exact reply; never resend solely because a reply is missing."
+                "instructions": "Talk with \(PeerFacingIdentity.agentName) through persistent full chat sessions. agent_message waits for the reply (up to wait_seconds) and returns it; status enqueued means queued, not finished, so read the rest with agent_reply. Keep the returned session and request IDs. Never resend solely because a reply is missing."
             ])
         case "ping": return success(id, result: [:])
         case "tools/list":
@@ -73,7 +80,7 @@ enum NativeAgentMCPWire {
                 return failure(id, code: -32602, message: "Tool name and arguments are required.")
             }
             if name == "agent_message" {
-                guard Set(args.keys).isSubset(of: ["text", "session_id", "request_id"]),
+                guard Set(args.keys).isSubset(of: ["text", "session_id", "request_id", "wait_seconds"]),
                       let text = args["text"] as? String,
                       !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                       text.utf8.count <= 64000 else {
@@ -96,6 +103,11 @@ enum NativeAgentMCPWire {
                       exactUUID(request) else {
                     return failure(id, code: -32602, message: "request_id is required and must be a canonical UUID. It is this message's replay key: retry the same message under the same request_id, and use a new one only for new content.")
                 }
+                if let raw = args["wait_seconds"], wholeNumber(raw, in: 0...maximumWaitSeconds) == nil {
+                    return failure(id, code: -32602, message: "wait_seconds must be an integer from 0 through \(maximumWaitSeconds).")
+                }
+                // wait_seconds stays OUT of the message body: that body is the
+                // replay digest, and waiting longer is not different content.
                 let message: [String: Any] = ["text": text, "sessionId": session, "request_id": request]
                 guard let data = try? JSONSerialization.data(withJSONObject: message, options: .sortedKeys) else {
                     return failure(id, code: -32603, message: "Could not encode message.")
@@ -114,7 +126,29 @@ enum NativeAgentMCPWire {
                     ]
                     if status >= 400 && status < 500 { result["status"] = "rejected" }
                     if !accepted, let detail = receipt["detail"] { result["detail"] = detail }
-                    return toolResult(id, fields: result, failed: !accepted)
+                    // The call waited (waitRequest): carry what the task holds now.
+                    var failed = !accepted
+                    if accepted, let state = receipt["original_status"] as? String {
+                        for key in ["reply", "has_more", "next_offset", "original_status", "run_id", "provider_failure", "work"] {
+                            result[key] = receipt[key]
+                        }
+                        let more = receipt["has_more"] as? Bool == true
+                        if more, let next = receipt["next_offset"] {
+                            result["read_with"] = ["tool": "agent_reply", "arguments": ["session_id": session, "request_id": request, "offset": next]]
+                        }
+                        switch state {
+                        case "completed":
+                            result["status"] = "answered"
+                            result["detail"] = more ? "\(agent) answered. Follow read_with for the rest of the reply." : "\(agent) answered."
+                        case "failed", "canceled":
+                            result["status"] = state
+                            result["detail"] = receipt["detail"] ?? "The turn did not finish. Do not resend automatically."
+                            failed = true
+                        default:
+                            result["detail"] = "Queued and still in progress (\(state)); reply holds what is written so far. Read the rest with agent_reply. Do not resend."
+                        }
+                    }
+                    return toolResult(id, fields: result, failed: failed)
                 })
             }
             if name == "agent_reply" {
@@ -125,11 +159,10 @@ enum NativeAgentMCPWire {
                 }
                 var offset = 0
                 if let raw = args["offset"] {
-                    guard let value = raw as? NSNumber, CFGetTypeID(value) != CFBooleanGetTypeID(),
-                          value.doubleValue == Double(value.intValue), (0...1_048_576).contains(value.intValue) else {
+                    guard let value = wholeNumber(raw, in: 0...1_048_576) else {
                         return failure(id, code: -32602, message: "offset must be an integer from 0 through 1048576.")
                     }
-                    offset = value.intValue
+                    offset = value
                 }
                 return .reply(requestID: request, sessionID: session, offset: offset, project: { receipt in
                     let allowed: Set<String> = ["status", "reply", "request_id", "session_id", "run_id", "offset", "next_offset", "has_more", "evidence", "coverage", "original_status", "original_outcome", "detail", "provider_failure", "work"]
@@ -142,6 +175,33 @@ enum NativeAgentMCPWire {
             return failure(id, code: -32602, message: "Unknown tool. Use tools/list.")
         default: return failure(id, code: -32601, message: "Method not supported.")
         }
+    }
+
+    /// What an already-parsed `agent_message` call asked of the wait: seconds
+    /// to hold the call for the reply (0 = the old immediate acknowledgement)
+    /// and the client's progress token, which turns the answer into an SSE
+    /// stream of `notifications/progress` carrying the partial reply.
+    static func waitRequest(_ body: Data) -> (seconds: Int, progressToken: ID?) {
+        let params = (try? JSONSerialization.jsonObject(with: body) as? [String: Any])?["params"] as? [String: Any]
+        let args = params?["arguments"] as? [String: Any]
+        let seconds = args?["wait_seconds"].flatMap { wholeNumber($0, in: 0...maximumWaitSeconds) } ?? defaultWaitSeconds
+        let raw = (params?["_meta"] as? [String: Any])?["progressToken"]
+        var token: ID?
+        if let text = raw as? String, text.utf8.count <= 256 { token = .string(text) }
+        else if let number = raw as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
+                number.stringValue == String(number.int64Value) { token = .number(number.int64Value) }
+        return (seconds, token)
+    }
+
+    static func progress(_ token: ID, step: Int, message: String) -> [String: Any] {
+        ["jsonrpc": "2.0", "method": "notifications/progress",
+         "params": ["progressToken": token.value, "progress": step, "message": message]]
+    }
+
+    private static func wholeNumber(_ raw: Any, in range: ClosedRange<Int>) -> Int? {
+        guard let value = raw as? NSNumber, CFGetTypeID(value) != CFBooleanGetTypeID(),
+              value.doubleValue == Double(value.intValue), range.contains(value.intValue) else { return nil }
+        return value.intValue
     }
 
     static func validSession(_ value: String) -> Bool {
@@ -172,11 +232,13 @@ enum NativeAgentMCPWire {
     static var tools: [[String: Any]] {
         let agent = PeerFacingIdentity.agentName
         return [
-            ["name": "agent_message", "description": "Talk with \(agent). Your contact's conversation continues automatically. To start a separate conversation, supply session_id as mcp- followed by a fresh UUID. Keep returned IDs to read the reply. The first answer confirms your message was queued.",
+            ["name": "agent_message", "description": "Talk with \(agent). Your contact's conversation continues automatically. To start a separate conversation, supply session_id as mcp- followed by a fresh UUID. The call waits up to wait_seconds and returns the reply (status answered). If it is still in progress the status is enqueued: keep the returned IDs and read the reply with agent_reply.",
              "inputSchema": ["type": "object", "properties": [
                 "text": ["type": "string", "maxLength": 64000],
                 "session_id": ["type": "string", "description": "Omit to continue your contact's usual conversation. Supply a returned ID to continue a separate conversation, or mcp- plus a fresh UUID to start one."],
-                "request_id": ["type": "string", "description": "Required canonical UUID you generate. It is this message's replay key: a retry of the SAME message must carry the same request_id, and new content needs a new one. Never resend solely because a reply is missing."]
+                "request_id": ["type": "string", "description": "Required canonical UUID you generate. It is this message's replay key: a retry of the SAME message must carry the same request_id, and new content needs a new one. Never resend solely because a reply is missing."],
+                "wait_seconds": ["type": "integer", "minimum": 0, "maximum": maximumWaitSeconds, "default": defaultWaitSeconds,
+                                 "description": "How long this call waits for the reply. Keep the default unless your client allows longer tool calls; 0 returns as soon as the message is queued."]
              ], "required": ["text", "request_id"], "additionalProperties": false],
              "annotations": ["readOnlyHint": false, "idempotentHint": false, "openWorldHint": true]],
             ["name": "agent_reply", "description": "Read the retained reply to an exact \(agent) message. Missing evidence does not prove failure or authorize replay. Follow next_offset when has_more is true.",

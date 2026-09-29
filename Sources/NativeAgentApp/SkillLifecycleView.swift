@@ -1,3 +1,5 @@
+import Connectors
+import ProviderRouting
 import SwiftUI
 import AppKit
 import PersistenceCore
@@ -1120,6 +1122,7 @@ struct OAuthFlowSheet: View {
             return
         }
         let result = await NativeOAuthFlow.startConnectorOAuthFlow(
+            platform: NativeOAuthPlatform.self,
             connectorId: connectorId,
             dataRoot: oauthDataRoot
         )

@@ -145,6 +145,11 @@
             (error) => sendPageError(sendResponse, error),
           );
           return true;
+        case "nativeagent.page.history":
+          // After the reply, so it is not lost to the page unloading.
+          setTimeout(() => history.go(message.delta < 0 ? -1 : 1), 0);
+          sendResponse({ ok: true, result: { length: history.length } });
+          break;
         case "nativeagent.page.scroll":
           void scrollPage(message).then(
             (result) => sendResponse({ ok: true, result }),
@@ -188,6 +193,8 @@
     const candidates = readingScope === "page" ? walk.elements : walk.elements.filter((element) =>
       modals.some((modal) => withinElement(element, modal))
       || (contentRegions.some((region) => withinElement(element, region)) && !insideNavigation(element)));
+    const glyphCounts = fragmentedTextGlyphCounts(candidates);
+    const collapsedText = new Set();
     let aggregateNodeText = 0;
     // 2026-09-23: node text honors max_text_chars too; only the summary was
     // bounded, so a 1k-char ask still shipped up to 200k chars of nodes.
@@ -195,20 +202,37 @@
     if (walk.truncated) truncationReasons.push("walk_limit");
 
     for (const element of candidates) {
+      if (collapsedText.has(element)) {
+        for (const child of element.children) collapsedText.add(child);
+        continue;
+      }
       if (nodes.length >= maxNodes) {
         truncationReasons.push("node_limit");
         break;
       }
       if (!isVisible(element) || !intersectsViewport(element)) continue;
       const kind = elementKind(element);
-      let text = snapshotText(element);
-      const name = bounded(accessibleName(element, text), 500);
+      const fragmented = element.children.length > 0 && glyphCounts.get(element) >= 2;
+      let text = fragmented ? bounded(normalizedText(visibleFragmentedText(element)), 1_000) : snapshotText(element);
+      let name = bounded(accessibleName(element, text), 500);
       // Layout wrappers repeat the entire feed at every nesting level. Keep
       // semantic containers and controls, and preserve direct/leaf text instead.
-      if (isRedundantLayoutWrapper(element, kind)) continue;
+      if (!fragmented && isRedundantLayoutWrapper(element, kind)) continue;
+      if (fragmented) for (const child of element.children) collapsedText.add(child);
+      if (fragmented && !text) continue;
       if (!name && !text && kind === "other") continue;
       const selectInfo = element.tagName.toLowerCase() === "select" ? selectDescription(element) : null;
-      const nodeTextCost = text.length + name.length + (selectInfo ? JSON.stringify(selectInfo).length : 0);
+      let nodeTextCost = text.length + name.length + (selectInfo ? JSON.stringify(selectInfo).length : 0);
+      // 2026-09-28: its glyphs are already consumed, so a collapsed run that
+      // overruns the budget keeps the part that fits instead of vanishing.
+      if (fragmented && aggregateNodeText + nodeTextCost > nodeTextBudget) {
+        const room = Math.floor((nodeTextBudget - aggregateNodeText) / 2);
+        if (room > 0) {
+          text = text.slice(0, room);
+          name = bounded(accessibleName(element, text), 500);
+          nodeTextCost = text.length + name.length;
+        }
+      }
       if (aggregateNodeText + nodeTextCost > nodeTextBudget) {
         truncationReasons.push(nodeTextBudget < MAX_AGGREGATE_NODE_TEXT ? "text_limit" : "encoded_size_limit");
         // 2026-09-23: past the text budget, drop prose but never a control; a
@@ -227,7 +251,9 @@
       // 2026-09-06: what this id claimed to be, so an action can refuse a node
       // that is now something else. A shadow-root swap keeps the same element
       // object and connection while the label and role move on.
-      identityByNodeId.set(nodeId, nodeIdentity(element, name));
+      // Text compaction changes presentation, not the identity used by wait/drop.
+      const identityName = fragmented ? bounded(accessibleName(element, snapshotText(element)), 500) : name;
+      identityByNodeId.set(nodeId, nodeIdentity(element, identityName));
       if (selectInfo) selectProofs.set(nodeId, JSON.stringify(selectInfo));
       const navigationProof = captureNavigationProof(element);
       if (navigationProof) navigationProofs.set(nodeId, navigationProof);
@@ -827,6 +853,47 @@
       ? Array.from(element.childNodes).filter((node) => node.nodeType === 3).map((node) => node.textContent ?? "").join(" ")
       : (element.innerText ?? element.textContent ?? "");
     return bounded(normalizedText(raw), 1_000);
+  }
+
+  function fragmentedTextGlyphCounts(elements) {
+    // Work bottom-up within the existing bounded walk. Only plain inline
+    // descendants qualify: never absorb controls, paragraph boundaries, shadow
+    // content or offscreen prose. Visibility is applied when assembling text,
+    // so transparent glyphs do not prevent their visible siblings collapsing.
+    const counts = new Map();
+    for (let index = elements.length - 1; index >= 0; index -= 1) {
+      const element = elements[index];
+      if (elementKind(element) !== "other" || element.getAttribute("role")
+        || element.getAttribute("aria-label") || element.getAttribute("aria-labelledby")
+        || element.shadowRoot || element.tagName.toLowerCase() === "slot" || !(element instanceof HTMLElement)
+        || element.isContentEditable || isKeypressable(element, "")
+        || isScrollable(element) || element.draggable === true) continue;
+      const children = Array.from(element.children);
+      if (children.some((child) => !counts.has(child)
+        || !["inline", "inline-block"].includes(getComputedStyle(child).display))) continue;
+      const fragments = Array.from(element.childNodes).filter((node) => node.nodeType === 3)
+        .map((node) => normalizedText(node.textContent ?? "")).filter(Boolean);
+      // 2026-09-28: longer direct text may sit between glyphs ("Read n·o·w
+      // please"); only single-character fragments count toward the run.
+      const glyphFragments = fragments.filter((text) => [...text].length === 1).length;
+      const count = glyphFragments + children.reduce((sum, child) => sum + counts.get(child), 0);
+      if (count && !intersectsViewport(element)) continue;
+      counts.set(element, count);
+    }
+    return counts;
+  }
+
+  function visibleFragmentedText(element) {
+    const raw = Array.from(element.childNodes).map((node) => {
+      if (node.nodeType === 3) return node.textContent ?? "";
+      if (node.nodeType === 1 && node.tagName === "BR") return "\n";
+      return node.nodeType === 1 ? visibleFragmentedText(node) : "";
+    }).join("");
+    // Keep whitespace-only spans, including those with no measurable box.
+    // Normalize only after joining so spaces between visible glyphs survive.
+    // A glyph must be seen AND on screen: a run crossing the viewport edge
+    // keeps only what is in view, as each glyph row did before collapsing.
+    return !normalizedText(raw) || (isVisible(element) && intersectsViewport(element)) ? raw : "";
   }
 
   function requireActionableSnapshotNode(snapshotId, nodeId, action) {

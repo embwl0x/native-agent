@@ -180,7 +180,7 @@ public struct TelegramPollLoop: LoopRunner {
         sendMessageWithReplyMarkup: (@Sendable (_ token: String, _ chatId: Int, _ text: String, _ replyMarkup: JSONValue) async throws -> Void)? = nil,
         editMessageTextWithReplyMarkup: (@Sendable (_ token: String, _ chatId: Int, _ messageId: Int, _ text: String, _ replyMarkup: JSONValue?) async throws -> Void)? = nil,
         deleteMessage: (@Sendable (_ token: String, _ chatId: Int, _ messageId: Int) async throws -> Void)? = nil,
-        draftEditIntervalSeconds: TimeInterval = 2.0,
+        draftEditIntervalSeconds: TimeInterval = 1.0,  // User 09-27: smaller chunks; Telegram allows ~1 edit/s per chat
         turnCardMinimumEditIntervalSeconds: TimeInterval = 5,
         turnCardHeartbeatNanoseconds: UInt64 = 7_000_000_000,
         turnCardStalledAfterSeconds: TimeInterval = TelegramTurnPresentationRenderer.defaultStalledAfter,
@@ -770,9 +770,17 @@ public struct TelegramPollLoop: LoopRunner {
                 } catch {
                     FileHandle.standardError.write(Data("TelegramPollLoop: voice typing action failed for update \(update.updateId): \(Self._tgRedactToken(String(describing: error)))\n".utf8))
                 }
+                // Kept by id so it goes away once transcription settles, like
+                // every other working notice (User 09-27).
+                var transcribingNoticeId: Int?
+                func dismissTranscribingNotice() async {
+                    guard let id = transcribingNoticeId, let deleteMessage else { return }
+                    transcribingNoticeId = nil
+                    try? await deleteMessage(token, msg.destination.chatId, id)
+                }
                 do {
                     if await !voicePermissionNotice.sent {
-                        try await sendMessage(token, msg.destination, "Transcribing voice message")
+                        transcribingNoticeId = try await sendMessageReturningId(token, msg.destination, "Transcribing voice message")
                     }
                 } catch {
                     FileHandle.standardError.write(Data("TelegramPollLoop: voice progress send failed for update \(update.updateId): \(Self._tgRedactToken(String(describing: error)))\n".utf8))
@@ -830,7 +838,9 @@ public struct TelegramPollLoop: LoopRunner {
                         """
                     }
                     receiptKind = "voice_reply"
+                    await dismissTranscribingNotice()
                 } catch where error is CancellationError || Self.isSpeechPermissionDenial(error) {
+                    await dismissTranscribingNotice()
                     let awaitingPermission = Self.isSpeechPermissionDenial(error)
                     if awaitingPermission, await !voicePermissionNotice.sent {
                         await recordError(context: "voice_transcription", error: String(describing: error), update: update, message: msg, text: nil)
@@ -882,6 +892,7 @@ public struct TelegramPollLoop: LoopRunner {
                     if awaitingPermission { continue }
                     return .skipped(reason: "Telegram voice transcription cancelled; durable update retained for retry")
                 } catch {
+                    await dismissTranscribingNotice()
                     FileHandle.standardError.write(Data("TelegramPollLoop: voice transcription failed for update \(update.updateId): \(Self._tgRedactToken(String(describing: error)))\n".utf8))
                     await recordError(context: "voice_transcription", error: String(describing: error), update: update, message: msg, text: nil)
                     // Ordinary media failures settle with a notice; permission

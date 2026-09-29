@@ -56,36 +56,5 @@ public enum NativeToolCapability {
             .lowercased()
             .replacingOccurrences(of: "_", with: "-")
     }
-
-    /// Model-id fallback for callers that only know the requested model (the
-    /// chat loop resolves provider id first and uses this only as a backstop).
-    /// Mirrors the model→provider mapping in LLMClient+Real.swift.
-    ///
-    /// DELIBERATELY kimi-only, and it must stay that way: a `claude-*` model id
-    /// says nothing about WHICH Claude transport is bound — the same id is
-    /// served by the api-key adapter and by the OAuth-direct adapter. Admitting
-    /// Claude model ids here would let the backstop turn an OAuth turn native.
-    /// The api-key path opts in through `providerSupportsNativeTools` on a
-    /// resolved PROVIDER id only.
-    public static func modelImpliesNativeToolProvider(_ model: String?) -> Bool {
-        guard let model else { return false }
-        let lower = model.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return FirstPartyModelCatalog.kimiCodeModelIDSet.contains(lower)
-    }
 }
 
-/// User, 2026-09-06: "is an OAuth adapter WIRED?" and "is a user SIGNED IN to
-/// it?" are different questions, and the unpinned model-prefix fallback in
-/// `LLMClient+Real.resolveAdapterAndModel` used to answer the second with the
-/// first. Production constructs every OAuth adapter unconditionally, so a user
-/// whose only Anthropic credential was an API key had `claude-*` routed to
-/// `anthropic_oauth_direct` and got `notConfigured` from a provider it never
-/// asked for. Each direct adapter answers for its own credential file, honoring
-/// the path override it was built with.
-protocol OAuthCredentialPresence {
-    var hasStoredOAuthCredential: Bool { get }
-}
-
-extension AnthropicOAuthDirectAdapter: OAuthCredentialPresence {}
-extension OpenAIOAuthDirectAdapter: OAuthCredentialPresence {}
-extension XAIOAuthDirectAdapter: OAuthCredentialPresence {}

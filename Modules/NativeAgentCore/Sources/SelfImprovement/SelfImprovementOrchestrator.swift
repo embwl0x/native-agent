@@ -104,7 +104,7 @@ public actor SelfImprovementOrchestrator {
         if !ok {
             return ImprovementRun(id: "", status: "disabled", phase: "disabled", objective: objective, exitReason: reason)
         }
-        await rehydrateIfNeeded()
+        try await rehydrateIfNeeded()
         let id = newRunId()
         let run = ImprovementRun(
             id: id,
@@ -121,7 +121,7 @@ public actor SelfImprovementOrchestrator {
     public func snapshot(runId: String) async throws -> SnapshotResult {
         let (ok, reason) = selfImprovementAvailable()
         if !ok { return SnapshotResult(ok: false, runId: runId, error: reason) }
-        await rehydrateIfNeeded()
+        try await rehydrateIfNeeded()
         guard var run = pending[runId] else {
             return SnapshotResult(ok: false, runId: runId, error: "not_found")
         }
@@ -143,8 +143,8 @@ public actor SelfImprovementOrchestrator {
     ) async throws -> PromoteOpResult {
         let (ok, reason) = selfImprovementAvailable()
         if !ok { return PromoteOpResult(ok: false, runId: runId, error: reason) }
-        await rehydrateIfNeeded()
-        let ledger = await loadLedgerRun(runId: runId)
+        try await rehydrateIfNeeded()
+        let ledger = try await loadLedgerRun(runId: runId)
         let pendingRun = pending[runId]
         guard var run = ledger?.run ?? pendingRun else {
             return PromoteOpResult(ok: false, runId: runId, error: "not_found")
@@ -236,8 +236,8 @@ public actor SelfImprovementOrchestrator {
     public func revert(runId: String, expectedCommitSha: String?) async throws -> RevertOpResult {
         let (ok, reason) = selfImprovementAvailable()
         if !ok { return RevertOpResult(ok: false, runId: runId, error: reason) }
-        await rehydrateIfNeeded()
-        let ledger = await loadLedgerRun(runId: runId)
+        try await rehydrateIfNeeded()
+        let ledger = try await loadLedgerRun(runId: runId)
         let pendingRun = pending[runId]
         guard var run = ledger?.run ?? pendingRun else {
             return RevertOpResult(ok: false, runId: runId, error: "not_found")
@@ -283,7 +283,7 @@ public actor SelfImprovementOrchestrator {
     public func sweep() async throws -> SweepReport {
         let (ok, reason) = selfImprovementAvailable()
         if !ok { return SweepReport(ok: false, error: reason) }
-        await rehydrateIfNeeded()
+        try await rehydrateIfNeeded()
         let inspected = pending.count
         // Keep all non-terminal phases; sweep terminal entries older than 7 days.
         let cutoff = Date().addingTimeInterval(-7 * 24 * 60 * 60)
@@ -305,7 +305,7 @@ public actor SelfImprovementOrchestrator {
     public func listPending() async throws -> [ImprovementRun] {
         let (ok, _) = selfImprovementAvailable()
         if !ok { return [] }
-        await rehydrateIfNeeded()
+        try await rehydrateIfNeeded()
         return Array(pending.values).sorted { ($0.createdAt ?? "") < ($1.createdAt ?? "") }
     }
 
@@ -331,16 +331,16 @@ public actor SelfImprovementOrchestrator {
         dataRoot.appendingPathComponent("improvements/runs.json")
     }
 
-    private func rehydrateIfNeeded() async {
+    private func rehydrateIfNeeded() async throws {
         if rehydrated { return }
-        rehydrated = true
         // Same flock convention as every other shared store: pending_actions
         // is read and written under the file lock so a sibling process
         // mid-write can never hand us a torn read.
         let path = pendingPath()
-        let raw = (try? await persistence.withFileLock(path) { [persistence] in
-            await persistence.readJSON(path, defaultValue: .array([]))
-        }) ?? .array([])
+        let raw = try await persistence.withFileLock(path) { [persistence] in
+            try await persistence.readJSON(path, ifMissing: .array([]))
+        }
+        rehydrated = true
         guard case .array(let arr) = raw else { return }
         let decoder = JSONDecoder()
         let encoder = JSONEncoder()
@@ -522,8 +522,8 @@ public actor SelfImprovementOrchestrator {
         var source: String
     }
 
-    private func loadLedgerRun(runId: String) async -> LedgerRun? {
-        let raw = await persistence.readJSON(runsPath(), defaultValue: .array([]))
+    private func loadLedgerRun(runId: String) async throws -> LedgerRun? {
+        let raw = try await persistence.readJSON(runsPath(), ifMissing: .array([]))
         guard case .array(let entries) = raw else { return nil }
         let encoder = JSONEncoder()
         let decoder = JSONDecoder()
@@ -592,7 +592,7 @@ public actor SelfImprovementOrchestrator {
     private func markLedgerRunPromoted(runId: String, commitSha: String, completedAt: String?) async throws {
         let path = runsPath()
         try await persistence.withFileLock(path) { [persistence] in
-            let raw = await persistence.readJSON(path, defaultValue: .array([]))
+            let raw = try await persistence.readJSON(path, ifMissing: .array([]))
             guard case .array(let entries) = raw else { return }
             var changed = false
             let updated: [JSONValue] = entries.map { entry in
@@ -617,7 +617,7 @@ public actor SelfImprovementOrchestrator {
     private func markLedgerRunReverted(runId: String, revertCommitSha: String, completedAt: String?) async throws {
         let path = runsPath()
         try await persistence.withFileLock(path) { [persistence] in
-            let raw = await persistence.readJSON(path, defaultValue: .array([]))
+            let raw = try await persistence.readJSON(path, ifMissing: .array([]))
             guard case .array(let entries) = raw else { return }
             var changed = false
             let updated: [JSONValue] = entries.map { entry in

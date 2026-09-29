@@ -113,7 +113,7 @@ enum EvolutionSupport {
         }
     }
 
-    /// Hermeticity overlay on top of the scrubbed base: candidate build/test
+    /// Hermeticity overlay on top of the scrubbed base: candidate build
     /// children get a per-candidate HOME and TMPDIR so SwiftPM caches, plugin
     /// state, and tmp droppings land inside the candidate dir instead of the
     /// real user profile. XDG_* are re-pointed under the temp home for the

@@ -83,7 +83,7 @@ public struct AutonomyPromotionLoop: LoopRunner {
     /// proposed for promotion.
     static let hardExcludeTools: Set<String> = [
         // shell-class builders (Process spawn / fs write / arbitrary code)
-        "shell", "bash", "git", "apply_patch", "run_tests",
+        "shell", "bash", "git", "apply_patch",
         "swift_build", "swift_test",
         // app/agent control surfaces
         "restart_app", "install_app", "invoke_claude", "invoke_codex",

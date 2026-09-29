@@ -7,64 +7,22 @@
 // change stream so an approve/reject (or a background reflection producing a new
 // proposal) reflects live, exactly as the observatory did.
 
+import Cognition
 import SwiftUI
 import Observation
 import CognitiveSubstrate
 
-// MARK: - Feed loader (shared with ActivityView's inline preview)
+// MARK: - Feed loader (Today's standing-views count)
 
-enum CognitionProposalsFeed {
-    struct Pending: Sendable, Equatable {
-        var standingViews: [CognitiveStandingView] = []
-        var schemaProposals: [CognitiveSchemaProposal] = []
-        var count: Int { standingViews.count + schemaProposals.count }
-    }
-
-    enum Read: Sendable, Equatable {
-        case available(Pending)
-        case unavailable(String)
-
-        var pending: Pending {
-            guard case .available(let pending) = self else { return Pending() }
-            return pending
-        }
-    }
-
-    /// Proposed-only, the actionable "needs your eyes" set that drives the
-    /// Activity row count and inline previews.
-    static func pending() async -> Pending {
-        await pending(runtime: .shared)
-    }
-
-    /// Keep the feed's filtering at its real runtime boundary.  The default
-    /// remains the resident runtime; accepting a runtime makes an isolated
-    /// cognition store testable without teaching the feed about test data or
-    /// creating a second proposal representation.
-    static func pending(runtime: NativeCognitionRuntime) async -> Pending {
-        await read(runtime: runtime).pending
-    }
-
-    /// A disabled cognition runtime is not a successful empty proposal read.
-    /// Activity uses this richer result for its live subscription while the
-    /// legacy convenience method above keeps callers that only need a count
-    /// source-compatible.
-    static func read(runtime: NativeCognitionRuntime) async -> Read {
-        let detail = await runtime.observatoryDetail()
-        guard detail.configuration.enabled else {
-            return .unavailable("Cognition proposals are unavailable while cognition is off.")
-        }
-        return .available(Pending(
-            standingViews: detail.standingViews.filter { $0.status == .proposed },
-            schemaProposals: []
-        ))
-    }
-}
-
-// MARK: - Full destination view (Activity ▸ Cognition Proposals)
+// MARK: - Full destination view (Today ▸ Standing views)
 
 struct CognitionProposalsView: View {
     @Environment(AppModel.self) private var appModel
-    @State private var detail: CognitiveObservatoryDetail?
+    private var cognition: CognitionViewFacade { appModel.engine.cognitionView }
+    private var detail: CognitiveObservatoryDetail? {
+        get { cognition.proposalsDetail }
+        nonmutating set { cognition.proposalsDetail = newValue }
+    }
     @State private var reviewError: String?
 
     // Retired views never render; the observatory applied the same filter so the
@@ -101,7 +59,7 @@ struct CognitionProposalsView: View {
         }
         .navigationTitle("Cognition Proposals")
         .task {
-            let changes = await NativeCognitionRuntime.shared.changes()
+            let changes = await cognition.changes()
             await refresh()
             for await _ in changes {
                 guard !Task.isCancelled else { return }
@@ -111,7 +69,7 @@ struct CognitionProposalsView: View {
     }
 
     private func refresh() async {
-        detail = await NativeCognitionRuntime.shared.observatoryDetail()
+        await cognition.refreshProposals()
     }
 
     // MARK: Standing views (moved from CognitionObservatoryView+Proposals)
@@ -152,9 +110,11 @@ struct CognitionProposalsView: View {
                         ) { action in
                             Button(action.title, systemImage: action.systemImage) {
                                 Task {
+                                    guard let runtime = cognition.runtime else { return }
                                     let result = action == .retire
-                                        ? await CognitionProposalActions.retireWithOutcome(id: view.id)
+                                        ? await CognitionProposalActions.retireWithOutcome(runtime: runtime, id: view.id)
                                         : await CognitionProposalActions.resolveWithOutcome(
+                                            runtime: runtime,
                                             id: view.id,
                                             approved: action.approved
                                         )
@@ -216,136 +176,6 @@ struct CognitionProposalsView: View {
         case .notSaved(let detail):
             reviewError = "\(action) was not saved and will not survive a restart: \(detail)"
             appModel.systemToasts.push(error: reviewError ?? detail)
-        }
-    }
-}
-
-// MARK: - Inline preview card (Activity landing page)
-
-/// Compact approve/reject card matching the other Activity inline previews
-/// (InlineApprovalPreviewCard etc.). Used for the top 1–2 pending cognition
-/// proposals so a small queue doesn't force a drill-down.
-@MainActor @Observable
-final class InlineCognitionProposalCardActionState {
-    enum Decision: Sendable, Equatable {
-        case approve
-        case reject
-    }
-
-    enum Feedback: Sendable, Equatable {
-        case saved(String)
-        case unavailable(String)
-
-        var message: String {
-            switch self {
-            case .saved(let message), .unavailable(let message): return message
-            }
-        }
-
-        var isError: Bool {
-            if case .unavailable = self { return true }
-            return false
-        }
-    }
-
-    private(set) var inFlight: Decision?
-    private(set) var feedback: Feedback?
-
-    var hasSavedDecision: Bool {
-        guard case .saved = feedback else { return false }
-        return true
-    }
-
-    var canResolve: Bool {
-        inFlight == nil && !hasSavedDecision
-    }
-
-    func begin(_ decision: Decision) -> Bool {
-        guard inFlight == nil else { return false }
-        feedback = nil
-        inFlight = decision
-        return true
-    }
-
-    func settle(
-        _ status: CognitionProposalActions.ResolveStatus,
-        decision: Decision
-    ) -> Feedback {
-        defer { inFlight = nil }
-        let result: Feedback
-        switch status {
-        case .applied:
-            result = .saved(decision == .approve
-                ? "Standing view approved and saved."
-                : "Standing view rejected and retired.")
-        case .unavailable(let detail):
-            result = .unavailable("Standing-view review not applied: \(detail)")
-        case .notSaved(let detail):
-            result = .unavailable("Standing-view review was not saved: \(detail)")
-        }
-        feedback = result
-        return result
-    }
-}
-
-struct InlineCognitionProposalCard: View {
-    let proposalID: UUID
-    let title: String
-    let subtitle: String
-    // Taste pass 2026-07-24: schema-proposal titles are machine-generated
-    // slugs; without the proposal body a user is asked to Approve/Reject
-    // something they can't evaluate.
-    let detail: String
-    let onResolve: @MainActor (Bool) async -> CognitionProposalActions.ResolveStatus
-
-    @State private var actionState = InlineCognitionProposalCardActionState()
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text(title)
-                .font(NativeAgentFont.label)
-                .lineLimit(3)
-            if !detail.isEmpty {
-                Text(detail)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(4)
-            }
-            Text(subtitle)
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-            if let feedback = actionState.feedback {
-                Label(feedback.message, systemImage: feedback.isError ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
-                    .font(.caption2)
-                    .foregroundStyle(feedback.isError ? Color.orange : Color.green)
-                    .lineLimit(2)
-                    .accessibilityIdentifier("activity.inlineDecisionActions.feedback.\(proposalID.uuidString)")
-            }
-            if actionState.inFlight != nil {
-                Label("Saving decision…", systemImage: "arrow.triangle.2.circlepath")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .accessibilityIdentifier("activity.inlineDecisionActions.inFlight.\(proposalID.uuidString)")
-            }
-            HStack(spacing: 8) {
-                Button("Approve", systemImage: "checkmark") { resolve(.approve) }
-                    .controlSize(.small)
-                    .accessibilityIdentifier("activity.inlineDecisionActions.approve.\(proposalID.uuidString)")
-                    .disabled(!actionState.canResolve)
-                Button("Reject", systemImage: "xmark") { resolve(.reject) }
-                    .controlSize(.small)
-                    .accessibilityIdentifier("activity.inlineDecisionActions.reject.\(proposalID.uuidString)")
-                    .disabled(!actionState.canResolve)
-            }
-        }
-        .padding(.vertical, 4)
-    }
-
-    private func resolve(_ decision: InlineCognitionProposalCardActionState.Decision) {
-        guard actionState.begin(decision) else { return }
-        Task {
-            let status = await onResolve(decision == .approve)
-            _ = actionState.settle(status, decision: decision)
         }
     }
 }

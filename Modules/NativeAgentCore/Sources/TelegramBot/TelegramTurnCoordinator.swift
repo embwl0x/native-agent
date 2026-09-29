@@ -63,6 +63,7 @@ public actor TelegramTurnCoordinator {
         let startedAt: String
         let promptPreview: String
         var card: TelegramTurnProgressCardDriver?
+        var continuationID: Int? = nil
     }
 
     private struct QueuedTurn: Sendable {
@@ -71,6 +72,7 @@ public actor TelegramTurnCoordinator {
         let acknowledgementMessageId: Int?
         let operation: @Sendable (_ turnId: UUID) async -> Void
         let onStart: @Sendable (_ acknowledgementMessageId: Int?) async -> Void
+        var onDiscard: (@Sendable () -> Void)? = nil
     }
 
     private var activeTurns: [TelegramDestination: ActiveTurn] = [:]
@@ -264,7 +266,8 @@ public actor TelegramTurnCoordinator {
         text: String,
         priority: TaskPriority? = nil,
         operation: @escaping @Sendable (_ turnId: UUID) async -> Void,
-        onStart: (@Sendable () async -> Void)? = nil
+        onStart: (@Sendable () async -> Void)? = nil,
+        continuationID: Int? = nil
     ) -> (id: UUID, task: Task<Void, Never>) {
         let id = UUID()
         let task = Task(priority: priority) { [weak self] in
@@ -277,13 +280,59 @@ public actor TelegramTurnCoordinator {
             task: task,
             startedAt: _tgNowString(),
             promptPreview: Self.preview(text),
-            card: nil
+            card: nil,
+            continuationID: continuationID
         )
         return (id, task)
     }
 
     func canEnqueue(destination: TelegramDestination) -> Bool {
         !isShuttingDown && (queuedTurns[destination]?.count ?? 0) < Self.maximumQueuedTurnsPerChat
+    }
+
+    /// Await an internal follow-up in the same destination queue as inbound
+    /// turns. The slot includes delivery; shutdown/cancellation settles waiters.
+    public func runApprovalContinuation(
+        destination: TelegramDestination,
+        text: String,
+        operation: @escaping @Sendable () async throws -> Void
+    ) async throws {
+        try Task.checkCancellation()
+        guard !isShuttingDown else { throw CancellationError() }
+        let updateID = nextInternalUpdateID
+        nextInternalUpdateID &+= 1
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                let queued = QueuedTurn(
+                    updateId: updateID, text: text, acknowledgementMessageId: nil,
+                    operation: { _ in
+                        do {
+                            try Task.checkCancellation()
+                            try await operation()
+                            continuation.resume()
+                        } catch {
+                            continuation.resume(throwing: error)
+                        }
+                    },
+                    onStart: { _ in },
+                    onDiscard: { continuation.resume(throwing: CancellationError()) }
+                )
+                queuedTurns[destination, default: []].append(queued)
+                startNextQueuedTurn(destination: destination)
+            }
+        } onCancel: {
+            Task { await self.cancelApprovalContinuation(destination: destination, updateID: updateID) }
+        }
+    }
+
+    private func cancelApprovalContinuation(destination: TelegramDestination, updateID: Int) {
+        if let index = queuedTurns[destination]?.firstIndex(where: { $0.updateId == updateID }),
+           let queued = queuedTurns[destination]?.remove(at: index) {
+            if queuedTurns[destination]?.isEmpty == true { queuedTurns[destination] = nil }
+            queued.onDiscard?()
+        } else if let active = activeTurns[destination], active.continuationID == updateID {
+            active.task.cancel()
+        }
     }
 
     @discardableResult
@@ -456,7 +505,8 @@ public actor TelegramTurnCoordinator {
             text: next.text,
             priority: .userInitiated,
             operation: next.operation,
-            onStart: { await next.onStart(next.acknowledgementMessageId) }
+            onStart: { await next.onStart(next.acknowledgementMessageId) },
+            continuationID: next.onDiscard == nil ? nil : next.updateId
         )
     }
 
@@ -568,6 +618,7 @@ public actor TelegramTurnCoordinator {
     public func shutdown() async {
         shutdownGeneration &+= 1
         isShuttingDown = true
+        for queued in queuedTurns.values.flatMap({ $0 }) { queued.onDiscard?() }
         queuedTurns.removeAll()
         let tasks = activeTurns.values.map(\.task) + Array(commandTasks.values)
         for task in tasks { task.cancel() }

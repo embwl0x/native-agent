@@ -1,3 +1,4 @@
+import NativeAgentCore
 import SwiftUI
 
 /// The inline card family — one grammar for every moment where Agent needs the

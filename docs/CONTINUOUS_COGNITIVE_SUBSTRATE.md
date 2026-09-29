@@ -1884,10 +1884,7 @@ Required work:
 
 7. Run:
    - `swift build --package-path Modules/NativeAgentShared`
-   - targeted `CognitiveSubstrateTests`
-   - `swift test --package-path Modules/NativeAgentCore --no-parallel`
    - `swift build`
-   - `./script/test.sh`
    - `git diff --check`
 
 8. Leave the tree clean and commit the change unless instructed otherwise.

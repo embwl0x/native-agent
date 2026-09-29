@@ -97,7 +97,7 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
     /// The id of the CoreML model that would load: the installed extras model
     /// when present, else the bundled one.
     private var resolvedModelID: String {
-        CoreMLEmbeddingProvider.installedExtrasModel(root: dataRoot)?.modelID
+        (try? CoreMLEmbeddingProvider.installedExtrasModel(root: dataRoot))?.modelID
             ?? CoreMLEmbeddingProvider.bundledModelID
     }
 
@@ -106,7 +106,7 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
         // Not resident yet: report the model that WOULD load, not the mock's
         // width, so status surfaces do not read "384d" beside a 1024-d model.
         if Self.readConfig(dataRoot: dataRoot).backend != Self.mockBackend,
-           let installed = CoreMLEmbeddingProvider.installedExtrasModel(root: dataRoot) {
+           let installed = try? CoreMLEmbeddingProvider.installedExtrasModel(root: dataRoot) {
             return installed.dimensions
         }
         return mock.dimensions
@@ -180,10 +180,8 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
                 domain: "NativeAgentMemoryV2",
                 code: -100,
                 userInfo: [NSLocalizedDescriptionKey:
-                    "CoreML embedding model unavailable. Reinstall the app to "
-                    + "restore the bundled MiniLM, or set "
-                    + "NATIVE_AGENT_EMBEDDING_MOCK=1 to opt into deterministic "
-                    + "test vectors. Underlying error: \(error.localizedDescription)"]
+                    "CoreML embedding model \(resolvedModelID) did not load: "
+                    + "\(error.localizedDescription)"]
             )
         }
         noteUse()
@@ -210,6 +208,18 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
         let config = Self.readConfig(dataRoot: dataRoot)
         let resourcesAvailable = availabilityProbe()
         let mockEnvOptIn = ProcessInfo.processInfo.environment["NATIVE_AGENT_EMBEDDING_MOCK"] == "1"
+        // A broken installed model is named before the first embed() tries it,
+        // so status never shows a plain "missing" for a model that is there
+        // but unusable.
+        let installedModelProblem: String? = {
+            guard config.backend != Self.mockBackend else { return nil }
+            do {
+                _ = try CoreMLEmbeddingProvider.installedExtrasModel(root: dataRoot)
+                return nil
+            } catch {
+                return error.localizedDescription
+            }
+        }()
         return lock.withLock {
             let loadedProvider = state.coreMLProvider
             let requestedCoreML = config.backend != Self.mockBackend
@@ -259,7 +269,7 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
                 lastLoadedAt: Self.isoString(state.lastLoadedAt),
                 lastUnloadedAt: Self.isoString(state.lastUnloadedAt),
                 unloadReason: state.unloadReason,
-                lastLoadError: state.lastLoadError,
+                lastLoadError: state.lastLoadError ?? installedModelProblem,
                 loadCount: state.loadCount,
                 unloadCount: state.unloadCount,
                 idleUnloadSeconds: Self.idleUnloadSeconds(for: config.mode)

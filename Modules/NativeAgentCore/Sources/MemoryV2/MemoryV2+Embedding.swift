@@ -615,7 +615,7 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
         extrasRoot: URL? = nil,
         lowMemory: Bool = false
     ) throws -> CoreMLEmbeddingProvider {
-        if let installed = installedExtrasModel(root: extrasRoot) {
+        if let installed = try installedExtrasModel(root: extrasRoot) {
             return try CoreMLEmbeddingProvider(
                 modelURL: installed.modelURL,
                 vocabURL: installed.vocabURL,
@@ -650,44 +650,66 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
         public let dimensions: Int
     }
 
-    public static func installedExtrasModel(root: URL?) -> InstalledExtrasModel? {
-        // Three tiers: what the user installed under the data root, then the
-        // large model inside older app bundles (Resources/embedding), then the
-        // bundled MiniLM floor that every source build has.
+    /// nil only when no `embedding.json` is installed. A manifest that IS
+    /// there but cannot be used throws (S12, 2026-09-26): the configured model
+    /// failing must not quietly hand recall to the bundled MiniLM (which would
+    /// also re-embed the store in MiniLM's space). It fails closed instead, and
+    /// Doctor and the memory status name the reason.
+    public static func installedExtrasModel(root: URL?) throws -> InstalledExtrasModel? {
+        // Where the large model is installed: under the data root, else inside
+        // the app bundle (Resources/embedding). With neither, the bundled
+        // MiniLM is the configured model.
         if let root,
-           let installed = extrasModel(inDirectory: root
+           let installed = try extrasModel(inDirectory: root
                .appendingPathComponent("extras", isDirectory: true)
                .appendingPathComponent("coreml", isDirectory: true)) {
             return installed
         }
         if let resources = Bundle.main.resourceURL,
-           let shipped = extrasModel(inDirectory: resources.appendingPathComponent("embedding", isDirectory: true)) {
+           let shipped = try extrasModel(inDirectory: resources.appendingPathComponent("embedding", isDirectory: true)) {
             return shipped
         }
         return nil
     }
 
-    static func extrasModel(inDirectory dir: URL) -> InstalledExtrasModel? {
+    /// nil when `dir` has no `embedding.json`; throws when it has one that
+    /// cannot be used, naming why.
+    static func extrasModel(inDirectory dir: URL) throws -> InstalledExtrasModel? {
         let manifest = dir.appendingPathComponent("embedding.json")
+        func unusable(_ reason: String) -> EmbeddingError {
+            .installedModelUnusable(manifest: manifest.path, reason: reason)
+        }
+        // Only a manifest that is genuinely absent means "nothing installed".
+        // lstat, not fileExists: a dangling symlink or an unreadable folder is
+        // a broken install, not an absent one.
+        var info = stat()
+        if lstat(manifest.path, &info) != 0 {
+            if errno == ENOENT || errno == ENOTDIR { return nil }
+            throw unusable("embedding.json cannot be checked: \(String(cString: strerror(errno)))")
+        }
         guard let data = try? Data(contentsOf: manifest),
-              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let model = object["model"] as? String, !model.isEmpty,
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { throw unusable("embedding.json is not readable JSON") }
+        guard let model = object["model"] as? String, !model.isEmpty,
               let vocab = object["vocab"] as? String, !vocab.isEmpty,
               let modelID = object["model_id"] as? String, !modelID.isEmpty,
-              let dimensions = object["dimensions"] as? Int, dimensions > 0,
-              !model.contains("/"), !vocab.contains("/")
-        else { return nil }
+              let dimensions = object["dimensions"] as? Int, dimensions > 0
+        else { throw unusable("embedding.json needs model, vocab, model_id and dimensions") }
+        guard !model.contains("/"), !vocab.contains("/")
+        else { throw unusable("model and vocab must be file names beside embedding.json") }
         let modelURL = dir.appendingPathComponent(model)
         let vocabURL = dir.appendingPathComponent(vocab)
-        guard allowedModelExtensions.contains(modelURL.pathExtension.lowercased()),
-              FileManager.default.fileExists(atPath: modelURL.path),
-              FileManager.default.fileExists(atPath: vocabURL.path)
-        else { return nil }
+        guard allowedModelExtensions.contains(modelURL.pathExtension.lowercased())
+        else { throw unusable("\(model) is not a Core ML model package") }
+        guard FileManager.default.fileExists(atPath: modelURL.path)
+        else { throw unusable("\(model) is missing") }
+        guard FileManager.default.fileExists(atPath: vocabURL.path)
+        else { throw unusable("\(vocab) is missing") }
         // Both files must resolve inside the extras directory, symlinks included.
         let base = dir.resolvingSymlinksInPath().path + "/"
         guard modelURL.resolvingSymlinksInPath().path.hasPrefix(base),
               vocabURL.resolvingSymlinksInPath().path.hasPrefix(base)
-        else { return nil }
+        else { throw unusable("\(model) or \(vocab) resolves outside \(dir.path)") }
         return InstalledExtrasModel(modelURL: modelURL, vocabURL: vocabURL, modelID: modelID, dimensions: dimensions)
     }
 
@@ -695,7 +717,7 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
         _ bundle: Bundle? = nil,
         extrasRoot: URL? = nil
     ) throws -> MemoryEmbeddingEpoch {
-        if let installed = installedExtrasModel(root: extrasRoot) {
+        if let installed = try installedExtrasModel(root: extrasRoot) {
             // Hashing a large package is not free; remember it per package
             // and recompute only when any file in it, the manifest, or the
             // vocab changes (relative path + size + mtime, recursively — a
@@ -754,7 +776,7 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
     /// module never need the private bundle-fallback plumbing.
     public static func wipeBundledCompileCache(_ bundle: Bundle? = nil, extrasRoot: URL? = nil) {
         #if canImport(CoreML) && !os(Linux)
-        if let installed = installedExtrasModel(root: extrasRoot) {
+        if let installed = try? installedExtrasModel(root: extrasRoot) {
             wipeCompileCache(packageURL: installed.modelURL)
         }
         let resolved = bundle ?? installedAppFallbackBundle() ?? Bundle.module
@@ -767,8 +789,14 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
     /// Cheap bundle-resource probe used by Settings/status. This intentionally
     /// does not compile or load the CoreML model, so merely opening Settings
     /// cannot pull the model into memory.
+    /// False when an installed model's manifest is unusable — the MiniLM floor
+    /// being present does not make a broken configured model available.
     public static func bundledResourcesAvailable(_ bundle: Bundle? = nil, extrasRoot: URL? = nil) -> Bool {
-        if installedExtrasModel(root: extrasRoot) != nil { return true }
+        do {
+            if try installedExtrasModel(root: extrasRoot) != nil { return true }
+        } catch {
+            return false
+        }
         return bundledFloorResourcesAvailable(bundle)
     }
 
@@ -915,6 +943,7 @@ public enum EmbeddingError: Error, LocalizedError {
     case modelNotLoaded(reason: String)
     case dimensionMismatch(expected: Int, got: Int)
     case invalidModelURL(reason: String)
+    case installedModelUnusable(manifest: String, reason: String)
 
     public var errorDescription: String? {
         switch self {
@@ -922,6 +951,7 @@ public enum EmbeddingError: Error, LocalizedError {
         case .modelNotLoaded(let r): return "embedding model not loaded: \(r)"
         case .dimensionMismatch(let e, let g): return "embedding dimension mismatch: expected \(e), got \(g)"
         case .invalidModelURL(let r): return "invalid embedding model URL: \(r)"
+        case .installedModelUnusable(let m, let r): return "installed embedding model did not load (\(m)): \(r)"
         }
     }
 }

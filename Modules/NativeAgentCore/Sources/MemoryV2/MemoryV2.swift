@@ -18,7 +18,7 @@ import PersistenceCore
 /// correctionHistory/lastUsedAt). Anything else the daemon ships rides in
 /// `extras` so this struct doesn't have to change every time Python adds a
 /// key.
-public struct MemoryRecord: Sendable, Codable, Equatable {
+public struct MemoryRecord: Sendable, Codable, Equatable, Identifiable {
     public var id: String
     public var text: String
     public var layer: String?
@@ -513,8 +513,8 @@ public actor SwiftNativeMemoryV2: MemoryV2Protocol {
     // Embedder (Core ML MiniLM in production, MockEmbeddingProvider in tests)
     // plus SQLite-backed MemoryStorage. Optional so tests can construct an
     // unwired actor and assert it fails closed.
-    internal let embedder: (any EmbeddingProvider)?
-    internal let storage: (any MemoryStorageProtocol)?
+    internal var embedder: (any EmbeddingProvider)?
+    internal var storage: (any MemoryStorageProtocol)?
     private struct EmbeddingRetryKey: Hashable {
         let epoch: String
         let kind: String

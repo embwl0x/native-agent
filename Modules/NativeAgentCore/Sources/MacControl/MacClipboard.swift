@@ -137,7 +137,7 @@ public enum MacClipboardRead {
     /// controls would make this organ useless for the job it exists for.
     public static let defaultMaxChars = 8_000
     public static let hardMaxChars = 32_000
-    public static let minMaxChars = 200
+    public static let minMaxChars = 0
     /// A single `clipboard_write` payload cap. Generous — she is writing text
     /// she composed — but bounded, because an unbounded pasteboard write is a
     /// memory shape, not a feature.

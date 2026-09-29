@@ -18,9 +18,11 @@
 // instead of silently producing random vectors.
 
 import Foundation
+import GRDB
 import KnowledgeGraph
 import NativeAgentCore
 import PersistenceCore
+import Synchronization
 
 // MARK: - MemoryStorageBridge — MemoryStorage actor → MemoryStorageProtocol
 
@@ -451,45 +453,7 @@ public actor MemoryStorageBridge: HybridMemoryStorageProtocol, KeywordRecallStor
     }
 
     private static func toMemoryRecord(_ s: StoredMemory) -> MemoryRecord {
-        // Surface the metadata-carried fields back into the typed slots so
-        // the UI/consumers see what was stored (the reverse of insert's fold).
-        var kind: String? = nil
-        var tags: [String]? = nil
-        var importance: Double? = nil
-        var pinned: Bool? = nil
-        if case .object(let m)? = s.metadata {
-            if case .string(let k)? = m["kind"] { kind = k }
-            if case .array(let arr)? = m["tags"] {
-                let strs = arr.compactMap { v -> String? in
-                    if case .string(let t) = v { return t } else { return nil }
-                }
-                if !strs.isEmpty { tags = strs }
-            }
-            if case .double(let i)? = m["importance"] { importance = i }
-            if case .int(let i)? = m["importance"] { importance = Double(i) }
-            if case .bool(let b)? = m["pinned"] { pinned = b }
-        }
-        return MemoryRecord(
-            id: s.id,
-            text: s.content,
-            layer: "semantic",
-            memoryKind: kind,
-            personaId: s.personaId,
-            lifecycle: s.lifecycle,
-            createdAt: s.createdAt,
-            updatedAt: s.updatedAt,
-            sourceRunId: s.source,
-            status: s.status,
-            pinned: pinned,
-            confidence: s.confidence,
-            importance: importance,
-            tags: tags,
-            validFrom: s.validFrom,
-            validTo: s.validTo,
-            observedAt: s.observedAt,
-            evidence: s.evidence,
-            extras: s.metadata
-        )
+        MemoryRecord(stored: s)
     }
 
     private static func metadataString(_ metadata: JSONValue?, _ key: String) -> String? {
@@ -498,16 +462,7 @@ public actor MemoryStorageBridge: HybridMemoryStorageProtocol, KeywordRecallStor
     }
 
     private static func toProposalRecord(_ p: StoredProposal) -> ProposalRecord {
-        ProposalRecord(
-            id: p.id,
-            content: p.content,
-            source: p.source,
-            status: p.status,
-            createdAt: p.stagedAt,
-            resolvedAt: p.resolvedAt,
-            rejectionReason: p.rejectionReason,
-            metadata: p.metadata
-        )
+        ProposalRecord(stored: p)
     }
 }
 
@@ -561,6 +516,23 @@ extension SwiftNativeMemoryV2 {
             return await bridge.underlyingStorage()
         }
         return try MemoryStorage(dataRoot: dataRoot.standardizedFileURL)
+    }
+
+    /// memory.sqlite's owner for the Knowledge Graph
+    /// (`KnowledgeGraphPoolCache.installOwner`): the kg_* tables live in this
+    /// store, so the graph reads and writes them through the owning storage's
+    /// pool, never a connection of its own.
+    public static func knowledgeGraphPool(at sqlitePath: URL) async throws -> DatabasePool {
+        let file = sqlitePath.standardizedFileURL
+        let memoryDir = file.deletingLastPathComponent()
+        guard file.lastPathComponent == "memory.sqlite",
+              memoryDir.lastPathComponent == "memory" else {
+            throw MemoryStorageError.databaseUnavailable(
+                "not a MemoryStorage database: \(file.path)"
+            )
+        }
+        let storage = try await resolvedStorage(dataRoot: memoryDir.deletingLastPathComponent())
+        return storage.dbPool
     }
 
     /// Build and attach the USER.md projection hook to this actor's exact
@@ -633,9 +605,9 @@ extension SwiftNativeMemoryV2 {
     /// the system index.
     public static let shared: SwiftNativeMemoryV2 = {
         let dataRoot = PersistenceCore.defaultDataRoot()
-        let storage: MemoryStorage
         do {
-            storage = try MemoryStorage(dataRoot: dataRoot)
+            let (bridge, embedder) = try sharedBackingStore(dataRoot: dataRoot)
+            return SwiftNativeMemoryV2(embedder: embedder, storage: bridge)
         } catch {
             // Fail LOUD, then closed. A migration/open failure here (e.g. busy
             // lock during the v3 column add) must not silently hand back an
@@ -644,8 +616,13 @@ extension SwiftNativeMemoryV2 {
             // preserves the existing fail-closed contract; the log makes it
             // diagnosable.
             NSLog("[MemoryV2] FATAL: MemoryStorage open/migration failed — memory is UNWIRED this session: %@", String(describing: error))
+            sharedOpenFailureSlot.withLock { $0 = "\(dataRoot.appendingPathComponent("memory/memory.sqlite").path): \(error)" }
             return SwiftNativeMemoryV2()
         }
+    }()
+
+    private static func sharedBackingStore(dataRoot: URL) throws -> (MemoryStorageBridge, ManagedEmbeddingProvider) {
+        let storage = try MemoryStorage(dataRoot: dataRoot)
         let bridge = MemoryStorageBridge(storage: storage)
         let embedder = ManagedEmbeddingProvider(dataRoot: dataRoot)
         // Spotlight indexing hook: every memory mutation (insert/update/
@@ -715,11 +692,16 @@ extension SwiftNativeMemoryV2 {
                 }
             }
         }
-        return SwiftNativeMemoryV2(
-            embedder: embedder,
-            storage: bridge
-        )
-    }()
+        return (bridge, embedder)
+    }
+
+    /// Why ``shared`` is unwired this session, or nil when memory.sqlite
+    /// opened. Launch and Doctor show it; the log line alone was the only trace.
+    public static var sharedOpenFailure: String? {
+        _ = shared
+        return sharedOpenFailureSlot.withLock { $0 }
+    }
+    private static let sharedOpenFailureSlot = Mutex<String?>(nil)
 
     /// Bridge access for callers that need to attach the UserMDGenerator
     /// to the same underlying MemoryStorage instance — write-side hook
@@ -727,6 +709,14 @@ extension SwiftNativeMemoryV2 {
     /// on the MemoryStorage that holds the generator reference.
     public func underlyingBridge() -> MemoryStorageBridge? {
         return storage as? MemoryStorageBridge
+    }
+}
+
+extension MemoryStorage {
+    /// Doctor's live-store probe: `PRAGMA quick_check` on the pool the running
+    /// app reads and writes through. Returns SQLite's rows ("ok" when clean).
+    public func quickCheck() async throws -> [String] {
+        try await dbPool.read { db in try String.fetchAll(db, sql: "PRAGMA quick_check") }
     }
 }
 
@@ -837,5 +827,66 @@ public struct SwiftNativeMemoryV2Recaller: Sendable {
             annotated.extras = .object(extras)
             return annotated
         }
+    }
+}
+
+// MARK: - Stored rows as records
+
+public extension MemoryRecord {
+    /// A canonical SQLite row as the typed record: the metadata-carried fields
+    /// surface back into their typed slots (the reverse of insert's fold).
+    init(stored s: StoredMemory) {
+        var kind: String? = nil
+        var tags: [String]? = nil
+        var importance: Double? = nil
+        var pinned: Bool? = nil
+        if case .object(let m)? = s.metadata {
+            if case .string(let k)? = m["kind"] { kind = k }
+            if case .array(let arr)? = m["tags"] {
+                let strs = arr.compactMap { v -> String? in
+                    if case .string(let t) = v { return t } else { return nil }
+                }
+                if !strs.isEmpty { tags = strs }
+            }
+            if case .double(let i)? = m["importance"] { importance = i }
+            if case .int(let i)? = m["importance"] { importance = Double(i) }
+            if case .bool(let b)? = m["pinned"] { pinned = b }
+        }
+        self.init(
+            id: s.id,
+            text: s.content,
+            layer: "semantic",
+            memoryKind: kind,
+            personaId: s.personaId,
+            lifecycle: s.lifecycle,
+            createdAt: s.createdAt,
+            updatedAt: s.updatedAt,
+            sourceRunId: s.source,
+            status: s.status,
+            pinned: pinned,
+            confidence: s.confidence,
+            importance: importance,
+            tags: tags,
+            validFrom: s.validFrom,
+            validTo: s.validTo,
+            observedAt: s.observedAt,
+            evidence: s.evidence,
+            extras: s.metadata
+        )
+    }
+}
+
+public extension ProposalRecord {
+    init(stored p: StoredProposal) {
+        self.init(
+            id: p.id,
+            content: p.content,
+            source: p.source,
+            status: p.status,
+            createdAt: p.stagedAt,
+            resolvedAt: p.resolvedAt,
+            rejectionReason: p.rejectionReason,
+            metadata: p.metadata
+        )
     }
 }

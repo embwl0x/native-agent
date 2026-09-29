@@ -13,12 +13,14 @@
 
 import SwiftUI
 import Context
+import ContextFlow
 import MacIntegration
 import NativeAgentCore
 import ProviderRouting
 // The hour's switch key lives with the lane law so the two can never disagree
 // about its spelling.
 import BackgroundLoops
+import Cognition
 
 // MARK: - Routes
 
@@ -245,6 +247,16 @@ struct SetupView: View {
 
     @State private var savingInnerLife = false
     @State private var innerLifeError: String?
+    /// What the inner life is ACTUALLY doing — the runtime's lanes and the
+    /// reflection route — not what the switch asked for.
+    private var subconsciousRuntime: NativeSubconsciousRuntimeState? {
+        get { appModel.engine.cognitionView.subconsciousRuntime }
+        nonmutating set { appModel.engine.cognitionView.subconsciousRuntime = newValue }
+    }
+    private var reflectionRoute: NativeReflectionRouteStatus? {
+        get { appModel.engine.cognitionView.reflectionRoute }
+        nonmutating set { appModel.engine.cognitionView.reflectionRoute = newValue }
+    }
     @State private var macPermissions: [String: MacIntegrationPermission] = [:]
     @State private var macPermissionsLoaded = false
     @State private var macPermissionsUnavailable = false
@@ -313,6 +325,17 @@ struct SetupView: View {
                 .frame(maxWidth: .infinity)
             }
             .navigationTitle("Settings")
+            // Coming back from Providers or minds is when a recovery lands.
+            .liveOnAppear { Task { await refreshInnerLifeStatus() } }
+            // A lane switched below (reflection, moods) moves the runtime, and
+            // the runtime says so: re-read the status on every change.
+            .liveTask {
+                let changes = await appModel.engine.cognitionView.changes()
+                for await _ in changes {
+                    guard !Task.isCancelled else { return }
+                    await refreshInnerLifeStatus()
+                }
+            }
             // The registration sits at the root and is unconditional, so a
             // link anywhere in the stack always finds its destination.
             .navigationDestination(for: SetupRoute.self) { route in
@@ -325,7 +348,7 @@ struct SetupView: View {
             // LIVE STATE, NOT DEFAULTS. Nothing on this page was pulling
             // Telegram's status, so the tile rendered the `false` default while
             // the bot was up. `.settings` is the sidebar item whose refresh
-            // fetches `getTelegramStatus()` (AppModel+ChatSessions), and the
+            // fetches `engine.telegram.load()` (AppModel+ChatSessions), and the
             // trust policy is fetched here too — without it `liveAccessMode`
             // falls back to the `chatFileAccess` default and the posture
             // control shows a grant the policy may not actually hold.
@@ -334,7 +357,7 @@ struct SetupView: View {
             // posture control would show a grant the policy may not hold, and
             // nothing said so. Say so.
             do {
-                appModel.trustPolicy = try await appModel.getTrustPolicy()
+                appModel.engine.trust.policy = try await appModel.engine.trust.load()
             } catch {
                 innerLifeError = "I couldn't read the trust policy just now, so what this page shows may be out of date."
             }
@@ -365,6 +388,7 @@ struct SetupView: View {
         ) {
             // ONE MIND ON THIS PAGE. The reflection-mind picker moved to
             // Advanced ▸ minds (SetupMindsView); this card is a switch.
+            innerLifeStatus
             if let innerLifeError {
                 Text(innerLifeError)
                     .font(ShellType.labelMedium)
@@ -421,6 +445,64 @@ struct SetupView: View {
         )
     }
 
+    /// The runtime's own receipt, and the one way back when it is not
+    /// running as asked: set up a connection, choose a ready reflection mind,
+    /// or enable again. Nothing while it is simply off or still being read.
+    @ViewBuilder
+    private var innerLifeStatus: some View {
+        let status = SlimSettingsSubconsciousStatusLine.state(
+            runtime: subconsciousRuntime,
+            reflectionRoute: reflectionRoute
+        )
+        if status.tone != .neutral, status.tone != .progress {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(alignment: .firstTextBaseline, spacing: 10) {
+                    Text(status.text)
+                        .font(.system(size: 12))
+                        .foregroundStyle(innerLifeStatusColor(status.tone))
+                        .fixedSize(horizontal: false, vertical: true)
+                        .accessibilityIdentifier("setup.innerLife.status")
+                    Spacer(minLength: 8)
+                    switch status.recovery {
+                    case .configureProvider:
+                        NavigationLink("Set up a connection", value: SetupRoute.providers)
+                    case .selectModel:
+                        NavigationLink("Choose my reflection mind", value: SetupRoute.minds)
+                    case .reapply:
+                        Button("Enable again") { Task { await setInnerLife(true) } }
+                            .disabled(savingInnerLife)
+                    case nil:
+                        EmptyView()
+                    }
+                }
+                .buttonStyle(.bordered)
+                .tint(NativeAgentShell.text)
+                .controlSize(.small)
+                if let detail = status.detail {
+                    Text(detail)
+                        .font(.system(size: 12))
+                        .foregroundStyle(NativeAgentShell.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .textSelection(.enabled)
+                }
+            }
+            .padding(.top, 8)
+        }
+    }
+
+    private func innerLifeStatusColor(_ tone: SlimSettingsSubconsciousStatusLine.Tone) -> Color {
+        switch tone {
+        case .neutral, .progress: NativeAgentShell.secondary
+        case .healthy: NativeAgentShell.calm
+        case .warning, .unavailable: NativeAgentShell.trouble
+        }
+    }
+
+    @MainActor
+    private func refreshInnerLifeStatus() async {
+        await appModel.engine.cognitionView.refreshVitals()
+    }
+
     private var anyMacCapabilityEnabled: Bool {
         macPermissions.values.contains { $0.read || $0.write }
     }
@@ -430,7 +512,7 @@ struct SetupView: View {
     private var postureRow: some View {
         let live = SetupPosture.resolve(
             accessMode: liveAccessMode,
-            outsideWorkspaceDefault: appModel.trustPolicy?.filePolicy?.outsideWorkspaceDefault
+            outsideWorkspaceDefault: appModel.engine.trust.policy?.filePolicy?.outsideWorkspaceDefault
         )
         // The control is always on the page. Full Mac is not one of these three
         // words, so it selects the nearest (Trusted) and says underneath what is
@@ -492,7 +574,7 @@ struct SetupView: View {
     }
 
     private var liveAccessMode: String {
-        if let policy = appModel.trustPolicy {
+        if let policy = appModel.engine.trust.policy {
             return AppModel.agentAccessMode(from: policy, fallback: appModel.chatFileAccess)
         }
         return AppModel.normalizedAgentAccessMode(appModel.chatFileAccess)
@@ -529,7 +611,7 @@ struct SetupView: View {
     private var connectionRows: some View {
         SetupInfoCard(
             title: "Telegram",
-            // The live status, not the launch-time default: `telegramStatus`
+            // The live status, not the launch-time default: `engine.telegram.status`
             // is what the Settings refresh actually fetches.
             detail: telegramConnected ? "Connected" : "Not set up",
             route: .telegram
@@ -542,7 +624,7 @@ struct SetupView: View {
     }
 
     private var telegramConnected: Bool {
-        appModel.telegramStatus?.tokenConfigured ?? appModel.telegramTokenConfigured
+        appModel.engine.telegram.status?.tokenConfigured ?? appModel.telegramTokenConfigured
     }
 
     private var appearanceRow: some View {
@@ -567,10 +649,11 @@ struct SetupView: View {
         innerLifeError = nil
         subconsciousEnabled = enabled
 
-        let state = await NativeCognitionRuntime.shared.setSubconsciousMasterEnabled(
+        let state = await NativeAgentEngine.liveCognition.setSubconsciousMasterEnabled(
             enabled,
             reflectionBudget: enabled ? max(1, reflectionBudget) : 0
         )
+        subconsciousRuntime = state
         subconsciousEnabled = state.enabled
         capsuleEnabled = state.capsuleEnabled
         backgroundEnabled = state.backgroundEnabled
@@ -581,6 +664,7 @@ struct SetupView: View {
         // The hour cannot outlive the master, and installation is cached —
         // the master moving in either direction has to drop that cache.
         await NativeCognitionRuntime.reloadStudioWanderInstallation()
+        await appModel.engine.cognitionView.refreshVitals()
 
         if enabled {
             // User, 2026-09-06: this used to force Fluid Context to Active on
@@ -595,10 +679,10 @@ struct SetupView: View {
             let preferred = stored ?? .active
             let status: NativeContextFlowModeStatus
             if stored == nil {
-                status = await NativeContextFlowRuntime.shared.setMode(.active)
+                status = await NativeAgentEngine.live.contextFlow.setMode(.active)
                 contextFlowMode = ContextFlowMode.active.rawValue
             } else {
-                status = await NativeContextFlowRuntime.shared.modeStatus()
+                status = await NativeAgentEngine.live.contextFlow.modeStatus()
             }
             if status.effectiveMode != preferred {
                 innerLifeError = "Some of my inner life is held off by setup, safety, or provider health."
@@ -961,7 +1045,7 @@ struct SetupChatMindPicker: View {
     }
 
     private var providers: [ProviderThenModelPicker.Provider] {
-        appModel.providersList.map { provider in
+        appModel.engine.providers.connections.map { provider in
             ProviderThenModelPicker.Provider(
                 id: provider.provider_id,
                 name: Self.plainProviderName(provider.display_name),
@@ -1007,7 +1091,7 @@ struct SetupChatMindPicker: View {
             }
         }
         appModel.chatModel = choice.modelID
-        // Same reconcile as ChatBrainControlBar: an effort the new model does
+        // Same reconcile as the composer's model pane: an effort the new model does
         // not support falls back, and Fast is cleared where unsupported.
         if let efforts = choice.supportedEfforts, !efforts.isEmpty,
            !efforts.contains(appModel.chatReasoningEffort) {
@@ -1052,13 +1136,13 @@ struct SetupReflectionModelPicker: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            if appModel.providersList.isEmpty {
+            if appModel.engine.providers.connections.isEmpty {
                 Text("Connect a provider to choose the mind I reflect with.")
                     .font(.caption)
                     .foregroundStyle(.orange)
             } else {
                 ProviderThenModelPicker(
-                    providers: appModel.providersList.map { provider in
+                    providers: appModel.engine.providers.connections.map { provider in
                         ProviderThenModelPicker.Provider(
                             id: provider.provider_id,
                             name: SetupChatMindPicker.plainProviderName(provider.display_name),
@@ -1089,7 +1173,7 @@ struct SetupReflectionModelPicker: View {
             }
         }
         .task {
-            if appModel.providersList.isEmpty {
+            if appModel.engine.providers.connections.isEmpty {
                 _ = await appModel.loadProvidersForChat()
             }
         }
@@ -1115,7 +1199,7 @@ struct SetupReflectionModelPicker: View {
         saving = true
         defer { saving = false }
         do {
-            try await NativeCognitionRuntime.shared.setReflectionSelection(
+            try await NativeAgentEngine.liveCognition.setReflectionSelection(
                 model: choice.modelID,
                 provider: choice.providerID
             )

@@ -18,9 +18,8 @@ import PersonaEngine
 //
 // Compatibility caveats:
 //
-//   • Persona-root resolution uses: (1) `NATIVE_AGENT_PERSONA_ROOT` env override, then
-//     (2) `<dataRoot>/../persona` if it exists, then (3) `<dataRoot>/memory`
-//     historical fallback.
+//   • Persona root: `PersistenceCore.defaultPersonaRoot` — `<repo>/persona`
+//     for a checkout's data root, otherwise `<dataRoot>/persona`.
 //
 //   • `complete` is file-authoritative: SOUL/VOICE/USER/GROWTH + profile.json
 //     must all verify before `.onboarded` is durably published.
@@ -533,8 +532,7 @@ public struct SwiftNativeOnboardingClient: OnboardingClient {
     }
 
     /// Resolve the persona root by delegating to `PersonaRootResolver.resolve()`
-    /// — the canonical 4-step chain (canonical FIRST, then env, then stamped
-    /// REPO_PATH, then dev fallback). The previous Onboarding-local resolver
+    /// — the one canonical rule. The previous Onboarding-local resolver
     /// diverged from PersonaEngine (env-first, sibling-dir before canonical)
     /// and could land the wizard at a different root than the engine reading
     /// the persona at chat/runtime — onboarding would write SOUL/USER docs to

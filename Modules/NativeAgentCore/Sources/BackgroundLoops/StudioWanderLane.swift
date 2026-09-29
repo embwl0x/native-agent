@@ -1,5 +1,6 @@
 import Foundation
 import PersistenceCore
+import Studio
 
 // MARK: - HER HOUR — personality-depth item 9 (User: "give it to her")
 //
@@ -12,7 +13,7 @@ import PersistenceCore
 // no clock, no provider and no substrate: it takes a reading and returns a
 // decision, so the whole gate set is testable without a running app. The organs
 // — composing her own material, making the call, writing the trace — live in
-// `Sources/NativeAgentApp/BackgroundLoopsAssembly+Studio.swift`, which is the
+// `Sources/NativeAgentApp/NativeCognitionRuntime+StudioWander.swift`, which is the
 // only thing that can reach them.
 //
 // ── NO SCHEDULE, NO BUDGET, NO WATCHDOG (NORTHSTAR clause 4) ─────────────────

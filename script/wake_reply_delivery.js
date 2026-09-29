@@ -3,6 +3,7 @@
 // Lane-specific reply delivery; entrypoints supply runtime policy and effects.
 
 function createCodexReplyDelivery({
+  BRIDGE_DESCRIPTOR_PATH,
   BRIDGE_TOKEN_PATH,
   USER_NAME,
   codexReturnBridgeEndpoint,
@@ -49,7 +50,7 @@ function formatCodexReplyForNativeAgent(job, turnResult) {
   if (firstPayload.messageId) lines.push(`Message id: ${firstPayload.messageId}`);
   if (job.threadId) {
     lines.push(`Conversation: codex:${job.threadId}`);
-    lines.push("Continue this same work by calling codex_message with conversation_id set to that exact value. Omit conversation_id for new work.");
+    lines.push("Continue this same work with agent_message: agent \"codex\" with conversation_id set to that exact value (it goes on in the conversation you named). Omit conversation_id for new work.");
   }
   if (job.turnId) lines.push(`Codex turn: ${job.turnId}`);
   if (turnResult.execution) lines.push(`Completion path: ${turnResult.execution}`);
@@ -161,12 +162,18 @@ function postBridgeMessage(text, sessionId, config, metadata = {}) {
     });
   }
 
+  // The descriptor first: a bridge that is down or restarting removes it and
+  // its token together, and that is a retryable absence, not a config fault.
+  const endpoint = codexReturnBridgeEndpoint(config);
+  if (!endpoint) {
+    return Promise.resolve({ status: "failed", reason: "bridge_descriptor_unavailable",
+      descriptorPath: stringSetting(config, "bridgeDescriptorPath", "NATIVE_AGENT_CODEX_BRIDGE_DESCRIPTOR_PATH", BRIDGE_DESCRIPTOR_PATH) });
+  }
+  const { host, port } = endpoint;
+
   const tokenPath = stringSetting(config, "bridgeTokenPath", "NATIVE_AGENT_CODEX_BRIDGE_TOKEN_PATH", BRIDGE_TOKEN_PATH);
   const { token, failure } = readWakeBridgeToken(tokenPath, (error) => String(error.message || error));
   if (failure) return Promise.resolve(failure);
-
-  const endpoint = codexReturnBridgeEndpoint(config);
-  const { host, port } = endpoint;
   // Outlive the app's 600s messageWorkDeadlineSeconds so work cancellation
   // settles before the socket deadline; equal deadlines can strand replies.
   const timeoutMs = numberSetting(config, "bridgeReplyTimeoutMs", "NATIVE_AGENT_CODEX_BRIDGE_REPLY_TIMEOUT_MS", 11 * 60 * 1000);
@@ -402,7 +409,6 @@ function createClaudeReplyDelivery({
   AGENT_NAME,
   BRIDGE_DESCRIPTOR_PATH,
   BRIDGE_MESSAGE_PATH,
-  DEFAULT_BRIDGE_URL,
   DEFAULT_TOPIC,
   TOKEN_PATH,
   missingWakeCompletionOrigin,
@@ -425,9 +431,8 @@ function readBridgeDescriptor() {
 }
 
 /// Precedence: explicit env override (tests / operator) -> the descriptor the
-/// running bridge published -> the legacy fixed port. The bridge advances off
-/// 8771 on collision, so hardcoding it meant every reply could be recorded as
-/// deliveryLost while a perfectly healthy bridge listened one port over.
+/// running bridge published. Null without either: each install listens on its
+/// own port, so there is no fixed one to guess.
 function bridgeURL() {
   const override = process.env.NATIVE_AGENT_CLAUDE_WAKE_BRIDGE_URL;
   if (override) return override;
@@ -447,13 +452,13 @@ function bridgeURL() {
       return `http://${host}:${port}${BRIDGE_MESSAGE_PATH}`;
     }
   }
-  return DEFAULT_BRIDGE_URL;
+  return null;
 }
 
 /// Where the app persists the agent's per-session transcript
-/// (data/chat/messages/<sessionId>.jsonl). The helper lives in <repo>/script
-/// and the app's data root is the repo checkout, so __dirname-relative is the
-/// production path; the env override exists for tests.
+/// (data/chat/messages/<sessionId>.jsonl). The app always sets the env var
+/// (a bundled helper lives inside the .app, nowhere near data/); the
+/// __dirname-relative path covers a checkout run by hand.
 function messageStoreDir() {
   return process.env.NATIVE_AGENT_CLAUDE_WAKE_MESSAGE_STORE_DIR ||
     path.join(__dirname, "..", "data", "chat", "messages");
@@ -526,19 +531,21 @@ function formatCompletionForAgent(result, payload) {
   // these at ~1,200 characters each were 13% of that day's text in the person's
   // own conversation. It says the one thing worth knowing and stops.
   if (isNoticeOnlyOutcome(result)) {
+    // Honest about who is answering: nobody yet. The open session's inbox is
+    // read only when someone types there.
     const where = result.status === "delivered_live"
-      ? "her session is open and will read it from the inbox"
+      ? "it is waiting in her inbox until her next turn in the open session, and no one is answering it yet"
       : "it waits in her inbox; no session was started";
     return [
-      `${NOTICE_PREFIX} Not a reply and nothing to do: your message to Claude (${payload.topic || DEFAULT_TOPIC}) was delivered; ${where}. Her answer, if one comes, arrives on its own.`,
+      `${NOTICE_PREFIX} Not a reply and nothing to do: your message to Claude (${payload.topic || DEFAULT_TOPIC}) was delivered; ${where}. If she answers later, it arrives on its own.`,
       deliveryMarker(payload.messageId),
       `Status: ${result.status}`,
     ].join("\n");
   }
   const lines = [
     isNoticeOnlyOutcome(result)
-      ? `${NOTICE_PREFIX} Transport record only — not a reply, and nothing to decide. Claude has not answered yet; this row exists so the transcript says where the message went. Take NO action on it: do not call claude_message, do not re-send, do not re-open the inbox, and do not revisit a decision you already sent. Claude's actual reply, if one comes, arrives as its own event.`
-      : "[claude-wake] Automated completion event. Do NOT auto-fire another claude_message in response unless you have new work for Claude — OR unless Claude ended with a question or decision request, in which case answering on the SAME topic resumes that session with full context. Question-and-answer on one topic is the supported conversation pattern; reflexive acknowledgment messages are the loop to avoid.",
+      ? `${NOTICE_PREFIX} Transport record only — not a reply, and nothing to decide. Claude has not answered yet; this row exists so the transcript says where the message went. Take NO action on it: do not call agent_message, do not re-send, do not re-open the inbox, and do not revisit a decision you already sent. Claude's actual reply, if one comes, arrives as its own event.`
+      : "[claude-wake] Automated completion event. Do NOT auto-fire another agent_message to Claude in response unless you have new work for Claude — OR unless Claude ended with a question or decision request, in which case answering on the SAME topic resumes that session with full context. Question-and-answer on one topic is the supported conversation pattern; reflexive acknowledgment messages are the loop to avoid.",
     "",
     deliveryMarker(payload.messageId),
     `Topic: ${payload.topic || DEFAULT_TOPIC}`,
@@ -547,7 +554,7 @@ function formatCompletionForAgent(result, payload) {
     // agent obeying this line on a row that was only a receipt.
     ...(isNoticeOnlyOutcome(result)
       ? ["That conversation id is recorded for later reference only; nothing here asks you to send to it."]
-      : ["Continue this same work by calling claude_message with conversation_id set to that exact value. Omit conversation_id for new work."]),
+      : ["Continue this same work with agent_message: agent \"claude\" with conversation_id set to that exact value (it goes on in the conversation you named). Omit conversation_id for new work."]),
     `Priority: ${payload.priority || "info"}`,
     `Status: ${result.status}`,
   ];
@@ -569,7 +576,7 @@ function formatCompletionForAgent(result, payload) {
     lines.push(
       result.detail || `Session ${result.sessionId} is open interactively; message left in the inbox for it, no wake spawned`,
       "",
-      "NO unattended session was started for this message, and the live session was NOT interrupted, resumed, or replaced — it is still running and still owns its working tree. The message sits in the durable inbox and reaches that session when it next reads the inbox. There is no reply to relay yet; do not treat this as a completion, a failure, or evidence that the session is gone."
+      "NO unattended session was started for this message, and the live session was NOT interrupted, resumed, or replaced — it is still running and still owns its working tree. The message waits in the durable inbox until that session's next turn (it reads the inbox only when someone types there), so no one is answering it yet. There is no reply to relay; do not treat this as a completion, a failure, or evidence that the session is gone."
     );
   } else if (result.status === "completed_without_reply") {
     lines.push(
@@ -624,12 +631,16 @@ function postBridgeMessage(text, sessionId) {
     });
   }
 
+  const target = bridgeURL();
+  if (!target) {
+    return Promise.resolve({ status: "failed", reason: "bridge_descriptor_unavailable", descriptorPath: BRIDGE_DESCRIPTOR_PATH });
+  }
   const { token, failure } = readWakeBridgeToken(TOKEN_PATH, (error) => String((error && error.message) || error));
   if (failure) return Promise.resolve(failure);
 
   let url;
   try {
-    url = new URL(bridgeURL());
+    url = new URL(target);
   } catch (error) {
     return Promise.resolve({
       status: "failed",

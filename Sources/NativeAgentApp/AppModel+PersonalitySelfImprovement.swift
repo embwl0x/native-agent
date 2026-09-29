@@ -131,7 +131,7 @@ extension AppModel {
         guard !supportDiagnosticsLoading else {
             return .unavailable("A Support Snapshot is already being prepared.")
         }
-        guard !doctorRunning else {
+        guard !engine.doctor.isRunning else {
             return .unavailable("Doctor is currently running. Wait for it to finish before preparing a Support Snapshot.")
         }
         supportDiagnosticsLoading = true
@@ -141,8 +141,8 @@ extension AppModel {
             // result (identical offline rollup) rather than re-running the
             // whole pass. Falls back to a fresh run when stale or never run.
             let reuse: DoctorReport? = {
-                guard let report = doctorReport,
-                      let completedAt = doctorReportCompletedAt else { return nil }
+                guard let report = engine.doctor.report,
+                      let completedAt = engine.doctor.reportCompletedAt else { return nil }
                 let age = Date().timeIntervalSince(completedAt)
                 guard age >= 0, age < Self.supportSnapshotDoctorReuseTTL
                 else { return nil }
@@ -209,13 +209,14 @@ extension AppModel {
     @MainActor
     func loadAllSelfImprovement() async {
         let api = client
-        async let nextTrust = try? api.getTrustPolicy()
+        let memory = engine.memory
+        async let nextTrust = try? engine.trust.load()
         async let nextImprovementSummary = try? api.getImprovementSummary()
         async let nextTrainingRuns = try? api.getTrainingRuns()
         async let nextTrainingProposals = try? api.getTrainingProposals()
         async let nextPromotionCandidates = try? api.getPromotionCandidates()
         async let nextPromotionPending = try? api.getPromotionPending()
-        async let nextMemoryProposals = try? api.getMemoryProposals()
+        async let nextMemoryProposals = try? memory.proposals(status: "pending")
         let (
             trustRow,
             improvementRow,
@@ -233,13 +234,13 @@ extension AppModel {
             nextPromotionPending,
             nextMemoryProposals
         )
-        trustPolicy = trustRow ?? trustPolicy
+        engine.trust.policy = trustRow ?? engine.trust.policy
         improvementSummary = improvementRow ?? improvementSummary
         trainingRuns = trainingRunRows ?? []
         trainingProposals = trainingProposalRows ?? []
         promotionCandidates = promotionRows ?? []
         promotionPending = pendingRows ?? []
-        memoryProposals = memoryProposalRows ?? []
+        engine.memory.proposals = memoryProposalRows ?? []
     }
 
     // PATCH-2026-05-07: living-memory AppModel methods for memory proposals
@@ -250,25 +251,23 @@ extension AppModel {
     // lastRefreshError instead of fabricating an empty success.
     @MainActor
     func loadMemoryProposals() async {
-        memoryProposals = await decodeLogged("getMemoryProposals", default: []) {
-            try await client.getMemoryProposals()
+        engine.memory.proposals = await decodeLogged("getMemoryProposals", default: []) {
+            try await engine.memory.proposals(status: "pending")
         }
     }
 
     @MainActor
-    func approveMemoryProposal(id: String) async throws -> [String: Any] {
-        let result = try await client.approveMemoryProposal(id: id)
+    func approveMemoryProposal(id: String) async throws {
+        _ = try await engine.memory.accept(proposalID: id)
         await loadMemoryProposals()
-        approvals = (try? await client.getApprovals()) ?? approvals
-        return result
+        engine.approvals.records = (try? await engine.approvals.list()) ?? engine.approvals.records
     }
 
     @MainActor
-    func rejectMemoryProposal(id: String, reason: String = "") async throws -> [String: Any] {
-        let result = try await client.rejectMemoryProposal(id: id, reason: reason)
+    func rejectMemoryProposal(id: String, reason: String = "") async throws {
+        try await engine.memory.reject(proposalID: id, reason: reason)
         await loadMemoryProposals()
-        approvals = (try? await client.getApprovals()) ?? approvals
-        return result
+        engine.approvals.records = (try? await engine.approvals.list()) ?? engine.approvals.records
     }
 
     @MainActor
@@ -290,10 +289,10 @@ extension AppModel {
     /// Fetch the dream diary (newest first) plus the composite dream-enabled flag.
     /// Returns nil on failure and records the error in `dreamError`.
     @MainActor
-    func fetchDreamDiary(limit: Int = 30) async -> DreamDiaryResponse? {
+    func fetchDreamDiary(limit: Int = 30) async -> DreamDiary? {
         dreamError = nil
         do {
-            return try await client.getDreamDiary(limit: limit)
+            return try await engine.cognitionView.dreamDiary(limit: limit)
         } catch {
             dreamError = "Load dream diary failed: \(error.localizedDescription)"
             return nil
@@ -305,7 +304,7 @@ extension AppModel {
     func fetchDreamEntry(date: String) async -> DreamEntry? {
         dreamError = nil
         do {
-            return try await client.getDreamEntry(date: date)
+            return try await engine.cognitionView.dreamEntry(date: date)
         } catch {
             dreamError = "Load entry \(date) failed: \(error.localizedDescription)"
             return nil
@@ -336,13 +335,13 @@ extension AppModel {
     }
 
     /// Toggle the deep dream kill switch (personalityPolicy.dream_cycle_enabled).
-    /// Persists via the deep-merged trust patch and refreshes `trustPolicy`.
+    /// Persists via the deep-merged trust patch and refreshes `engine.trust.policy`.
     @MainActor
     func setDreamCycleEnabled(_ enabled: Bool) async -> Bool {
         dreamError = nil
         do {
             let saved = try await client.patchDreamCycleEnabled(enabled)
-            trustPolicy = saved
+            engine.trust.policy = saved
             statusText = enabled ? "Dream cycle enabled" : "Dream cycle disabled"
             return true
         } catch {
@@ -352,13 +351,13 @@ extension AppModel {
     }
 
     /// Toggle the REM kill switch (trainingPolicy.rem_cycle_enabled).
-    /// Persists via the deep-merged trust patch and refreshes `trustPolicy`.
+    /// Persists via the deep-merged trust patch and refreshes `engine.trust.policy`.
     @MainActor
     func setRemCycleEnabled(_ enabled: Bool) async -> Bool {
         dreamError = nil
         do {
             let saved = try await client.patchRemCycleEnabled(enabled)
-            trustPolicy = saved
+            engine.trust.policy = saved
             statusText = enabled ? "REM cycle enabled" : "REM cycle disabled"
             return true
         } catch {

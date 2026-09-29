@@ -1,4 +1,5 @@
 import Foundation
+import Cognition
 import NativeAgentShared
 import PersistenceCore
 import CognitiveSubstrate
@@ -19,7 +20,7 @@ extension NativeClient {
         // to an empty Self-half here.
         let impl = SwiftNativeDreamREMCycle(
             dataRoot: root,
-            gate: await swiftDreamREMGate(),
+            gate: await CognitionViewFacade(dataRoot: root).dreamGate(),
             dreamMemoryDeltaProvider: BackgroundLoopsAssembly.makeDreamMemoryDeltaProvider(),
             // Felt tone rides the scheduled nightly too (same lesson as the
             // delta provider: this path bypasses BackgroundLoopsAssembly).
@@ -31,7 +32,7 @@ extension NativeClient {
             // …and the dream's mood flows back out into her slow disposition
             // layer, for the same reason (U2a, 2026-07-09).
             dreamMoodSink: BackgroundLoopsAssembly.makeDreamMoodSink(),
-            lifecycleObserver: NativeCognitionRuntime.shared
+            lifecycleObserver: NativeAgentEngine.liveCognition
         )
         let result = try await impl.runDream(force: force, trigger: trigger)
         let response = try Self.foundationDictionary(result.rawResponse)
@@ -44,7 +45,7 @@ extension NativeClient {
         if let feltSummary, !feltSummary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             metadata["feltDaySummary"] = .string(feltSummary)
         }
-        await NativeCognitionRuntime.shared.ingestOrganismSignal(
+        await NativeAgentEngine.liveCognition.ingestOrganismSignal(
             kind: .dreamCompleted,
             sourceOrgan: "dream",
             intensity: 0.62,
@@ -53,99 +54,6 @@ extension NativeClient {
             metadata: metadata
         )
         return response
-    }
-
-    // Read the file-backed diary and project its composite TrustCenter gate.
-    func getDreamDiary(limit: Int = 30) async throws -> DreamDiaryResponse {
-        let root = dataRootOverride ?? PersistenceCore.defaultDataRoot()
-        let diary = root.appendingPathComponent("dream_diary", isDirectory: true)
-        var isDirectory: ObjCBool = false
-        if FileManager.default.fileExists(atPath: diary.path, isDirectory: &isDirectory), !isDirectory.boolValue {
-            throw DreamREMCycleError.underlying("dream_diary is not a directory")
-        }
-        let impl = makeDreamREMCycle(root: root)
-        let moduleEntries = try await impl.listDreamDiary(limit: limit)
-        let entries = try Self.decodeDreamEntries(moduleEntries)
-        // Same file set the listing reads (top level + archive/<year>), so the
-        // header's count and the list agree after REM archives older nights.
-        let diaryNames = FileBackedDreamDiary(dataRoot: root).entryFileNames()
-        let totalEntries: Int? = diaryNames.count
-        // FileBackedDreamDiary intentionally skips individual unreadable files
-        // so one damaged entry does not hide readable ones. Carry that evidence
-        // forward: an all-unreadable window must not become "No dreams yet."
-        let boundedCount = min(max(1, limit), diaryNames.count)
-        let visibleNames = Set(entries.compactMap(\.filename))
-        let unreadableEntries = diaryNames.prefix(boundedCount).count {
-            !visibleNames.contains($0)
-        }
-        let enabled = await swiftDreamCompositeEnabled()
-        return DreamDiaryResponse(
-            entries: entries,
-            enabled: enabled,
-            totalEntries: totalEntries,
-            unreadableEntries: unreadableEntries
-        )
-    }
-
-    // Missing diary entries preserve the app read route's not-found error.
-    func getDreamEntry(date: String) async throws -> DreamEntry {
-        let impl = makeDreamREMCycle(root: dataRootOverride ?? PersistenceCore.defaultDataRoot())
-        guard let moduleEntry = try await impl.getDreamForDate(date) else {
-            throw DaemonError.notFound("/v1/dream/\(date)")
-        }
-        let entries = try Self.decodeDreamEntries([moduleEntry])
-        guard let first = entries.first else {
-            throw DaemonError.notFound("/v1/dream/\(date)")
-        }
-        return first
-    }
-
-    /// Preserve the module's encoded field mapping when projecting the app model.
-    static func decodeDreamEntries(
-        _ moduleEntries: [DreamREMCycle.DreamEntry]
-    ) throws -> [DreamEntry] {
-        let data = try JSONEncoder().encode(moduleEntries)
-        return try JSONDecoder().decode([DreamEntry].self, from: data)
-    }
-
-    /// A dream needs both the scheduler and personality-cycle gates.
-    func swiftDreamCompositeEnabled() async -> Bool {
-        await swiftDreamREMGate().dreamEnabled
-    }
-
-    /// TrustCenter supplies policy; DreamREMCycle owns the composite gate arithmetic.
-    func swiftDreamREMGate() async -> DreamREMGatePolicy {
-        let root = dataRootOverride ?? PersistenceCore.defaultDataRoot()
-        let policy = await SwiftNativeTrustCenter(dataRoot: root).loadTrustPolicy()
-        return Self.dreamREMGate(from: policy)
-    }
-
-    /// Manual REM changes persistent, approval-gated state. Unlike a passive
-    /// compatibility read, its effect-time policy check must expose damaged
-    /// authority bytes rather than turn a fail-closed projection into an
-    /// apparently enabled REM cycle.
-    func swiftREMGateChecked(root: URL) async throws -> DreamREMGatePolicy {
-        let policy = try await SwiftNativeTrustCenter(dataRoot: root).loadTrustPolicyChecked()
-        return Self.dreamREMGate(from: policy)
-    }
-
-    private static func dreamREMGate(
-        from policy: [String: JSONValue]
-    ) -> DreamREMGatePolicy {
-        func boolAt(_ section: String, _ key: String, default def: Bool) -> Bool {
-            guard case .object(let sec)? = policy[section] else { return def }
-            if case .bool(let b)? = sec[key] { return b }
-            return def
-        }
-        // `policy` here is the NORMALIZED policy (loadTrustPolicy merges
-        // defaultTrustPolicy), so these fallbacks only fire for keys the
-        // shipped defaults do not carry. Keep them equal to TrustCenter+Defaults
-        // anyway — a false here silently disagreed with the shipped `true`.
-        return DreamREMGatePolicy(
-            dreamScheduler: boolAt("trainingPolicy", "dream_scheduler", default: true),
-            dreamCycleEnabled: boolAt("personalityPolicy", "dream_cycle_enabled", default: true),
-            remCycleEnabled: boolAt("trainingPolicy", "rem_cycle_enabled", default: true)
-        )
     }
 
     // PATCH-2026-05-29: dreams-tab POST /v1/rem/run — manual weekly REM consolidation.
@@ -166,15 +74,15 @@ extension NativeClient {
         let root = dataRootOverride ?? PersistenceCore.defaultDataRoot()
         let impl = makeDreamREMCycle(
             root: root,
-            gate: try await swiftREMGateChecked(root: root),
+            gate: try await CognitionViewFacade(dataRoot: root).dreamGateChecked(),
             remStageApproval: BackgroundLoopsAssembly.makeREMProposalStager(dataRoot: root),
-            lifecycleObserver: NativeCognitionRuntime.shared
+            lifecycleObserver: NativeAgentEngine.liveCognition
         )
         let result = try await impl.runREM(force: force)
         let response = try Self.foundationDictionary(result.rawResponse)
         let proposals = Self.dreamNumber(response["proposalsGenerated"])
         let archived = Self.dreamNumber(response["archivedEntries"])
-        await NativeCognitionRuntime.shared.ingestOrganismSignal(
+        await NativeAgentEngine.liveCognition.ingestOrganismSignal(
             kind: .remIntegrated,
             sourceOrgan: "rem",
             intensity: proposals > 0 ? 0.58 : 0.22,

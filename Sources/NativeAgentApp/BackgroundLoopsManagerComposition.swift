@@ -16,9 +16,10 @@ import PersistenceCore
 public actor BackgroundLoopsManager {
     public static let shared = BackgroundLoopsManager()
 
-    private let coreManager: BackgroundLoops.BackgroundLoopsManager
+    nonisolated let coreManager: BackgroundLoops.BackgroundLoopsManager
     private let assembleLoops: @Sendable () -> [any LoopRunner]
     private let replacementLoop: @Sendable (String) -> (any LoopRunner)?
+    private var assembledLoopIntervals: [String: TimeInterval] = [:]
     private let runAutoDoctorAtLaunch: @Sendable () -> Bool
     private let runHeartbeatAtLaunch: @Sendable () -> Bool
 
@@ -99,6 +100,9 @@ public actor BackgroundLoopsManager {
     }
 
     public func start(loops: [any LoopRunner]) async {
+        for loop in loops {
+            assembledLoopIntervals[loop.loopId] = loop.interval
+        }
         // A4.2/A4.8: install the failure push before starting so an early
         // failure streak knocks. Idempotent — the scheduler just re-stores the
         // closure. The scheduler owns the gating (2 consecutive failures +
@@ -292,6 +296,10 @@ public actor BackgroundLoopsManager {
 
     public func status() async -> [LoopStatus] {
         await coreManager.status().map(LoopStatus.init)
+    }
+
+    func assembledLoopIntervalsSnapshot() -> [String: TimeInterval] {
+        assembledLoopIntervals
     }
 
     public func isRunning() async -> Bool {

@@ -32,7 +32,7 @@ public struct ContextStoreHealthSnapshot: Sendable, Equatable {
 /// derived generations.
 public actor ContextSQLiteStore {
     public let databaseURL: URL
-    private let dbQueue: DatabaseQueue
+    private let dbPool: DatabasePool
 
     public init(dataRoot: URL) throws {
         let directory = dataRoot.appendingPathComponent("context", isDirectory: true)
@@ -51,8 +51,10 @@ public actor ContextSQLiteStore {
         configuration.prepareDatabase { db in
             try db.execute(sql: "PRAGMA journal_size_limit = 4194304")
         }
-        self.dbQueue = try DatabaseQueue(path: databaseURL.path, configuration: configuration)
-        try Self.migrator.migrate(dbQueue)
+        // WAL pool, like memory.sqlite: turn-path reads run beside a publish,
+        // prune or vacuum instead of queueing behind it on one connection.
+        self.dbPool = try DatabasePool(path: databaseURL.path, configuration: configuration)
+        try Self.migrator.migrate(dbPool)
     }
 
     // MARK: - Publication
@@ -61,7 +63,7 @@ public actor ContextSQLiteStore {
     public func publish(_ draft: ContextGenerationDraft) async throws -> ContextGenerationRecord {
         try Self.validate(draft)
 
-        return try await dbQueue.write { db in
+        return try await dbPool.write { db in
             let parentID = try Int64.fetchOne(
                 db,
                 sql: "SELECT id FROM context_generations WHERE status = 'completed' ORDER BY id DESC LIMIT 1"
@@ -348,8 +350,11 @@ public actor ContextSQLiteStore {
         }
     }
 
+    // Generation reads go through the writer, as they did on the queue: a
+    // reconciliation diffs against this baseline, so it must wait for an
+    // in-flight publish instead of reading the generation that publish replaces.
     public func activeGeneration() async throws -> ContextGenerationRecord? {
-        try await dbQueue.read { db in
+        try await dbPool.write { db in
             guard let id = try Int64.fetchOne(
                 db,
                 sql: "SELECT id FROM context_generations WHERE status = 'completed' ORDER BY id DESC LIMIT 1"
@@ -364,7 +369,7 @@ public actor ContextSQLiteStore {
     }
 
     public func loadGeneration(id: Int64) async throws -> ContextStoredGeneration {
-        try await dbQueue.read { db in
+        try await dbPool.write { db in
             guard let generation = try Self.generation(id: id, db: db) else {
                 throw ContextFlowStoreError.generationNotFound(id)
             }
@@ -431,7 +436,7 @@ public actor ContextSQLiteStore {
         at date: Date = Date()
     ) async throws {
         let boundedError = Self.bounded(error, maxUTF8Bytes: 2_048, fallback: "compile failed")
-        try await dbQueue.write { db in
+        try await dbPool.write { db in
             try db.execute(
                 sql: """
                 UPDATE context_sources
@@ -460,13 +465,13 @@ public actor ContextSQLiteStore {
     }
 
     public func recordReceipt(_ receipt: ContextStoreReceipt) async throws {
-        try await dbQueue.write { db in
+        try await dbPool.write { db in
             try Self.insertReceipt(receipt, db: db)
         }
     }
 
     public func recentReceipts(limit: Int = 100) async throws -> [ContextStoreReceipt] {
-        try await dbQueue.read { db in
+        try await dbPool.read { db in
             let boundedLimit = max(0, min(limit, 500))
             let rows = try Row.fetchAll(
                 db,
@@ -486,7 +491,7 @@ public actor ContextSQLiteStore {
     /// lets a new coordinator rebuild the same advisory ranking after restart
     /// without turning Context into a second fact store.
     public func recordFeedbackEvent(_ event: ContextFeedbackEvent) async throws {
-        try await dbQueue.write { db in
+        try await dbPool.write { db in
             try db.execute(
                 sql: """
                 INSERT INTO context_feedback_events (
@@ -513,8 +518,10 @@ public actor ContextSQLiteStore {
         }
     }
 
+    // Restoration reads go through the writer too, so they see a feedback
+    // event whose write is already in flight (its ordinal must not be reused).
     public func recentFeedbackEvents(limit: Int = 4_096) async throws -> [ContextFeedbackEvent] {
-        try await dbQueue.read { db in
+        try await dbPool.write { db in
             let boundedLimit = max(0, min(limit, 4_096))
             let rows = try Row.fetchAll(
                 db,
@@ -531,7 +538,7 @@ public actor ContextSQLiteStore {
     }
 
     public func feedbackEventOrdinalHighWaterMark() async throws -> UInt64 {
-        try await dbQueue.read { db in
+        try await dbPool.write { db in
             let value = try Int64.fetchOne(
                 db,
                 sql: "SELECT COALESCE(MAX(sequence), 0) FROM context_feedback_events"
@@ -541,7 +548,7 @@ public actor ContextSQLiteStore {
     }
 
     public func healthSnapshot() async throws -> ContextStoreHealthSnapshot {
-        try await dbQueue.read { db in
+        try await dbPool.read { db in
             let activeGenerationID = try Int64.fetchOne(
                 db,
                 sql: "SELECT id FROM context_generations WHERE status = 'completed' ORDER BY id DESC LIMIT 1"
@@ -567,7 +574,7 @@ public actor ContextSQLiteStore {
     // MARK: - Rebuild and retention
 
     public func resetDerivedState() async throws {
-        try await dbQueue.write { db in
+        try await dbPool.write { db in
             try db.execute(sql: "DELETE FROM context_feedback_events")
             try db.execute(sql: "DELETE FROM context_embeddings")
             try db.execute(sql: "DELETE FROM context_relationship_versions")
@@ -586,7 +593,7 @@ public actor ContextSQLiteStore {
         protectedGenerationIDs: Set<Int64> = [],
         receiptLimit: Int = 10_000
     ) async throws -> ContextStorePruneResult {
-        try await dbQueue.write { db in
+        try await dbPool.write { db in
             let activeID = try Int64.fetchOne(
                 db,
                 sql: "SELECT id FROM context_generations WHERE status = 'completed' ORDER BY id DESC LIMIT 1"
@@ -706,7 +713,7 @@ public actor ContextSQLiteStore {
     /// regular `write` wrapper opens a transaction). Caller gates the cadence —
     /// VACUUM rewrites the whole file, so it runs far less often than prune.
     public func vacuum() async throws {
-        try await dbQueue.writeWithoutTransaction { db in
+        try await dbPool.writeWithoutTransaction { db in
             try db.execute(sql: "VACUUM")
         }
     }

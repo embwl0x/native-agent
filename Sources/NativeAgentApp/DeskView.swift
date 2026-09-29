@@ -1,7 +1,10 @@
 import SwiftUI
 import AppKit
 import BackgroundLoops
+import Cognition
 import PersistenceCore
+import Desk
+import GitHubConnector
 import WorkshopExecution
 
 // MARK: - DeskView — the owner's window into the agent's Desk
@@ -298,7 +301,7 @@ struct DeskView: View {
                 headerRow
 
                 if let loadError {
-                    Label(DeskItemPresentation.boundedLoadFailure(loadError), systemImage: "exclamationmark.triangle")
+                    Label(DeskFacade.boundedLoadFailure(loadError), systemImage: "exclamationmark.triangle")
                         .font(.callout)
                         .foregroundStyle(.orange)
                         .lineLimit(3)
@@ -1909,11 +1912,13 @@ struct DeskView: View {
         // error — because a partial publish is the same stomp in slow motion.
         let token = loadGate.begin()
         DeskLiveReloader.shared.traceEvent("load begin token=\(token)")
-        // ONE read, shared with DeskPageView (DeskBoardRead.swift). The classic
+        // ONE read, shared with DeskPageView (engine.desk.loadBoard). The classic
         // page is the one that renders the sequencing plan and the alias map,
         // so it — and only it — asks for them.
+        // The page's own root, the one its store, router and watches use.
+        let desk = DeskFacade(dataRoot: root)
         let snapshot = await Task.detached(priority: .userInitiated) {
-            await DeskBoardRead.load(root: root, includeSequencing: true)
+            await desk.loadBoard(includeSequencing: true)
         }.value
         DeskLiveReloader.shared.traceEvent("load snapshot done token=\(token) cancelled=\(Task.isCancelled) accepts=\(loadGate.accepts(token))")
         guard !Task.isCancelled, loadGate.accepts(token) else { return false }
@@ -2003,33 +2008,5 @@ struct DeskView: View {
     ///     crash-safe ordering, not a lost record.
     /// A record dir whose CONTENTS can't be listed still counts: unreadable is
     /// not absent, and that skew is exactly what should surface.
-    nonisolated static func probeExecutionRecords(_ root: URL) -> DeskRecordProbe {
-        let fm = FileManager.default
-        var isDirectory: ObjCBool = false
-        guard fm.fileExists(atPath: root.path, isDirectory: &isDirectory) else { return .empty }
-        guard isDirectory.boolValue else {
-            return .unreadable("execution root is not a directory")
-        }
-        let entries: [URL]
-        do {
-            entries = try fm.contentsOfDirectory(
-                at: root, includingPropertiesForKeys: [.isDirectoryKey], options: [])
-        } catch {
-            return .unreadable("\(error.localizedDescription)")
-        }
-        var count = 0
-        for entry in entries {
-            // Dot entries are the runner's own bookkeeping (.admission lock).
-            guard !entry.lastPathComponent.hasPrefix(".") else { continue }
-            guard (try? entry.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true
-            else { continue }
-            if ExecutionRecordFile.exists(in: entry, fileManager: fm) {
-                count += 1
-            } else if (try? fm.contentsOfDirectory(atPath: entry.path)) == nil {
-                // Can't tell whether it holds a record — malformed, count it.
-                count += 1
-            }
-        }
-        return .records(count)
-    }
+
 }

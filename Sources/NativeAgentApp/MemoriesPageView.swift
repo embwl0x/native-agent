@@ -29,23 +29,24 @@
 // Nothing is lost. Every action the classic page offers is still here and calls
 // the SAME function:
 //
-//   the memories        AppModel.memories (refreshForSidebarItem(.memories))
-//   search              AppModel.runMemorySemanticSearch + the same
+//   the memories        engine.memory.memories (refreshForSidebarItem(.memories))
+//   search              engine.memory.search + the same
 //                       MemorySearchPresentation.displayedRecords projection,
 //                       so meaning-based results win over word matches exactly
 //                       as they do on the classic page
-//   pending proposals   AppModel.memoryProposals, status "pending"
+//   pending proposals   engine.memory.proposals, status "pending"
 //   keep / don't keep   AppModel.approveMemoryProposal / rejectMemoryProposal
 //   pin / unpin         AppModel.pinMemory
 //   delete              AppModel.deleteMemory (behind the same confirmation)
 //   read                MemoryFullTextView, the classic page's own sheet
-//   deleted             AppModel.memoryProposals, status "rejected"
+//   deleted             engine.memory.proposals(status: "rejected")
 //   a moment's quote    SwiftNativeMemoryV2.listProposals(status:"pending"),
 //                       metadata `quote` — the same read Today's kept-moments
 //                       fold makes, joined to the proposal by id
 //
-// MemoryView is untouched: the classic shell still renders it, and the
-// consolidate / hygiene / Spotlight-reindex menu lives there.
+// The classic page's consolidate / hygiene / Spotlight-reindex menu and its
+// status block (with Advanced diagnostics) are the "Upkeep and details" fold
+// at the foot of the page (MemoryUpkeepPanel, MemoryView.swift).
 //
 // Alive glass (2026-09-23), from AlivePageKit like Today and the Desk: the
 // rail page's frame draws the serif "Memories" and one counts sentence for
@@ -164,14 +165,14 @@ enum MemoriesWhen {
     }
 
     /// The row sorts on the newest of the two stamps the store keeps.
-    static func sortDate(_ memory: NativeAgentShared.MemoryRecord) -> Date {
+    static func sortDate(_ memory: MemoryV2.MemoryRecord) -> Date {
         let updated = memory.updatedAt.flatMap { UserDisplayFormatters.parseISOTimestamp($0) }
         let created = UserDisplayFormatters.parseISOTimestamp(memory.createdAt)
         return updated ?? created ?? .distantPast
     }
 
     /// The stamp the meta line shows: the update if there is one, else the save.
-    static func stamp(_ memory: NativeAgentShared.MemoryRecord) -> String? {
+    static func stamp(_ memory: MemoryV2.MemoryRecord) -> String? {
         if let updated = memory.updatedAt?.trimmingCharacters(in: .whitespacesAndNewlines),
            !updated.isEmpty {
             return updated
@@ -217,12 +218,12 @@ enum MemoriesPageContent {
         return headerLine(
             loaded: status != nil,
             failed: status?.failedEndpoints.contains("memories") == true,
-            kept: appModel.memories.count,
-            toLookAt: appModel.memoryProposals.filter { $0.status == "pending" }.count)
+            kept: appModel.engine.memory.memories.count,
+            toLookAt: appModel.engine.memory.proposals.filter { $0.status == "pending" }.count)
     }
 
     /// Pinned first, then newest. The same order the conversations list keeps.
-    static func ordered(_ memories: [NativeAgentShared.MemoryRecord]) -> [NativeAgentShared.MemoryRecord] {
+    static func ordered(_ memories: [MemoryV2.MemoryRecord]) -> [MemoryV2.MemoryRecord] {
         memories.sorted { lhs, rhs in
             let lp = lhs.pinned == true, rp = rhs.pinned == true
             if lp != rp { return lp }
@@ -233,7 +234,7 @@ enum MemoriesPageContent {
     }
 
     /// "Pinned · in July · I checked it myself".
-    static func meta(_ memory: NativeAgentShared.MemoryRecord, now: Date) -> String {
+    static func meta(_ memory: MemoryV2.MemoryRecord, now: Date) -> String {
         var parts: [String] = []
         if memory.pinned == true { parts.append("Pinned") }
         parts.append(MemoriesWhen.words(MemoriesWhen.stamp(memory), now: now))
@@ -253,8 +254,8 @@ enum MemoriesPageContent {
     /// The memory itself leads: for a moment that is the agent's own sentence,
     /// for a fact the fact. The quote that made a moment is evidence, shown
     /// beneath, never in place of the memory (User, 2026-09-10).
-    static func proposalLine(_ proposal: MemoryProposalRecord) -> String {
-        TodayWords.line(proposal.display_text ?? proposal.fact_text, limit: 200)
+    static func proposalLine(_ proposal: ProposalRecord) -> String {
+        TodayWords.line(proposal.content, limit: 200)
     }
     static func proposalMeta(quote: String?, staged: String) -> String {
         guard let quote, !quote.isEmpty else { return staged }
@@ -306,7 +307,7 @@ struct MemoriesPageView: View {
 
     @State private var query = ""
     @State private var snapshot = MemoriesPageSnapshot.empty
-    @State private var rejectedProposals: [MemoryProposalRecord] = []
+    @State private var rejectedProposals: [ProposalRecord] = []
     @State private var rejectedShown = MemoriesPageMetrics.foldRowCap
     @State private var now = Date()
     @State private var searchTask: Task<Void, Never>?
@@ -317,6 +318,7 @@ struct MemoriesPageView: View {
     private enum Fold {
         static let showAll = "show-all"
         static let deleted = "deleted"
+        static let upkeep = "upkeep"
     }
 
     var body: some View {
@@ -334,6 +336,12 @@ struct MemoriesPageView: View {
                     if !pendingProposals.isEmpty { waitingCard }
                     keptSection
                     deletedFold
+                    // The store's upkeep and status, folded: nobody needs it
+                    // to read what was kept, and nothing of it is lost.
+                    MemoriesFold(title: "Upkeep and details", isOpen: binding(Fold.upkeep)) {
+                        MemoryUpkeepPanel()
+                    }
+                    .accessibilityIdentifier("memories.upkeep")
                 }
 
                 if let notice {
@@ -395,14 +403,15 @@ struct MemoriesPageView: View {
         // page makes, so "meaning, not words" behaves identically here.
         .onChange(of: query) { _, newValue in
             searchTask?.cancel()
-            searchTask = Task { await appModel.runMemorySemanticSearch(query: newValue) }
+            searchTask = Task { await memory.search(query: newValue) }
         }
         .onDisappear { searchTask?.cancel() }
     }
 
     // MARK: header
 
-    private var memories: [NativeAgentShared.MemoryRecord] { appModel.memories }
+    private var memory: MemoryFacade { appModel.engine.memory }
+    private var memories: [MemoryV2.MemoryRecord] { memory.memories }
 
     private var header: some View {
         AlivePageHeader(
@@ -424,14 +433,14 @@ struct MemoriesPageView: View {
 
     /// The SAME projection the classic page uses: semantic results when they
     /// name the query in the field, the cheap lexical pass otherwise.
-    private var found: [NativeAgentShared.MemoryRecord] {
+    private var found: [MemoryV2.MemoryRecord] {
         MemorySearchPresentation.displayedRecords(
             memories,
             query: query,
-            semanticResults: appModel.memorySearchResults,
-            resultQuery: appModel.memorySearchResultQuery
-        ) { memory, lower in
-            memory.text.lowercased().contains(lower) || memory.layer.lowercased().contains(lower)
+            semanticResults: memory.searchResults,
+            resultQuery: memory.searchResultQuery
+        ) { record, lower in
+            record.text.lowercased().contains(lower)
         }
     }
 
@@ -439,12 +448,12 @@ struct MemoriesPageView: View {
         MemorySearchPresentation.resolve(
             query: query,
             resultCount: found.count,
-            isLoading: appModel.memorySearchIsLoading
+            isLoading: memory.searchIsLoading
                 && MemorySearchPresentation.matchesCurrentQuery(
-                    query, resultQuery: appModel.memorySearchResultQuery),
+                    query, resultQuery: memory.searchResultQuery),
             error: MemorySearchPresentation.matchesCurrentQuery(
-                query, resultQuery: appModel.memorySearchResultQuery)
-                ? appModel.memorySearchError
+                query, resultQuery: memory.searchResultQuery)
+                ? memory.searchError
                 : nil
         )
     }
@@ -486,8 +495,8 @@ struct MemoriesPageView: View {
 
     // MARK: waiting for you
 
-    private var pendingProposals: [MemoryProposalRecord] {
-        appModel.memoryProposals.filter { $0.status == "pending" }
+    private var pendingProposals: [ProposalRecord] {
+        memory.proposals.filter { $0.status == "pending" }
     }
 
     /// Today's waiting card, and only when something is actually pending.
@@ -499,8 +508,8 @@ struct MemoriesPageView: View {
                     MemoriesProposalRow(
                         line: MemoriesPageContent.proposalLine(proposal),
                         meta: MemoriesPageContent.proposalMeta(
-                            quote: snapshot.momentQuotes[proposal.proposal_id],
-                            staged: "staged \(MemoriesWhen.words(proposal.staged_at, now: now))"),
+                            quote: snapshot.momentQuotes[proposal.id],
+                            staged: "staged \(MemoriesWhen.words(proposal.createdAt, now: now))"),
                         onKeep: { decide(proposal, keep: true) },
                         onNotNow: { decide(proposal, keep: false) }
                     )
@@ -512,7 +521,7 @@ struct MemoriesPageView: View {
 
     // MARK: what I've kept
 
-    private var ordered: [NativeAgentShared.MemoryRecord] {
+    private var ordered: [MemoryV2.MemoryRecord] {
         MemoriesPageContent.ordered(memories)
     }
 
@@ -549,7 +558,7 @@ struct MemoriesPageView: View {
         }
     }
 
-    private func keptRow(_ memory: NativeAgentShared.MemoryRecord) -> some View {
+    private func keptRow(_ memory: MemoryV2.MemoryRecord) -> some View {
         MemoriesRowCard(
             line: MemoriesPageContent.line(memory.text),
             meta: MemoriesPageContent.meta(memory, now: now),
@@ -576,7 +585,7 @@ struct MemoriesPageView: View {
                 AliveGroupCard {
                     MemoriesRejectedHistory(proposals: rejectedProposals, shown: $rejectedShown) { proposal in
                         fullText = MemoriesFullText(
-                            id: proposal.id, text: proposal.display_text ?? proposal.fact_text)
+                            id: proposal.id, text: proposal.content)
                     }
                 }
             }
@@ -595,17 +604,15 @@ struct MemoriesPageView: View {
     }
 
     /// The SAME accept/reject the classic Pending tab calls, one for one.
-    private func decide(_ proposal: MemoryProposalRecord, keep: Bool) {
+    private func decide(_ proposal: ProposalRecord, keep: Bool) {
         Task {
             do {
-                let result = keep
-                    ? try await appModel.approveMemoryProposal(id: proposal.proposal_id)
-                    : try await appModel.rejectMemoryProposal(id: proposal.proposal_id)
-                if (result["status"] as? String) == "pending_approval" {
-                    notice = "I've asked first; it's waiting on an approval."
+                if keep {
+                    try await appModel.approveMemoryProposal(id: proposal.id)
                 } else {
-                    notice = keep ? "Kept it." : "Left it."
+                    try await appModel.rejectMemoryProposal(id: proposal.id)
                 }
+                notice = keep ? "Kept it." : "Left it."
                 await reload()
             } catch {
                 notice = "I couldn't save that decision just now."
@@ -630,13 +637,13 @@ struct MemoriesPageView: View {
     }
 
     @MainActor
-    private func togglePin(_ memory: NativeAgentShared.MemoryRecord) async {
+    private func togglePin(_ memory: MemoryV2.MemoryRecord) async {
         let outcome = await appModel.pinMemory(memory, pinned: !(memory.pinned ?? false))
         notice = outcome.message
     }
 
     @MainActor
-    private func delete(_ memory: NativeAgentShared.MemoryRecord) async {
+    private func delete(_ memory: MemoryV2.MemoryRecord) async {
         await appModel.deleteMemory(memory)
         if appModel.statusText.hasPrefix("Memory delete failed:") {
             appModel.systemToasts.push(error: appModel.statusText)
@@ -652,7 +659,7 @@ struct MemoriesPageView: View {
         // memories, the proposals and the status all move together.
         await appModel.refreshForSidebarItem(.memories)
         do {
-            let rejected = try await appModel.client.getRejectedMemoryProposals()
+            let rejected = try await memory.proposals(status: "rejected")
             guard !Task.isCancelled else { return }
             rejectedProposals = rejected
         } catch {
@@ -684,38 +691,10 @@ struct MemoriesFullText: Identifiable, Equatable {
 /// glyphs are secondary: tertiary grey fails 4.5:1 where the haze peaks.
 struct MemoriesSearchField: View {
     @Binding var text: String
-    @FocusState private var focused: Bool
-    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
     var body: some View {
-        let shape = RoundedRectangle(cornerRadius: 12, style: .continuous)
-        HStack(spacing: 10) {
-            Image(systemName: "magnifyingglass")
-                .font(.system(size: 14, weight: .medium))
-                .foregroundStyle(NativeAgentShell.secondary)
-                .accessibilityHidden(true)
-            TextField("Search what I remember", text: $text)
-                .textFieldStyle(.plain)
-                .font(.system(size: 14))
-                .focused($focused)
-                .accessibilityIdentifier("memories.search")
-            if !text.isEmpty {
-                Button {
-                    text = ""
-                } label: {
-                    Image(systemName: "xmark.circle.fill")
-                        .font(ShellType.label)
-                        .foregroundStyle(NativeAgentShell.secondary)
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Clear the search")
-            }
-        }
-        .padding(.horizontal, 14)
-        .frame(height: 38)
-        .background(shape.fill(reduceTransparency ? TodayPalette.cardFill : NativeAgentShell.quietFill))
-        // A focused field lifts its rim to the hairline; nothing animates.
-        .overlay(shape.strokeBorder(focused ? NativeAgentShell.hairline : AlivePalette.rim, lineWidth: 1))
+        NativeSearchField(text: $text, prompt: "Search what I remember",
+                          identifier: "memories.search", accessibilityLabel: "Search memories")
     }
 }
 
@@ -728,29 +707,14 @@ struct MemoriesFold<Content: View>: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        VStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
-            Button {
-                withAnimation(NativeAgentMotion.respecting(NativeAgentMotion.quick, reduceMotion: reduceMotion)) {
-                    isOpen.toggle()
-                }
-            } label: {
-                HStack(spacing: 6) {
-                    Text(title)
-                        .font(.system(size: 13, weight: .medium))
-                        .foregroundStyle(isOpen ? NativeAgentShell.text : NativeAgentShell.secondary)
-                    Image(systemName: "chevron.right")
-                        .font(ShellType.captionSemibold)
-                        .foregroundStyle(NativeAgentShell.secondary)
-                        .rotationEffect(.degrees(isOpen ? 90 : 0))
-                }
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .accessibilityValue(isOpen ? "Open" : "Folded")
-            if isOpen {
-                content()
-                    .transition(NativeAgentMotion.reveal(reduceMotion: reduceMotion))
-            }
+        // The Mac's own disclosure (User 09-27: all controls native).
+        DisclosureGroup(isExpanded: $isOpen) {
+            content()
+                .padding(.top, AliveMetrics.eyebrowGap)
+        } label: {
+            Text(title)
+                .font(.system(size: 13, weight: .medium))
+                .foregroundStyle(isOpen ? NativeAgentShell.text : NativeAgentShell.secondary)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
@@ -794,7 +758,6 @@ struct MemoriesRowCard: View {
                     tint: isPinned ? NativeAgentShell.text : nil,
                     action: onTogglePin
                 )
-                iconButton("trash", help: "Forget this") { confirmingDelete = true }
             }
             // Pinned rows keep the pin visible; everything else appears under
             // the cursor, so sixty rows read as sixty lines, not sixty toolbars.
@@ -803,6 +766,14 @@ struct MemoriesRowCard: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(Rectangle())
         .onHover { hovering = $0 }
+        // The Mac's own right-click menu (User 09-27: all controls native).
+        .contextMenu {
+            Button("Read the whole thing", systemImage: "doc.text.magnifyingglass", action: onRead)
+            Button(isPinned ? "Unpin" : "Pin to the top", systemImage: isPinned ? "pin.slash" : "pin",
+                   action: onTogglePin)
+            Divider()
+            Button("Forget this…", systemImage: "trash", role: .destructive) { confirmingDelete = true }
+        }
         // The classic row's confirmation, kept: a delete cannot be undone.
         .confirmationDialog(
             "Forget this memory?",
@@ -879,16 +850,16 @@ struct MemoriesProposalRow: View {
 /// Loaded history retains the store's order and proposal identity. Reading is
 /// available independently of the terminal review decision.
 struct MemoriesRejectedHistory: View {
-    let proposals: [MemoryProposalRecord]
+    let proposals: [ProposalRecord]
     @Binding var shown: Int
-    let onRead: (MemoryProposalRecord) -> Void
+    let onRead: (ProposalRecord) -> Void
 
     var body: some View {
         ForEach(Array(proposals.prefix(shown))) { proposal in
             Button { onRead(proposal) } label: {
                 HStack {
                     DeskPageDetailRow(
-                        title: MemoriesPageContent.line(proposal.display_text ?? proposal.fact_text),
+                        title: MemoriesPageContent.line(proposal.content),
                         line: "", meta: "I didn't keep this")
                     Image(systemName: "doc.text.magnifyingglass")
                         .foregroundStyle(NativeAgentShell.secondary)

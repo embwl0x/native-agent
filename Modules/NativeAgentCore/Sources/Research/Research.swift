@@ -46,7 +46,8 @@ public struct SearXNGAutodetectResult: Sendable, Equatable {
     }
 }
 
-public struct ResearchSearchResult: Sendable, Equatable {
+public struct ResearchSearchResult: Identifiable, Sendable, Hashable {
+    public var id: String { url }
     public let title: String
     public let url: String
     public let snippet: String
@@ -151,7 +152,7 @@ public struct ResearchFetchRecord: Sendable, Equatable {
 /// Mirrors Python `run_research_lab`'s `run` dict:
 /// `{id, objective, status, query, sources, brief, createdAt, connector,
 /// error}`. `error` is null on success, a string when search failed.
-public struct ResearchLabRun: Sendable, Equatable {
+public struct ResearchLabRun: Identifiable, Sendable, Hashable {
     public let id: String
     public let objective: String
     public let status: String      // "completed" | "needs_connector"
@@ -192,6 +193,58 @@ public struct ResearchLabRun: Sendable, Equatable {
             "connector": .string(connector),
             "error": error.map { .string($0) } ?? .null,
         ])
+    }
+}
+
+// MARK: - Stored rows (S10)
+
+extension ResearchSearchResult {
+    /// One stored source row: `title`, `url` and `snippet` are required;
+    /// a present field of the wrong type makes the row malformed.
+    public init?(row: JSONValue) {
+        guard case .object(let obj) = row,
+              case .string(let title)? = obj["title"],
+              case .string(let url)? = obj["url"],
+              case .string(let snippet)? = obj["snippet"] else { return nil }
+        switch obj["source"] {
+        case nil, .null?: self.init(title: title, url: url, snippet: snippet, source: nil)
+        case .string(let source)?: self.init(title: title, url: url, snippet: snippet, source: source)
+        default: return nil
+        }
+    }
+}
+
+extension ResearchLabRun {
+    /// One stored `lab/runs.json` row: `id`, `objective`, `status` and every
+    /// source are required; an absent text field reads as empty, a present
+    /// field of the wrong type makes the run malformed.
+    public init?(row: JSONValue) {
+        guard case .object(let obj) = row,
+              case .string(let id)? = obj["id"],
+              case .string(let objective)? = obj["objective"],
+              case .string(let status)? = obj["status"],
+              case .array(let sourceRows)? = obj["sources"] else { return nil }
+        var sources: [ResearchSearchResult] = []
+        for sourceRow in sourceRows {
+            guard let source = ResearchSearchResult(row: sourceRow) else { return nil }
+            sources.append(source)
+        }
+        var malformed = false
+        func text(_ key: String) -> String? {
+            switch obj[key] {
+            case nil, .null?: return nil
+            case .string(let value)?: return value
+            default: malformed = true; return nil
+            }
+        }
+        let query = text("query"), brief = text("brief"), connector = text("connector")
+        let error = text("error"), createdAt = text("createdAt")
+        guard !malformed else { return nil }
+        self.init(
+            id: id, objective: objective, status: status, query: query ?? "",
+            sources: sources, brief: brief ?? "", createdAt: createdAt ?? "",
+            connector: connector ?? "", error: error
+        )
     }
 }
 

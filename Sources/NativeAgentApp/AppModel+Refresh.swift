@@ -111,53 +111,43 @@ extension AppModel {
         // concurrent user mutation gets clobbered by an older fetched value
         // from ~one section to the entire pass. Those are timing-visible
         // regressions; per-section batching gets the coalescing without them.
-        setIfChanged(\.health, await refreshPreserving("getHealth", current: health) {
-            try await api.getHealth()
-        })
-        if health == nil {
-            // Interim message, deliberately written before the retry await so
-            // it is on screen while the retry is in flight.
-            setIfChanged(\.statusText, "Swift runtime unavailable")
-            setIfChanged(\.health, await refreshPreserving("getHealth", current: health) {
-                try await api.getHealth()
-            })
-        }
+        setIfChanged(\.engine.doctor.health, engine.doctor.readHealth())
 
         let fetchedRuns = await refreshPreserving("getRuns", current: runs) { try await api.getRuns() }
         let fetchedActivity = await refreshPreserving("getActivity", current: activityEvents) { try await api.getActivity() }
-        let fetchedExecutions = await refreshPreserving("getWorkshopExecutions", current: executions) { try await api.getWorkshopExecutions() }
-        let fetchedMemories = await refreshPreserving("getMemories", current: memories) { try await api.getMemories() }
+        let fetchedMemories = await refreshPreserving("getMemories", current: engine.memory.memories) {
+            try await engine.memory.activeMemories()
+        }
         let fetchedPersonality = await refreshPreserving("getPersonality", current: personality) { try await api.getPersonality() }
         let fetchedPersonalityDocs = await decodeLogged("getPersonalityDocs", { try await api.getPersonalityDocs() })
         let fetchedSkills = await refreshPreserving("getSkills", current: skills) { try await api.getSkills() }
-        let fetchedTools = await refreshPreserving("getTools", current: tools) { try await api.getTools() }
-        let fetchedCapabilitySummary = await refreshPreserving("getCapabilities", current: capabilitySummary) { try await api.getCapabilities() }
+        let fetchedTools = await refreshPreserving("getTools", current: engine.tools.authored) { try await engine.tools.listAuthored() }
+        let fetchedCapabilitySummary = await refreshPreserving("getCapabilities", current: engine.trust.capabilitySummary) { try await engine.trust.loadCapabilities() }
         let fetchedWorkflows = await refreshPreserving("getWorkflows", current: workflows) { try await api.getWorkflows() }
-        let fetchedApprovals = await refreshPreserving("getApprovals", current: approvals) { try await api.getApprovals() }
+        let fetchedApprovals = await refreshPreserving("getApprovals", current: engine.approvals.records) { try await engine.approvals.list() }
         // An unavailable inbox read is not an honest empty inbox. Keep the
         // last model snapshot on failure so InboxView receives `[]` only when
         // the real reader actually reported no cards.
-        let fetchedInboxItems = await refreshPreserving("getInboxItems", current: inboxItems) { try await api.getInboxItems(unreadOnly: false) }
+        let fetchedInboxItems = await refreshPreserving("getInboxItems", current: engine.inbox.items) { try await engine.inbox.list() }
         let fetchedMCPServers = await refreshPreserving("getMCPServers", current: mcpServers) { try await api.getMCPServers() }
-        let fetchedMCPSessions = await refreshPreserving("getMCPSessions", current: mcpSessions) { try await api.getMCPSessions() }
+        let fetchedMCPSessions = await refreshPreserving("getMCPSessions", current: engine.tools.mcpSessions) { try await engine.tools.listMCPSessions() }
         let fetchedMCPConsent = await refreshPreserving("getMCPConsent", current: mcpConsent) { try await api.getMCPConsent() }
         // No `await` from here to the end of the block: one MainActor turn.
         setIfChanged(\.runs, fetchedRuns)
         setIfChanged(\.activityEvents, fetchedActivity)
-        setIfChanged(\.executions, fetchedExecutions)
-        setIfChanged(\.memories, fetchedMemories)
+        if engine.memory.memories != fetchedMemories { engine.memory.memories = fetchedMemories }
         setIfChanged(\.personality, fetchedPersonality)
         if let docsResponse = fetchedPersonalityDocs {
             setIfChanged(\.personalityDocs, docsResponse.docs)
         }
         setIfChanged(\.skills, fetchedSkills)
-        setIfChanged(\.tools, fetchedTools)
-        setIfChanged(\.capabilitySummary, fetchedCapabilitySummary)
+        setIfChanged(\.engine.tools.authored, fetchedTools)
+        setIfChanged(\.engine.trust.capabilitySummary, fetchedCapabilitySummary)
         setIfChanged(\.workflows, fetchedWorkflows)
-        setIfChanged(\.approvals, fetchedApprovals)
-        setIfChanged(\.inboxItems, fetchedInboxItems)
+        if engine.approvals.records != fetchedApprovals { engine.approvals.records = fetchedApprovals }
+        if engine.inbox.items != fetchedInboxItems { engine.inbox.items = fetchedInboxItems }
         setIfChanged(\.mcpServers, fetchedMCPServers)
-        setIfChanged(\.mcpSessions, fetchedMCPSessions)
+        setIfChanged(\.engine.tools.mcpSessions, fetchedMCPSessions)
         setIfChanged(\.mcpConsent, fetchedMCPConsent)
         // gpt-5.5 review-2 race-safety: late-arrival guard for tools/
         // resources here too. refreshAll is invoked by long-lived polling
@@ -215,7 +205,7 @@ extension AppModel {
         }
         refreshMCPHubRecentCall()
 
-        let fetchedResearchLabRuns = await refreshPreserving("getResearchLabRuns", current: researchLabRuns) { try await api.getResearchLabRuns() }
+        let fetchedResearchLabRuns = await refreshPreserving("getResearchLabRuns", current: engine.desk.researchRuns) { try await engine.desk.listResearchRuns() }
         let fetchedTraceTimeline = api.getCapabilityTraceTimeline()
         let fetchedAgentGraph = await decodeLogged("getAgentGraph") { try await api.getAgentGraph() }
         let fetchedGraphEntities = await refreshPreserving("getGraphEntities", current: graphEntities) { try await api.getGraphEntities() }
@@ -229,7 +219,7 @@ extension AppModel {
         // the visible refresh status; only a successful read may clear this
         // collection to the legitimate bootstrap/empty state.
         let fetchedCapabilityPackInstalls = await decodeLogged("getCapabilityPackInstalls") { try await api.getCapabilityPackInstalls() }
-        let fetchedCapabilityTrust = await decodeLogged("getCapabilityTrust") { try await api.getCapabilityTrust() }
+        let fetchedCapabilityTrust = await decodeLogged("getCapabilityTrust") { try await engine.trust.loadCapabilityNetwork() }
         let fetchedNextGenPhases = await refreshPreserving("getNextGenPhases", current: nextGenPhases) { try await api.getNextGenPhases() }
         let fetchedPersonalityGrowth = await decodeLogged("getPersonalityGrowth") { try await api.getPersonalityGrowth() }
         let fetchedNativePower = await decodeLogged("getNativePower") { try await api.getNativePower() }
@@ -243,23 +233,23 @@ extension AppModel {
         let fetchedImprovementGauntletStatus = await decodeLogged("getImprovementGauntlet") { try await api.getImprovementGauntlet() }
         let fetchedProductionHardening = await decodeLogged("getProductionHardening") { try await api.getProductionHardening() }
         let fetchedProductionExports = await refreshPreserving("getProductionExports", current: productionExports) { try await api.getProductionExports() }
-        let fetchedTrustPolicy = await decodeLogged("getTrustPolicy") { try await api.getTrustPolicy() }
-        let fetchedBackups = await refreshPreserving("getBackups", current: backups) { try await api.getBackups() }
+        let fetchedTrustPolicy = await decodeLogged("getTrustPolicy") { try await engine.trust.load() }
+        let fetchedBackups = await refreshPreserving("getBackups", current: engine.trust.backups) { try await engine.trust.listBackups() }
         let fetchedConnectors = await refreshPreserving("getConnectors", current: connectors) { try await api.getConnectors() }
         let fetchedWorkspaces = await refreshPreserving("getWorkspaces", current: workspaces) { try await api.getWorkspaces() }
         let fetchedEvals = await refreshPreserving("getEvals", current: evals) { try await api.getEvals() }
         let fetchedReleaseChecklist = await decodeLogged("getReleaseChecklist") { try await api.getReleaseChecklist() }
-        let fetchedWatchdogStatus = await decodeLogged("getWatchdog") { try await api.getWatchdog() }
+        let fetchedWatchdogStatus = await decodeLogged("getWatchdog") { await engine.doctor.readWatchdog(manager: api.backgroundLoopsManager.coreManager) }
         let fetchedTrainingArtifacts = await refreshPreserving("getTrainingArtifacts", current: trainingArtifacts) { try await api.getTrainingArtifacts() }
-        let fetchedJobs = await refreshPreserving("getJobs", current: jobs) { try await api.getJobs() }
+        let fetchedJobs = await refreshPreserving("getJobs", current: engine.desk.jobs) { try await engine.desk.listJobs() }
         let fetchedImprovementSummary = await decodeLogged("getImprovementSummary") { try await api.getImprovementSummary() }
         let fetchedImprovements = await refreshPreserving("getImprovements", current: improvements) { try await api.getImprovements() }
         let fetchedTrainingRuns = await refreshPreserving("getTrainingRuns", current: trainingRuns) { try await api.getTrainingRuns() }
         let fetchedTrainingProposals = await refreshPreserving("getTrainingProposals", current: trainingProposals) { try await api.getTrainingProposals() }
         let fetchedPromotionCandidates = await refreshPreserving("getPromotionCandidates", current: promotionCandidates) { try await api.getPromotionCandidates() }
-        let fetchedTelegramStatus = await decodeLogged("getTelegramStatus") { try await api.getTelegramStatus() }
+        let fetchedTelegramStatus = await decodeLogged("getTelegramStatus") { try await engine.telegram.load(manager: api.backgroundLoopsManager.coreManager) }
         // No `await` from here to the end of the block: one MainActor turn.
-        setIfChanged(\.researchLabRuns, fetchedResearchLabRuns)
+        setIfChanged(\.engine.desk.researchRuns, fetchedResearchLabRuns)
         setIfChanged(\.capabilityTraceTimeline, fetchedTraceTimeline)
         setIfChanged(\.traces, fetchedTraceTimeline.traces)
         setIfChanged(\.agentGraph, fetchedAgentGraph)
@@ -272,7 +262,7 @@ extension AppModel {
         if let fetchedCapabilityPackInstalls {
             setIfChanged(\.capabilityPackInstalls, fetchedCapabilityPackInstalls)
         }
-        setIfChanged(\.capabilityTrust, fetchedCapabilityTrust)
+        setIfChanged(\.engine.trust.capabilityNetwork, fetchedCapabilityTrust)
         // DAEMON-KILL refreshAll: /v1/nextgen/summary + /v1/nextgen/receipts retired.
         // nextGenPhases reads <dataRoot>/runtime/nextgen_phases.json natively; keep it.
         setIfChanged(\.nextGenSummary, nil)
@@ -293,22 +283,22 @@ extension AppModel {
         setIfChanged(\.improvementGauntletStatus, fetchedImprovementGauntletStatus)
         setIfChanged(\.productionHardening, fetchedProductionHardening)
         setIfChanged(\.productionExports, fetchedProductionExports)
-        // NOT gated: `trustPolicy` has a `didSet` that re-syncs `chatFileAccess`
+        // NOT gated: `engine.trust.policy` has a `didSet` that re-syncs `chatFileAccess`
         // from the policy (AppModel.swift:370-378). Skipping the write on an
         // unchanged policy would also skip that re-sync, so a `chatFileAccess`
         // changed elsewhere would stop being snapped back to the policy value.
         // That is a security-adjacent behavior change, not a render saving.
-        trustPolicy = fetchedTrustPolicy
-        setIfChanged(\.backups, fetchedBackups)
+        engine.trust.policy = fetchedTrustPolicy
+        setIfChanged(\.engine.trust.backups, fetchedBackups)
         // DAEMON-DEAD PORT: read the Swift-owned connector registry directly;
         // leaving this empty makes the Connectors tab race broad refreshes.
         setIfChanged(\.connectors, fetchedConnectors)
         setIfChanged(\.workspaces, fetchedWorkspaces)
         setIfChanged(\.evals, fetchedEvals)
         setIfChanged(\.releaseChecklist, fetchedReleaseChecklist)
-        setIfChanged(\.watchdogStatus, fetchedWatchdogStatus)
+        setIfChanged(\.engine.doctor.watchdog, fetchedWatchdogStatus)
         setIfChanged(\.trainingArtifacts, fetchedTrainingArtifacts)
-        setIfChanged(\.jobs, fetchedJobs)
+        setIfChanged(\.engine.desk.jobs, fetchedJobs)
         setIfChanged(\.improvementSummary, fetchedImprovementSummary)
         setIfChanged(\.improvements, fetchedImprovements)
         // Perf wave 2: the three that wave 1 had to leave ungated for a type
@@ -322,11 +312,11 @@ extension AppModel {
         setIfChanged(\.trainingRuns, fetchedTrainingRuns)
         setIfChanged(\.trainingProposals, fetchedTrainingProposals)
         setIfChanged(\.promotionCandidates, fetchedPromotionCandidates)
-        setIfChanged(\.telegramStatus, fetchedTelegramStatus)
+        setIfChanged(\.engine.telegram.status, fetchedTelegramStatus)
         if fetchedTelegramStatus != nil {
             telegramStatusRefreshError = nil
         }
-        if let st = telegramStatus {
+        if let st = engine.telegram.status {
             // Swift-native cutover: drive the UI vars straight from the native status
             // so the Bot-token-configured badge + allowed list don't depend on
             // the legacy config.json[telegram] overlay path decoding cleanly.
@@ -347,7 +337,7 @@ extension AppModel {
             }
             telegramSettingsDraftBaseline = telegramSettingsDraftSnapshot
         }
-        setIfChanged(\.modelCatalog, await decodeLogged("getModelCatalog") { try await api.getModelCatalog(refresh: false) })
+        setIfChanged(\.engine.providers.catalog, await decodeLogged("getModelCatalog") { try await engine.providers.modelCatalog(refresh: false) })
         // PATCH-2026-05-07: chat-provider-picker Populate providers list at
         // app startup so the chat brain bar's Provider dropdown isn't
         // empty on first render. The bar's own .task also calls this, but
@@ -364,18 +354,18 @@ extension AppModel {
             try await api.getPrivacyMap(includeInventory: false)
         }
         let fetchedConfig = await decodeLogged("getConfig", { try await api.getConfig() })
-        // No `await` from here to the end of the function: one MainActor turn.
+        // Apply the fetched UI state in one MainActor turn before publishing the widget.
         setIfChanged(\.compiledPersonality, fetchedCompiledPersonality)
         setIfChanged(\.privacyMap, fetchedPrivacyMap)
         if let config = fetchedConfig {
-            setIfChanged(\.codexAuthStatus, config.codexAuth)
+            setIfChanged(\.engine.providers.codexAuth, config.codexAuth)
             _ = applyRefreshedSearXNGBaseURL(config.searxngBaseURL)
             if let telegram = config.telegram {
-                setIfChanged(\.telegramTokenConfigured, telegram.tokenConfigured ?? false)
-                setIfChanged(\.telegramEnabled, telegram.enabled ?? false)
-                telegramAllowedChats = (telegram.allowedChatIds ?? []).joined(separator: ",")
-                telegramAllowedUsers = (telegram.allowedUserIds ?? []).joined(separator: ",")
-                telegramRequireMention = telegram.requireMention ?? true
+                setIfChanged(\.telegramTokenConfigured, telegram.tokenConfigured)
+                setIfChanged(\.telegramEnabled, telegram.enabled)
+                telegramAllowedChats = telegram.allowedChatIds.joined(separator: ",")
+                telegramAllowedUsers = telegram.allowedUserIds.joined(separator: ",")
+                telegramRequireMention = telegram.requireMention
                 telegramModel = telegram.model ?? telegramModel
                 telegramReasoningEffort = telegram.reasoningEffort ?? telegramReasoningEffort
                 telegramSettingsDraftBaseline = telegramSettingsDraftSnapshot
@@ -404,6 +394,7 @@ extension AppModel {
                 }
             }
         }
-        setIfChanged(\.statusText, health?.ok == true ? "I'm online" : "I'm unavailable")
+        setIfChanged(\.statusText, engine.doctor.health?.ok == true ? "I'm online" : "I'm unavailable")
+        if #available(macOS 27, *) { await publishWidgetStatus() }
     }
 }

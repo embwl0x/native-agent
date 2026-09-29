@@ -151,10 +151,8 @@ struct ChatSessionTab: Identifiable, Hashable {
     }
 }
 
-/// The conversation anchor as the phone consumes it: the session the human is
-/// currently active in on a direct remote surface (Telegram today; Signal or
-/// WhatsApp later), published by the Mac as `chat_anchor.json` in the same
-/// `.core` snapshot group as `sessions.json`.
+/// The Mac window's current chat, published as `chat_anchor.json` in the same
+/// `.core` snapshot group as `sessions.json`. The phone's main chat follows it.
 ///
 /// Field-for-field mirror of `PersistenceCore.ConversationAnchorPin`, declared
 /// here because the phone links only `NativeAgentShared`. `source` and
@@ -214,6 +212,11 @@ enum MobileConversationAnchor {
 @MainActor
 enum MobileChatSelectionIntent {
     private(set) static var userChoseThisLaunch = false
+
+    static func followMain() {
+        userChoseThisLaunch = false
+        notifiedSessionID = nil
+    }
 
     /// 2026-09-06: the conversation a tapped reply notification opened. It is
     /// an explicit selection, not a pinned tab, so the externally-removed-pin
@@ -277,7 +280,7 @@ enum ChatSessionTabProjection {
             tabs.append(ChatSessionTab(
                 id: session.id,
                 title: cleanTitle(session.displayTitle, fallback: "Chat"),
-                systemImage: "pin.fill",
+                systemImage: isAnchor ? "clock" : "pin.fill",
                 sessionID: session.id,
                 kind: isAnchor ? .anchor(session.id) : .pinned(session.id)
             ))

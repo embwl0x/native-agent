@@ -1,3 +1,4 @@
+import FeedPolicy
 // Canonical memories, proposals, and rejection tombstones in
 // <dataRoot>/memory/memory.sqlite, owned by the MemoryStorage actor.
 

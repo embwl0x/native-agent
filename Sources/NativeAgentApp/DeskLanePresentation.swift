@@ -2,6 +2,8 @@ import SwiftUI
 import AppKit
 import BackgroundLoops
 import PersistenceCore
+import Desk
+import GitHubConnector
 import WorkshopExecution
 
 /// HER HOUR, on the Desk — personality-depth item 9.
@@ -61,61 +63,6 @@ enum DeskHerHourPresentation {
 /// failed or the store is corrupt. A failure must NEVER render as emptiness:
 /// "Quiet right now", "No tracked GitHub work…" and "The bench is clear" are
 /// read as facts about the bench, not as facts about the reader.
-enum DeskLaneState<Row: Sendable>: Sendable {
-    case unavailable(String)
-    case rows([Row])
-
-    static var maxReasonChars: Int { 240 }
-
-    /// Every failure notice on the Desk uses this cap. Keeping the truncation
-    /// at the state boundary makes an unreadable store visible without letting
-    /// an untrusted error string take over the board.
-    static func boundedReason(_ reason: String) -> String {
-        String(reason.prefix(maxReasonChars))
-    }
-
-    var items: [Row] {
-        if case .rows(let rows) = self { return rows }
-        return []
-    }
-
-    var unavailableReason: String? {
-        if case .unavailable(let reason) = self { return reason }
-        return nil
-    }
-
-    /// A throwing read: the error text IS the reason, bounded.
-    static func failed(_ error: any Error) -> DeskLaneState {
-        .unavailable(boundedReason("\(error)"))
-    }
-
-    /// Silent-zero cross-check, for readers that CANNOT throw.
-    /// `SwiftNativeWorkshopRunner.listAll()` swallows an unreadable execution
-    /// root and returns `[]`, so the only honest signal available to this
-    /// surface is the disk cross-check. The probe is TRI-state on purpose: a
-    /// bare count conflated "the root isn't there" (honest zero) with "the root
-    /// wouldn't open" (the corrupt-store case this whole check exists to
-    /// expose), because both produced 0.
-    static func classify(rows: [Row], probe: DeskRecordProbe, noun: String) -> DeskLaneState {
-        switch probe {
-        case .empty:
-            // No store yet — a genuinely empty lane, rows or not.
-            return .rows(rows)
-        case .unreadable(let detail):
-            // The reader could not even enumerate the store. `rows` is [] by
-            // construction in that case; saying "empty" here is the exact lie
-            // this primitive exists to prevent.
-            return .unavailable(
-                boundedReason("Couldn't read the \(noun) store — \(detail)"))
-        case .records(let recordsOnDisk):
-            if rows.isEmpty && recordsOnDisk > 0 {
-                return .unavailable("\(recordsOnDisk) \(noun) on disk, none could be read")
-            }
-            return .rows(rows)
-        }
-    }
-}
-
 /// The GitHub part of Desk's "Needs you" headline. A missing or unreadable
 /// command feed is not evidence that no GitHub decision needs User; preserve
 /// that distinction instead of folding the failed lane into a reassuring zero.
@@ -241,19 +188,6 @@ enum DeskGitHubCallbackFailurePresentation {
 /// What a store's record root looked like on disk, for readers that swallow
 /// their own failures. Three states, because the count alone cannot tell an
 /// absent store from an unopenable one — and only one of those is empty.
-enum DeskRecordProbe: Sendable, Equatable {
-    /// The root does not exist. Nothing has been written yet: an honest zero.
-    case empty
-    /// The root exists but could not be enumerated (permissions, corruption,
-    /// not-a-directory). NOT zero — unknown.
-    case unreadable(String)
-    /// The root was enumerated: this many directories actually hold a record
-    /// (or are malformed record dirs). Reservation/cancellation leftovers that
-    /// legitimately carry no record are NOT counted — counting them turned a
-    /// healthy empty bench into a bogus "unavailable" banner.
-    case records(Int)
-}
-
 /// One rendered line in the "Waiting on you" strip.
 struct DeskAttentionLine: Identifiable, Equatable, Sendable {
     enum Shape: Equatable, Sendable {

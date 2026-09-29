@@ -1,0 +1,355 @@
+import ChatToolParsing
+// SwiftToolDispatcher+InnerStateTools.swift
+// Personality depth, item 3 — the `inner_state` pull (2026-09-02).
+//
+// Agent: "introspection is production … I can't reliably tell noticing from
+// making-on-demand." Asked how she feels, she had nothing to READ, so she
+// composed — and the composition bent toward whatever the question expected.
+//
+// This is the tool that gives her something to read. It returns her own organs'
+// record: the felt fingerprint and its object, the mood integral and the
+// disposition undertone as words AND numbers, the window's felt nodes as
+// labelled points, the body's chemistry in the body line's own vocabulary, her
+// open seeds, what she is still waiting on, what the night left, and the views
+// she is standing on.
+//
+// ── WIRING CANON ─────────────────────────────────────────────────────────────
+// ALWAYS-ON (in `alwaysOnCoreNames`), unlike the studio/desk/task lanes. A tool
+// she has to `tool_load` before she can answer "how are you" is a tool she will
+// not reach for mid-sentence — the same chicken-and-egg that made
+// `agent_introspect` always-on. NORTHSTAR clause 6 is satisfied by REACH: the
+// cost of this lane is one catalog row, and zero prompt bytes until she pulls.
+// The description is deliberately explicit that pulling comes BEFORE speaking.
+//
+// ── PAYLOAD-FREE, BY CONSTRUCTION ────────────────────────────────────────────
+// The reading itself (CognitiveSubstrate+InnerState.swift) is where the
+// discipline lives: labels and numbers, never node summaries, never the user's
+// words. This file only renders it. Anything that is not in the reading cannot
+// appear here, which is why the renderer is dumb on purpose.
+//
+// TWO exceptions cross, and both are HER OWN prose: a thought seed she minted
+// (≤120) and a standing view she authored (≤80). That is deliberate — this is
+// her own pull, and a record of her thinking with her thoughts removed is not a
+// record. But "hers" is a claim about PROVENANCE, not about content: a seed is
+// minted from material that passed through a conversation, so both strings run
+// through the SAME three filters the chat path already trusts before anything
+// is rendered (`innerStateSafeText`):
+//
+//   1. `ToolCallParser.stripToolUseMarkers`, then `neutralizeToolUseMarkers` —
+//      no tool-call syntax can ride back in as text and be re-parsed as a call.
+//      The stripper deletes the two attribute forms the tool loop emits; the
+//      neutralizer catches the bare `<tool_use>{…}</tool_use>` a hand-written
+//      seed can carry, keeping her words and breaking the syntax
+//      (Agent, 2026-09-06).
+//   2. `ChatSecretRedactor.redactText` — the canonical eight-pattern,
+//      digest-bearing secret contract every durable local surface uses.
+//   3. `promptSafeCapabilityText` — the shipped prompt-injection marker scan,
+//      which also collapses whitespace and enforces the bound.
+//
+// And the rumination candidate does NOT cross as prose at all: it renders as
+// (seed id, kind, weight, subject label). She already holds the seed; a second
+// free-form door for it to leave through buys nothing and costs a surface.
+//
+// ── HOW IT REACHES THE LIVE MIND ─────────────────────────────────────────────
+// Through the wire that already carries it. The app hands this dispatcher
+// `NativeCognitionRuntime.shared` as its `providerLifecycleObserver`
+// (AppChatToolDispatcher: `usesLiveAppBody ? NativeCognitionRuntime.shared :
+// nil`) — the one object that owns BOTH the substrate and the organism, which
+// is exactly what this reading needs. Conditionally casting that same reference
+// to `InnerStateProviding` adds no second owner, no registry, and no global:
+// there is one mind, and this is a second question asked of it. A dispatcher
+// with no live body (hermetic tests, synthetic roots) has no provider and says
+// so out loud rather than fabricating a mood.
+
+import CognitiveSubstrate
+import Foundation
+import NativeAgentCore
+import PersistenceCore
+import TrustCenter
+
+/// The live mind, answering for itself. Implemented by the app's cognition
+/// runtime, which is the only object that owns both the substrate (mind) and
+/// the organism kernel (body).
+public protocol InnerStateProviding: Sendable {
+    func innerStateReading(
+        windowHours: Double,
+        detail: CognitiveInnerStateReading.Detail
+    ) async -> CognitiveInnerStateReading
+}
+
+extension SwiftToolDispatcher {
+
+    func impl_inner_state(input: [String: JSONValue]) async -> JSONValue {
+        let requested = Self.innerStateWindowHours(input)
+        let detail: CognitiveInnerStateReading.Detail =
+            (optionalString(input, "detail")?.lowercased() == "full") ? .full : .compact
+
+        guard let observer = providerLifecycleObserver,
+              let mind = observer as? any InnerStateProviding else {
+            // NORTHSTAR clause 2: no live body means no reading. Say it; do not
+            // return a shaped zero that reads like a mood.
+            return .object([
+                "status": .string("unavailable"),
+                "available": .bool(false),
+                "reason": .string(
+                    "no live cognition runtime is wired to this dispatcher; "
+                        + "inner state can only be read from the running mind"),
+            ])
+        }
+
+        let reading = await mind.innerStateReading(windowHours: requested, detail: detail)
+        return Self.innerStateJSON(reading, requestedWindowHours: Self.innerStateRawWindowHours(input))
+    }
+
+    /// The window as ASKED FOR, before the clamp. Nil when the caller omitted
+    /// it (or sent something unparseable) — there is then no request to report,
+    /// only the default.
+    ///
+    /// Agent asked for 168 and was answered 48.0 with nothing saying so
+    /// (2026-09-13). The clamp is right — the felt field is a day-scale record
+    /// and a week-wide window would put an honest-looking number over nodes
+    /// that were never there — but a cap that applies in silence is a cap she
+    /// cannot read, so she reads the shortfall as her own memory being empty.
+    static func innerStateRawWindowHours(_ input: [String: JSONValue]) -> Double? {
+        let raw: Double?
+        switch input["window_hours"] {
+        case .some(.int(let value)): raw = Double(value)
+        case .some(.double(let value)): raw = value
+        case .some(.string(let value)): raw = Double(value)
+        default: raw = nil
+        }
+        guard let raw, raw.isFinite else { return nil }
+        return raw
+    }
+
+
+    /// 1–168, default 6. Out-of-range values CLAMP rather than fail — she asked
+    /// about her own week, not about a parameter.
+    static func innerStateWindowHours(_ input: [String: JSONValue]) -> Double {
+        guard let raw = Self.innerStateRawWindowHours(input) else {
+            return CognitiveInnerStateReading.defaultWindowHours
+        }
+        return min(
+            CognitiveInnerStateReading.maximumWindowHours,
+            max(CognitiveInnerStateReading.minimumWindowHours, raw))
+    }
+
+    /// The three filters, composed, in the order the chat path applies them.
+    ///
+    /// Strip FIRST (so a marker split across a redaction can't survive), redact
+    /// SECOND (so a secret is digested before any truncation can cut it into an
+    /// undetectable fragment), scan and bound LAST. Applied to every free-text
+    /// field this tool renders — there are exactly two, and they are the two
+    /// this function is called on.
+    static func innerStateSafeText(_ raw: String, limit: Int) -> String {
+        promptSafeCapabilityText(
+            ChatSecretRedactor.redactText(
+                neutralizeToolUseMarkers(ToolCallParser.stripToolUseMarkers(raw))
+            ),
+            limit: limit
+        )
+    }
+
+    /// `stripToolUseMarkers` deletes only the two ATTRIBUTE forms the tool loop
+    /// emits (`<tool_use name="…">…</tool_use>` and the id form) — by design:
+    /// its other callers render assistant prose, where a leftover bracket would
+    /// be worse than a clean deletion. A seed she wrote by hand can carry the
+    /// bare form, `<tool_use>{"name":"shell"}</tool_use>`, and that survived
+    /// intact into a rendered inner-state payload (Agent, 2026-09-06).
+    ///
+    /// Here the words are hers and worth keeping, so the marker is NEUTRALISED
+    /// rather than deleted: the angle brackets become square ones, which
+    /// `ToolCallParser` cannot parse as a call, and the sentence still reads.
+    static func neutralizeToolUseMarkers(_ raw: String) -> String {
+        guard raw.contains("<") else { return raw }
+        let pattern = #"</?\s*tool_(?:use|result)\b[^>]*>"#
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else {
+            return raw
+        }
+        var out = raw as NSString
+        let matches = regex.matches(
+            in: raw, options: [], range: NSRange(location: 0, length: out.length)
+        )
+        // Back to front so earlier ranges stay valid as later ones are edited.
+        for match in matches.reversed() {
+            let marker = out.substring(with: match.range)
+            let neutral = marker
+                .replacingOccurrences(of: "<", with: "[")
+                .replacingOccurrences(of: ">", with: "]")
+            out = out.replacingCharacters(in: match.range, with: neutral) as NSString
+        }
+        return out as String
+    }
+
+    /// The renderer. Deliberately mechanical: every value here comes straight
+    /// off the reading, so the payload-free guarantee is enforced in ONE place
+    /// (the reading) and cannot be widened by accident here.
+    static func innerStateJSON(
+        _ reading: CognitiveInnerStateReading,
+        requestedWindowHours: Double? = nil
+    ) -> JSONValue {
+        let iso = ISO8601DateFormatter()
+        iso.formatOptions = [.withInternetDateTime]
+        let window = innerStateWindowFields(
+            requested: requestedWindowHours, applied: reading.windowHours)
+
+        guard reading.available else {
+            return .object([
+                "status": .string("ok"),
+                "available": .bool(false),
+                "generated_at": .string(iso.string(from: reading.generatedAt)),
+                "detail": .string(reading.detail.rawValue),
+                "reason": .string("cognition or affect is switched off; nothing is being felt"),
+            ].merging(window) { current, _ in current })
+        }
+
+        var now: [String: JSONValue] = [:]
+        now["felt"] = reading.fingerprint.map(JSONValue.string) ?? .null
+        now["about"] = reading.fingerprintSubject.map(JSONValue.string) ?? .null
+
+        var body: [String: JSONValue] = [
+            "words": .array(reading.chemistryWords.map(JSONValue.string)),
+        ]
+        body["fatigue"] = reading.fatigue.map(JSONValue.double) ?? .null
+        body["time_of_day"] = reading.timeOfDayPhase.map(JSONValue.string) ?? .null
+
+        var out: [String: JSONValue] = [
+            "status": .string("ok"),
+            "available": .bool(true),
+            "generated_at": .string(iso.string(from: reading.generatedAt)),
+            "detail": .string(reading.detail.rawValue),
+            "now": .object(now),
+            "mood": .object([
+                "word": .string(reading.moodWord),
+                "valence": .double(reading.moodValence),
+                "basis": .int(Int64(reading.moodBasis)),
+            ]),
+            "disposition": .object([
+                "word": .string(reading.dispositionWord),
+                "valence": .double(reading.dispositionValence),
+            ]),
+            "body": .object(body),
+            "felt_moments": .array(reading.feltNodes.map { node in
+                .object([
+                    "when": .string(iso.string(from: node.when)),
+                    // HOW LONG AGO, beside the stamp. A correctly-dated moment
+                    // from last night read as "now" to Agent (2026-09-14) when
+                    // it was the only thing on its subject in the list; an age
+                    // makes that impossible to misread.
+                    "age_hours": .double(
+                        (reading.generatedAt.timeIntervalSince(node.when) / 3600 * 10).rounded() / 10),
+                    // Which list it came from: `felt` = among the window's
+                    // strongest, `recent` = among the newest. Different claims.
+                    "selection": .string(node.selection.rawValue),
+                    "subject": .string(node.subject),
+                    "valence": .double(node.valence),
+                    "arousal": .double(node.arousal),
+                    "warmth": .double(node.warmth),
+                ])
+            }),
+            "seeds": .array(reading.seeds.map { seed in
+                .object([
+                    "kind": .string(seed.kind),
+                    "text": .string(innerStateSafeText(
+                        seed.text, limit: CognitiveInnerStateReading.seedTextCharacters)),
+                    "priority": .double(seed.priority),
+                ])
+            }),
+            "expectations": .array(reading.expectations.map { expectation in
+                .object([
+                    "label": .string(expectation.label),
+                    "due": .string(iso.string(from: expectation.due)),
+                    "valence_sign": .int(Int64(expectation.valenceSign)),
+                ])
+            }),
+            // `toward` — the forward-facing register (#4). A label, a sign, a
+            // date. Absent when she is facing nothing, which renders as null
+            // rather than as a flat "nothing planned".
+            "toward": reading.toward.map { toward in
+                .object([
+                    "label": .string(toward.label),
+                    "source": .string(toward.sourceKind),
+                    "valence_sign": .int(Int64(toward.valenceSign)),
+                    "due": .string(iso.string(from: toward.due)),
+                    "overdue": .bool(toward.isOverdue),
+                ])
+            } ?? .null,
+            "standing_views": .array(reading.standingViews.map { view in
+                .object([
+                    "id": .string(view.id.uuidString),
+                    "status": .string(view.status),
+                    "text": .string(innerStateSafeText(
+                        view.text, limit: CognitiveInnerStateReading.standingViewCharacters)),
+                    // Grounding as a COUNT. The excerpts themselves are the
+                    // user's words and stay behind law 2.
+                    "evidence_count": .int(Int64(view.evidenceCount)),
+                    "revisit_count": .int(Int64(view.revisitCount)),
+                ])
+            }),
+        ]
+        // WHAT CHANGED THIS WEEK. The substrate has computed these lines on the
+        // `full` path since 2026-09-13 and the renderer dropped them on the
+        // floor, so growth rows, the reason each released view was released
+        // (carried in the row's own outcome) and the undertone trail were all
+        // invisible to her. `full` only — and when the week is genuinely empty
+        // it SAYS so, because a section that vanishes reads as "no such thing".
+        if reading.detail == .full {
+            let lines = reading.growthWeek.isEmpty
+                ? ["No changes recorded in the last 7 days."]
+                : reading.growthWeek
+            out["growth_week"] = .array(lines.map(JSONValue.string))
+        }
+        out["last_night"] = reading.dream.map { dream in
+            .object([
+                "mood": .string(dream.moodWord),
+                "date": .string(dream.date),
+            ])
+        } ?? .null
+        // A POINTER, never prose (2026-09-02 reviewer call). She can look the
+        // seed up in the list above; there is no reason for the nag to have a
+        // second, unbounded way out.
+        out["rumination"] = reading.ruminationCandidate.map { candidate in
+            var object: [String: JSONValue] = [
+                "seed_id": .string(candidate.seedId.uuidString),
+                "kind": .string(candidate.kind),
+                "weight": .double(candidate.weight),
+            ]
+            object["subject"] = candidate.subject.map(JSONValue.string) ?? .null
+            return .object(object)
+        } ?? .null
+        for (key, value) in window { out[key] = value }
+        return .object(out)
+    }
+
+    /// The window, said out loud: what was asked for, what was used, and — only
+    /// when they differ — one line naming the cap that made the difference.
+    ///
+    /// `window_hours` keeps its meaning (the window ACTUALLY used) so every
+    /// existing reader is unchanged; the two new keys are what turn a silent
+    /// clamp into a stated one.
+    static func innerStateWindowFields(
+        requested: Double?, applied: Double
+    ) -> [String: JSONValue] {
+        var fields: [String: JSONValue] = [
+            "window_hours": .double(applied),
+            "window_hours_requested": .double(requested ?? applied),
+            "window_hours_applied": .double(applied),
+        ]
+        guard let requested, requested != applied else { return fields }
+        let maximum = CognitiveInnerStateReading.maximumWindowHours
+        let minimum = CognitiveInnerStateReading.minimumWindowHours
+        let bound = requested > maximum
+            ? "the maximum window is \(Self.innerStateHours(maximum)) hours"
+            : "the minimum window is \(Self.innerStateHours(minimum)) hour"
+        fields["window_hours_note"] = .string(
+            "you asked for \(Self.innerStateHours(requested)) hours; \(bound), "
+                + "so this reading covers the last \(Self.innerStateHours(applied)) hours "
+                + "and says nothing about anything older")
+        return fields
+    }
+
+    /// Whole numbers read as whole numbers: "168", not "168.0".
+    static func innerStateHours(_ value: Double) -> String {
+        value == value.rounded() ? String(Int(value)) : String(value)
+    }
+}

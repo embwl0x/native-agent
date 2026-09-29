@@ -11,16 +11,14 @@ import PersistenceCore
 //   git worktree add --detach @ expectedHead
 //     → git apply --3way (conflict = typed fail)
 //     → FULL root `swift build` (closes the orchestrator's
-//       NativeAgentCore-only gap)
-//     → filtered `swift test` (suites mapped from the diff's touched
-//       modules; full-suite escalation for out-of-module paths)
+//       NativeAgentCore-only gap) — the candidate's gate
 //
 // Child processes run under the daemon-era env-scrub allowlist
 // so API keys never reach the sandbox, with a
 // per-candidate temp HOME + temp TMPDIR overlaid on top (hermeticEnvironment)
-// so build/test children cannot reach the real user profile through
-// env-derived paths. Build and test output stream straight to build.log /
-// test.log (receipts). The machine-readable verdict is result.json, written
+// so build children cannot reach the real user profile through
+// env-derived paths. Build output streams straight to build.log
+// (receipt). The machine-readable verdict is result.json, written
 // under flock — wave 2's promote-on-approve requires a green result.json for
 // the same diff sha before it will touch the live repo.
 //
@@ -28,11 +26,11 @@ import PersistenceCore
 // MISTAKE-CONTAINMENT boundary, not a malicious-code boundary. Wave-1
 // candidates build ONLY diffs that arrive through the approval-gated
 // proposal store — every diff has passed the user's tap before it reaches this
-// builder, so the adversary here is a *buggy* approved diff (a test that
-// writes to $HOME, a build plugin that scribbles over user caches), not a
+// builder, so the adversary here is a *buggy* approved diff (a build
+// plugin that writes to $HOME or scribbles over user caches), not a
 // hostile one. Containment layers: (1) env scrub — the child env is the
 // daemon-era allowlist, so API keys and tokens never reach candidate
-// processes; (2) temp HOME + temp TMPDIR — build/test children get a
+// processes; (2) temp HOME + temp TMPDIR — build children get a
 // per-candidate home/ and tmp/ under the candidate dir, so SwiftPM caches,
 // plugin state, and tmp droppings land inside the candidate dir instead of
 // the real user profile; (3) detached worktree — source mutations never
@@ -40,7 +38,7 @@ import PersistenceCore
 // OS-enforced file containment — a malicious diff could still exfiltrate or
 // write outside the sandbox via absolute paths. Defense against malicious
 // diffs is the approval gate upstream, by design. Full OS sandboxing
-// (sandbox-exec/Seatbelt profile around build/test children) is the named
+// (sandbox-exec/Seatbelt profile around build children) is the named
 // U4 follow-up, user-gated.
 //
 // NOTHING here executes installs or restarts. Worktree + temp home/tmp are
@@ -54,13 +52,7 @@ public struct EvolutionBuildConfig: Sendable {
     /// builds use a fresh `.build` — budget generously (plan A3: the
     /// daemon-era 180s cap is known-insufficient for a full cold root build).
     public var buildTimeout: TimeInterval
-    public var testTimeout: TimeInterval
     public var gitTimeout: TimeInterval
-    /// Subpath of the package whose tests run (nil → test the worktree root
-    /// package; used by fixture repos in tests).
-    public var testPackageSubpath: String?
-    public var moduleSourcePrefix: String
-    public var moduleTestPrefix: String
     /// Keep the worktree on failure for post-mortem (default false: cleanup
     /// on every terminal status, logs + result.json carry the evidence).
     public var keepWorktreeOnFailure: Bool
@@ -69,20 +61,12 @@ public struct EvolutionBuildConfig: Sendable {
 
     public init(
         buildTimeout: TimeInterval = 1800,
-        testTimeout: TimeInterval = 1800,
         gitTimeout: TimeInterval = 120,
-        testPackageSubpath: String? = "Modules/NativeAgentCore",
-        moduleSourcePrefix: String = "Modules/NativeAgentCore/Sources/",
-        moduleTestPrefix: String = "Modules/NativeAgentCore/Tests/",
         keepWorktreeOnFailure: Bool = false,
         environmentOverride: [String: String]? = nil
     ) {
         self.buildTimeout = buildTimeout
-        self.testTimeout = testTimeout
         self.gitTimeout = gitTimeout
-        self.testPackageSubpath = testPackageSubpath
-        self.moduleSourcePrefix = moduleSourcePrefix
-        self.moduleTestPrefix = moduleTestPrefix
         self.keepWorktreeOnFailure = keepWorktreeOnFailure
         self.environmentOverride = environmentOverride
     }
@@ -120,7 +104,6 @@ public enum EvolutionCandidatePhase: String, Sendable, Codable {
     case headVerify = "head_verify"
     case apply
     case build
-    case test
     case complete
 }
 
@@ -133,11 +116,7 @@ public struct EvolutionCandidateResult: Sendable, Codable, Equatable {
     public var expectedHead: String
     public var diffSHA256: String
     public var touchedPaths: [String]
-    public var testFilters: [String]
-    public var escalatedFullSuite: Bool
-    public var testsSkippedReason: String?
     public var buildExit: Int32?
-    public var testExit: Int32?
     public var timedOutPhase: String?
     public var error: String?
     public var startedAt: String
@@ -200,12 +179,12 @@ public actor EvolutionCandidateBuilder {
         candidateDir(runId: runId).appendingPathComponent("claim.json")
     }
 
-    /// Per-candidate temp HOME for build/test children (hermeticity).
+    /// Per-candidate temp HOME for build children (hermeticity).
     public nonisolated func homeDir(runId: String) -> URL {
         candidateDir(runId: runId).appendingPathComponent("home", isDirectory: true)
     }
 
-    /// Per-candidate temp TMPDIR for build/test children (hermeticity).
+    /// Per-candidate temp TMPDIR for build children (hermeticity).
     public nonisolated func tmpDir(runId: String) -> URL {
         candidateDir(runId: runId).appendingPathComponent("tmp", isDirectory: true)
     }
@@ -231,8 +210,7 @@ public actor EvolutionCandidateBuilder {
                 runId: request.runId, proposalId: request.proposalId, ok: false,
                 phase: .validate, expectedHead: request.expectedHead,
                 diffSHA256: EvolutionSupport.sha256Hex(request.diffText),
-                touchedPaths: [], testFilters: [], escalatedFullSuite: false,
-                testsSkippedReason: nil, buildExit: nil, testExit: nil,
+                touchedPaths: [], buildExit: nil,
                 timedOutPhase: nil, error: "duplicate_run_in_flight",
                 startedAt: startedAt, finishedAt: EvolutionSupport.isoTimestamp(now()),
                 worktreeCleaned: false)
@@ -280,23 +258,18 @@ public actor EvolutionCandidateBuilder {
 
         let worktree = worktreeDir(runId: request.runId)
         let candidateRoot = candidateDir(runId: request.runId)
-        let mapping = Self.mapTouchedPathsToTests(
-            diffText: request.diffText,
-            sourcePrefix: config.moduleSourcePrefix,
-            testPrefix: config.moduleTestPrefix)
 
         var result = EvolutionCandidateResult(
             runId: request.runId, proposalId: request.proposalId, ok: false,
             phase: .validate, expectedHead: request.expectedHead, diffSHA256: actualSha,
-            touchedPaths: mapping.touchedPaths, testFilters: mapping.filters,
-            escalatedFullSuite: mapping.escalate, testsSkippedReason: nil,
-            buildExit: nil, testExit: nil, timedOutPhase: nil, error: nil,
+            touchedPaths: Self.touchedPaths(diffText: request.diffText),
+            buildExit: nil, timedOutPhase: nil, error: nil,
             startedAt: startedAt, finishedAt: startedAt, worktreeCleaned: false)
 
         do {
             try FileManager.default.createDirectory(at: candidateRoot, withIntermediateDirectories: true)
             // Hermeticity: per-candidate HOME/TMPDIR so child processes
-            // (SwiftPM, plugins, tests) write inside the candidate dir, not
+            // (SwiftPM, plugins) write inside the candidate dir, not
             // the real user profile. See the file-header threat model.
             let home = homeDir(runId: request.runId)
             let tmp = tmpDir(runId: request.runId)
@@ -361,29 +334,6 @@ public actor EvolutionCandidateBuilder {
                     build.timedOut ? "build_timeout" : "build_failed (exit \(build.exit), see build.log)")
             }
 
-            // 6. Filtered tests (skip only when the diff touches no code).
-            result.phase = .test
-            if mapping.filters.isEmpty && !mapping.escalate {
-                result.testsSkippedReason = "no_code_paths_touched"
-            } else {
-                let testPackage = config.testPackageSubpath
-                    .map { worktree.appendingPathComponent($0, isDirectory: true) } ?? worktree
-                var args = ["swift", "test", "--package-path", testPackage.path]
-                if !mapping.escalate {
-                    for f in mapping.filters { args += ["--filter", f] }
-                }
-                let testLog = candidateRoot.appendingPathComponent("test.log")
-                let test = try await EvolutionSupport.run(
-                    args, cwd: worktree, environment: env,
-                    timeout: config.testTimeout, logURL: testLog)
-                result.testExit = test.exit
-                if test.timedOut { result.timedOutPhase = "test" }
-                guard test.exit == 0, !test.timedOut else {
-                    throw EvolutionEngineError.underlying(
-                        test.timedOut ? "test_timeout" : "tests_failed (exit \(test.exit), see test.log)")
-                }
-            }
-
             result.phase = .complete
             return await finish(&result, ok: true, error: nil, worktree: worktree, candidateRoot: candidateRoot)
         } catch {
@@ -446,25 +396,10 @@ public actor EvolutionCandidateBuilder {
         return removed
     }
 
-    // MARK: - Test mapping
+    // MARK: - Touched paths
 
-    struct TestMapping: Sendable {
-        var touchedPaths: [String]
-        var filters: [String]
-        var escalate: Bool
-    }
-
-    /// diff path → test-suite mapping (plan open question #1 — proposed table):
-    ///   Modules/NativeAgentCore/Sources/<M>/…  → filter "<M>Tests"
-    ///   Modules/NativeAgentCore/Tests/<X>Tests/… → filter "<X>Tests"
-    ///   docs/ *.md (docs-only diff)             → no tests
-    ///   anything else (app target, Package.swift, script/) → ESCALATE to the
-    ///   full core-package suite (change-class escalation per plan A3).
-    static func mapTouchedPathsToTests(
-        diffText: String,
-        sourcePrefix: String,
-        testPrefix: String
-    ) -> TestMapping {
+    /// Paths the diff touches (`--- a/` and `+++ b/` headers, deduped, in order).
+    static func touchedPaths(diffText: String) -> [String] {
         var touched: [String] = []
         var seen = Set<String>()
         for line in diffText.split(separator: "\n", omittingEmptySubsequences: false) {
@@ -480,34 +415,7 @@ public actor EvolutionCandidateBuilder {
             seen.insert(p)
             touched.append(p)
         }
-
-        var filters = Set<String>()
-        var escalate = false
-        for p in touched {
-            if p.hasPrefix(sourcePrefix) {
-                let rest = p.dropFirst(sourcePrefix.count)
-                if let module = rest.split(separator: "/").first, !module.isEmpty {
-                    filters.insert("\(module)Tests")
-                    continue
-                }
-                escalate = true
-            } else if p.hasPrefix(testPrefix) {
-                let rest = p.dropFirst(testPrefix.count)
-                if let target = rest.split(separator: "/").first, target.hasSuffix("Tests") {
-                    filters.insert(String(target))
-                    continue
-                }
-                escalate = true
-            } else if p.hasPrefix("docs/") || p.lowercased().hasSuffix(".md") {
-                continue // docs-only paths carry no test obligation
-            } else {
-                escalate = true
-            }
-        }
-        return TestMapping(
-            touchedPaths: touched,
-            filters: escalate ? [] : filters.sorted(),
-            escalate: escalate)
+        return touched
     }
 
     // MARK: - Internals
@@ -582,8 +490,7 @@ public actor EvolutionCandidateBuilder {
             runId: request.runId, proposalId: request.proposalId, ok: false,
             phase: phase, expectedHead: request.expectedHead,
             diffSHA256: EvolutionSupport.sha256Hex(request.diffText),
-            touchedPaths: [], testFilters: [], escalatedFullSuite: false,
-            testsSkippedReason: nil, buildExit: nil, testExit: nil,
+            touchedPaths: [], buildExit: nil,
             timedOutPhase: nil, error: error,
             startedAt: startedAt, finishedAt: EvolutionSupport.isoTimestamp(now()),
             worktreeCleaned: false)

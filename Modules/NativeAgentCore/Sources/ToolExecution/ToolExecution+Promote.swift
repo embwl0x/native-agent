@@ -399,7 +399,7 @@ public actor ToolPromoteEngine {
         }
 
         // 1. Read the proposal manifest — serves as `record` for the merge.
-        let manifestRaw = await persistence.readJSON(manifestURL, defaultValue: .object([:]))
+        let manifestRaw = try await persistence.readJSON(manifestURL, ifMissing: .object([:]))
         guard case .object(let manifest) = manifestRaw, !manifest.isEmpty else {
             throw ToolPromoteError.unknownProposal(id: proposalId)
         }
@@ -482,7 +482,7 @@ public actor ToolPromoteEngine {
             //     so validation, authorization, signing, and fingerprinting now
             //     all operate on the same isolated staged copy.
             let stagedManifestURL = stagingDir.appendingPathComponent("manifest.json")
-            let stagedManifestRaw = await persistence.readJSON(stagedManifestURL, defaultValue: .object([:]))
+            let stagedManifestRaw = try await persistence.readJSON(stagedManifestURL, ifMissing: .object([:]))
             guard case .object(var activeManifest) = stagedManifestRaw else {
                 throw ToolPromoteError.persistenceFailed("staged manifest unparseable")
             }

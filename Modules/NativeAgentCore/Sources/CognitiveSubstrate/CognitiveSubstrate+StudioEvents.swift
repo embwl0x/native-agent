@@ -46,6 +46,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import Studio
 
 public extension CognitiveEvent {
     /// Metadata key for a felt valence its OWNER measured rather than the

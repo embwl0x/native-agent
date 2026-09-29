@@ -239,7 +239,39 @@ function createTurnCompletionEventWaiter(client, threadId, turnId, config, deadl
   return { promise, close, rolloutPath };
 }
 
-async function waitForTurnResultEventFirst(threadId, turnId, config, client = null, windowMs = null) {
+/// Display-only: the app-server's agent-message deltas and item starts for
+/// this turn, forwarded to the app's live stream. Never turn evidence.
+function forwardTurnLive(client, threadId, turnId, live) {
+  if (!live || !client || typeof client.onNotification !== "function") return () => {};
+  let text = "";
+  let itemId = null;
+  return client.onNotification((message) => {
+    const params = message && message.params;
+    if (!params || params.threadId !== threadId || (params.turnId && params.turnId !== turnId)) return;
+    const item = params.item || {};
+    // Only a message seen from its start: joining mid-message would show a
+    // reply with its head cut off.
+    if (message.method === "item/agentMessage/delta" && typeof params.delta === "string" && params.itemId === itemId) {
+      text += params.delta;
+      live.partial(text);
+    } else if (message.method === "item/started" && item.type === "agentMessage") {
+      text = "";
+      itemId = item.id;
+    } else if (message.method === "item/started" && item.type === "commandExecution") {
+      live.note(`Running ${String(item.command || "a command").slice(0, 200)}`);
+    } else if (message.method === "item/started" && item.type === "mcpToolCall") {
+      live.note(`Using ${item.tool || "a tool"}`);
+    } else if (message.method === "item/started" && item.type === "fileChange") {
+      live.note("Editing files");
+    } else if (message.method === "item/started" && item.type === "webSearch") {
+      live.note("Searching the web");
+    } else {
+      live.activity();
+    }
+  });
+}
+
+async function waitForTurnResultEventFirst(threadId, turnId, config, client = null, windowMs = null, live = null) {
   const timeoutMs = numberSetting(
     config,
     "replyWaitTimeoutMs",
@@ -255,7 +287,15 @@ async function waitForTurnResultEventFirst(threadId, turnId, config, client = nu
     : timeoutMs;
   const deadline = Date.now() + effectiveMs;
   let lastRolloutPath = findThreadRolloutPath(threadId, config);
-
+  const stopLive = forwardTurnLive(client, threadId, turnId, live);
+  try {
+  // Thread events go only to connections subscribed to the thread, and this
+  // one is fresh. Rejoin it (listener already registered, so nothing is
+  // missed): threadId only, so no turn starts and no setting changes; the
+  // reply itself still comes from the canonical reads below.
+  if (live && client) {
+    try { await client.request("thread/resume", { threadId, excludeTurns: true }); } catch {}
+  }
   while (Date.now() < deadline) {
     // Register both exact event sources before rereading canonical truth. A
     // completion racing registration is therefore caught by the initial read.
@@ -278,6 +318,8 @@ async function waitForTurnResultEventFirst(threadId, turnId, config, client = nu
 
     const event = await waiter.promise;
     if (event.source === "exact_timeout") break;
+    // A rollout write is a real sign of life even when no delta reaches us.
+    if (live) live.activity();
     const result = await readCanonicalTurnResult(
       client,
       threadId,
@@ -289,6 +331,7 @@ async function waitForTurnResultEventFirst(threadId, turnId, config, client = nu
     // A file edge may precede the terminal line becoming visible. Re-arm the
     // event sources and close that race with another canonical read; never poll.
   }
+  } finally { stopLive(); }
 
   return {
     status: "timeout",
@@ -300,7 +343,7 @@ async function waitForTurnResultEventFirst(threadId, turnId, config, client = nu
   };
 }
 
-async function waitForTurnResult(threadId, turnId, config, windowMs = null) {
+async function waitForTurnResult(threadId, turnId, config, windowMs = null, live = null) {
   const requestTimeoutMs = numberSetting(
     config,
     "requestTimeoutMs",
@@ -314,7 +357,7 @@ async function waitForTurnResult(threadId, turnId, config, windowMs = null) {
     // The vnode-backed durable rollout path still provides event-first repair.
   }
   try {
-    return await waitForTurnResultEventFirst(threadId, turnId, config, client, windowMs);
+    return await waitForTurnResultEventFirst(threadId, turnId, config, client, windowMs, live);
   } finally {
     if (client) client.close();
   }
@@ -328,7 +371,7 @@ async function waitForTurnResultWithEmptyRetry(job, config, options = {}) {
   const threadId = job.threadId;
   const turnId = job.turnId;
   const wait = options.waitForTurnResult || waitForTurnResult;
-  const turnResult = await wait(threadId, turnId, config, options.windowMs || null);
+  const turnResult = await wait(threadId, turnId, config, options.windowMs || null, options.live || null);
   return { threadId, turnId, turnResult, attempts: [{ threadId, turnId, turnResult }] };
 }
 
@@ -671,16 +714,23 @@ function parseCpuTimeMs(raw) {
 /// Spawn `claude -p` and settle EXACTLY once. Four racers can finish this
 /// run — the exit handler, the deadline watchdog, the stall watchdog, and a
 /// spawn error — and any double-settle would double-post a completion to the agent.
-function runClaude({ prompt, sessionArgs, sessionId, cwd, timeoutSeconds, stallSeconds, onProgress }) {
+function runClaude({ prompt, sessionArgs, sessionId, cwd, timeoutSeconds, stallSeconds, onProgress, live, messageId }) {
   return new Promise((resolve) => {
     const started = Date.now();
     const binOverride = process.env.NATIVE_AGENT_CLAUDE_WAKE_CLAUDE_BIN;
     const command = binOverride || "/usr/bin/env";
     // the user, 2026-09-04: a wake session is a worker, and workers run Opus 5.
     const model = process.env.NATIVE_AGENT_CLAUDE_WAKE_MODEL || "claude-opus-5-5";
+    // 2026-09-25: when the app is listening, stream events so the reply shows
+    // as it is written. The reply is still exactly the CLI's final result
+    // (the `result` event's text, which plain -p prints); a stdout that is not
+    // stream-json falls back to the raw text as before.
+    const streamJSON = Boolean(live) && process.env.NATIVE_AGENT_WAKE_LIVE === "1"
+      && process.env.NATIVE_AGENT_CLAUDE_WAKE_STREAM !== "0";
+    const streamArgs = streamJSON ? ["--output-format", "stream-json", "--verbose", "--include-partial-messages"] : [];
     const args = binOverride
-      ? [...sessionArgs, "-p", prompt, "--model", model]
-      : ["claude", ...sessionArgs, "-p", prompt, "--model", model];
+      ? [...sessionArgs, ...streamArgs, "-p", prompt, "--model", model]
+      : ["claude", ...sessionArgs, ...streamArgs, "-p", prompt, "--model", model];
 
     let settled = false;
     let timedOut = false;
@@ -690,6 +740,42 @@ function runClaude({ prompt, sessionArgs, sessionId, cwd, timeoutSeconds, stallS
     let stallTimer = null;
     let stdoutText = "";
     let stderrText = "";
+    // Set once a stream-json event is seen: { result, message, said }.
+    // result stays null until a `result` event arrives ("" is an empty result).
+    let stream = null;
+    let lineBuffer = "";
+    const onStreamLine = (line) => {
+      let event;
+      try { event = JSON.parse(line); } catch { return; }
+      if (!event || typeof event !== "object" || typeof event.type !== "string") return;
+      if (!stream) stream = { result: null, message: "", said: "" };
+      if (event.type === "result") {
+        if (typeof event.result === "string") stream.result = event.result;
+        return;
+      }
+      // A subagent's own stream is not this reply.
+      if (event.parent_tool_use_id) { live.activity(); return; }
+      if (event.type === "stream_event" && event.event) {
+        const inner = event.event;
+        if (inner.type === "message_start") stream.message = "";
+        else if (inner.type === "content_block_delta" && inner.delta && inner.delta.type === "text_delta"
+          && typeof inner.delta.text === "string") {
+          stream.message += inner.delta.text;
+          live.partial(stream.message);
+        } else live.activity();
+        return;
+      }
+      if (event.type === "assistant" && event.message && Array.isArray(event.message.content)) {
+        for (const block of event.message.content) {
+          if (block && block.type === "tool_use" && typeof block.name === "string") live.note(`Using ${block.name}`);
+          if (block && block.type === "text" && typeof block.text === "string" && block.text) {
+            // Bounded fallback for a run that ends without a `result`.
+            stream.said = `${stream.said}${stream.said ? "\n\n" : ""}${block.text}`.slice(-STDOUT_CAP);
+            stream.message = "";
+          }
+        }
+      }
+    };
 
     const settle = (extra) => {
       if (settled) return;
@@ -697,9 +783,14 @@ function runClaude({ prompt, sessionArgs, sessionId, cwd, timeoutSeconds, stallS
       if (timeoutTimer) clearTimeout(timeoutTimer);
       if (killTimer) clearTimeout(killTimer);
       if (stallTimer) clearInterval(stallTimer);
+      if (lineBuffer.trim()) onStreamLine(lineBuffer);
       resolve({
         durationMs: Date.now() - started,
-        stdout: stdoutText,
+        // No `result` (killed, crashed, interrupted): keep what it had said,
+        // as the plain path kept its stdout. An empty result stays empty.
+        stdout: !stream ? stdoutText
+          : stream.result !== null ? stream.result
+          : `${stream.said}${stream.said && stream.message ? "\n\n" : ""}${stream.message}`.slice(-STDOUT_CAP),
         stderr: stderrText,
         timedOut,
         stalled,
@@ -711,7 +802,10 @@ function runClaude({ prompt, sessionArgs, sessionId, cwd, timeoutSeconds, stallS
 
     let child;
     try {
-      child = spawn(command, args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
+      // The wake's own message id, so Claude's inbox hook in this session can
+      // mark just that row read and leave the rest for the sessions they are for.
+      const env = messageId ? { ...process.env, NATIVE_AGENT_CLAUDE_WAKE_MESSAGE_ID: messageId } : process.env;
+      child = spawn(command, args, { cwd, env, stdio: ["ignore", "pipe", "pipe"] });
     } catch (error) {
       settle({ exitCode: null, signal: null, spawnError: String((error && error.message) || error) });
       return;
@@ -720,7 +814,17 @@ function runClaude({ prompt, sessionArgs, sessionId, cwd, timeoutSeconds, stallS
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
     child.stdout.on("data", (chunk) => {
-      if (stdoutText.length < STDOUT_CAP) stdoutText += chunk;
+      if (!stream && stdoutText.length < STDOUT_CAP) stdoutText += chunk;
+      if (!streamJSON) return;
+      lineBuffer += chunk;
+      let newline;
+      while ((newline = lineBuffer.indexOf("\n")) >= 0) {
+        const line = lineBuffer.slice(0, newline);
+        lineBuffer = lineBuffer.slice(newline + 1);
+        if (line.trim()) onStreamLine(line);
+      }
+      // One event line is never this large; drop rather than grow unbounded.
+      if (lineBuffer.length > STDOUT_CAP * 8) lineBuffer = "";
     });
     child.stderr.on("data", (chunk) => {
       if (stderrText.length < STDERR_CAP) stderrText += chunk;

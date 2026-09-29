@@ -12,18 +12,9 @@
 
 import SwiftUI
 
-// MARK: - Color hex helper
-
-extension Color {
-    init(hex: UInt, opacity: Double = 1) {
-        self.init(
-            .sRGB,
-            red:   Double((hex >> 16) & 0xFF) / 255,
-            green: Double((hex >> 8)  & 0xFF) / 255,
-            blue:  Double( hex        & 0xFF) / 255,
-            opacity: opacity
-        )
-    }
+/// The app's animated ground stays outside the extension's shared glass tokens.
+struct MobileRoomBackground: View {
+    var body: some View { AliveRoom() }
 }
 
 // MARK: - Palette (per-identity tinting hook)

@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import Procedures
 
 public enum WorkshopCompiledProcedurePlanError: Error, LocalizedError, Equatable {
     case artifactNotEligible

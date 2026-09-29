@@ -3,6 +3,7 @@ import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
 import NativeAgentShared
+import enum ChatOrchestration.ChatAttachmentTypeResolver
 import ScreenVision
 
 extension ChatView {
@@ -102,7 +103,7 @@ extension ChatView {
         // Return whose send is still in flight leaves `isBusy` false and the
         // capture button live — the screenshot was admitted as a second turn.
         guard !isSubmittingSend else { return }
-        guard appModel.trustPolicy?.multimodalPolicy?.screen_capture == true else {
+        guard appModel.engine.trust.policy?.multimodalPolicy?.screen_capture == true else {
             showToast("Enable screen capture in Trust → Multimodal Capabilities")
             return
         }

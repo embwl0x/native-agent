@@ -25,10 +25,6 @@ public final class MoonshotAdapter: LLMAdapter {
     private let reasoningLedger = MoonshotReasoningLedger()
 
     private var credentialRoot: URL { dataRootOverride ?? PersistenceCore.defaultDataRoot() }
-    private var includesEnvironment: Bool {
-        dataRootOverride == nil
-            || credentialRoot.standardizedFileURL == PersistenceCore.defaultDataRoot().standardizedFileURL
-    }
 
     public init(
         session: URLSession = .shared,
@@ -119,6 +115,8 @@ public final class MoonshotAdapter: LLMAdapter {
         streamMessages(messages: [.user(prompt)], system: system, model: model, tools: nil)
             .textDeltas(omittingEmpty: false)
     }
+
+    public func messagesStreamKind(tools: [LLMToolSchema]?) -> LLMMessagesStreamKind { .incremental }
 
     public func streamMessages(
         messages: [LLMMessage],
@@ -292,10 +290,8 @@ public final class MoonshotAdapter: LLMAdapter {
 
     private func apiKey() throws -> String {
         guard let key = apiKeyOverride ?? LLMCredentialResolver.resolveAPIKey(
-            envVar: "MOONSHOT_API_KEY",
             providerConfigFile: "moonshot.json",
-            dataRoot: credentialRoot,
-            includeEnvironment: includesEnvironment
+            dataRoot: credentialRoot
         ), !key.isEmpty else {
             throw LLMError.notConfigured(provider: "moonshot")
         }

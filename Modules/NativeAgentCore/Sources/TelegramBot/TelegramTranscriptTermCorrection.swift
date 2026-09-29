@@ -1,3 +1,4 @@
+import NativeAgentCore
 import Foundation
 
 /// W5 L1#11 "voice term correction": speech-to-text reliably mangles this

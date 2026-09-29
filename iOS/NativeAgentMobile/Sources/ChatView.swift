@@ -29,6 +29,7 @@ struct ChatView: View {
     /// (`adoptSurfaceModelPreferenceFromSync`). Empty until that snapshot
     /// arrives — and empty is sent as NO override, so the Mac resolves the turn
     /// (2026-09-13: no model id chosen on the phone).
+    @AppStorage(HazeColor.key) private var hazeColorRaw = HazeColor.defaultValue.rawValue
     @AppStorage("chatModel") private var selectedModel = ""
     @AppStorage("chatReasoningEffort") private var selectedReasoningEffort = "high"
     @AppStorage("chatFastMode") private var selectedFastMode = false
@@ -85,15 +86,15 @@ struct ChatView: View {
     // 800 KiB. Base64 expands image bytes by roughly one third, so reserve
     // ample room for JSON, text, signatures, and controls and keep the
     // aggregate raw photo payload below 520 KiB.
-    static let cloudKitPhotoPayloadBudgetBytes = 520 * 1024
+    static let cloudKitPhotoPayloadBudgetBytes = MobileChatAttachmentPreparation.payloadBudgetBytes
 
     private var agentDisplayName: String {
         sync.agentDisplayName
     }
 
     private var composerPlaceholder: String {
-        let name = sync.personality?.name.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        return name.isEmpty ? "Message…" : "Message \(agentDisplayName)…"
+        // Before any name is known the fallback is the product, not the agent.
+        return agentDisplayName == NativeAgentIdentity.displayName(nil) ? "Message…" : "Message \(agentDisplayName)…"
     }
 
     // Process-local visual fixture: no transcript/cache writes and no transport sends.
@@ -120,9 +121,17 @@ struct ChatView: View {
                 ChatMessage(id: UUID(uuidString: "00000000-0000-0000-0000-000000000005")!, role: .user,
                             text: "I'll finish the outline in the morning, then take the afternoon outside.")
             ]
+            let extras = ProcessInfo.processInfo.arguments.contains("-chatSampleExtras")
+            if extras {
+                messages[3] = ChatMessage(id: messages[3].id, role: .assistant, text: messages[3].text,
+                                          toolEvents: [ToolEvent(name: "calendar_read", seq: 1),
+                                                       ToolEvent(name: "weather_forecast", seq: 2),
+                                                       ToolEvent(name: "read_skill", seq: 3)])
+            }
             if ProcessInfo.processInfo.arguments.contains("-chatSampleStreaming") {
                 messages.append(ChatMessage(id: UUID(uuidString: "00000000-0000-0000-0000-000000000006")!,
-                                            role: .assistant, text: "Writing the next step…", isStreaming: true))
+                                            role: .assistant, text: extras ? "" : "Writing the next step…", isStreaming: true,
+                                            toolEvents: extras ? [ToolEvent(name: "calendar_read", seq: 1)] : []))
             }
             return messages
         }
@@ -130,28 +139,39 @@ struct ChatView: View {
         return store.messages
     }
 
+    /// A quiet door, in the agent's own voice: one serif line, one sentence,
+    /// and one action only when there is something to do.
     private var chatEmptyState: some View {
-        VStack(spacing: 16) {
-            Image(systemName: transcriptNotSynced ? "icloud.slash" : "bubble.left.and.bubble.right")
-                .font(.system(size: 48, weight: .regular))
-                .foregroundStyle(.secondary)
-                .frame(width: 64, height: 64)
-            Text(transcriptNotSynced ? "History not synced" : !pairingStore.isPaired ? "Connect to start chatting" : bridgeClient.bridgeStatus == .offline ? "iCloud unavailable" : "No messages yet")
-                .font(.title3.weight(.semibold))
-            Text(transcriptNotSynced
-                 ? "The Mac has not published this conversation's transcript to this iPhone."
-                 : !pairingStore.isPaired ? "Set up the iCloud connection to your Mac to send and receive messages."
-                 : bridgeClient.bridgeStatus == .offline ? "Open the connection status above for details before sending a message."
-                 : "Say something to get started.")
-                .font(.body).foregroundStyle(.secondary)
+        let copy: (title: String, line: String) = transcriptNotSynced
+            ? ("Not here yet", "This conversation is still on your Mac. I'll bring it over when it syncs.")
+            : !pairingStore.isPaired ? ("I live on your Mac", "Connect this iPhone and I can talk with you from anywhere.")
+            : bridgeClient.bridgeStatus == .offline ? ("Out of reach for now", AliveConnection.noICloud + ". When it's back, so am I.")
+            : ("I'm here", "Ask me anything, or tell me what you're working on.")
+        return VStack(spacing: 12) {
+            Text(copy.title)
+                .font(.system(.title, design: .serif))
+                .foregroundStyle(AlivePalette.text)
+                .accessibilityAddTraits(.isHeader)
+            Text(copy.line)
+                .font(.body)
+                .foregroundStyle(AlivePalette.secondary)
+                .fixedSize(horizontal: false, vertical: true)
             if !pairingStore.isPaired {
-                Button("Set up connection") { showsChatSetup = true }
-                    .font(.body).frame(minHeight: 44)
-                    .tint(NativeAgentMobileTheme.Colors.accentForeground)
+                Button { showsChatSetup = true } label: {
+                    Text("Connect this iPhone")
+                        .font(.body.weight(.semibold))
+                        .padding(.horizontal, 8)
+                        .frame(minHeight: 36)
+                }
+                .alivePrimaryButton()
+                .padding(.top, 10)
             }
         }
         .multilineTextAlignment(.center)
-        .padding(24).frame(maxWidth: .infinity)
+        .frame(maxWidth: 320)
+        .padding(24)
+        .padding(.bottom, 60)
+        .frame(maxWidth: .infinity)
     }
 
     private var chatSessionTabs: [ChatSessionTab] {
@@ -163,21 +183,13 @@ struct ChatView: View {
         )
     }
 
-    /// The conversation anchor resolved against the rows the Mac published —
-    /// the session User is currently active in on a direct remote surface.
-    ///
-    /// Purely derived on read: it is merged to the front of the pinned run for
-    /// display and defaulted to on launch, and is never written into the
-    /// human's pins nor sent back to the Mac. Nothing here knows which surface
-    /// published it. It is skipped when it is already the phone's main slot —
-    /// that tab is the same conversation under a different name.
+    /// An explicitly opened history thread gets a temporary, non-closable
+    /// tab beside main. Opening history never changes the Mac's pin list.
     private var anchorSession: ChatSession? {
-        guard let anchorID = sync.chatAnchor?.cleanSessionId,
-              anchorID != effectiveMainSessionID else { return nil }
-        if let pinned = sync.pinnedChatSessions.first(where: { $0.id == anchorID }) {
-            return pinned.archived == true ? nil : pinned
-        }
-        return sync.sessions.first(where: { $0.id == anchorID && $0.archived != true })
+        guard let selectedID = store.selectedSessionID,
+              selectedID != effectiveMainSessionID,
+              !sync.pinnedChatSessions.contains(where: { $0.id == selectedID }) else { return nil }
+        return sync.sessions.first(where: { $0.id == selectedID && $0.archived != true })
     }
 
     /// The pinned ids the strip actually shows: the Mac's pinned snapshot plus
@@ -201,7 +213,8 @@ struct ChatView: View {
     }
 
     private var showsChatSessionTabs: Bool {
-        anchorSession != nil || sync.pinnedChatSessions.contains(where: { $0.archived != true })
+        store.selectedSessionID != effectiveMainSessionID
+            || anchorSession != nil || sync.pinnedChatSessions.contains(where: { $0.archived != true })
     }
 
     /// Sweep 2026-09-01 item 36 — the pending approvals raised by the chat on
@@ -209,7 +222,21 @@ struct ChatView: View {
     /// approvals `iCloudSyncEngine` already publishes for the Activity tab; no
     /// second store, no second refresh loop.
     private var inlineChatApprovals: [ApprovalRequest] {
-        MobileChatApprovalProjection.pendingApprovals(
+        #if DEBUG
+        if isChatSample && ProcessInfo.processInfo.arguments.contains("-chatSampleExtras") {
+            return [ApprovalRequest(id: "sample-approval", title: "Add a calendar block",
+                                    action: "calendar_create", risk: "medium",
+                                    reason: "Tomorrow 9–11 AM, “Outline”, on your personal calendar.",
+                                    status: "pending",
+                                    payloadPreview: #"{"input":{"calendar":"Personal","title":"Outline","eventId":"evt_77"}}"#,
+                                    localOnly: false, remoteResolvable: true),
+                    ApprovalRequest(id: "sample-approval-hygiene", title: "",
+                                    action: "self_improvement.apply", risk: "medium",
+                                    reason: "[run_memory_hygiene] Run memory hygiene to consolidate duplicates and clear test-derived noise before it settles into long-term memory.",
+                                    status: "pending", localOnly: true, remoteResolvable: false)]
+        }
+        #endif
+        return MobileChatApprovalProjection.pendingApprovals(
             sessionId: store.selectedSessionID,
             approvals: sync.approvals
         )
@@ -217,7 +244,19 @@ struct ChatView: View {
 
     private var inlineApprovalAnchorID: UUID? {
         guard !inlineChatApprovals.isEmpty else { return nil }
-        return MobileChatApprovalProjection.anchorMessageID(in: store.messages)
+        return MobileChatApprovalProjection.anchorMessageID(in: visibleMessages)
+    }
+
+    private var queuedTurns: [QueuedChatSend] {
+        #if DEBUG
+        if isChatSample && ProcessInfo.processInfo.arguments.contains("-chatSampleExtras") {
+            return ["Also remind me to call Sam", "And pick a walking route"].map {
+                QueuedChatSend(id: UUID(), sessionID: nil, text: $0, controls: runtimeControls,
+                               attachments: [], createdAt: Date())
+            }
+        }
+        #endif
+        return store.queuedSendsForSelectedSession
     }
 
     private var selectedChatSessionTabID: String {
@@ -227,12 +266,7 @@ struct ChatView: View {
     }
 
     private var effectiveMainSessionID: String? {
-        store.mainSessionID
-            ?? sync.sessions.first(where: {
-                (NativeAgentICloudBridgeConstants.isMobileSourceKey($0.sourceKey)
-                    || (($0.source ?? "").lowercased() == "ios" && ($0.sourceKey ?? "").isEmpty))
-                    && $0.archived != true
-            })?.id
+        store.mainSessionID ?? sync.chatAnchor?.cleanSessionId
     }
 
     private var mainSessionTitle: String {
@@ -271,12 +305,18 @@ struct ChatView: View {
             .onChange(of: sync.pinnedChatSessions) { _, _ in
                 reconcilePublishedChatSessions()
             }
-            // A new anchor can land while this screen is already up (the Mac
-            // publishes on every remote session change). Without this the
-            // window would only pick it up on the next appear/foreground.
-            // Adoption still stops dead once the human has picked a session.
+            // Main follows Mac selection changes, including while already open.
             .onChange(of: sync.chatAnchor) { _, _ in
                 adoptConversationAnchorIfNeeded()
+            }
+            .onChange(of: hasComposerDraft) { _, hasDraft in
+                if !hasDraft { adoptMainSessionFromSnapshots(afterClearingDraft: true) }
+            }
+            .onChange(of: composerIsFocused) { _, focused in
+                if !focused { adoptMainSessionFromSnapshots() }
+            }
+            .onChange(of: store.queuedSends.map(\.id)) { _, _ in
+                adoptMainSessionFromSnapshots(afterClearingDraft: true)
             }
             .onChange(of: store.isLoading) { _, isLoading in
                 if !isLoading {
@@ -349,7 +389,7 @@ struct ChatView: View {
                             chatEmptyState
                                 .containerRelativeFrame(.vertical)
                         } else {
-                            LazyVStack(alignment: .leading, spacing: NativeAgentMobileTheme.Spacing.xl) {
+                            LazyVStack(alignment: .leading, spacing: 26) {
 	                                ForEach(visibleMessages) { msg in
 	                                    BubbleView(
 	                                        message: msg,
@@ -393,18 +433,50 @@ struct ChatView: View {
 	                                        }
 	                                    }
 	                                }
+                                // Reaching the bottom by hand is following again:
+                                // the Latest button goes away on its own.
+                                Color.clear.frame(height: 1)
+                                    .onAppear {
+                                        let follow = ChatFollowPresentation.followLatest()
+                                        autoFollowChat = follow.autoFollow
+                                        showLatestButton = follow.showsLatest
+                                    }
                             }
                             .frame(maxWidth: NativeAgentMobileTheme.Layout.roomColumn)
                             .frame(maxWidth: .infinity)
-                            .padding(NativeAgentMobileTheme.Spacing.lg)
+                            .padding(.horizontal, 20).padding(.vertical, 12)
                         }
                     }
+                    // The transcript softens out under the composer and the tab bar.
+                    .aliveBottomFade(room: AliveChatRoom(store: store))
                     // The scroll view owns the inset: SwiftUI measures every composer
                     // row and subtracts it from the keyboard-adjusted viewport.
                     .safeAreaInset(edge: .bottom, spacing: NativeAgentMobileTheme.Spacing.md) {
-                        MobileGlassContainer { composerBar }
-                            .padding(.horizontal, NativeAgentMobileTheme.Spacing.lg)
-                            .padding(.bottom, NativeAgentMobileTheme.Spacing.sm)
+                        VStack(alignment: .trailing, spacing: 8) {
+                            // Only while scrolled up, and above the composer, never on it.
+                            if showLatestButton {
+                                Button {
+                                    let follow = ChatFollowPresentation.followLatest()
+                                    autoFollowChat = follow.autoFollow
+                                    showLatestButton = follow.showsLatest
+                                    scheduleScrollToBottom(proxy, animated: true, delayMilliseconds: 0, force: true)
+                                } label: {
+                                    Label("Latest", systemImage: "arrow.down")
+                                        .font(.footnote.weight(.semibold))
+                                        .foregroundStyle(AlivePalette.text)
+                                        .padding(.horizontal, 14)
+                                        .frame(minHeight: 36)
+                                        .aliveGlass(in: Capsule(), interactive: true)
+                                }
+                                .buttonStyle(.plain)
+                                .padding(.trailing, NativeAgentMobileTheme.Spacing.lg)
+                                .transition(.opacity)
+                            }
+                            MobileGlassContainer { composerBar }
+                                .padding(.horizontal, NativeAgentMobileTheme.Spacing.lg)
+                                .padding(.bottom, NativeAgentMobileTheme.Spacing.sm)
+                        }
+                        .animation(.easeOut(duration: 0.18), value: showLatestButton)
                     }
                     .onGeometryChange(for: CGFloat.self) { $0.size.height - $0.safeAreaInsets.bottom } action: { _ in
                         scheduleScrollToBottom(proxy, animated: false)
@@ -424,30 +496,14 @@ struct ChatView: View {
                         )
                     }
                     .simultaneousGesture(
-                        DragGesture(minimumDistance: 8).onChanged { _ in
-                            if store.isLoading || !store.messages.isEmpty {
+                        DragGesture(minimumDistance: 8).onChanged { drag in
+                            if drag.translation.height > 0, store.isLoading || !store.messages.isEmpty {
                                 let follow = ChatFollowPresentation.userScrolledAway()
                                 autoFollowChat = follow.autoFollow
                                 showLatestButton = follow.showsLatest
                             }
                         }
                     )
-                    .overlay(alignment: .bottomTrailing) {
-                        if showLatestButton {
-                            Button {
-                                let follow = ChatFollowPresentation.followLatest()
-                                autoFollowChat = follow.autoFollow
-                                showLatestButton = follow.showsLatest
-                                scheduleScrollToBottom(proxy, animated: true, delayMilliseconds: 0, force: true)
-                            } label: {
-                                Label("Latest", systemImage: "arrow.down")
-                                    .font(AppFont.tag)
-                            }
-                            .buttonStyle(.borderedProminent)
-                            .padding(.trailing, 14)
-                            .padding(.bottom, 10)
-                        }
-                    }
                     .onAppear {
                         let follow = ChatFollowPresentation.followLatest()
                         autoFollowChat = follow.autoFollow
@@ -502,65 +558,39 @@ struct ChatView: View {
                 }
 
             }
-            .background { MobileRoomBackground() }
-            .navigationTitle(isChatSample ? "Chat · Sample" : "Chat")
-            .tint(NativeAgentMobileTheme.Colors.accentForeground)
-            .navigationBarTitleDisplayMode(.inline)
+            .background { AliveChatRoom(store: store) }
+            // The serif header carries the name and every chat action, so the
+            // bar has nothing left to draw. The title stays for VoiceOver and
+            // the app switcher.
+            .navigationTitle(agentDisplayName)
+            .toolbar(.hidden, for: .navigationBar)
+            .tint(AlivePalette.text)
             .animation(AppMotion.snappy, value: voiceInput.isListening)
             // Sweep R4 C11.3: iCloudSyncEngine.syncError was published and read
             // by nothing. Render-only — no retry, no new sync work.
             .macSyncErrorBanner()
-            .toolbar {
-                // Sweep R4 C11.4: connection state used to live on Diagnostics
-                // and Settings only, so a sleeping Mac looked exactly like a
-                // healthy one right up until a send timed out.
-                ToolbarItem(placement: .navigationBarLeading) {
-                    Button {
-                        store.regenerateLast(client: bridgeClient, controls: runtimeControls)
-                    } label: {
-                        Image(systemName: "arrow.clockwise")
-                    }
-                    .disabled(!store.canRegenerateLast)
-                    .accessibilityLabel("Regenerate last response")
-                    .accessibilityHint("Asks the agent to answer the latest message again")
-                }
-                ToolbarItem(placement: .navigationBarTrailing) {
-                    Button {
-                        store.startNewSession()
-                    } label: {
-                        Image(systemName: "plus")
-                            .foregroundStyle(NativeAgentMobileTheme.Colors.accentForeground)
-                    }
-                    // A new-session action must never be gated by an in-flight
-                    // turn on the session we're leaving — that made a stuck
-                    // "working" turn also freeze the one control that recovers
-                    // it (chat hang -> isLoading stuck true -> + permanently
-                    // disabled). startNewSession() cancels the in-flight send and
-                    // resets isLoading, so it is safe to run while loading.
-                    .disabled(store.isSwitchingSession)
-                    .accessibilityLabel("New chat")
-                }
-                ToolbarItem(placement: .navigationBarTrailing) {
-                    speakerButton
-                }
-            }
             .sheet(isPresented: $showsChatSetup) {
                 PairingView(onSkip: { showsChatSetup = false }, onPaired: { showsChatSetup = false })
             }
             .sheet(isPresented: $showsConfiguration) {
                 NavigationStack {
                     ScrollView { configurationControls }
+                        .mobileReadingScreen()
                         .navigationTitle("Chat options")
                         .navigationBarTitleDisplayMode(.inline)
                         .toolbar { Button("Done") { showsConfiguration = false } }
-                        .background(NativeAgentMobileTheme.Colors.canvas)
-                        .tint(NativeAgentMobileTheme.Colors.accentText)
+                        .hazeTinted()
                 }
+                // Five rows: a half sheet, where the room's haze fills the view.
+                .presentationDetents([.medium, .large])
             }
             .task {
                 #if DEBUG
                 if isChatSample && ProcessInfo.processInfo.arguments.contains("-chatSampleModel") {
                     showsConfiguration = true
+                }
+                if isChatSample && ProcessInfo.processInfo.arguments.contains("-chatSampleToast") {
+                    iOSSystemToastCenter.shared.push(success: "Approved. I'll add it now.", autoDismissAfter: nil)
                 }
                 if isChatSample && ProcessInfo.processInfo.arguments.contains("-chatSampleKeyboard") {
                     if let index = ProcessInfo.processInfo.arguments.firstIndex(of: "-chatSampleDraft"),
@@ -580,6 +610,8 @@ struct ChatView: View {
                 // the user is already reading. This is the only place that
                 // knows a chat surface is on screen.
                 ChatStore.visibleStore = store
+                adoptMainSessionFromSnapshots()
+                if MobileQuickAskRoute.consume() { composerIsFocused = true }
                 consumeNotifiedChatSessionIfNeeded()
                 // 2026-09-13 review: local model state left over from an older
                 // build is CLEARED before anything can be sent, not kept until a
@@ -589,6 +621,7 @@ struct ChatView: View {
                 // choice; until that lands it sends no override at all.
                 clearLegacyLocalModelStateIfNeeded()
                 adoptSurfaceModelPreferenceFromSync()
+                importSharedItems()
                 // Wire TTS callback into store
                 store.onReply = { [voiceOutput] text in
                     voiceOutput.speak(text)
@@ -657,6 +690,8 @@ struct ChatView: View {
             // PATCH-2026-05-11: foreground-refresh — pull latest history when app foregrounds.
             .onChange(of: scenePhase) { _, newPhase in
                 if newPhase == .active {
+                    if MobileQuickAskRoute.consume() { composerIsFocused = true }
+                    importSharedItems()
                     store.resumeObservingPendingExchanges(using: bridgeClient)
                     Task {
                         await bridgeClient.pollICloudRepliesNow()
@@ -680,17 +715,25 @@ struct ChatView: View {
                 iCloudRejectionObserverID = nil
                 iCloudResyncObserverID = nil
             }
+            .onChange(of: store.isSwitchingSession) { _, switching in
+                if !switching { importSharedItems() }
+            }
+            .onChange(of: agentDisplayName) { _, _ in rememberShareAgentName() }
             // 2026-09-06: a reply notification names the conversation it came
             // from. Consume it here too — onAppear only fires when the chat
             // surface was not already mounted.
             .onReceive(NotificationCenter.default.publisher(for: .nativeagentOpenActivity)) { _ in
                 consumeNotifiedChatSessionIfNeeded()
             }
+            .onReceive(NotificationCenter.default.publisher(for: MobileQuickAskRoute.notification)) { _ in
+                if MobileQuickAskRoute.consume() { composerIsFocused = true }
+            }
             // 2026-09-06: a notification that arrived mid-load kept its intent
             // rather than losing it. Retry the moment the load releases.
             .onChange(of: store.isSwitchingSession) { _, switching in
                 guard !switching else { return }
                 consumeNotifiedChatSessionIfNeeded()
+                adoptMainSessionFromSnapshots()
             }
             // Simulator/process-argument test hook. The release target exposes
             // no URL scheme that can inject a real agent turn.
@@ -744,30 +787,32 @@ struct ChatView: View {
             if !pendingPhotos.isEmpty || isLoadingPhotos {
                 pendingPhotoStrip
             }
-            if !store.queuedSendsForSelectedSession.isEmpty {
+            if !queuedTurns.isEmpty {
                 queuedSendStrip
             }
 
-            let layout = dynamicTypeSize.isAccessibilitySize
+            let a11y = dynamicTypeSize.isAccessibilitySize
+            let layout = a11y
                 ? AnyLayout(VStackLayout(alignment: .leading, spacing: 4))
-                : AnyLayout(HStackLayout(alignment: .bottom, spacing: 4))
+                : AnyLayout(HStackLayout(alignment: .bottom, spacing: 2))
             layout {
+                if !a11y { photosPickerButton }
                 TextField(composerPlaceholder, text: Binding(
                     get: { inputText },
                     set: { inputText = $0 }
-                ), prompt: Text(composerPlaceholder).foregroundStyle(NativeAgentMobileTheme.Colors.tertiary), axis: .vertical)
+                ), prompt: Text(composerPlaceholder).foregroundStyle(AlivePalette.secondary), axis: .vertical)
                     .textFieldStyle(.plain)
                     .focused($composerIsFocused)
                     .mobileTypography(.body)
-                    .lineLimit(dynamicTypeSize.isAccessibilitySize ? 1...8 : 1...5)
+                    .lineLimit(a11y ? 1...8 : 1...5)
+                    .padding(.vertical, 11)
                     .frame(minHeight: 44)
                     .submitLabel(.send)
                     .onSubmit { submitMessage() }
                     .disabled(store.isSwitchingSession)
 
-            HStack(spacing: 8) {
-                photosPickerButton
-                if dynamicTypeSize.isAccessibilitySize { Spacer(minLength: 8) }
+            HStack(spacing: 2) {
+                if a11y { photosPickerButton; Spacer(minLength: 8) }
                 micButton
                     .disabled(store.isSwitchingSession)
 
@@ -776,13 +821,12 @@ struct ChatView: View {
                         guard !isChatSample else { return }
                         store.stop(client: bridgeClient)
                     } label: {
-                        Text("Stop")
-                            .font(.callout.weight(.semibold))
-                            .fixedSize()
-                            .foregroundStyle(NativeAgentMobileTheme.Colors.text)
-                            .padding(.horizontal, 10)
-                            .frame(minWidth: 44, minHeight: 44)
-                            .background(NativeAgentMobileTheme.Colors.softFill, in: Capsule())
+                        Image(systemName: "stop.fill")
+                            .font(.system(size: 13, weight: .bold))
+                            .foregroundStyle(AlivePalette.text)
+                            .frame(width: 36, height: 36)
+                            .background(NativeAgentMobileTheme.Colors.softFill, in: Circle())
+                            .frame(width: 44, height: 44)
                     }
                     .accessibilityLabel("Stop generation")
                 } else {
@@ -792,13 +836,13 @@ struct ChatView: View {
                 } label: {
                     let active = canSend && !store.isSwitchingSession
                     Image(systemName: "arrow.up")
-                        .font(.system(size: 16, weight: .bold))
-                        .foregroundStyle(active ? NativeAgentMobileTheme.Colors.onAccent : NativeAgentMobileTheme.Colors.tertiary)
-                        .frame(width: 44, height: 44)
+                        .font(.system(size: 15, weight: .bold))
+                        .foregroundStyle(active ? Color.white : AlivePalette.secondary)
+                        .frame(width: 36, height: 36)
                         .background {
-                            ZStack {
-                                Circle().fill(active ? NativeAgentMobileTheme.Colors.accentText : NativeAgentMobileTheme.Colors.softFill)
-                            }
+                            Circle().fill(active
+                                ? HazeColor(stored: hazeColorRaw).control(dark: true, labelled: true)
+                                : NativeAgentMobileTheme.Colors.softFill)
                             // phase 6: send-control micro-feedback — fade the
                             // enabled/sending fills instead of popping. Bound to
                             // the two discrete state flags (canSend/isLoading),
@@ -807,6 +851,7 @@ struct ChatView: View {
                                 AppMotion.respecting(AppMotion.snappy, reduceMotion: reduceMotion),
                                 value: active)
                         }
+                        .frame(width: 44, height: 44)
                 }
                 .disabled(!canSend || store.isSwitchingSession)
                 .accessibilityLabel("Send message")
@@ -814,9 +859,15 @@ struct ChatView: View {
             }
             }
         }
-        .foregroundStyle(NativeAgentMobileTheme.Colors.text)
-        .tint(NativeAgentMobileTheme.Colors.accentText)
-        .mobileComposer(isFocused: composerIsFocused)
+        .foregroundStyle(AlivePalette.text)
+        .hazeTinted()
+        // One floating glass capsule: the functional layer, over the thread.
+        .padding(.horizontal, 6)
+        .padding(.vertical, 4)
+        .aliveGlass(in: RoundedRectangle(cornerRadius: 26, style: .continuous), interactive: true)
+        .overlay {
+            PhoneThinkingLight(correlationIDs: Set(store.pendingICloudPlaceholders.keys))
+        }
         .frame(maxWidth: NativeAgentMobileTheme.Layout.roomColumn)
     }
 
@@ -825,78 +876,87 @@ struct ChatView: View {
             || !pendingPhotos.isEmpty
     }
 
+    private var hasComposerDraft: Bool {
+        !inputText.isEmpty || !pendingPhotos.isEmpty
+            || !selectedPhotoItems.isEmpty || isLoadingPhotos
+    }
+
     private var queuedSendStrip: some View {
-        let turns = store.queuedSendsForSelectedSession
+        let turns = queuedTurns
         let next = turns[0]
         let primaryAction = QueuedSendStripAction.resolve(
             id: next.id,
             isLoading: store.isLoading
         )
-        return HStack(spacing: 7) {
-            Image(systemName: store.isSelectedQueuePaused
-                  ? "pause.fill"
-                  : "text.line.last.and.arrowtriangle.forward")
-                .foregroundStyle(NativeAgentMobileTheme.Colors.accentText)
-
-            Text(store.isSelectedQueuePaused ? "Paused" : "Next")
-                .font(.system(size: 10, weight: .bold, design: .rounded))
-                .foregroundStyle(.secondary)
+        // One line: what waits, its preview, and ONE menu for what to do with
+        // it (send, remove, and the rest of the queue when there is more).
+        return HStack(spacing: 10) {
+            Text(store.isSelectedQueuePaused ? "Paused" : turns.count > 1 ? "Next of \(turns.count)" : "Next")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(AlivePalette.secondary)
+                .fixedSize()
 
             Text(next.preview)
-                .font(AppFont.tag)
+                .font(.footnote)
+                .foregroundStyle(AlivePalette.text)
                 .lineLimit(1)
                 .truncationMode(.tail)
                 .frame(maxWidth: .infinity, alignment: .leading)
 
             Menu {
-                ForEach(Array(turns.enumerated()), id: \.element.id) { index, queued in
-                    let action = QueuedSendStripAction.resolve(
-                        id: queued.id,
-                        isLoading: store.isLoading
+                Button {
+                    primaryAction.apply(
+                        onSteer: { store.sendQueuedNow($0, client: bridgeClient) },
+                        onSend: { store.resumeQueuedSends(startingWith: $0) }
                     )
-                    Button {
-                        action.apply(
-                            onSteer: { store.sendQueuedNow($0, client: bridgeClient) },
-                            onSend: { store.resumeQueuedSends(startingWith: $0) }
-                        )
-                    } label: {
-                        Label(action.menuTitle(position: index + 1, preview: queued.preview), systemImage: "arrow.up")
+                } label: {
+                    Label(primaryAction.primaryTitle, systemImage: "arrow.up")
+                }
+                Button(role: .destructive) {
+                    store.removeQueuedSend(next.id)
+                } label: {
+                    Label("Remove", systemImage: "xmark")
+                }
+                if turns.count > 1 {
+                    Section(AliveWords.count(turns.count, "message") + " waiting") {
+                        ForEach(Array(turns.enumerated().dropFirst()), id: \.element.id) { index, queued in
+                            let action = QueuedSendStripAction.resolve(
+                                id: queued.id,
+                                isLoading: store.isLoading
+                            )
+                            Button {
+                                action.apply(
+                                    onSteer: { store.sendQueuedNow($0, client: bridgeClient) },
+                                    onSend: { store.resumeQueuedSends(startingWith: $0) }
+                                )
+                            } label: {
+                                Label(action.menuTitle(position: index + 1, preview: queued.preview), systemImage: "arrow.up")
+                            }
+                            Button(role: .destructive) {
+                                store.removeQueuedSend(queued.id)
+                            } label: {
+                                Label("Remove \(index + 1): \(queued.preview)", systemImage: "xmark")
+                            }
+                        }
                     }
-                    Button(role: .destructive) {
-                        store.removeQueuedSend(queued.id)
-                    } label: {
-                        Label("Remove \(index + 1): \(queued.preview)", systemImage: "xmark")
-                    }
-                    if index < turns.count - 1 { Divider() }
                 }
             } label: {
-                Text("\(turns.count) queued")
-                    .font(AppFont.tag)
-                    .foregroundStyle(.secondary)
+                Image(systemName: "ellipsis")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(AlivePalette.text)
+                    .frame(width: 30, height: 30)
+                    .background(AlivePalette.fill, in: Circle())
+                    .overlay(Circle().strokeBorder(AlivePalette.rim, lineWidth: 1))
+                    .frame(width: 44, height: 44)
+                    .contentShape(Rectangle())
             }
-            .fixedSize()
-            .accessibilityLabel("Show all \(turns.count) queued messages")
-
-            Button(primaryAction.primaryTitle) {
-                primaryAction.apply(
-                    onSteer: { store.sendQueuedNow($0, client: bridgeClient) },
-                    onSend: { store.resumeQueuedSends(startingWith: $0) }
-                )
-            }
-            .buttonStyle(.borderless)
-
-            Button {
-                store.removeQueuedSend(next.id)
-            } label: {
-                Image(systemName: "xmark")
-            }
-            .buttonStyle(.borderless)
-            .foregroundStyle(.secondary)
-            .accessibilityLabel("Remove next queued message")
+            .accessibilityLabel("Queued message actions")
         }
-        .padding(.horizontal, 9)
-        .padding(.vertical, 5)
-        .background(NativeAgentPalette.agentAccent.opacity(0.07), in: RoundedRectangle(cornerRadius: 10))
+        .padding(.leading, 12)
+        .padding(.trailing, 0)
+        .overlay(alignment: .bottom) {
+            Rectangle().fill(AlivePalette.divider).frame(height: 1).padding(.horizontal, 8)
+        }
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Send-next queue, \(turns.count) queued")
     }
@@ -910,7 +970,7 @@ struct ChatView: View {
                         .foregroundStyle(.secondary)
                         .padding(.horizontal, 10)
                         .padding(.vertical, 8)
-                        .background(Color(.systemGray6), in: Capsule())
+                        .background(AlivePalette.fill, in: Capsule())
                 }
                 ForEach(pendingPhotos) { photo in
                     ZStack(alignment: .topTrailing) {
@@ -964,36 +1024,15 @@ struct ChatView: View {
                                 Image(systemName: tab.systemImage)
                                     .font(.system(size: 11, weight: .semibold))
                                 Text(tab.title)
-                                    .font(AppFont.tag.weight(selected ? .semibold : .medium))
+                                    .font(.footnote.weight(selected ? .semibold : .regular))
                                     .lineLimit(1)
                             }
-                            .foregroundStyle(selected ? NativeAgentMobileTheme.Colors.accentText : .primary)
-                            .padding(.leading, 10)
-                            .padding(.trailing, tab.closableSessionID == nil ? 10 : 30)
-                            .frame(width: tab.kind == .main ? 112 : 156, height: 32)
-                            .background {
-                                ZStack {
-                                    RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                        .fill(
-                                            selected
-                                                ? AnyShapeStyle(.ultraThinMaterial)
-                                                : AnyShapeStyle(Color(.secondarySystemGroupedBackground).opacity(0.5))
-                                        )
-                                    RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                        .fill(selected ? NativeAgentPalette.agentAccent.opacity(0.12) : Color.clear)
-                                }
-                            }
-                            .overlay(alignment: .bottom) {
-                                Capsule(style: .continuous)
-                                    .fill(
-                                        selected
-                                            ? AnyShapeStyle(NativeAgentPalette.agentGradient)
-                                            : AnyShapeStyle(Color.clear)
-                                    )
-                                    .frame(height: 2)
-                                    .padding(.horizontal, 12)
-                            }
-                            .shadow(color: selected ? Color.black.opacity(0.06) : .clear, radius: 3, y: 1)
+                            .foregroundStyle(selected ? AlivePalette.text : AlivePalette.secondary)
+                            .padding(.leading, 12)
+                            .padding(.trailing, tab.closableSessionID == nil ? 12 : 30)
+                            .frame(width: tab.kind == .main ? 112 : 156, height: 34)
+                            .background(selected ? AlivePalette.fill : Color.clear, in: Capsule())
+                            .overlay { if selected { Capsule().strokeBorder(AlivePalette.rim, lineWidth: 1) } }
                         }
                         .buttonStyle(.plain)
                         .disabled(
@@ -1033,18 +1072,10 @@ struct ChatView: View {
                     }
                 }
             }
-            .padding(.horizontal, 12)
+            .padding(.horizontal, 16)
             .padding(.vertical, 4)
         }
         .frame(height: 42)
-        .background(.bar)
-        .overlay(alignment: .bottom) {
-            // ui-polish 2026-05-22 — softer 0.5pt divider so the tab strip
-            // layers cleanly into the chat shell instead of banding it.
-            Rectangle()
-                .fill(Color.primary.opacity(0.06))
-                .frame(height: 0.5)
-        }
     }
 
     /// PhotosPicker's label is an escaping @Sendable closure, so it cannot
@@ -1058,32 +1089,44 @@ struct ChatView: View {
             maxSelectionCount: maxPendingPhotos,
             matching: .images
         ) {
-            Image(systemName: loading ? "hourglass" : "photo.on.rectangle")
-                .font(.system(size: 16, weight: .semibold))
-                .foregroundStyle(NativeAgentMobileTheme.Colors.secondary)
+            Image(systemName: loading ? "hourglass" : "plus")
+                .font(.system(size: 18, weight: .regular))
+                .foregroundStyle(AlivePalette.secondary)
                 .frame(width: 44, height: 44)
-                .background(Color(.systemGray5), in: Circle())
+                .contentShape(Circle())
         }
         .disabled(store.isLoading || store.isSwitchingSession || loading)
         .accessibilityLabel("Add photos")
     }
 
+    /// The Mac Simple header: the agent's name in serif with its light, and
+    /// one line under it saying what it is doing (or why the Mac is away).
     private var runtimeControlsBar: some View {
-            HStack(spacing: 8) {
-                MacStatusChip().fixedSize(horizontal: true, vertical: false)
-                Spacer(minLength: 8)
-                Button { showsConfiguration = true } label: {
-                    Label("Options", systemImage: "slider.horizontal.3")
-                        .font(.callout)
-                        .frame(minHeight: 44)
-                }
-                .accessibilityLabel("Chat options: provider, model and processing")
-            }
-            .padding(.horizontal, 16)
+        let online = isChatSample || bridgeClient.bridgeStatus == .online
+        // The kit's door, at the same height as every tab: when the Mac is
+        // away the line under the name becomes its status (the chip keeps its
+        // full 44pt target).
+        return AlivePageHeader(title: agentDisplayName, line: agentDoing.text,
+                               dot: online ? agentDoing.dot : .away, showsStatus: !isChatSample) {
+            chatActionsMenu
+        }
+        .padding(.horizontal, AliveMetrics.pageInset + 4)
+        .padding(.top, AliveMetrics.rootTop)
+        .padding(.bottom, 6)
+    }
+
+    /// What the agent is doing, in the Mac's words.
+    private var agentDoing: (text: String, dot: AliveStatusDot.State) {
+        if store.isLoading || (isChatSample && visibleMessages.last?.isStreaming == true) {
+            let replying = visibleMessages.last.map { $0.role == .assistant && $0.isStreaming && !$0.text.isEmpty } ?? false
+            return (replying ? "Replying…" : "Thinking…", .working)
+        }
+        if !inlineChatApprovals.isEmpty { return ("Waiting on you", .waiting) }
+        return ("Here", .here)
     }
 
     private var configurationControls: some View {
-            VStack(alignment: .leading, spacing: 8) {
+            VStack(alignment: .leading, spacing: 0) {
                 Menu {
                     ForEach(selectableProviders) { provider in
                         Button {
@@ -1093,9 +1136,10 @@ struct ChatView: View {
                         }
                     }
                 } label: {
-                    controlPill(icon: "server.rack", title: isChatSample ? "Anthropic · extended workspace" : providerLabel(selectedProviderId))
+                    controlPill("Provider", title: isChatSample ? "Anthropic · extended workspace" : providerLabel(selectedProviderId))
                 }
 
+                AliveDivider()
                 Menu {
                     ForEach(availableModelIDs, id: \.self) { model in
                         Button {
@@ -1160,9 +1204,10 @@ struct ChatView: View {
                         Label("Refresh Models", systemImage: "arrow.clockwise")
                     }
                 } label: {
-                    controlPill(icon: "cpu", title: isChatSample ? "Claude Fable 5.1 · extended context" : modelLabel(selectedModel))
+                    controlPill("Model", title: isChatSample ? "Claude Fable 5.1 · extended context" : modelLabel(selectedModel))
                 }
 
+                AliveDivider()
                 Menu {
                     ForEach(reasoningOptions, id: \.id) { option in
                         Button {
@@ -1208,9 +1253,10 @@ struct ChatView: View {
                         }
                     }
                 } label: {
-                    controlPill(icon: "brain", title: reasoningLabel(selectedReasoningEffort))
+                    controlPill("Thinking", title: reasoningLabel(selectedReasoningEffort))
                 }
 
+                AliveDivider()
                 Menu {
                     Button { setFastMode(false) } label: {
                         Label("Normal", systemImage: selectedFastMode ? "circle" : "checkmark")
@@ -1221,12 +1267,13 @@ struct ChatView: View {
                     .disabled(!selectedModelSupportsFast)
                 } label: {
                     controlPill(
-                        icon: selectedFastMode ? "bolt.fill" : "gauge.with.dots.needle.33percent",
+                        "Speed",
                         title: ChatRuntimeControlPresentation.processingModeTitle(fastMode: selectedFastMode)
                     )
                 }
                 .accessibilityLabel("Processing mode: \(selectedFastMode ? "Fast" : "Normal")")
 
+                AliveDivider()
                 Menu {
                     ForEach(fileAccessOptions, id: \.id) { option in
                         Button {
@@ -1236,13 +1283,13 @@ struct ChatView: View {
                         }
                     }
                 } label: {
-                    controlPill(icon: fileAccessIcon(selectedFileAccess), title: fileAccessLabel(selectedFileAccess))
+                    controlPill("File access", title: fileAccessLabel(selectedFileAccess))
                 }
             }
+            .aliveCard()
             .padding(.horizontal, 16)
-            .padding(.vertical, 8)
-        .background(NativeAgentMobileTheme.Colors.canvas)
-        .tint(NativeAgentMobileTheme.Colors.accentText)
+            .padding(.vertical, 12)
+        .tint(AlivePalette.text)
         // Seed the provider pill off this small subview rather than the main
         // `body` chain — adding another modifier to body tips its expression
         // past the Swift type-checker's complexity budget (build timeout).
@@ -1252,19 +1299,26 @@ struct ChatView: View {
         }
     }
 
-    private func controlPill(icon: String, title: String) -> some View {
-        HStack(spacing: 8) {
-            Image(systemName: icon)
-                .font(.system(size: 12, weight: .semibold))
+    /// One row of the options card: what it is on the left, the current
+    /// choice on the right. The whole row opens its menu.
+    private func controlPill(_ label: String, title: String) -> some View {
+        HStack(spacing: 12) {
+            Text(label)
+                .font(.body)
+                .foregroundStyle(AlivePalette.text)
+            Spacer(minLength: 8)
             Text(title)
-                .font(.callout)
+                .font(.body)
+                .foregroundStyle(AlivePalette.secondary)
+                .multilineTextAlignment(.trailing)
                 .fixedSize(horizontal: false, vertical: true)
-            Image(systemName: "chevron.down").font(.caption2)
+            Image(systemName: "chevron.up.chevron.down")
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(AlivePalette.secondary)
         }
-        .foregroundStyle(NativeAgentMobileTheme.Colors.accentText)
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
+        .aliveRow()
         .frame(minHeight: 44)
+        .contentShape(Rectangle())
     }
 
     private var selectableProviders: [ProviderInfo] {
@@ -1528,13 +1582,13 @@ struct ChatView: View {
 
     private var reasoningOptions: [(id: String, label: String)] {
         let all = [
-            ("none", "No Think"),
-            ("low", "Low Think"),
-            ("medium", "Medium Think"),
-            ("high", "High Think"),
-            ("xhigh", "XHigh Think"),
-            ("max", "Max Think"),
-            ("ultra", "Ultra Think")
+            ("none", "None"),
+            ("low", "Low"),
+            ("medium", "Medium"),
+            ("high", "High"),
+            ("xhigh", "XHigh"),
+            ("max", "Max"),
+            ("ultra", "Ultra")
         ]
         guard let supported = selectedModelInfo?.supported_reasoning_efforts,
               !supported.isEmpty else { return Array(all.prefix(4)) }
@@ -1565,8 +1619,8 @@ struct ChatView: View {
 
     private var fileAccessOptions: [(id: String, label: String, icon: String)] {
         [
-            ("auto", "Auto Access", "wand.and.stars"),
-            ("read_only", "Read Only", "eye"),
+            ("auto", "Auto", "wand.and.stars"),
+            ("read_only", "Read only", "eye"),
             ("workspace", "Workspace", "folder"),
             ("full", "Full Mac", "bolt.trianglebadge.exclamationmark")
         ]
@@ -1605,7 +1659,11 @@ struct ChatView: View {
         // externally-removed-pin reconciler from reading its absence from the
         // pinned snapshot as a pin the Mac took away and bouncing the user back
         // to the main chat. Note first; only the redundant load is skipped.
-        MobileChatSelectionIntent.noteNotifiedSelection(sessionID)
+        if sessionID == effectiveMainSessionID {
+            MobileChatSelectionIntent.followMain()
+        } else {
+            MobileChatSelectionIntent.noteNotifiedSelection(sessionID)
+        }
         guard sessionID != store.selectedSessionID else { return }
         store.switchSession(
             to: sessionID,
@@ -1614,8 +1672,20 @@ struct ChatView: View {
         )
     }
 
-    private func adoptMainSessionFromSnapshots() {
-        store.adoptMainSessionIDIfNeeded(effectiveMainSessionID)
+    private func adoptMainSessionFromSnapshots(afterClearingDraft: Bool = false) {
+        guard !store.isSwitchingSession,
+              !hasComposerDraft,
+              !composerIsFocused || afterClearingDraft,
+              // Switching cancels the send task. Keep accepted drafts here
+              // until their exact-session handoff has crossed the transport.
+              !store.queuedSends.contains(where: { $0.sessionID == store.selectedSessionID }),
+              let anchorID = sync.chatAnchor?.cleanSessionId,
+              sync.sessions.contains(where: { $0.id == anchorID && $0.archived != true }) else { return }
+        store.replaceMainSessionID(anchorID)
+        guard !MobileChatSelectionIntent.userChoseThisLaunch,
+              store.selectedSessionID != anchorID else { return }
+        store.switchSession(to: anchorID, using: bridgeClient,
+                            fallbackMessages: snapshotMessages(for: anchorID))
     }
 
     /// Rows to show while a real read is in flight. 2026-09-06: still nil for an
@@ -1660,38 +1730,23 @@ struct ChatView: View {
         )
     }
 
-    /// Default the chat to the conversation anchor — but only until the human
-    /// picks something themselves this launch. Same rule and the same guard
-    /// rails as the Mac's `AppModel.performLoadChatState`: a live anchor only,
-    /// and never a yank off a chosen session.
+    /// History is an explicit destination; main continuously follows the Mac.
     private func adoptConversationAnchorIfNeeded() {
-        guard let anchorID = sync.chatAnchor?.cleanSessionId,
-              MobileConversationAnchor.shouldAdoptAnchor(
-                  anchorSessionId: anchorID,
-                  currentSelection: store.selectedSessionID,
-                  userChoseThisLaunch: MobileChatSelectionIntent.userChoseThisLaunch,
-                  liveSessionIds: Set(sync.sessions.filter { $0.archived != true }.map(\.id))
-              ) else { return }
-        store.switchSession(
-            to: anchorID,
-            using: bridgeClient,
-            fallbackMessages: snapshotMessages(for: anchorID)
-        )
+        adoptMainSessionFromSnapshots()
     }
 
     private func selectChatSessionTab(_ tab: ChatSessionTab) {
-        // The human has picked a session. From here on this launch the chat
-        // stops defaulting to the conversation anchor.
-        MobileChatSelectionIntent.noteUserChoice()
         let follow = ChatFollowPresentation.followLatest()
         autoFollowChat = follow.autoFollow
         showLatestButton = follow.showsLatest
         switch tab.kind {
         case .main:
+            MobileChatSelectionIntent.followMain()
             adoptMainSessionFromSnapshots()
             store.switchToMainSession(using: bridgeClient, fallbackMessages: snapshotMessages(for: tab.sessionID ?? effectiveMainSessionID))
         case .pinned, .anchor:
             guard let sessionID = tab.sessionID else { return }
+            MobileChatSelectionIntent.noteNotifiedSelection(sessionID)
             store.switchSession(to: sessionID, using: bridgeClient, fallbackMessages: snapshotMessages(for: sessionID))
         }
     }
@@ -1701,7 +1756,14 @@ struct ChatView: View {
         Task { @MainActor in
             defer { closingPinnedSessionIDs.remove(sessionID) }
             do {
-                _ = try await sync.unpinChatSession(sessionId: sessionID)
+                do {
+                    _ = try await sync.unpinChatSession(sessionId: sessionID)
+                } catch SyncError.timeout {
+                    // Unconfirmed, not failed: the Mac may not have picked it
+                    // up yet. The same request (same message ID) re-checks or
+                    // resends, and closing a tab twice is harmless.
+                    _ = try await sync.unpinChatSession(sessionId: sessionID)
+                }
                 // The Mac response is the authority receipt. Remove the
                 // mirrored row immediately; the snapshot/KVS write performed
                 // before that response will then converge the durable mirror.
@@ -1712,14 +1774,19 @@ struct ChatView: View {
                 sync.chatSessionListRefreshGeneration &+= 1
                 sync.pinnedChatSessions.removeAll { $0.id == sessionID }
                 if store.selectedSessionID == sessionID {
+                    MobileChatSelectionIntent.followMain()
                     adoptMainSessionFromSnapshots()
                     store.switchToMainSession(
                         using: bridgeClient,
                         fallbackMessages: snapshotMessages(for: effectiveMainSessionID)
                     )
                 }
+            } catch SyncError.timeout {
+                // Still unconfirmed. The request stays queued for the Mac and
+                // the next pinned-list snapshot drops the tab once it lands;
+                // there is nothing for the person to do yet.
             } catch {
-                store.errorBanner = "Could not close the pinned tab: \(error.localizedDescription)"
+                store.errorBanner = "Couldn't close that tab — try again."
             }
         }
     }
@@ -1736,12 +1803,12 @@ struct ChatView: View {
     }
 
     private func reasoningLabel(_ id: String) -> String {
-        reasoningOptions.first(where: { $0.id == id })?.label ?? "Think"
+        reasoningOptions.first(where: { $0.id == id })?.label ?? "Thinking"
     }
 
     private func fileAccessLabel(_ id: String) -> String {
         let normalized = ChatRuntimeControlPresentation.normalizedFileAccessID(id)
-        return fileAccessOptions.first(where: { $0.id == normalized })?.label ?? "Auto Access"
+        return fileAccessOptions.first(where: { $0.id == normalized })?.label ?? "Auto"
     }
 
     private func fileAccessIcon(_ id: String) -> String {
@@ -1765,45 +1832,97 @@ struct ChatView: View {
                 Task { await voiceInput.start() }
             }
         } label: {
+            let haze = HazeColor(stored: hazeColorRaw).control(dark: true, labelled: true)
             ZStack {
                 if micActive {
                     Circle()
-                        .strokeBorder(NativeAgentPalette.agentAccent.opacity(0.45), lineWidth: 2)
-                        .frame(width: 46, height: 46)
-                        .scaleEffect(1.12)
+                        .strokeBorder(haze.opacity(0.5), lineWidth: 2)
+                        .frame(width: 42, height: 42)
+                        .scaleEffect(1.08)
                         .animation(AppMotion.pulse, value: micActive)
                 }
 
                 Circle()
-                    .fill(micActive
-                          ? AnyShapeStyle(NativeAgentMobileTheme.Colors.accentForeground)
-                          : AnyShapeStyle(Color(.systemGray5)))
+                    .fill(micActive ? haze : Color.clear)
                     .frame(width: 36, height: 36)
                     .overlay {
-                        Image(systemName: micActive ? "mic.circle.fill" : "mic.fill")
-                            .font(.system(size: micActive ? 18 : 16, weight: .semibold))
-                            .foregroundStyle(micActive ? NativeAgentMobileTheme.Colors.onAccent : NativeAgentMobileTheme.Colors.secondary)
+                        Image(systemName: "mic")
+                            .font(.system(size: 17, weight: micActive ? .semibold : .regular))
+                            .symbolVariant(micActive ? .fill : .none)
+                            .foregroundStyle(micActive ? Color.white : AlivePalette.secondary)
                     }
                     .animation(AppMotion.snappy, value: micActive)
             }
-            .frame(width: 46, height: 46)
+            .frame(width: 44, height: 44)
+            .contentShape(Circle())
         }
         .buttonStyle(.plain)
         .accessibilityLabel(micActive ? "Stop dictation" : "Start dictation")
     }
 
-    // MARK: - Speaker toggle
+    // MARK: - Chat actions
 
-    private var speakerButton: some View {
-        Button {
-            voiceOutput.setEnabled(!voiceOutput.enabled)
+    /// One glass control for everything the chat can do besides talk: a new
+    /// conversation, another answer, spoken replies and the options sheet.
+    /// Sweep R4 C11.4's connection state lives in the status line beside it.
+    private var chatActionsMenu: some View {
+        Menu {
+            Menu("History", systemImage: "clock") {
+                ForEach(sync.sessions.filter { $0.archived != true && $0.id != effectiveMainSessionID }) { session in
+                    Button(session.displayTitle) {
+                        MobileChatSelectionIntent.noteNotifiedSelection(session.id)
+                        store.switchSession(to: session.id, using: bridgeClient,
+                                            fallbackMessages: snapshotMessages(for: session.id))
+                    }
+                }
+            }
+            .disabled(store.isSwitchingSession)
+
+            // A new-session action must never be blocked by an in-flight turn
+            // on the session we're leaving: a stuck "working" turn would also
+            // freeze the one control that recovers it. startNewSession()
+            // cancels the in-flight send and resets isLoading.
+            Button {
+                store.startNewSession()
+            } label: {
+                Label("New chat", systemImage: "square.and.pencil")
+            }
+            .disabled(store.isSwitchingSession)
+
+            // No reply yet, nothing to answer again: no dead item.
+            if store.messages.contains(where: { $0.role == .assistant }) {
+                Button {
+                    store.regenerateLast(client: bridgeClient, controls: runtimeControls)
+                } label: {
+                    Label("Answer again", systemImage: "arrow.clockwise")
+                }
+                .disabled(!store.canRegenerateLast)
+                .accessibilityLabel("Regenerate last response")
+                .accessibilityHint("Asks the agent to answer the latest message again")
+            }
+
+            Toggle(isOn: Binding(
+                get: { voiceOutput.enabled },
+                set: { voiceOutput.setEnabled($0) }
+            )) {
+                Label("Speak replies", systemImage: "speaker.wave.2")
+            }
+            .accessibilityLabel(voiceOutput.enabled ? "Disable spoken replies" : "Enable spoken replies")
+
+            Divider()
+
+            Button {
+                showsConfiguration = true
+            } label: {
+                Label("Chat options", systemImage: "slider.horizontal.3")
+            }
+            .accessibilityLabel("Chat options: provider, model and processing")
         } label: {
-            Image(systemName: voiceOutput.enabled ? "speaker.wave.2.fill" : "speaker.slash.fill")
-                .font(.system(size: 16, weight: .medium))
-                .foregroundStyle(voiceOutput.enabled ? NativeAgentMobileTheme.Colors.accentForeground : NativeAgentMobileTheme.Colors.secondary)
+            AliveTitleControlLabel(systemImage: "ellipsis")
         }
-        .animation(AppMotion.snappy, value: voiceOutput.enabled)
-        .accessibilityLabel(voiceOutput.enabled ? "Disable spoken replies" : "Enable spoken replies")
+        .buttonStyle(.plain)
+        .accessibilityLabel("Chat actions")
+        .accessibilityHint("New chat, answer again, spoken replies and chat options")
     }
 
     // MARK: - Send
@@ -1923,31 +2042,17 @@ struct ChatView: View {
         maxDimension: CGFloat = 1400,
         maxBytes: Int = cloudKitPhotoPayloadBudgetBytes
     ) -> Data? {
-        guard maxBytes > 0 else { return nil }
-        let sourceSize = image.size
-        let sourceLongest = max(sourceSize.width, sourceSize.height)
-        var dimension = min(maxDimension, sourceLongest)
+        MobileChatAttachmentPreparation.preparedJPEGData(from: image, maxDimension: maxDimension, maxBytes: maxBytes)
+    }
 
-        while dimension >= 320 {
-            let scale = sourceLongest > dimension ? dimension / sourceLongest : 1
-            let targetSize = CGSize(
-                width: max(1, sourceSize.width * scale),
-                height: max(1, sourceSize.height * scale)
-            )
-            let renderer = UIGraphicsImageRenderer(size: targetSize)
-            let normalized = renderer.image { _ in
-                image.draw(in: CGRect(origin: .zero, size: targetSize))
-            }
+    private func importSharedItems() {
+        rememberShareAgentName()
+        store.importSharedItems(controls: runtimeControls)
+    }
 
-            for quality in [0.78, 0.66, 0.54, 0.42, 0.32, 0.24] {
-                if let data = normalized.jpegData(compressionQuality: quality),
-                   data.count <= maxBytes {
-                    return data
-                }
-            }
-            dimension *= 0.78
-        }
-        return nil
+    private func rememberShareAgentName() {
+        do { try SharedChatInbox.rememberAgentName(agentDisplayName) }
+        catch { store.errorBanner = "Sharing is unavailable: \(error.localizedDescription)" }
     }
 
     private func scheduleScrollToBottom(

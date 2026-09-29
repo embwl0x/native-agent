@@ -1,13 +1,16 @@
+import AppToolRuntime
 import AppKit
 import Foundation
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
+import Desk
 // The page projection reads the same stores the pages read: the bots shelf's
 // run queue (StandingBots) and the Providers group table (ProviderRouting).
 import ProviderRouting
 import StandingBots
 import SwiftUI
+import MemoryV2
 
 /// Looking at a page without anyone else looking at it.
 ///
@@ -23,7 +26,7 @@ import SwiftUI
 /// `NSWindow.level` and every synthesized-event API (`CGEvent`,
 /// `CGWarpMouseCursorPosition`) appear nowhere in this file, in
 /// `QuietSelfAdmin.swift`, in `QuietSelfAdminSettings.swift`, or in
-/// `AppChatToolDispatcher+QuietSelfAdmin.swift` — that absence is the whole
+/// `AppToolExecutor+QuietSelfAdmin.swift` — that absence is the whole
 /// guarantee, and a grep over those four files is how to check it.
 /// True for the offscreen copy a quiet read mounts, false for the window the
 /// person is looking at.
@@ -480,9 +483,8 @@ extension QuietSelfAdminRender {
         ])
     }
 
-    private static func proposalLine(_ proposal: MemoryProposalRecord) -> String {
-        let text = proposal.display_text ?? proposal.fact_text
-        return text.isEmpty ? proposal.fact_text : text
+    private static func proposalLine(_ proposal: ProposalRecord) -> String {
+        proposal.content
     }
 
     private static func countLine(_ count: Int, _ one: String, _ many: String) -> String {
@@ -537,11 +539,11 @@ extension QuietSelfAdminRender {
             return [section("Chat", ["No conversation is open.", MoodTintProjection.line()])]
         }
         let root = dataRoot(appModel)
-        let messages = appModel.chatMessages(for: sessionID)
+        let messages = appModel.engine.transcripts.messages(for: sessionID)
         let groups = MessageGrouper.groups(
             for: messages,
             sessionId: sessionID,
-            structureVersion: appModel.chatMessagesStructureVersion
+            structureVersion: appModel.engine.transcripts.structureVersion
         )
         var sections: [JSONValue] = [section("Chat", [
             "Conversation: \(sessionID)",
@@ -779,9 +781,9 @@ extension QuietSelfAdminRender {
     // MARK: Today
 
     private static func todayProjection(appModel: AppModel) -> [JSONValue] {
-        let pending = appModel.approvals.filter { $0.status.lowercased() == "pending" }
-        let waitingNotes = appModel.inboxItems.filter { $0.status == "unread" }
-        let proposals = appModel.memoryProposals
+        let pending = appModel.engine.approvals.records.filter { $0.status.lowercased() == "pending" }
+        let waitingNotes = appModel.engine.inbox.items.filter { $0.status == "unread" }
+        let proposals = appModel.engine.memory.proposals
         var waiting: [String] = []
         waiting.append(countLine(pending.count, "approval waiting", "approvals waiting"))
         waiting.append(countLine(waitingNotes.count, "unread note", "unread notes"))
@@ -837,7 +839,7 @@ extension QuietSelfAdminRender {
     // MARK: Trust
 
     private static func trustProjection(appModel: AppModel) -> [JSONValue] {
-        guard let policy = appModel.trustPolicy else {
+        guard let policy = appModel.engine.trust.policy else {
             return [section("Trust", ["No Trust policy has loaded."])]
         }
         let mode = AppModel.agentAccessMode(from: policy)
@@ -855,9 +857,9 @@ extension QuietSelfAdminRender {
     // MARK: Memories
 
     private static func memoriesProjection(appModel: AppModel) -> [JSONValue] {
-        let memories = appModel.memories
+        let memories = appModel.engine.memory.memories
         var head = [MemoriesPageContent.keptLine(memories.count)]
-        head.append(countLine(appModel.memoryProposals.count, "proposal waiting", "proposals waiting"))
+        head.append(countLine(appModel.engine.memory.proposals.count, "proposal waiting", "proposals waiting"))
         head.append(countLine(appModel.graphEntities.count, "thing in the graph", "things in the graph"))
         var sections = [section("Memories", head)]
         if !memories.isEmpty {
@@ -865,11 +867,11 @@ extension QuietSelfAdminRender {
                 let first = record.text.split(whereSeparator: \.isNewline)
                     .map { $0.trimmingCharacters(in: .whitespaces) }
                     .first { !$0.isEmpty } ?? record.text
-                return "\(record.layer): \(first)"
+                return "\(record.layer ?? ""): \(first)"
             }))
         }
-        if !appModel.memoryProposals.isEmpty {
-            sections.append(section("Waiting", appModel.memoryProposals.prefix(12).map(proposalLine)))
+        if !appModel.engine.memory.proposals.isEmpty {
+            sections.append(section("Waiting", appModel.engine.memory.proposals.prefix(12).map(proposalLine)))
         }
         return sections
     }
@@ -879,9 +881,9 @@ extension QuietSelfAdminRender {
     /// The Desk loads its own board too (`refreshForSidebarItem(.desk)` is a
     /// no-op), so the projection takes the same read the page takes.
     private static func deskProjection(appModel: AppModel) async -> [JSONValue] {
-        let root = dataRoot(appModel)
+        let desk = appModel.engine.desk
         let snapshot = await Task.detached(priority: .userInitiated) {
-            await DeskPageSnapshot.load(root: root)
+            await DeskPageSnapshot.load(desk: desk)
         }.value
         guard snapshot.loaded else {
             return [section("Desk", [snapshot.deskUnavailable ?? "The board could not be read."])]
@@ -916,7 +918,7 @@ extension QuietSelfAdminRender {
     // MARK: Notifications
 
     private static func notificationsProjection(appModel: AppModel) -> [JSONValue] {
-        let items = appModel.inboxItems
+        let items = appModel.engine.inbox.items
         var sections = [section("Notifications", [
             countLine(items.count, "item in the inbox", "items in the inbox"),
             countLine(items.filter { $0.status == "unread" }.count, "unread", "unread"),
@@ -937,10 +939,10 @@ extension QuietSelfAdminRender {
         // that row under a "Health check failed" status is a claim about a
         // reading that never came back.
         let runtime: String
-        if appModel.healthProbeFailed {
+        if appModel.engine.doctor.healthProbeFailed {
             runtime = "unknown (last check failed)"
         } else {
-            runtime = appModel.health?.ok == true ? "online" : "not reachable"
+            runtime = appModel.engine.doctor.health?.ok == true ? "online" : "not reachable"
         }
         var head = ["Runtime: \(runtime)"]
         head.append("Status line: \(appModel.statusText)")
@@ -954,11 +956,11 @@ extension QuietSelfAdminRender {
 
     private static func capabilitiesProjection(appModel: AppModel) -> [JSONValue] {
         [section("Capabilities", [
-            countLine(appModel.capabilitySummary?.records.count ?? 0, "capability", "capabilities"),
+            countLine(appModel.engine.trust.capabilitySummary?.records.count ?? 0, "capability", "capabilities"),
             countLine(appModel.workflows.count, "workflow", "workflows"),
             countLine(appModel.mcpServers.count, "MCP server", "MCP servers"),
             countLine(appModel.nativeActions.count, "action", "actions"),
-            countLine(appModel.approvals.filter { $0.status.lowercased() == "pending" }.count,
+            countLine(appModel.engine.approvals.records.filter { $0.status.lowercased() == "pending" }.count,
                       "approval waiting", "approvals waiting"),
         ])]
     }
@@ -967,7 +969,7 @@ extension QuietSelfAdminRender {
         var sections = [section("Connectors", [
             countLine(appModel.connectors.count, "connector", "connectors"),
             countLine(appModel.workspaces.count, "workspace", "workspaces"),
-            "Telegram: \(appModel.telegramStatus?.tokenConfigured == true ? "configured" : "not configured")",
+            "Telegram: \(appModel.engine.telegram.status?.tokenConfigured == true ? "configured" : "not configured")",
         ])]
         if !appModel.connectors.isEmpty {
             sections.append(section("Connected", appModel.connectors.map {

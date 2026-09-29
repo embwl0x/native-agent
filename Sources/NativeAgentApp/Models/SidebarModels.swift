@@ -1,3 +1,4 @@
+import AppToolRuntime
 import Foundation
 import Observation
 import NativeAgentShared
@@ -89,14 +90,12 @@ enum SidebarItem: String, CaseIterable, Identifiable, Sendable {
     // Integration — it's one of the first pages a new user should see.
     // ui-simplify 2026-09-02 (Lane A): five places, not nine. Four of the old
     // nine primaries were SETUP, not use — they moved behind Settings ▸
-    // Advanced, where a person goes once. The previous nine survive as
-    // `classicPrimaryItems` so the `uiClassicShell` kill switch restores the
-    // old shell exactly.
+    // Advanced, where a person goes once.
     // User, 2026-09-04: Advanced emptied onto the rail. Memories, Personality,
     // Trust, Connectors and Diagnostics carry tabs (ShellRailPages.swift);
     // Providers, Capabilities and Notifications stand alone. Settings stays
     // last, at the bottom.
-    static let shellPrimaryItems: [SidebarItem] = [
+    static let primaryItems: [SidebarItem] = [
         .chat, .activity, .memories, .desk, .inboxPolicy,
         .personality, .providers, .trust, .connectors, .capabilities, .diagnostics, .settings,
     ]
@@ -129,86 +128,15 @@ enum SidebarItem: String, CaseIterable, Identifiable, Sendable {
         }
     }
 
-    static let classicPrimaryItems: [SidebarItem] = [
-        .chat, .activity, .memories, .desk, .skills, .providers, .trust, .macIntegration, .settings,
-    ]
-
-    static var primaryItems: [SidebarItem] {
-        NativeAgentShellPreference.isClassic() ? classicPrimaryItems : shellPrimaryItems
-    }
-
-    // Authoritative full Advanced set — the single source of membership.
-    // 2026-07-23: `.command` removed (Command Center retired; case survives as
-    // a normalized alias → .desk). Consumer-facing set-once tabs come
-    // first, developer/internal surfaces after.
-    // 2026-09-02: the four setup pages (Skills & Tools, Providers, Trust, Mac
-    // Integration) join the consumer half — same views, one door in.
-    static let classicAdvancedItems: [SidebarItem] = [
-        // B2.4/B2.6: .cognition and .inspector are route-only now — their
-        // content renders as Diagnostics segments (see ContentView), so they
-        // are not sidebar rows in ANY bucket. Diagnostics itself is
-        // developer-gated, which keeps both behind the same gate.
-        .personality, .connectors,
-        .capabilities, .knowledge, .dreams, .diagnostics,
-        .inboxPolicy, .mcp,
-    ]
-
     // The pages that are tabs now. Still listed so the palette and deep links
     // reach them; each lands on its rail page with that tab open.
-    static let shellAdvancedItems: [SidebarItem] = [
+    static let advancedItems: [SidebarItem] = [
         .skills, .macIntegration, .knowledge, .dreams, .mcp, .cognition, .inspector,
     ]
-
-    static var advancedItems: [SidebarItem] {
-        NativeAgentShellPreference.isClassic() ? classicAdvancedItems : shellAdvancedItems
-    }
-
-    // 2026-07-23 (B2.2): developer/internal surfaces. A collapsed disclosure
-    // is NOT a gate — these expose raw internals (Turn Inspector, MCP, the
-    // Cognition observatory, Knowledge Graph) a stranger should never reach by
-    // accident. They render only when the "showDeveloperSurfaces" UI-visibility
-    // preference is on (see ContentView / CommandPalette / SlimSettingsView).
-    // This is deliberately NOT coupled to Trust Center's developerMode policy
-    // field, which is a security-domain object.
-    static var developerItems: [SidebarItem] {
-        // B2.4/B2.6: .cognition and .inspector no longer appear as sidebar
-        // rows — their content lives as Diagnostics segments and their routes
-        // render those segments directly (ContentView), so listing them here
-        // would duplicate the Diagnostics row for developers. Deep links to
-        // both still land on the segment content.
-        // User, 2026-09-04: in the new shell Diagnostics, Capabilities and
-        // Notifications sit on the rail for everyone, so the gate covers only
-        // what is still filed under Advanced there.
-        // User, 2026-09-04: and the new shell gates nothing at all.
-        guard NativeAgentShellPreference.isClassic() else { return [] }
-        return advancedItems.filter {
-            [.capabilities, .knowledge, .dreams, .diagnostics, .inboxPolicy, .mcp].contains($0)
-        }
-    }
-
-    // Advanced rows always visible to consumers (set-once config tabs):
-    // the authoritative Advanced set minus the developer-gated surfaces.
-    static var consumerAdvancedItems: [SidebarItem] {
-        advancedItems.filter { !developerItems.contains($0) }
-    }
-
-    // The Advanced rows to render for a given developer-surfaces preference.
-    // Off → consumer-only; on → the full authoritative set. Lossless:
-    // consumerAdvancedItems and developerItems partition advancedItems, so no
-    // item is ever dropped — a developer surface hidden here is still reachable
-    // by deep link (the detail switch renders it regardless of row visibility).
-    static func visibleAdvancedItems(developerSurfacesEnabled: Bool) -> [SidebarItem] {
-        developerSurfacesEnabled ? advancedItems : consumerAdvancedItems
-    }
 
     // Returns true for items shown in the Advanced disclosure section
     var isAdvanced: Bool {
         SidebarItem.advancedItems.contains(self)
-    }
-
-    // Returns true for developer/internal surfaces gated behind showDeveloperSurfaces.
-    var isDeveloperSurface: Bool {
-        SidebarItem.developerItems.contains(self)
     }
 
     var systemImage: String {

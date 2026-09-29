@@ -1,3 +1,4 @@
+import AppToolRuntime
 // TodayView.swift
 // HER DAY, IN HER WORDS. (ui-simplify 2026-09-02, lane C; rebuilt to Agent's
 // own review of the page, 2026-09-02.)
@@ -27,7 +28,7 @@
 //   last night's dream       AppModel.fetchDreamDiary → dream_diary/<date>.md
 //   something she's facing   NativeCognitionRuntime.towardRead() (horizon)
 //   she wrote up the night   ChatSessionRecollections (compaction_summary rows)
-//   approvals / notifications AppModel.approvals + AppModel.inboxItems
+//   approvals / notifications engine.approvals.records + engine.inbox.items
 //
 // Rule of the page: no counts as numerals, no valence, no weights, no ids, no
 // internal vocabulary, no markdown. Clock times and weekday names are the only
@@ -39,12 +40,18 @@
 // I did as a timeline on a haze line, and what's ahead as pills.
 
 import SwiftUI
+import NotificationInbox
 import NativeAgentShared
 import NativeAgentCore
 import CognitiveSubstrate
 import PersistenceCore
+import Desk
+import Transcripts
 import MemoryV2
 import ApprovalInbox
+import Cognition
+import DeviceSync
+import DreamREMCycle
 
 // MARK: - Palette
 
@@ -545,7 +552,7 @@ struct TodaySnapshot: Sendable, Equatable {
         }
 
         // ── Something I'm facing ─────────────────────────────────────────
-        if let toward = await NativeCognitionRuntime.shared.towardRead() {
+        if let toward = await NativeAgentEngine.live.cognitionView.towardRead() {
             let label = TodayWords.capitalizedFirst(TodayWords.line(toward.displayLabel))
             if label.lowercased().contains("dream") {
                 snapshot.facing = TodayRow(
@@ -604,8 +611,8 @@ enum TodayWaitingCopy {
 
     /// An approval's name in plain words. A skill proposal's own title is a
     /// tool sequence ("workspace → workspace"); that is not a name.
-    static func approvalTitle(_ approval: ApprovalRequest) -> String {
-        ApprovalWords.title(action: approval.action, title: approval.title, reason: approval.reason ?? "")
+    static func approvalTitle(_ approval: ApprovalRecord) -> String {
+        ApprovalWords.title(action: approval.action, title: approval.title, reason: approval.reason)
     }
 }
 
@@ -617,16 +624,42 @@ enum TodayWaitingCopy {
 /// Desk item waiting on him. Failures and notices are never in it.
 @MainActor
 enum WaitingOnYou {
-    static func approvals(_ appModel: AppModel) -> [ApprovalRequest] {
-        appModel.approvals.filter { OwnerAttentionPolicy.approvalWaits(status: $0.status) }
+    static func approvals(_ appModel: AppModel) -> [ApprovalRecord] {
+        appModel.engine.approvals.records.filter { OwnerAttentionPolicy.approvalWaits(status: $0.status) }
     }
 
-    static func memories(_ appModel: AppModel) -> Int { appModel.memoryProposals.count }
+    static func memories(_ appModel: AppModel) -> Int { appModel.engine.memory.proposals.count }
 
     static func deskItems(_ items: [DeskItem]) -> [DeskItem] { DeskPageContent.waitingOnOwner(items) }
 
     static func count(_ appModel: AppModel, deskItems items: [DeskItem]) -> Int {
         approvals(appModel).count + memories(appModel) + deskItems(items).count
+    }
+}
+
+// MARK: - The full queues
+
+/// The queues a route can open (⌘⇧A, ⌘⇧I, a notification, a command). Behind
+/// the rail each opens on Today in a sheet; `memoryProposals` lands on the
+/// Memories page instead (ContentView.applyActivitySection).
+enum ActivitySection: String, Sendable, Identifiable {
+    case approvals
+    case inbox
+    case memoryProposals
+    case selfImprovement
+    /// Standing views from reflection, with the replay lineage beside them.
+    case cognitionProposals
+
+    var id: String { rawValue }
+
+    var sheetTitle: String {
+        switch self {
+        case .approvals: "Approvals and past decisions"
+        case .inbox: "Every note I've left you"
+        case .memoryProposals: "Memories to look at"
+        case .selfImprovement: "Self-improvement"
+        case .cognitionProposals: "Standing views"
+        }
     }
 }
 
@@ -681,6 +714,12 @@ struct TodayView: View {
     /// The Desk board, for the one shared "waiting on you" count.
     @State private var deskItems: [DeskItem] = []
     @State private var deskUnreadable = false
+    /// The full queue a route (⌘⇧A, ⌘⇧I, a notification) or the quiet line
+    /// at the foot of the page opened.
+    @State private var sheet: ActivitySection?
+    /// Standing views waiting on him — not mirrored into AppModel, so this
+    /// mounted owner reads the runtime and follows its change stream.
+    @State private var cognitionSubscription = ActivityCognitionSubscription()
 
     var body: some View {
         ScrollView {
@@ -692,7 +731,8 @@ struct TodayView: View {
                         momentsLine: TodayWaitingCopy.momentsLine(WaitingOnYou.memories(appModel)),
                         onReadMoments: openMomentReview,
                         approvals: WaitingOnYou.approvals(appModel),
-                        deskCount: WaitingOnYou.deskItems(deskItems).count
+                        deskCount: WaitingOnYou.deskItems(deskItems).count,
+                        onOpenApprovals: { sheet = .approvals }
                     )
                 }
 
@@ -719,7 +759,13 @@ struct TodayView: View {
 
                 let did = didTodayRows
                 if !did.isEmpty {
-                    TodaySection(title: "What I did today", rows: did, onReadDream: readDream)
+                    TodaySection(
+                        title: "What I did today",
+                        rows: did,
+                        onReadDream: readDream,
+                        notes: noteItems,
+                        onOpenNote: { openedNote = $0 }
+                    )
                 }
 
                 let ahead = aheadRows
@@ -734,6 +780,8 @@ struct TodayView: View {
                         .foregroundStyle(NativeAgentShell.secondary)
                         .padding(.top, 8)
                 }
+
+                queuesLine
 
                 // A store that would not open is the one thing a quiet page
                 // must still say out loud. One line, grey, no error text.
@@ -772,19 +820,53 @@ struct TodayView: View {
         .sheet(item: $openedNote) { item in
             InboxItemDetailSheet(
                 item: item,
-                allItems: appModel.inboxItems,
+                allItems: appModel.engine.inbox.items,
                 onAction: { actionID in
                     let outcome = await noteFlight.perform {
                         try await appModel.client.inboxAction(item.id, action: actionID)
                     }
                     if case .succeeded = outcome {
                         _ = await appModel.refreshForSidebarItem(.activity)
+                        // Same as the Inbox page: a resolving action reaches
+                        // the iPhone now, not on the next sync pass.
+                        if actionID != "read" { await NativeAgentEngine.liveDeviceSync.engine.writeSnapshots() }
                     }
                     return outcome
                 },
                 onClose: { openedNote = nil }
             )
             .presentationDetents([.medium, .large])
+        }
+        .sheet(item: $sheet) { section in
+            PageSheetHost(title: section.sheetTitle, onDone: { sheet = nil }) {
+                switch section {
+                case .approvals: ApprovalsView()
+                case .inbox: InboxView()
+                case .selfImprovement: SelfImprovementView()
+                case .cognitionProposals: CognitionProposalsView()
+                // Routed to the Memories page before it gets here.
+                case .memoryProposals: EmptyView()
+                }
+            }
+        }
+        // A route that arrived before this page mounted is stashed on
+        // AppModel; one that arrives while it is up is posted.
+        .liveOnAppear {
+            if let raw = appModel.pendingActivitySectionRaw {
+                appModel.pendingActivitySectionRaw = nil
+                openSection(raw)
+            }
+            cognitionSubscription.start()
+        }
+        .onDisappear { cognitionSubscription.stop() }
+        .onReceive(NotificationCenter.default.publisher(for: .openActivitySectionRequest)) { note in
+            guard !quietOffscreenRead else { return }
+            appModel.pendingActivitySectionRaw = nil
+            openSection(note.object as? String)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .openActivityRootRequest)) { _ in
+            guard !quietOffscreenRead else { return }
+            sheet = nil
         }
         .onChange(of: snapshot.pendingMoments, initial: true) { _, count in
             // Nobody is looking at this copy, so it has cleared nothing.
@@ -815,6 +897,47 @@ struct TodayView: View {
             _ = await appModel.refreshForSidebarItem(.activity)
             await loadHerLanes()
         }
+    }
+
+    private func openSection(_ raw: String?) {
+        guard let raw, let section = ActivitySection(rawValue: raw),
+              section != .memoryProposals else { return }
+        sheet = section
+    }
+
+    // MARK: the full queues
+
+    /// One quiet line of the full queues this page folds to: every approval
+    /// with the decisions already made, every note, the self-improvement
+    /// pass, and the standing views waiting for a call. A count rides a word
+    /// only when something in it is waiting.
+    private var queuesLine: some View {
+        let standing = cognitionSubscription.pending.count
+        // An unreadable queue says so; it never passes for an empty one.
+        let standingUnavailable: String? = {
+            if case .unavailable(let detail) = cognitionSubscription.state { return detail }
+            return nil
+        }()
+        let entries: [(ActivitySection, String)] = [
+            (.approvals, ActivitySection.approvals.sheetTitle),
+            (.inbox, ActivitySection.inbox.sheetTitle
+                + (appModel.pendingInboxCount > 0 ? " (\(appModel.pendingInboxCount))" : "")),
+            (.selfImprovement, ActivitySection.selfImprovement.sheetTitle
+                + (appModel.pendingSelfImprovementCount > 0 ? " (\(appModel.pendingSelfImprovementCount))" : "")),
+            (.cognitionProposals, ActivitySection.cognitionProposals.sheetTitle
+                + (standingUnavailable != nil ? " (couldn't check)" : standing > 0 ? " (\(standing))" : "")),
+        ]
+        return AliveFlow(spacing: 18, lineSpacing: 6) {
+            ForEach(entries, id: \.0) { section, label in
+                Button(label) { sheet = section }
+                    .buttonStyle(.plain)
+                    .font(.system(size: 13))
+                    .foregroundStyle(NativeAgentShell.secondary)
+                    .help(section == .cognitionProposals ? (standingUnavailable ?? "") : "")
+                    .accessibilityIdentifier("today.queue.\(section.rawValue)")
+            }
+        }
+        .padding(.top, 4)
     }
 
     // MARK: the header's one sentence
@@ -851,7 +974,7 @@ struct TodayView: View {
     private var earlierNotes: [TodayEarlierNote] {
         let now = Date()
         var groups: [String: TodayEarlierNote] = [:]
-        for item in appModel.inboxItems where item.isActivityPending && item.isForYouLane {
+        for item in appModel.engine.inbox.items where item.isActivityPending && item.isForYouLane {
             guard let at = TodayWords.parseTimestamp(item.created_at),
                   !Calendar.current.isDate(at, inSameDayAs: now) else { continue }
             let title = TodayWords.withoutIDs(TodayWords.line(item.title, limit: 90))
@@ -927,7 +1050,7 @@ struct TodayView: View {
         let calendar = Calendar.current
         struct Span { var count = 0; var start = Date.distantFuture; var end = Date.distantPast; var surfaces = Set<String>() }
         var people = Span()
-        for session in appModel.chatSessions {
+        for session in appModel.engine.transcripts.sessions {
             guard let end = UserDisplayFormatters.parseISOTimestamp(session.updatedAt ?? session.createdAt),
                   calendar.isDate(end, inSameDayAs: now),
                   (session.messageCount ?? 0) > 0 else { continue }
@@ -995,12 +1118,23 @@ struct TodayView: View {
     }
 
     private var noteRows: [TodayRow] {
+        foldClaudeRows(todayNotes.map(\.row))
+    }
+
+    /// Today's notes by row, so a row opens the note it came from — the same
+    /// detail sheet, with the same actions, an earlier note opens in. A row
+    /// that folds several notes opens none.
+    private var noteItems: [String: InboxItemRecord] {
+        Dictionary(todayNotes.map { ($0.row.id, $0.item) }, uniquingKeysWith: { first, _ in first })
+    }
+
+    private var todayNotes: [(row: TodayRow, item: InboxItemRecord)] {
         let now = Date()
         let calendar = Calendar.current
         let haveDreamRow = snapshot.dream != nil
-        let rows: [TodayRow] = appModel.inboxItems
+        return appModel.engine.inbox.items
             .filter { $0.isActivityPending && $0.isForYouLane }
-            .compactMap { item -> TodayRow? in
+            .compactMap { item -> (row: TodayRow, item: InboxItemRecord)? in
                 // The dream already has its own row; a `dream_cycle` card
                 // beside it is the same night told twice.
                 let source = item.source.lowercased()
@@ -1025,17 +1159,16 @@ struct TodayView: View {
                     if let job = Self.claudeJobIdentity(item) { rowID = "claude:\(job):\(item.id)" }
                 }
                 guard !title.isEmpty || !summary.isEmpty else { return nil }
-                return TodayRow(
+                return (TodayRow(
                     id: rowID,
                     title: title.isEmpty ? "I left you a note" : title,
                     line: summary,
                     at: at
-                )
+                ), item)
             }
-            .sorted { $0.at < $1.at }
+            .sorted { $0.row.at < $1.row.at }
             .suffix(TodayMetrics.noteRowsShown)
             .map { $0 }
-        return foldClaudeRows(rows)
     }
 
     /// The job a Claude routing note refers to: the referenced execution when
@@ -1112,7 +1245,7 @@ struct TodayView: View {
     /// important row is the live trouble. The detailed cards stay on the
     /// classic Activity page and in Diagnostics.
     private var providerTroubleLine: String? {
-        let degraded = appModel.inboxItems.contains {
+        let degraded = appModel.engine.inbox.items.contains {
             $0.source.lowercased() == "provider_vitals"
                 && $0.isActivityPending
                 && $0.severity.lowercased() == "important"
@@ -1123,15 +1256,15 @@ struct TodayView: View {
     // MARK: loading
 
     private func loadHerLanes() async {
-        let sessionIDs = appModel.chatSessions
+        let sessionIDs = appModel.engine.transcripts.sessions
             .filter { $0.archived != true }
             .sorted { ($0.updatedAt ?? $0.createdAt) > ($1.updatedAt ?? $1.createdAt) }
             .prefix(TodayMetrics.sessionsScanned)
             .map(\.id)
         let diary = await appModel.fetchDreamDiary(limit: 1)
         let entry = diary?.entries.first
-        let markdown = entry?.content
-        let dreamAt = TodayWords.parseTimestamp(entry?.modified_at)
+        let markdown = entry?.text
+        let dreamAt = TodayWords.parseTimestamp(entry?.modifiedAt)
         dreamUnavailable = diary == nil || (diary?.unreadableEntries ?? 0) > 0
             || (entry != nil && (markdown?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true))
         var loaded: [String: [ChatMessage]] = [:]
@@ -1140,7 +1273,7 @@ struct TodayView: View {
         // eight JSONL files.
         var recollections: [ChatSessionRecollection] = []
         for id in sessionIDs {
-            if let transcript = try? await appModel.client.getChatTranscript(sessionId: id) {
+            if let transcript = try? await appModel.engine.transcripts.loadTranscript(sessionId: id, cached: true) {
                 loaded[id] = transcript.messages
                 recollections += transcript.recollections
             }
@@ -1165,7 +1298,7 @@ struct TodayView: View {
 
     private func readDream(_ date: String) async -> Bool {
         guard let entry = await appModel.fetchDreamEntry(date: date),
-              !entry.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+              !entry.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             dreamUnavailable = true
             return false
         }
@@ -1182,6 +1315,9 @@ struct TodaySection: View {
     let title: String
     let rows: [TodayRow]
     var onReadDream: ((String) async -> Bool)? = nil
+    /// The note behind each row that is one; a click opens it.
+    var notes: [String: InboxItemRecord] = [:]
+    var onOpenNote: ((InboxItemRecord) -> Void)? = nil
     @AppStorage(HazeColor.key) private var colorRaw = HazeColor.defaultValue.rawValue
 
     var body: some View {
@@ -1195,7 +1331,8 @@ struct TodaySection: View {
                         // Each ring a little quieter than the one above it.
                         dotOpacity: rows.count <= 1 ? 1 : 1 - 0.55 * Double(index) / Double(rows.count - 1),
                         haze: haze,
-                        onReadDream: onReadDream)
+                        onReadDream: onReadDream,
+                        onOpen: notes[row.id].flatMap { note in onOpenNote.map { open in { open(note) } } })
                 }
             }
             .background(alignment: .topLeading) {
@@ -1238,9 +1375,11 @@ struct TodayAhead: View {
 struct TodayWaitingCard: View {
     let momentsLine: String?
     let onReadMoments: () -> Void
-    let approvals: [ApprovalRequest]
+    let approvals: [ApprovalRecord]
     /// Desk items waiting on him; one row that opens the Desk.
     var deskCount = 0
+    /// The full request behind an approval, and the decisions already made.
+    var onOpenApprovals: (() -> Void)? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
@@ -1265,7 +1404,7 @@ struct TodayWaitingCard: View {
                 }
 
                 ForEach(approvals) { approval in
-                    TodayApprovalRow(approval: approval)
+                    TodayApprovalRow(approval: approval, onShowFull: onOpenApprovals)
                 }
 
                 if deskCount > 0 {
@@ -1338,7 +1477,9 @@ struct TodayEarlierNoteRow: View {
 /// offers — `ApprovalDecisionAction` is literally the same call.
 struct TodayApprovalRow: View {
     @Environment(AppModel.self) private var appModel
-    let approval: ApprovalRequest
+    let approval: ApprovalRecord
+    /// Opens the full request — every preview line, the risk, the action.
+    var onShowFull: (() -> Void)? = nil
 
     @State private var isDeciding = false
     @State private var errorText: String?
@@ -1353,16 +1494,18 @@ struct TodayApprovalRow: View {
     }
 
     private var reason: String {
-        let stated = TodayWords.firstSentence(approval.reason ?? "")
+        let stated = TodayWords.firstSentence(approval.reason)
         if !stated.isEmpty { return stated }
         // A card with no reason line carries the thing itself in its preview
         // (a REM lesson is the lesson; User, 2026-09-12: "I can't see the REM
         // lesson, what it is, to approve it"). Show her words, not just a title.
-        return TodayWords.bounded(TodayWords.plain(approval.payloadPreview ?? ""), limit: 240)
+        return TodayWords.bounded(TodayWords.plain(approval.payloadPreview), limit: 240)
     }
 
     private var shortReason: String { TodayWords.bounded(reason, limit: 90) }
-    private var reasonFolds: Bool { shortReason != reason }
+    /// The row opens when its reason is cut, or when the full request is one
+    /// click further; closed, it keeps the row's fixed height.
+    private var reasonFolds: Bool { shortReason != reason || onShowFull != nil }
     private var canResolve: Bool { ApprovalPayloadPreviewPresentation.canResolve(approval) }
 
     var body: some View {
@@ -1370,11 +1513,20 @@ struct TodayApprovalRow: View {
             HStack(alignment: .center, spacing: 12) {
                 AliveWaitingDot()
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(title.isEmpty ? "I'm asking first" : TodayWords.bounded(title, limit: 70))
-                        .font(.system(size: 15, weight: .medium))
-                        .foregroundStyle(NativeAgentShell.text)
-                        .lineLimit(1)
-                        .truncationMode(.tail)
+                    HStack(alignment: .firstTextBaseline, spacing: 6) {
+                        Text(title.isEmpty ? "I'm asking first" : TodayWords.bounded(title, limit: 70))
+                            .font(.system(size: 15, weight: .medium))
+                            .foregroundStyle(NativeAgentShell.text)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                        if reasonFolds {
+                            NativeDisclosureTriangle(isOpen: reasonOpen,
+                                                     accessibilityLabel: reasonOpen ? "Show less" : "Read the whole reason") {
+                                reasonOpen.toggle()
+                            }
+                            .fixedSize()
+                        }
+                    }
                     if !reason.isEmpty {
                         Text(reasonOpen ? reason : shortReason)
                             .font(.system(size: 13))
@@ -1406,6 +1558,14 @@ struct TodayApprovalRow: View {
                     .hazeTinted(.button)
                     .disabled(isDeciding || !canResolve)
                     .accessibilityIdentifier("today.waiting.approve.\(approval.id)")
+            }
+            if reasonOpen, let onShowFull {
+                Button("Show the full request", action: onShowFull)
+                    .buttonStyle(.plain)
+                    .font(.system(size: 13))
+                    .foregroundStyle(NativeAgentShell.secondary)
+                    .padding(.leading, 20)
+                    .accessibilityIdentifier("today.waiting.full-request.\(approval.id)")
             }
             if !canResolve {
                 troubleLine(ApprovalPayloadPreviewPresentation.unavailableText)
@@ -1451,6 +1611,8 @@ struct TodayTimelineRow: View {
     var dotOpacity: Double = 1
     var haze: Color
     var onReadDream: ((String) async -> Bool)? = nil
+    /// A row that is one note opens it; a row that folds opens in place.
+    var onOpen: (() -> Void)? = nil
     @State private var isOpen = false
     @State private var readingDream = false
     @State private var dreamMissing = false
@@ -1499,11 +1661,8 @@ struct TodayTimelineRow: View {
                             .lineLimit(1)
                             .truncationMode(.tail)
                         if foldable {
-                            Image(systemName: "chevron.right")
-                                .font(ShellType.captionSemibold)
-                                .foregroundStyle(NativeAgentShell.secondary)
-                                .rotationEffect(.degrees(isOpen ? 90 : 0))
-                                .accessibilityHidden(true)
+                            NativeDisclosureTriangle(isOpen: isOpen, accessibilityLabel: isOpen ? "Fold" : "Open") { toggle() }
+                                .fixedSize()
                         }
                         Spacer(minLength: 0)
                     }
@@ -1560,11 +1719,12 @@ struct TodayTimelineRow: View {
         .contentShape(Rectangle())
         .onTapGesture { toggle() }
         .accessibilityAction(named: isOpen ? "Fold" : "Open") { toggle() }
+        .help(onOpen != nil && !foldable ? "Open this note" : "")
         .accessibilityIdentifier("today.row")
     }
 
     private func toggle() {
-        guard foldable else { return }
+        guard foldable else { onOpen?(); return }
         withAnimation(NativeAgentMotion.respecting(
             NativeAgentMotion.quick, reduceMotion: reduceMotion
         )) { isOpen.toggle() }

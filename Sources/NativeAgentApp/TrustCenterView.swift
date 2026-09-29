@@ -1,3 +1,4 @@
+import AppToolRuntime
 import SwiftUI
 import AppKit
 import CoreGraphics
@@ -15,6 +16,7 @@ import CoreSpotlight
 #endif
 #if canImport(CloudKit)
 import CloudKit
+import TrustCenter
 #endif
 
 /// The collapsed Trust Advanced header is the only visible surface for its
@@ -227,21 +229,9 @@ struct TrustCenterView: View {
     // 2026-07-22 trust-tighten: disclosure state persists across visits so a
     // power user who opens the Advanced group finds it open next time.
     @AppStorage("trustShowAdvanced") private var showAdvancedTrust = false
-    private var loadsSecurityStatus = true
 
     init() {}
 
-    #if DEBUG
-    init(snapshotPolicy: TrustPolicy, expanded: Bool) {
-        loadsSecurityStatus = false
-        _permissionLevel = State(initialValue: snapshotPolicy.permissionLevel)
-        _autonomyDefault = State(initialValue: snapshotPolicy.autonomyDefault ?? "supervised")
-        _requireBackups = State(initialValue: snapshotPolicy.filePolicy?.requireBackupBeforeWrite ?? true)
-        _outsideDefault = State(initialValue: snapshotPolicy.filePolicy?.outsideWorkspaceDefault ?? "deny")
-        _developerMode = State(initialValue: snapshotPolicy.developerMode)
-        _agentAccessMode = State(initialValue: AppModel.agentAccessMode(from: snapshotPolicy))
-    }
-    #endif
 
     var body: some View {
         ScrollView {
@@ -262,7 +252,7 @@ struct TrustCenterView: View {
                 // The 2026-07-22 deletion was right about the old panel — five
                 // hand-written tiles restating controls below them, which is a
                 // trust claim that goes stale silently. TrustGuardrailSummary
-                // is a pure function of `appModel.trustPolicy` plus the access
+                // is a pure function of `appModel.engine.trust.policy` plus the access
                 // mode this page already resolved, so it cannot drift from the
                 // switches underneath it. Read-only: it renders no controls.
                 accessAndPolicyPanel
@@ -274,9 +264,9 @@ struct TrustCenterView: View {
                     }
                 }
 
-                TrustGuardrailSummaryPanel(accessMode: appModel.trustPolicy.map { accessMode(from: $0) } ?? "auto")
+                TrustGuardrailSummaryPanel(accessMode: appModel.engine.trust.policy.map { accessMode(from: $0) } ?? "auto")
 
-                NativeSecurityCenterPanel(loadsOnAppear: loadsSecurityStatus, modeTitle: activePreset?.title)
+                NativeSecurityCenterPanel(modeTitle: activePreset?.title)
 
                 // Alive glass (2026-09-23): the feature permissions grid is
                 // an eyebrow over one group card per feature, and the old
@@ -363,11 +353,11 @@ struct TrustCenterView: View {
         }
         .navigationTitle("Trust")
         .quietReadTask {
-            if let policy = appModel.trustPolicy {
+            if let policy = appModel.engine.trust.policy {
                 applyPolicy(policy)
             }
         }
-        .onChange(of: appModel.trustPolicy) { _, newPolicy in
+        .onChange(of: appModel.engine.trust.policy) { _, newPolicy in
             if let newPolicy {
                 applyPolicy(newPolicy)
             }
@@ -393,20 +383,25 @@ struct TrustCenterView: View {
         // carries no card of its own — a card inside a card is a plate.
         TrustSection(title: "Access and policy", carded: false) {
             VStack(alignment: .leading, spacing: 12) {
-                LazyVGrid(columns: [GridItem(.flexible(), spacing: 10, alignment: .top), GridItem(.flexible(), alignment: .top)], spacing: 10) {
-                    TrustPresetButton(title: TrustPolicyPreset.safe.title, subtitle: TrustPolicyPreset.safe.summary, isSelected: activePreset == .safe) {
-                        applyTrustPreset(.safe)
-                    }
-                    TrustPresetButton(title: TrustPolicyPreset.work.title, subtitle: TrustPolicyPreset.work.summary, isSelected: activePreset == .work) {
-                        applyTrustPreset(.work)
-                    }
-                    TrustPresetButton(title: TrustPolicyPreset.builder.title, subtitle: TrustPolicyPreset.builder.summary, isSelected: activePreset == .builder) {
-                        applyTrustPreset(.builder)
-                    }
-                    TrustPresetButton(title: TrustPolicyPreset.fullMac.title, subtitle: TrustPolicyPreset.fullMac.summary, isSelected: activePreset == .fullMac) {
-                        applyTrustPreset(.fullMac)
+                // The Mac's own radio group (User 09-27: all controls native).
+                Picker("Access", selection: Binding<TrustPolicyPreset?>(
+                    get: { activePreset },
+                    set: { if let preset = $0 { applyTrustPreset(preset) } }
+                )) {
+                    ForEach(TrustPolicyPreset.allCases, id: \.quietID) { preset in
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(preset.title)
+                            Text(preset.summary)
+                                .font(ShellType.label)
+                                .foregroundStyle(NativeAgentShell.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        .padding(.vertical, 3)
+                        .tag(Optional(preset))
                     }
                 }
+                .pickerStyle(.radioGroup)
+                .labelsHidden()
                 Text(policyStatusLine)
                     .font(ShellType.labelSemibold)
                     .foregroundStyle(NativeAgentShell.text)
@@ -415,31 +410,25 @@ struct TrustCenterView: View {
                 // What I can do right now, where it says what it copies.
             }
             .alert(
-                "Enable Full Mac access?",
+                MobileTrustAction.fullMacTitle,
                 isPresented: $showFullMacAlert
             ) {
-                Button("Enable Full Mac", role: .destructive) {
+                Button(MobileTrustAction.fullMacButton, role: .destructive) {
                     confirmPendingFullMacPolicy()
                 }
                 Button("Cancel", role: .cancel) {
                     cancelPendingFullMacPolicy()
                 }
             } message: {
-                Text("""
-                I will be able to read and modify files anywhere, run shell commands, control the system, and move or trash files across app surfaces.
-
-                Workspace actions run autonomously, and access outside workspaces is allowed. Pre-write backups stay on.
-
-                Full Mac does not bypass macOS itself. Documents, Desktop, Downloads, and other protected folders still need their own approval in System Settings → Privacy & Security → Files and Folders (or Full Disk Access) before anything can read them.
-                """)
+                Text(MobileTrustAction.fullMacMessage)
             }
         }
     }
 
     private var policyStatusLine: String {
         TrustCenterPolicyStatusPresentation.line(
-            policy: appModel.trustPolicy,
-            accessMode: appModel.trustPolicy.map { accessMode(from: $0) },
+            policy: appModel.engine.trust.policy,
+            accessMode: appModel.engine.trust.policy.map { accessMode(from: $0) },
             permissionLevel: permissionLevel,
             autonomyDefault: autonomyDefault,
             requireBackups: requireBackups,
@@ -453,7 +442,7 @@ struct TrustCenterView: View {
     }
 
     private var activePreset: TrustPolicyPreset? {
-        guard let policy = appModel.trustPolicy,
+        guard let policy = appModel.engine.trust.policy,
               appModel.panelRefreshStatus[.trust]?.failedEndpoints.contains("trust policy") != true else { return nil }
         return TrustCenterPolicyStatusPresentation.preset(policy: policy, accessMode: accessMode(from: policy))
     }
@@ -467,10 +456,10 @@ struct TrustCenterView: View {
     private var advancedPresentation: TrustCenterAdvancedDisclosurePresentation.State {
         let refresh = appModel.panelRefreshStatus[.trust]
         return TrustCenterAdvancedDisclosurePresentation.resolve(
-            hasPolicy: appModel.trustPolicy != nil,
+            hasPolicy: appModel.engine.trust.policy != nil,
             hasPrivacyMap: appModel.privacyMap != nil,
-            backupCount: appModel.backups.count,
-            backupBeforeWriteEnabled: appModel.trustPolicy?.filePolicy?.requireBackupBeforeWrite,
+            backupCount: appModel.engine.trust.backups.count,
+            backupBeforeWriteEnabled: appModel.engine.trust.policy?.filePolicy?.requireBackupBeforeWrite,
             hasRefreshAttempt: refresh != nil,
             failedEndpoints: refresh?.failedEndpoints ?? []
         )
@@ -501,7 +490,7 @@ struct TrustCenterView: View {
     private var safetyBoundariesPanel: some View {
         TrustSection(title: "Safety boundaries") {
             let state = TrustSafetyBoundariesPresentation.state(
-                policy: appModel.trustPolicy,
+                policy: appModel.engine.trust.policy,
                 accessMode: agentAccessMode
             )
             if let unavailable = state.unavailableMessage {
@@ -524,7 +513,7 @@ struct TrustCenterView: View {
 
     private var privacyMapPanel: some View {
         PrivacyMapPanel(
-            trustPolicyRoot: appModel.trustPolicy?.appDataRoot,
+            trustPolicyRoot: appModel.engine.trust.policy?.appDataRoot,
             privacyMap: appModel.privacyMap
         )
     }
@@ -536,20 +525,20 @@ struct TrustCenterView: View {
                     .font(ShellType.label)
                     .foregroundStyle(NativeAgentShell.secondary)
             } else if advancedPresentation.backups == .unavailable || advancedPresentation.backups == .stale {
-                Text(appModel.backups.isEmpty
+                Text(appModel.engine.trust.backups.isEmpty
                      ? "Backups could not be loaded. Reopen Trust to try again."
                      : "Showing the last loaded backups. Reopen Trust to check for changes.")
                     .font(ShellType.label)
                     .foregroundStyle(NativeAgentShell.trouble)
                     .fixedSize(horizontal: false, vertical: true)
             }
-            if appModel.backups.isEmpty, advancedPresentation.backups == .available {
+            if appModel.engine.trust.backups.isEmpty, advancedPresentation.backups == .available {
                 Text("No backups yet. Backups made here, and the ones taken before a workspace write, will be listed with their date and what they covered.")
                     .font(ShellType.label)
                     .foregroundStyle(NativeAgentShell.secondary)
                     .fixedSize(horizontal: false, vertical: true)
-            } else if !appModel.backups.isEmpty {
-                ForEach(appModel.backups.prefix(8)) { backup in
+            } else if !appModel.engine.trust.backups.isEmpty {
+                ForEach(appModel.engine.trust.backups.prefix(8)) { backup in
                     HStack(spacing: 8) {
                         VStack(alignment: .leading, spacing: 2) {
                             Text(backup.reason)
@@ -640,93 +629,15 @@ struct TrustCenterView: View {
         appModel.statusText = TrustPolicyPresetActionPresentation.statusText(for: outcome)
         switch outcome {
         case .confirmationRequired:
-            agentAccessMode = appModel.trustPolicy.map { accessMode(from: $0) }
+            agentAccessMode = appModel.engine.trust.policy.map { accessMode(from: $0) }
                 ?? AppModel.normalizedAgentAccessMode(appModel.chatFileAccess)
             showFullMacAlert = true
         case .applied(let policy):
             applyPolicy(policy)
         case .failed:
-            if let policy = appModel.trustPolicy {
+            if let policy = appModel.engine.trust.policy {
                 applyPolicy(policy)
             }
-        }
-    }
-}
-
-enum TrustPolicyPreset: CaseIterable, Equatable {
-    case safe
-    case work
-    case builder
-    case fullMac
-
-    var title: String {
-        switch self {
-        case .safe: "Safe"
-        case .work: "Work mode"
-        case .builder: "Builder"
-        case .fullMac: "Full Mac"
-        }
-    }
-
-    /// What this posture actually permits, in one line. The Trust page and the
-    /// composer's Trust card read the same string, so a posture can never mean
-    /// one thing on one surface and another somewhere else.
-    var summary: String {
-        switch self {
-        case .safe: "Read files; no changes or Mac control"
-        case .work: "Edit approved workspaces; no outside writes or shell"
-        case .builder: "Edit workspaces; ask to write outside; no shell"
-        case .fullMac: "Files anywhere, shell, system control, move or trash"
-        }
-    }
-
-    /// The name quiet self-administration uses for this preset.
-    var quietID: String {
-        switch self {
-        case .safe: "safe"
-        case .work: "work_mode"
-        case .builder: "builder"
-        case .fullMac: "full_mac"
-        }
-    }
-
-    /// The presets the agent may apply to itself while this Mac is in Full Mac.
-    /// Full Mac is deliberately absent: lowering the fence is allowed, raising
-    /// it to Full Mac is the person's alone.
-    static var quietWritable: [TrustPolicyPreset] { [.safe, .work, .builder] }
-
-    var plan: TrustPolicyPresetPlan {
-        switch self {
-        case .safe:
-            TrustPolicyPresetPlan(
-                agentAccessMode: "read_only", permissionLevel: "strict",
-                autonomyDefault: "supervised", requireBackups: true,
-                outsideDefault: "deny", developerMode: false,
-                commit: .accessModeOnly, requiresFullMacConfirmation: false,
-                enablesAutonomy: false
-            )
-        case .work:
-            TrustPolicyPresetPlan(
-                agentAccessMode: "workspace", permissionLevel: "balanced",
-                autonomyDefault: "workspace_autonomous", requireBackups: true,
-                outsideDefault: "deny", developerMode: false,
-                commit: .accessModeOnly, requiresFullMacConfirmation: false
-            )
-        case .builder:
-            TrustPolicyPresetPlan(
-                agentAccessMode: "workspace", permissionLevel: "balanced",
-                autonomyDefault: "workspace_autonomous", requireBackups: true,
-                outsideDefault: "ask", developerMode: false,
-                commit: .accessModeThenTrustPolicy, requiresFullMacConfirmation: false
-            )
-        case .fullMac:
-            TrustPolicyPresetPlan(
-                agentAccessMode: "full", permissionLevel: "full_mac_os",
-                autonomyDefault: "workspace_autonomous", requireBackups: true,
-                outsideDefault: "allow", developerMode: true,
-                commit: .accessModeOnly, requiresFullMacConfirmation: true,
-                enablesAutonomy: true
-            )
         }
     }
 }
@@ -830,28 +741,6 @@ private struct PrivacyMapPanelCategoryRow: View {
     }
 }
 
-struct TrustPolicyPresetPlan: Equatable {
-    enum Commit: Equatable {
-        case accessModeOnly
-        case accessModeThenTrustPolicy
-    }
-
-    let agentAccessMode: String
-    let permissionLevel: String
-    let autonomyDefault: String
-    let requireBackups: Bool
-    let outsideDefault: String
-    let developerMode: Bool
-    let commit: Commit
-    let requiresFullMacConfirmation: Bool
-    /// What this preset does to unattended work. Full Mac means unattended work
-    /// too (User, 2026-09-13), so it writes the switch on; Safe means the
-    /// opposite and writes it OFF — leaving it alone meant Full Mac → Safe kept
-    /// running unattended under a card that says it cannot change anything.
-    /// Work mode and Builder are silent (nil) and leave the person's choice.
-    var enablesAutonomy: Bool? = nil
-}
-
 enum TrustPolicyPresetTransition: Equatable {
     case apply(TrustPolicyPresetPlan)
     case confirmationRequired(TrustPolicyPresetPlan)
@@ -897,44 +786,12 @@ enum TrustPolicyPresetAction {
             return .confirmationRequired(plan)
         }
 
-        // Destructive actions and shell ride with Full Mac's developer mode
-        // only — the same pairing the access-mode writer used.
-        let destructive = plan.agentAccessMode == "full" && plan.developerMode
-        let remoteFromIosAllowed: Bool
-        switch plan.agentAccessMode {
-        case "read_only":
-            remoteFromIosAllowed = false
-        case "full":
-            remoteFromIosAllowed = true
-        default:
-            var existing = appModel.trustPolicy
-            if existing == nil { existing = try? await appModel.getTrustPolicy() }
-            remoteFromIosAllowed = existing?.macControlPolicy?.remoteFromIosAllowed ?? false
-        }
-        var body: [String: Any] = [
-            "permissionLevel": plan.permissionLevel,
-            "autonomyDefault": plan.autonomyDefault,
-            "developerMode": plan.developerMode,
-            "filePolicy": [
-                "requireBackupBeforeWrite": plan.requireBackups,
-                "outsideWorkspaceDefault": plan.outsideDefault,
-                "allowDestructiveActions": destructive,
-            ],
-            "macControlPolicy": NativeClient.macControlPolicyForAccessMode(
-                plan.agentAccessMode,
-                remoteFromIosAllowed: remoteFromIosAllowed,
-                developerMode: destructive
-            ),
-        ]
-        if let enablesAutonomy = plan.enablesAutonomy {
-            body["enableAutonomy"] = enablesAutonomy
-        }
-
         let policy: TrustPolicy
         do {
-            policy = try await NativeClient.applyTrustPolicyPatch(
-                body: body,
+            policy = try await NativeClient.saveTrustPreset(
+                preset,
                 dataRoot: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot(),
+                fullMacConfirmed: fullMacConfirmed,
                 guardedByLockedPolicy: guardedByLockedPolicy
             )
         } catch {
@@ -969,53 +826,6 @@ enum TrustPolicyPresetActionPresentation {
     }
 }
 
-/// One of the four presets, as a selectable card (Alive glass, 2026-09-23).
-/// The selected one wears a ring in the haze; the others stay quiet cards.
-private struct TrustPresetButton: View {
-    var title: String
-    var subtitle: String
-    var isSelected: Bool
-    var action: () -> Void
-    @AppStorage(HazeColor.key) private var colorRaw = HazeColor.defaultValue.rawValue
-
-    var body: some View {
-        let haze = HazeColor(stored: colorRaw).base
-        let shape = RoundedRectangle(cornerRadius: AliveMetrics.cardRadius, style: .continuous)
-        Button(action: action) {
-            VStack(alignment: .leading, spacing: 4) {
-                HStack(spacing: 6) {
-                    Text(title)
-                        .font(.system(size: 14, weight: .medium))
-                        .foregroundStyle(NativeAgentShell.text)
-                    Spacer(minLength: 4)
-                    // Not colour alone: the chosen one also carries a mark.
-                    if isSelected {
-                        Image(systemName: "checkmark.circle.fill")
-                            .font(.system(size: 13))
-                            .foregroundStyle(haze)
-                            .accessibilityHidden(true)
-                    }
-                }
-                Text(subtitle)
-                    .font(.system(size: 12))
-                    .foregroundStyle(NativeAgentShell.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 14)
-            .frame(maxWidth: .infinity, minHeight: 76, alignment: .topLeading)
-            .aliveCard()
-            .overlay {
-                if isSelected {
-                    shape.strokeBorder(haze, lineWidth: 2)
-                }
-            }
-            .contentShape(shape)
-        }
-        .buttonStyle(.naFeel)
-        .accessibilityAddTraits(isSelected ? [.isSelected] : [])
-    }
-}
 
 // MARK: - Page kit (2026-09-03 Advanced refinement)
 //
@@ -1108,32 +918,15 @@ struct TrustFold<Label: View, Trailing: View, Content: View>: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Button {
-                withAnimation(NativeAgentMotion.respecting(NativeAgentMotion.spring, reduceMotion: reduceMotion)) {
-                    isExpanded.toggle()
-                }
-            } label: {
-                // First baseline: with a title and a subtitle, centring put
-                // the chevron between the two lines instead of beside the title.
-                HStack(alignment: .firstTextBaseline, spacing: 8) {
-                    Image(systemName: "chevron.right")
-                        .font(ShellType.captionSemibold)
-                        // Secondary: tertiary fails where the haze peaks.
-                        .foregroundStyle(NativeAgentShell.secondary)
-                        .rotationEffect(.degrees(isExpanded ? 90 : 0))
-                    label
-                    Spacer(minLength: 8)
-                    trailing
-                }
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .accessibilityValue(isExpanded ? "Expanded" : "Collapsed")
-
-            if isExpanded {
-                content
-                    .transition(NativeAgentMotion.reveal(reduceMotion: reduceMotion))
+        // The Mac's own disclosure (User 09-27: all controls native).
+        DisclosureGroup(isExpanded: $isExpanded) {
+            content
+                .padding(.top, 12)
+        } label: {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                label
+                Spacer(minLength: 8)
+                trailing
             }
         }
     }

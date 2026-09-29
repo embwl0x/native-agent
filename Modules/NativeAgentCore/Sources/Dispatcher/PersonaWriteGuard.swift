@@ -18,7 +18,7 @@ import Foundation
 //                 autonomy_source="dynamic_persona_guard",
 //             )
 //
-// WHY THIS IS A SEPARATE LAYER (CUTOVER_PLAN.md §6.30 prereq #12):
+// WHY THIS IS A SEPARATE LAYER:
 // The generic unified-policy resolver (`resolve_effective_policy`) decides
 // autonomy per-TOOL. It does NOT inspect the *kind* argument, so under a
 // permissive trust policy a `persona_write{kind:"soul"}` could resolve to
@@ -31,9 +31,8 @@ import Foundation
 // already speaking; the guard does not second-guess it).
 //
 // SCOPE / DORMANCY: the Swift `Dispatcher` module is still a DORMANT-PROXY for
-// execution (see Dispatcher.swift header + CUTOVER_PLAN.md §6.11/§6.30) — the
-// native unified-policy resolver (`resolve_effective_policy`) is NOT yet ported
-// (that is prereqs #1-#11 in the §6.30 list). This file ports ONLY the guard
+// execution (see Dispatcher.swift header) — the native unified-policy resolver
+// (`resolve_effective_policy`) is NOT yet ported. This file ports ONLY the guard
 // predicate, as a pure function with no side effects, so it is ready to slot
 // into the native resolver the moment that lands. It mutates nothing and is
 // not yet wired into the proxy run() path (where autonomy is decided by the

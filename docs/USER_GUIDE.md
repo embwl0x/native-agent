@@ -10,13 +10,33 @@ other devices and grant access as you need them.
    drag NativeAgent to Applications, and open the app.
 2. Enter your name and the agent's name. Expand **What the agent can help with ·
    Optional** for an overview.
-3. Connect one AI account during setup, then finish onboarding. If you skip
-   connecting, open **Providers** on the left rail before chatting.
-4. Open **Chat** and say hello, or ask for help with a task.
+3. Connect one AI account during setup, then finish onboarding. You can skip
+   and connect later.
+4. The app opens in **Simple** view. The agent asks what it should be for you
+   and how it should sound, then offers to set things up by talking; anything
+   it needs arrives as a card in the chat.
 
-Without a connected account, Chat offers **Open Providers**. Sign in with an
-account you already use or add an API key; **Cancel** stops a stalled browser
-sign-in so you can retry.
+Without a connected account, the agent points at a **Providers** card beside
+the message. Sign in with an account you already use or add an API key;
+**Cancel** stops a stalled browser sign-in so you can retry.
+
+### Simple, Advanced and Agent
+
+The switch at the window's top right picks the view:
+
+- **Simple** — the agent, the agents it talks to, and its helpers on one panel
+  beside the chat. Click any of them to talk to it directly; a working one shows
+  a moving rim. There are no settings pages: ask the agent, or use the gear at
+  the foot of the panel for the colour of the light, **Warmth in the glass**
+  (offered in dark mode) and **More settings**, which opens Settings in
+  Advanced.
+- **Advanced** — the full app, with the rail of pages described under
+  [Main Mac pages](#main-mac-pages).
+- **Agent** — what the agent sees on its own desktop, read-only.
+
+A fresh install starts in Simple; an install that already had chats starts in
+Advanced. The agent can switch the view for you. The rest of this guide names
+pages as they appear in Advanced.
 
 Connect one AI account to start chatting. **Work** and **Memory and mind** follow
 **Chat** unless you choose otherwise in Providers; a group that holds a choice of
@@ -55,18 +75,8 @@ These settings are optional and can be changed after your first chat.
    replies. **Observe Only** measures selection without supplying it to the
    model; **Off** disables it.
 
-In the classic sidebar, use **Settings → Advanced → Subconscious** and set
-**Fluid Context** to **Active** for resident context selection to feed
-replies.
-
-The classic reflection status names the selected model with **Running with …**
-or explains a missing connection, unavailable model, or inactive background
-activity. To inspect the exact state, open
-**Diagnostics → Cognition** on the default rail. In the classic sidebar, turn
-on **Settings → Show Developer Surfaces**, then use **Settings → Advanced →
-Diagnostics → Cognition**. Developer Surfaces changes UI visibility only; the
-saved Trust policy's shell and system-control authority is a separate thing —
-see [Three terms that are often confused](#three-terms-that-are-often-confused).
+To inspect the exact state of background reflection and context selection,
+open **Diagnostics → Cognition**.
 
 Background reflection can shape attention, voice, and carefulness, but cannot
 grant permissions, approve actions, or bypass Trust.
@@ -120,7 +130,7 @@ grant permissions, approve actions, or bypass Trust.
 
 ## Main Mac pages
 
-The default shell puts the main pages on the left rail, in the order below, and
+Advanced view puts the main pages on the left rail, in the order below, and
 related controls are tabs within those pages. A hairline separates the everyday
 places from the setup ones, and **Settings** sits at the foot.
 
@@ -131,14 +141,14 @@ places from the setup ones, and **Settings** sits at the foot.
 | **Memories** | Search and manage saved facts; decide **Keep** or **Don't keep** beside each proposal. Kept facts sit under **What I've kept**; a fold at the bottom — **N things I let go** — lists what you rejected, read-only, so the same fact cannot quietly return. The **Knowledge graph** is the second tab. |
 | **Desk** | Line up large projects, dependencies, bridge work, schedules, research, agent pursuits, approvals, progress, verification, and outcomes. |
 | **Notifications** | **Proactive inbox** — **Let the agent raise things unasked** — plus its **Triggers**, **Watched folders**, and the inbox history. |
-| **Bots** | Standing briefs the agent runs on a schedule or on a GitHub or Slack event, their dated replies, **Run once** and **Pause**. On the rail by default since 0.4.10. |
+| **Helpers** | Standing helpers (bots) the agent runs on a schedule or on a GitHub or Slack event, their dated replies, **Run once** and **Pause**. |
 | **Personality** | Documents labeled by purpose: **Identity**, **Expression**, **About you**, **Personal growth**, and **Working guidelines**; the agent's minds and **Dreams** have their own tabs. |
 | **Providers** | Connect an AI account; optionally tune models per activity group. An account whose access has expired says so rather than reading as ready. |
 | **Trust** | Presets, feature permissions and approvals; the **Mac integration** tab holds individual Mac-service access. |
-| **Connectors** | Service connections, with **MCP**, **Telegram**, and **iPhone** tabs. |
+| **Connectors** | Service connections, with **Agents**, **MCP**, **Telegram**, and **iPhone** tabs. |
 | **Capabilities** | What the agent can actually do, with **Show all actions**. |
-| **Diagnostics** | **Doctor**, **Status**, **Runs log**, **Cognition**, **Inspector**, **Skills**, and **Tools** tabs. |
-| **Settings** | Appearance, shortcuts, updates, help, **An inner life**, and **Memory in every reply**. The classic layout also shows **App status**. |
+| **Diagnostics** | **Health checks**, **Status**, **Run history**, **Cognition**, **Chat turn details**, **Skills**, and **Tools** tabs. |
+| **Settings** | Appearance, shortcuts, updates, help, **An inner life**, and **Memory in every reply**. |
 
 ### The agent reading and setting these pages, quietly
 
@@ -164,18 +174,8 @@ this app only; anything on the rest of the Mac still goes through Mac control.
   report how long it runs, how large it is, and which voice spoke, without the
   speakers ever opening. Your own read-aloud setting is untouched by it.
 
-**Classic sidebar note:** **Settings → Use the classic sidebar**
-switches layouts. That layout's own sidebar rows are Chat, Activity, Memories,
-Desk, Skills & Tools, Providers, Trust, Mac Integration, and Settings, and its
-**Advanced** disclosure holds **Personality** and **Connectors** plus the
-developer-gated **Capabilities**, **Knowledge Graph**, **Dreams**,
-**Diagnostics**, **Inbox Policy**, and **MCP**. **Show Developer Surfaces**
-reveals that second half. The same disclosure holds embeddings and
-**Subconscious**. Providers, Trust, and Mac Integration are classic sidebar rows
-in their own right, not Advanced entries.
-
-The system-health pill (the "N warnings" readout) and the session token meter
-live in **Diagnostics**, not in the chat window. Chat carries one status dot
+The system-health pill (the "N warnings" readout) lives in **Diagnostics**, not
+in the chat window; the composer carries only the context ring. Chat carries one status dot
 instead of two competing warning surfaces.
 
 Every page is still reachable by **Command-K** and by its existing deep link,
@@ -204,8 +204,8 @@ unsaved edits.
 
 NativeAgent keeps ordinary turns small by loading capabilities lazily.
 
-- Twenty tools ride every request (sixteen until Full Mac accessibility is on,
-  since the four Mac verbs wait for it), and so do the tools of any MCP server you
+- A short always-on set of tools rides every request (the four Mac verbs only
+  once Full Mac accessibility is on), and so do the tools of any MCP server you
   have mounted — those are inserted automatically. Everything else is catalogued
   but costs nothing until it is needed, and leaves again after two turns without
   a real call — including under Full Mac, where the file and system tools load
@@ -311,9 +311,7 @@ change only lands on the next launch, the control carries a restart tag.
   and every other preset clears it. The operator-facing control nearest to it is
   **Enable Shell Commands**, in the **Shell Commands** panel further down the
   **Trust** tab; it is marked restart, and its caption says to keep it off
-  unless that field is intentionally on for the operator session. **Show
-  Developer Surfaces** in Settings is a third, unrelated thing — it changes UI
-  visibility only and grants nothing.
+  unless that field is intentionally on for the operator session.
 - **YOLO** is not a mode and there is nothing to switch on. It is the name for
   the 2026-08-12 defaults ruling in the Trust defaults table: unlisted tools
   resolve to `auto` rather than asking, and Mac motor actions are `auto`, so an
@@ -353,9 +351,9 @@ place. A partial result says what was not created and why.
   Swarms provider default unless explicitly specialized, start read-only by
   default, and gain no authority beyond the parent turn.
 
-## Bots: standing helpers
+## Helpers: standing bots
 
-**Bots** holds the standing helpers the agent makes — for you, or to help itself.
+**Helpers** holds the standing helpers (bots) the agent makes — for you, or to help itself.
 A bot needs a name, a brief, and a model. It keeps its own conversation, uses the
 agent's ordinary tools under the Trust policy you have saved, gets the same
 remembered context any other turn gets, and lives until the agent deletes it.
@@ -412,8 +410,8 @@ remembered context any other turn gets, and lives until the agent deletes it.
 
 1. Install NativeAgent Mobile and keep the Mac and mobile device signed into
    the intended iCloud account.
-2. On Mac, open **Connectors → iPhone** (classic sidebar:
-   **Settings → Pair iPhone / iPad**).
+2. On Mac, open **Connectors → iPhone** (in Simple view, ask the agent to pair
+   the phone).
 3. Pairing details arrive automatically for the same Apple Account. On mobile,
    choose **Connect via iCloud** when ready. If waiting, tap **Check for Mac**.
    **Correct pairing key manually** appears only after the Mac's details arrive.
@@ -439,8 +437,7 @@ available to run provider turns and tools. See
 ## Telegram, Slack, and local bridges
 
 - Configure Telegram in **Connectors → Telegram** and other services in
-  **Connectors**. In the classic sidebar, use **Settings → Telegram** and
-  **Settings → Advanced → Connectors**.
+  **Connectors**.
 - Each surface has a scoped session but uses the same persona, memory, Fluid
   Context, provider policy, tools, trust gates, and receipts. A bridge turn is a
   full turn: what the agent remembers from it names the sender, and the session is
@@ -534,11 +531,11 @@ the verified result returns to that same mind.
 
 ## Health and troubleshooting
 
-- **Diagnostics → Doctor** checks providers, connectors, storage, tools, and
+- **Diagnostics → Health checks** checks providers, connectors, storage, tools, and
   background loops. It reports when the checks were taken, not just when the page
   last saved them, and declines to grade a sample too small to judge.
-- **Diagnostics → Status** and **Runs log** show app and execution state, and
-  **Inspector** reads one turn end to end.
+- **Diagnostics → Status** and **Run history** show app and execution state, and
+  **Chat turn details** reads one turn end to end.
 - **Diagnostics → Cognition** shows Fluid Context and Organism readouts.
 - **Today** is the first place to check approvals, warnings, and work waiting
   on the user.

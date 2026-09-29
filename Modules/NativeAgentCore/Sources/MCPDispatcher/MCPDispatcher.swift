@@ -734,12 +734,12 @@ public actor SwiftNativeMCPDispatcher: MCPDispatcherProtocol {
     /// Uncached read path — extracted so the cache wrapper above can call
     /// the real logic without inlining a 90-line method.
     func _readServersUncached() async throws -> [MCPServer] {
-        let raw = await persistence.readJSON(serversPath, defaultValue: .array([]))
+        let raw = try await persistence.readJSON(serversPath, ifMissing: .array([]))
         let savedRecords: [JSONValue]
         if case .array(let items) = raw { savedRecords = items } else { savedRecords = [] }
 
         // Read searxng_base_url from the Swift-native research config.
-        let configRaw = await persistence.readJSON(configPath, defaultValue: .object([:]))
+        let configRaw = try await persistence.readJSON(configPath, ifMissing: .object([:]))
         var searxngURL = ""
         if case .object(let cfg) = configRaw,
            case .string(let s) = cfg["searxng_base_url"] ?? .null {
@@ -824,7 +824,7 @@ public actor SwiftNativeMCPDispatcher: MCPDispatcherProtocol {
     }
 
     public func listTools(forServer serverId: String) async throws -> [MCPTool] {
-        let raw = await persistence.readJSON(toolsCachePath, defaultValue: .object([:]))
+        let raw = try await persistence.readJSON(toolsCachePath, ifMissing: .object([:]))
         guard case .object(let dict) = raw else { return [] }
         guard case .object(let entry) = dict[serverId] ?? .null else { return [] }
         let cachedAt: String? = {

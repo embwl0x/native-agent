@@ -1,3 +1,4 @@
+import MacAssistantStatus
 import SwiftUI
 import Observation
 
@@ -10,7 +11,7 @@ final class MacAssistantWatchSetupReadState {
     @ObservationIgnored private var generation: UInt64 = 0
 
     @discardableResult
-    func reload(read: @MainActor () async throws -> MacAssistantStatusResponse) async -> Bool {
+    func reload(read: @MainActor () async throws -> MacAssistantStatusResult) async -> Bool {
         generation &+= 1
         let request = generation
         isLoading = true
@@ -33,7 +34,7 @@ final class MacAssistantWatchSetupReadState {
 }
 
 struct MacAssistantWatchSetupView: View {
-    typealias StatusReader = @MainActor () async throws -> MacAssistantStatusResponse
+    typealias StatusReader = @MainActor () async throws -> MacAssistantStatusResult
 
     var refreshToken: Int
     private let statusReader: StatusReader?
@@ -166,9 +167,9 @@ struct MacAssistantWatchSetupView: View {
 
     private func templateRow(_ template: MacAssistantWatchTemplate) -> some View {
         let plain = Self.plainTemplate[template.id]
-        let when = template.scheduleLabel.map { $0.prefix(1).lowercased() + $0.dropFirst() }
-        let sentence = plain.map { $0.sentence.replacingOccurrences(of: "{when}", with: when ?? "on a schedule") }
-            ?? [template.scheduleLabel, template.summary].compactMap { $0 }.joined(separator: " · ")
+        let when = template.scheduleLabel.prefix(1).lowercased() + template.scheduleLabel.dropFirst()
+        let sentence = plain.map { $0.sentence.replacingOccurrences(of: "{when}", with: when) }
+            ?? [template.scheduleLabel, template.summary].joined(separator: " · ")
         return statusRow(
             title: plain?.title ?? template.title,
             detail: sentence,
@@ -187,7 +188,7 @@ struct MacAssistantWatchSetupView: View {
         // The macOS prompt note matters only until access is ready.
         var detail = plain?.detail ?? item.detail
         if status != "ready", let note = Self.promptNote[item.id] {
-            detail = (detail ?? "") + note
+            detail = detail + note
         }
         // The two next steps that are a place in this app become a button to
         // that place, not a sentence pointing at it; Mac Mail gets a real check.

@@ -40,6 +40,7 @@ import WorkflowOrchestration
 import Skills
 import Connectors
 import Browser
+import DeviceSync
 
 /// Result of asking the Swift-owned device-login manager to start OAuth.
 /// `started` does not, by itself, claim that macOS opened a browser or that
@@ -49,60 +50,16 @@ enum CodexOAuthLoginLaunchOutcome: Equatable {
     case failed(String)
 }
 
-extension NativeClient {
-    /// One trust-aware catalog projection for the Mac Tools page and the
-    /// paired iPhone snapshot. This uses the same dispatcher composition as
-    /// ordinary app chat, including Mac Integration availability.
-    func getChatToolCatalogSnapshot() async throws -> ChatToolCatalogSnapshot {
-        let root = dataRootOverride ?? PersistenceCore.defaultDataRoot()
-        let inner = SwiftToolDispatcher(
-            dataRoot: root,
-            macIntegrationBridge: MacIntegrationBridgeImpl(),
-            agentBridgeConfigRoot: NativeAgentPaths.bridgeConfigRoot(dataRoot: root)
-        )
-        let dispatcher = AppChatToolDispatcher(inner: inner)
-        let envelope = try await dispatcher.dispatch(
-            tool: "tool_catalog",
-            input: ["detail": .string("full")],
-            surface: "chat"
-        )
-        guard let snapshot = ChatToolCatalogSnapshot.from(jsonValue: envelope) else {
-            throw NSError(
-                domain: "NativeAgent.ChatToolCatalog",
-                code: 1,
-                userInfo: [NSLocalizedDescriptionKey: "Tool catalog returned an invalid envelope."]
-            )
-        }
-        return snapshot
-    }
-}
-
 @MainActor
 extension AppModel {
     @MainActor
     func verifyCodex() async {
         do {
             let result = try await client.verifyCodex()
-            codexAuthStatus = try? await client.getCodexAuthStatus()
+            engine.providers.codexAuth = try? await engine.providers.codexAuthStatus()
             statusText = result.ok ? "Codex ready: \(result.model)" : "Codex check failed"
         } catch {
             statusText = "Codex check failed: \(error.localizedDescription)"
-        }
-    }
-
-    @MainActor
-    @discardableResult
-    func refreshChatToolCatalog() async -> Bool {
-        chatToolCatalogLoadFailed = false
-        chatToolCatalogLoadError = nil
-        do {
-            chatToolCatalog = try await client.getChatToolCatalogSnapshot()
-            return true
-        } catch {
-            NSLog("[ChatToolCatalog] dispatch failed: \(error.localizedDescription)")
-            chatToolCatalogLoadFailed = true
-            chatToolCatalogLoadError = error.localizedDescription
-            return false
         }
     }
 
@@ -119,8 +76,8 @@ extension AppModel {
         await refreshForSidebarItem(.tools)
         let result = ToolsRefreshPresentation.completion(
             panelRefresh: panelRefreshStatus[.tools],
-            catalogLoadFailed: chatToolCatalogLoadFailed,
-            hasCatalog: chatToolCatalog != nil
+            catalogLoadFailed: engine.tools.catalogLoadError != nil,
+            hasCatalog: engine.tools.catalog != nil
         )
         toolsRefreshState = result
         if let message = ToolsRefreshPresentation.message(for: result) {
@@ -133,8 +90,8 @@ extension AppModel {
     @discardableResult
     func refreshModelCatalog() async -> Bool {
         do {
-            let catalog = try await client.getModelCatalog(refresh: true)
-            modelCatalog = catalog
+            let catalog = try await engine.providers.modelCatalog(refresh: true)
+            engine.providers.catalog = catalog
             // User, 2026-09-06: a refresh that never reached the provider used
             // to report success — the catalog read now says where its rows came
             // from, and this says the same thing out loud instead of claiming a
@@ -148,14 +105,10 @@ extension AppModel {
             let freshness = catalog.catalogFreshness
                 .flatMap(ModelCatalogFreshness.init(rawValue:))
             switch freshness {
-            case .staleAfterFailedRefresh:
-                statusText = "Model catalog refresh failed — showing the cached list"
-            case .builtInAfterFailedRefresh:
-                statusText = "Model catalog refresh failed — showing the built-in list"
+            case .staleAfterFailedRefresh, .unavailable:
+                statusText = catalog.catalogNote ?? "Couldn't load models."
             case .cached:
                 statusText = "Model catalog unchanged (cached)"
-            case .builtIn:
-                statusText = "Model catalog showing the built-in list"
             case .liveIncomplete:
                 // User, 2026-09-06: a partial page used to be labelled `cached`
                 // and reported as a refresh that could not reach the provider.
@@ -229,7 +182,7 @@ extension AppModel {
             do {
                 let receipt = try await writeChatBrainSelection(pending.selection)
                 if let catalog = receipt.catalog {
-                    modelCatalog = catalog
+                    engine.providers.catalog = catalog
                 }
                 chatBrainCanonicalSelection = receipt.selection
 
@@ -323,10 +276,10 @@ extension AppModel {
     }
 
     private func publishProviderCatalogStatusAfterBrainSave() {
-        let providerSnapshot = providersList
+        let providerSnapshot = engine.providers.connections
         Task {
-            _ = await iCloudBridge.shared.publishProviderCatalogStatus(
-                providers: providerSnapshot
+            _ = await NativeAgentEngine.liveDeviceSync.bridge.publishProviderCatalogStatus(
+                providers: providerSnapshot.map(NAProviderCatalogProvider.init)
             )
         }
     }
@@ -342,11 +295,11 @@ extension AppModel {
     func loadProvidersForChat() async -> Bool {
         var providersFresh = true
         do {
-            providersList = try await client.listProviders()
-            let providerSnapshot = providersList
+            engine.providers.connections = try await engine.providers.list()
+            let providerSnapshot = engine.providers.connections
             Task {
-                _ = await iCloudBridge.shared.publishProviderCatalogStatus(
-                    providers: providerSnapshot
+                _ = await NativeAgentEngine.liveDeviceSync.bridge.publishProviderCatalogStatus(
+                    providers: providerSnapshot.map(NAProviderCatalogProvider.init)
                 )
             }
         } catch {
@@ -354,7 +307,7 @@ extension AppModel {
             providersFresh = false
         }
         do {
-            if let pid = try await NativeClient.readActiveProvidersFromDisk()["chat"] {
+            if let pid = try await engine.providers.activeProviders()["chat"] {
                 chatProvider = pid
             }
         } catch {
@@ -371,10 +324,10 @@ extension AppModel {
         do {
             _ = try await client.setActiveProvider(surface: "chat", providerId: providerId)
             chatProvider = providerId
-            let providerSnapshot = providersList
+            let providerSnapshot = engine.providers.connections
             Task {
-                _ = await iCloudBridge.shared.publishProviderCatalogStatus(
-                    providers: providerSnapshot
+                _ = await NativeAgentEngine.liveDeviceSync.bridge.publishProviderCatalogStatus(
+                    providers: providerSnapshot.map(NAProviderCatalogProvider.init)
                 )
             }
             statusText = "Chat provider → \(providerId)"
@@ -407,7 +360,7 @@ extension AppModel {
     @MainActor
     func adoptProviderForBlankSurfaces(_ providerId: String) async {
         let available: Set<String> = Set(
-            ((try? await client.listProviders()) ?? [])
+            ((try? await engine.providers.list()) ?? [])
                 .filter { $0.auth_status.state == "ready" }
                 .map { $0.provider_id }
         )

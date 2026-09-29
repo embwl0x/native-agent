@@ -10,6 +10,9 @@ import CryptoKit
 
 #if canImport(CloudKit) && !os(Linux)
 import CloudKit
+import OSLog
+
+private let devicePushLog = Logger(subsystem: "NativeAgent.DeviceSync", category: "subscription")
 
 enum DeviceCloudKitSubscriptionID {
     static let chat = "NAChatMessage.incoming"
@@ -68,6 +71,7 @@ struct DeviceCKUnsortableField: LocalizedError, Sendable {
 private func withDeviceCKTimeout<T: Sendable>(
     _ label: String,
     seconds: TimeInterval = 5,
+    onFailure: (@Sendable (Error) async -> Void)? = nil,
     _ work: @Sendable @escaping () async throws -> T
 ) async -> T? {
     guard NADeviceSyncRecoveryBudget.hasTime else { return nil }
@@ -87,7 +91,7 @@ private func withDeviceCKTimeout<T: Sendable>(
             guard let result = await state.wait() else { return .cancelled }
             switch result {
             case .success(let value): return .success(value)
-            case .failure(let error): return .failure(String(describing: error))
+            case .failure(let error): return .failureError(error)
             }
         }
         group.addTask {
@@ -107,6 +111,7 @@ private func withDeviceCKTimeout<T: Sendable>(
         case .failure(let error):
             NSLog("[ck-device] \(label) failed: \(error)"); return nil
         case .failureError(let error):
+            await onFailure?(error)
             NSLog("[ck-device] \(label) failed: \(error)"); return nil
         case .timedOut:
             NSLog("[ck-device] \(label) timed out after \(formatDeviceCKTimeoutSeconds(seconds)); cloudd unhealthy?")
@@ -120,6 +125,7 @@ private func withDeviceCKTimeout<T: Sendable>(
 private func withDeviceCKTimeoutThrowing<T: Sendable>(
     _ label: String,
     seconds: TimeInterval = 5,
+    onFailure: (@Sendable (Error) async -> Void)? = nil,
     _ work: @Sendable @escaping () async throws -> T
 ) async throws -> T {
     guard NADeviceSyncRecoveryBudget.hasTime else { throw CancellationError() }
@@ -153,7 +159,9 @@ private func withDeviceCKTimeoutThrowing<T: Sendable>(
         group.cancelAll(); workTask.cancel(); await state.cancelWaiter()
         switch first {
         case .success(let v): return v
-        case .failureError(let e): throw e
+        case .failureError(let e):
+            await onFailure?(e)
+            throw e
         case .failure(let msg): throw DeviceSyncError.transient(message: msg)
         case .timedOut:
             NSLog("[ck-device] \(label) timed out after \(formatDeviceCKTimeoutSeconds(seconds)); cloudd unhealthy?")
@@ -255,7 +263,6 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
     private var pairingHandler: (@Sendable (Data) async -> Bool)?
     private var statusWrites: [String: Task<Void, Error>] = [:]
     private var statusHandlers: [String: @Sendable (String) async -> Bool] = [:]
-    private var visibleNotificationSubscriptionReady = false
     private var lastPullDate: Date?
     private var lastPullCursorPersistenceAt: Date?
     // CK-3c: transport-level drain serialization (guarded by `lock`). Concurrent
@@ -312,6 +319,26 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
     private var seenMessageIDs: Set<String> = []
     private var seenMessageIDsOrdered: [String] = []
     private let seenMessageIDsCap = 2000
+    private var accountFailureHandler: (@Sendable (DeviceSyncAccountFailure) async -> Void)?
+
+    public func observeAccountFailures(_ handler: @escaping @Sendable (DeviceSyncAccountFailure) async -> Void) {
+        lock.lock(); defer { lock.unlock() }
+        accountFailureHandler = handler
+    }
+
+    private func loadAccountFailureHandler() -> (@Sendable (DeviceSyncAccountFailure) async -> Void)? {
+        lock.lock(); defer { lock.unlock() }
+        return accountFailureHandler
+    }
+
+    private func reportAccountFailure(_ error: Error) async {
+        guard case .account(let failure) = Self.mapError(error) else { return }
+        await loadAccountFailureHandler()?(failure)
+    }
+
+    private var accountFailureReporter: @Sendable (Error) async -> Void {
+        { error in await self.reportAccountFailure(error) }
+    }
 
     public init(
         role: NADeviceRole,
@@ -334,11 +361,7 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
         }
     }
 
-    public var presentsVisualNotifications: Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return visibleNotificationSubscriptionReady
-    }
+    public var presentsVisualNotifications: Bool { false }
 
     private static func cursorKey(role: NADeviceRole, container: String) -> String {
         "NADeviceSync.cursor.\(role.rawValue).\(container)"
@@ -388,7 +411,7 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
         let fields = try NAChatMessageCodec.encode(message)
         let recordType = Self.recordType(for: fields)
         do {
-            try await withDeviceCKTimeoutThrowing("CloudKitDeviceTransport.send") {
+            try await withDeviceCKTimeoutThrowing("CloudKitDeviceTransport.send", onFailure: accountFailureReporter) {
                 let ck = CKRecord(
                     recordType: recordType,
                     recordID: CKRecord.ID(recordName: fields.recordName)
@@ -449,7 +472,7 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
     /// is left alone. Best effort: a failed touch costs the record its
     /// refreshed clock, never the send's success.
     private func touchExistingRecord(named recordName: String) async {
-        _ = await withDeviceCKTimeout("CloudKitDeviceTransport.sendReplayTouch") {
+        _ = await withDeviceCKTimeout("CloudKitDeviceTransport.sendReplayTouch", onFailure: accountFailureReporter) {
             let record = try await self.database.record(
                 for: CKRecord.ID(recordName: recordName)
             )
@@ -470,7 +493,7 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
     }
 
     private func existingMessageRecordMatches(_ fields: NAChatMessageFields) async -> Bool {
-        await withDeviceCKTimeout("CloudKitDeviceTransport.sendReplayProof") {
+        await withDeviceCKTimeout("CloudKitDeviceTransport.sendReplayProof", onFailure: accountFailureReporter) {
             let record = try await self.database.record(
                 for: CKRecord.ID(recordName: fields.recordName)
             )
@@ -495,41 +518,47 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
         // already waiting. Live push → drain wiring is CK-3; drainIncoming() is
         // the pull half and is exercisable now.
         _ = await ensurePushSubscriptions()
-        await drainIncoming()
+        let result = await drainIncoming()
+        devicePushLog.info("Initial incoming drain role=\(self.role.rawValue, privacy: .public) dispatched=\(result.dispatchedCount)")
     }
 
     public func ensurePushSubscriptions() async -> Bool {
         guard configured else { return false }
         do {
             try await subscribeToChanges()
-            return role != .ios || presentsVisualNotifications
+            return true
         } catch {
             // Fail loud (no-silent-fallbacks): a failed subscription means no
             // live push wakeups — the drain still works when polled, but callers
             // must not describe the visual route as eligible.
             NSLog("[ck-device] subscription registration FAILED (no live push): \(error)")
+            devicePushLog.error("Chat subscription failed role=\(self.role.rawValue, privacy: .public): \(String(describing: error), privacy: .private)")
             return false
         }
     }
 
     /// Pull incoming messages since the last cursor, decode, dispatch to the
     /// registered handler, and advance the cursor with a clock-skew overlap
-    /// window. Idempotent per message id. Returns the count dispatched.
+    /// window. Idempotent per message id. Failed queries never report an empty success.
     @discardableResult
-    public func drainIncoming() async -> Int {
-        guard NADeviceSyncRecoveryBudget.hasTime else { return 0 }
-        guard configured else { return 0 }  // crash-guard: pull() touches CKContainer
+    public func drainIncoming() async -> DeviceSyncDrainResult {
+        guard NADeviceSyncRecoveryBudget.hasTime else { return .skipped(0) }
+        guard configured else { return .skipped(0) }  // crash-guard: pull() touches CKContainer
         // CK-3c: serialize via SYNC lock helpers (the codebase keeps every NSLock
         // use in a synchronous scope — never held across an await). The body's own
         // fine-grained locking still works since the slot flag isn't held here.
-        guard beginDrainOrCoalesce() else { return await drainIncomingCancellations() }
+        guard beginDrainOrCoalesce() else { return .skipped(await drainIncomingCancellations()) }
         var total = 0
+        var outcome: DeviceSyncDrainResult = .skipped(0)
         while true {
-            total += await drainIncomingBody()
+            outcome = await drainIncomingBody()
+            total += outcome.dispatchedCount
             if endDrainOrContinue() { continue }  // a concurrent caller requested a re-run
             break
         }
-        return total
+        if case .success = outcome { return .success(total) }
+        if case .failure(let error, _) = outcome { return .failure(error, dispatched: total) }
+        return .skipped(total)
     }
 
     /// Acquire the single drain slot. Returns true if acquired; false if a drain
@@ -553,9 +582,9 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
 
     /// The drain body — always run serialized by `drainIncoming`; never call it
     /// directly (concurrent bodies can drop records, the P0 the wrapper prevents).
-    private func drainIncomingBody() async -> Int {
+    private func drainIncomingBody() async -> DeviceSyncDrainResult {
         let (handler, since) = loadHandlerAndCursor()
-        guard handler != nil else { return 0 }
+        guard handler != nil else { return .skipped(0) }
         let queryStartedAt = Date()
 
         let inbound = role.inboundDirection.rawValue
@@ -576,10 +605,10 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
             fetched = records
         } catch {
             NSLog("[ck-device] drainIncoming pull failed: \(error)")
-            return 0
+            return .failure(Self.mapError(error))
         }
 
-        return await deliverIncoming(fetched, since: since, queryStartedAt: queryStartedAt)
+        return .success(await deliverIncoming(fetched, since: since, queryStartedAt: queryStartedAt))
     }
 
     func deliverIncoming(_ fetched: [(fields: NAChatMessageFields, modDate: Date?)], since: Date?, queryStartedAt: Date) async -> Int {
@@ -867,7 +896,8 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
         do {
             page = try await withDeviceCKTimeoutThrowing(
                 "CloudKitDeviceTransport.sweep",
-                seconds: 10
+                seconds: 10,
+                onFailure: accountFailureReporter
             ) {
                 if orderedByServerModDate {
                     do {
@@ -923,7 +953,8 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
         do {
             try await withDeviceCKTimeoutThrowing(
                 "CloudKitDeviceTransport.sweepDelete",
-                seconds: 15
+                seconds: 15,
+                onFailure: accountFailureReporter
             ) {
                 let op = CKModifyRecordsOperation(
                     recordsToSave: nil,
@@ -1040,7 +1071,7 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
         let recordName = "pairing.\(role.rawValue)"
         let publishedAt = isoNow()
         do {
-            try await withDeviceCKTimeoutThrowing("CloudKitDeviceTransport.publishPairing") {
+            try await withDeviceCKTimeoutThrowing("CloudKitDeviceTransport.publishPairing", onFailure: accountFailureReporter) {
                 let ck = CKRecord(
                     recordType: recordType,
                     recordID: CKRecord.ID(recordName: recordName)
@@ -1086,7 +1117,7 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
         guard configured else { return nil }  // crash-guard: record(for:) touches CKContainer
         let peerRole: NADeviceRole = role == .mac ? .ios : .mac
         let recordName = "pairing.\(peerRole.rawValue)"
-        return await withDeviceCKTimeout("CloudKitDeviceTransport.peekPairingSecret") {
+        return await withDeviceCKTimeout("CloudKitDeviceTransport.peekPairingSecret", onFailure: accountFailureReporter) {
             let record = try await self.database.record(for: CKRecord.ID(recordName: recordName))
             guard let hex = record["secretHex"] as? String else { return nil }
             return Self.data(fromHex: hex)
@@ -1104,7 +1135,7 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
         guard let handler = loadPairingHandler() else { return false }
         let peerRole: NADeviceRole = role == .mac ? .ios : .mac
         let recordName = "pairing.\(peerRole.rawValue)"
-        let hit: PeerPairingHit? = await withDeviceCKTimeout("CloudKitDeviceTransport.drainPairing") {
+        let hit: PeerPairingHit? = await withDeviceCKTimeout("CloudKitDeviceTransport.drainPairing", onFailure: accountFailureReporter) {
             let record = try await self.database.record(for: CKRecord.ID(recordName: recordName))
             guard let hex = record["secretHex"] as? String,
                   let data = Self.data(fromHex: hex) else { return nil }
@@ -1142,7 +1173,7 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
                 try await self.performModifyRecords(op)
         }
         do {
-            try await withDeviceCKTimeoutThrowing("CloudKitDeviceTransport.setStatus", seconds: 3) {
+            try await withDeviceCKTimeoutThrowing("CloudKitDeviceTransport.setStatus", seconds: 3, onFailure: accountFailureReporter) {
                 try await write.value
             }
         } catch is DeviceCKLandmineTimeout {
@@ -1239,7 +1270,7 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
         for (key, handler) in handlers {
             guard NADeviceSyncRecoveryBudget.hasTime else { break }
             let recordName = "status.\(peerRole.rawValue).\(key)"
-            let hit: PeerStatusHit? = await withDeviceCKTimeout("CloudKitDeviceTransport.drainStatus", seconds: 3) {
+            let hit: PeerStatusHit? = await withDeviceCKTimeout("CloudKitDeviceTransport.drainStatus", seconds: 3, onFailure: accountFailureReporter) {
                 let record = try await self.database.record(for: CKRecord.ID(recordName: recordName))
                 guard let value = record["value"] as? String else { return nil }
                 return PeerStatusHit(value: value, modDate: record.modificationDate)
@@ -1262,7 +1293,7 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
 
     public func accountStatus() async -> String {
         guard configured else { return "notConfigured" }  // crash-guard: CKContainer init is the trap site
-        return await withDeviceCKTimeout("CloudKitDeviceTransport.accountStatus") {
+        return await withDeviceCKTimeout("CloudKitDeviceTransport.accountStatus", onFailure: accountFailureReporter) {
             let s = try await CKContainer(identifier: self.containerIdentifier).accountStatus()
             switch s {
             case .available: return "available"
@@ -1280,13 +1311,10 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
     public func subscribeToChanges() async throws {
         guard configured else { throw DeviceSyncError.notConfigured }  // crash-guard: no CKContainer
         do {
-            try await withDeviceCKTimeoutThrowing("CloudKitDeviceTransport.subscribeToChanges") {
-                // Register the visible lane first on iOS. A schema or migration
-                // failure in silent sync must not prevent explicit alerts from
-                // reaching APNS.
-                if self.role == .ios {
-                    try await self.ensureVisibleNotificationSubscription()
-                }
+            try await withDeviceCKTimeoutThrowing("CloudKitDeviceTransport.subscribeToChanges", onFailure: accountFailureReporter) {
+                // Both peers repair the shared legacy visible subscription.
+                // Direct APNS is the sole remote alert; CloudKit only wakes sync.
+                try await self.ensureSilentNotificationSubscription()
                 let sub = Self.makeSilentChatSubscription()
                 try await self.ensureSubscription(sub, id: sub.subscriptionID)
             }
@@ -1300,9 +1328,8 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
     /// Keep this predicate schema-independent. A production build using a
     /// compound optional-`kind` predicate stopped receiving alerts, and its
     /// serial registration order allowed any silent-lane failure to prevent
-    /// visible registration. Explicit alerts use the visible subscription
-    /// below; dependable repeated delivery is owned by direct APNS when
-    /// configured.
+    /// notification registration. Explicit alerts are owned by direct APNS;
+    /// both CloudKit subscriptions only wake sync.
     static func makeSilentChatSubscription() -> CKQuerySubscription {
         let sub = CKQuerySubscription(
             recordType: NADeviceSyncRecordType.chatMessage,
@@ -1316,24 +1343,14 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
         return sub
     }
 
-    /// A high-priority visual CloudKit notification for explicit
-    /// `mobile.notify` records. The dedicated record type guarantees that a
-    /// notification matches exactly one APNS-producing subscription rather
-    /// than racing a silent chat projection that CloudKit may coalesce with it.
-    private func ensureVisibleNotificationSubscription() async throws {
-        let sub = Self.makeVisibleNotificationSubscription()
+    /// Wake sync for explicit notification records without a second alert.
+    private func ensureSilentNotificationSubscription() async throws {
+        let sub = Self.makeSilentNotificationSubscription()
         try await ensureSubscription(sub, id: sub.subscriptionID)
         try await retireSubscription(id: "NAChatMessage.notifications.visible")
-        markVisibleNotificationSubscriptionReady()
     }
 
-    private func markVisibleNotificationSubscriptionReady() {
-        lock.lock()
-        visibleNotificationSubscriptionReady = true
-        lock.unlock()
-    }
-
-    static func makeVisibleNotificationSubscription() -> CKQuerySubscription {
+    static func makeSilentNotificationSubscription() -> CKQuerySubscription {
         let sub = CKQuerySubscription(
             recordType: NADeviceSyncRecordType.notification,
             predicate: NSPredicate(value: true),
@@ -1341,14 +1358,8 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
             options: [.firesOnRecordCreation]
         )
         let info = CKSubscription.NotificationInfo()
-        info.alertLocalizationKey = "NATIVEAGENT_CLOUDKIT_NOTIFICATION_BODY_FORMAT"
-        info.alertLocalizationArgs = ["text"]
-        info.titleLocalizationKey = "NATIVEAGENT_CLOUDKIT_NOTIFICATION_TITLE_FORMAT"
-        info.titleLocalizationArgs = ["notificationTitle"]
-        info.soundName = "default"
-        // Apple permits at most three desiredKeys. The alert/title localization
-        // arguments already extract `text` and `notificationTitle`; the three
-        // extra fields below are the bounded app-side routing/dedup projection.
+        info.shouldSendContentAvailable = true
+        // Preserve the deployed subscription ID so upgrades remove its alert.
         info.desiredKeys = [
             "notificationScreen",
             "notificationEventId",
@@ -1402,7 +1413,7 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
     ) async throws {
         guard configured else { throw DeviceSyncError.notConfigured }  // crash-guard: no CKContainer
         do {
-            try await withDeviceCKTimeoutThrowing("CloudKitDeviceTransport.\(label)") {
+            try await withDeviceCKTimeoutThrowing("CloudKitDeviceTransport.\(label)", onFailure: accountFailureReporter) {
                 let predicate = NSPredicate(value: true)
                 let sub = CKQuerySubscription(
                     recordType: recordType,
@@ -1426,21 +1437,31 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
     /// Development and promoted to Production, so accepting that code blindly
     /// leaves the silent-push lane dead while reporting success.
     ///
-    /// Fetch first. An ID match alone is not success: an older/silent
-    /// subscription under the visible-notification ID leaves records queued
-    /// until foreground drain while falsely reporting that Apple owns visual
-    /// presentation. Compare the complete shape and save the expected
-    /// subscription when it drifted.
+    /// Fetch first. An ID match alone is not success: an older visible
+    /// subscription would still alert alongside direct APNS. Compare the
+    /// complete shape and save the expected silent subscription when it drifted.
     ///
     /// If a concurrent process wins the create/repair race, fetch again after a
     /// failed save and accept only an exact shape match. Every other failure
     /// remains visible.
     private func ensureSubscription(_ subscription: CKSubscription, id: CKSubscription.ID) async throws {
+        var verified = false
+        defer {
+            if verified {
+                devicePushLog.notice("Subscription verified role=\(self.role.rawValue, privacy: .public) id=\(id, privacy: .public)")
+            } else {
+                devicePushLog.error("Subscription not verified role=\(self.role.rawValue, privacy: .public) id=\(id, privacy: .public)")
+            }
+        }
         do {
             let existing = try await database.subscription(for: id)
             if Self.subscription(existing, matches: subscription) {
+                verified = true
                 return
             }
+            let zoneMatches = (existing as? CKQuerySubscription)?.zoneID
+                == (subscription as? CKQuerySubscription)?.zoneID
+            devicePushLog.notice("Subscription repair role=\(self.role.rawValue, privacy: .public) id=\(id, privacy: .public) zoneMatches=\(zoneMatches)")
             NSLog("[ck-device] repairing stale subscription shape for \(id)")
         } catch let error as CKError where error.code == .unknownItem {
             // Absent is the only state that authorizes a create attempt.
@@ -1455,9 +1476,11 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
                     message: "CloudKit saved subscription \(id) with an unexpected shape"
                 )
             }
+            verified = true
         } catch {
             if let existing = try? await database.subscription(for: id),
                Self.subscription(existing, matches: subscription) {
+                verified = true
                 return
             }
             if let syncError = error as? DeviceSyncError {
@@ -1475,6 +1498,9 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
               let existingQuery = existing as? CKQuerySubscription,
               let expectedQuery = expected as? CKQuerySubscription,
               existingQuery.recordType == expectedQuery.recordType,
+              // Sends use the default zone. A stale custom-zone subscription
+              // must not pass verification against our unscoped query.
+              existingQuery.zoneID == expectedQuery.zoneID,
               existingQuery.predicate.predicateFormat == expectedQuery.predicate.predicateFormat,
               existingQuery.querySubscriptionOptions == expectedQuery.querySubscriptionOptions
         else {
@@ -1490,6 +1516,8 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
                 && existingInfo.shouldSendMutableContent
                     == expectedInfo.shouldSendMutableContent
                 && existingInfo.shouldBadge == expectedInfo.shouldBadge
+                && existingInfo.alertBody == expectedInfo.alertBody
+                && existingInfo.title == expectedInfo.title
                 && existingInfo.alertLocalizationKey
                     == expectedInfo.alertLocalizationKey
                 && existingInfo.alertLocalizationArgs
@@ -1544,7 +1572,7 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
     ) async throws -> [(fields: NAChatMessageFields, modDate: Date?)] {
         guard configured else { throw DeviceSyncError.notConfigured }  // crash-guard: no CKContainer
         do {
-            return try await withDeviceCKTimeoutThrowing("CloudKitDeviceTransport.pull") {
+            return try await withDeviceCKTimeoutThrowing("CloudKitDeviceTransport.pull", onFailure: accountFailureReporter) {
                 if self.serverModDateSortAvailable(recordType: recordType) {
                     do {
                         return try await self.pullPages(
@@ -1885,6 +1913,8 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
     }
 
     private static func mapError(_ err: Error) -> DeviceSyncError {
+        if let error = err as? DeviceSyncError { return error }
+        if let failure = accountFailure(in: err) { return .account(failure) }
         if let ck = err as? CKError {
             if ck.code == .partialFailure,
                let partial = ck.partialErrorsByItemID {
@@ -1907,6 +1937,26 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
             }
         }
         return .underlying(message: err.localizedDescription)
+    }
+
+    private static func accountFailure(in error: Error) -> DeviceSyncAccountFailure? {
+        guard let ck = error as? CKError else { return nil }
+        switch ck.code {
+        case .accountTemporarilyUnavailable, .notAuthenticated, .badContainer,
+             .badDatabase, .missingEntitlement, .managedAccountRestricted, .permissionFailure:
+            return DeviceSyncAccountFailure(code: ck.code.rawValue, detail: ck.localizedDescription)
+        default:
+            // A batch can wrap the actual account rejection in partialFailure.
+            if let partial = ck.partialErrorsByItemID {
+                for nested in partial.values {
+                    if let failure = accountFailure(in: nested) { return failure }
+                }
+            }
+            if let underlying = (error as NSError).userInfo[NSUnderlyingErrorKey] as? Error {
+                return accountFailure(in: underlying)
+            }
+            return nil
+        }
     }
 }
 

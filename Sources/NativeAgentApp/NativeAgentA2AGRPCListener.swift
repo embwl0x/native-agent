@@ -1,10 +1,11 @@
 import Foundation
+import Agents
 import ChatOrchestration
 import GRPCCore
 import GRPCNIOTransportHTTP2TransportServices
 import NativeAgentCore
 
-/// The third A2A wire listener. All task ownership and execution stays in AgentContactRuntime.
+/// The third A2A wire listener. All task ownership and execution stays in AgentContactTasks.
 final class NativeAgentA2AGRPCListener: @unchecked Sendable {
     static let shared = NativeAgentA2AGRPCListener()
     private let lock = NSLock()
@@ -29,7 +30,7 @@ final class NativeAgentA2AGRPCListener: @unchecked Sendable {
                 let transport = HTTP2ServerTransport.TransportServices(
                     address: .ipv4(host: "127.0.0.1", port: 0), transportSecurity: .plaintext)
                 let service = NativeAgentA2AGRPCService(endpoint: {
-                    AgentContactA2AEndpoint(tasks: AgentContactRuntime.tasks,
+                    AgentContactA2AEndpoint(tasks: NativeAgentEngine.live.agents.tasks,
                         port: ClaudeBridge.shared.activePort, grpcPort: self.port)
                 }, authenticate: { metadata in
                     try NativeAgentA2AGRPCService.authenticate(metadata: metadata,

@@ -29,10 +29,33 @@ public struct InstallPaths: Sendable {
     }
     public var bridgeConfigRelativePath: String { usesLegacyPaths ? ".config" : ".config/" + bundleIdentifier }
     public var bridgeConfigRoot: URL { home.appendingPathComponent(bridgeConfigRelativePath, isDirectory: true) }
+    /// 2026-09-26: per bundle for the shipped installs too. Both shared one
+    /// socket and token, so the second to launch unlinked the first's listener.
+    /// The relay derives this from its own bundle; Chrome's one host name
+    /// picks the relay via the manifest's owner.
     public var chromeSocket: URL {
-        usesLegacyPaths
-            ? home.appendingPathComponent("Library/Application Support/NativeAgent/chrome-control.sock")
-            : bridgeConfigRoot.appendingPathComponent("chrome.sock")
+        home.appendingPathComponent(".config/" + bundleIdentifier + "/chrome.sock")
+    }
+    /// 2026-09-26: each install's own FIXED loopback ports, like its Chrome
+    /// socket. The primary install keeps 8770 (Mac control), 8771 (bridge) and
+    /// 8766 (browser IPC); another bundle, or an install marked secondary,
+    /// gets its own set from its bundle id, so two installs never contend.
+    /// A taken port fails loudly; nothing hops. Clients read the descriptor.
+    public struct LoopbackPorts: Sendable, Equatable {
+        public let macControl: UInt16
+        public let bridge: UInt16
+        public let browserIPC: UInt16
+    }
+    public func loopbackPorts(
+        secondary: Bool = UserDefaults.standard.bool(forKey: "NativeAgentSecondaryInstall")
+    ) -> LoopbackPorts {
+        guard secondary || !usesLegacyPaths else { return LoopbackPorts(macControl: 8770, bridge: 8771, browserIPC: 8766) }
+        // FNV-1a over the bundle id: the same set every launch and build, in
+        // 18700-19696, below macOS's ephemeral range.
+        var hash: UInt32 = 2_166_136_261
+        for byte in bundleIdentifier.utf8 { hash = (hash ^ UInt32(byte)) &* 16_777_619 }
+        let base = UInt16(18_700 + Int(hash % 100) * 10)
+        return LoopbackPorts(macControl: base, bridge: base + 1, browserIPC: base + 6)
     }
     public var chromeManifest: URL {
         home.appendingPathComponent("Library/Application Support/Google/Chrome/NativeMessagingHosts/com.nativeagent.chrome.json")

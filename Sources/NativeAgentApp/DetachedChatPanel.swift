@@ -313,8 +313,8 @@ final class DetachedChatWindowController {
         // session list arrived) — pruning then would silently drop a valid
         // persisted window. Skip without pruning; the retry in
         // restoreFromPersist(after:) catches it once sessions load.
-        if !appModel.chatSessions.contains(where: { $0.id == sessionId }) {
-            if appModel.chatSessions.isEmpty {
+        if !appModel.engine.transcripts.sessions.contains(where: { $0.id == sessionId }) {
+            if appModel.engine.transcripts.sessions.isEmpty {
                 NSLog("[DetachedChatPanel] open(%@) — sessions not loaded yet; deferring", sessionId)
             } else {
                 NSLog("[DetachedChatPanel] open(%@) — session not found; pruning persist set", sessionId)
@@ -323,7 +323,7 @@ final class DetachedChatWindowController {
             return
         }
 
-        let title = appModel.chatSessions.first(where: { $0.id == sessionId })?.displayTitle
+        let title = appModel.engine.transcripts.sessions.first(where: { $0.id == sessionId })?.displayTitle
             ?? "Chat \(sessionId.prefix(6))"
         let size = NSSize(width: 520, height: 600)
         let initialFrame: NSRect
@@ -400,7 +400,7 @@ final class DetachedChatWindowController {
         Task { @MainActor in
             // Poll for sessions to load (≤ ~10s), then restore.
             for _ in 0..<40 {
-                if !(appModel?.chatSessions.isEmpty ?? true) { break }
+                if !(appModel?.engine.transcripts.sessions.isEmpty ?? true) { break }
                 try? await Task.sleep(nanoseconds: 250_000_000)  // 0.25s
             }
             for sid in saved {

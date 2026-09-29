@@ -46,7 +46,7 @@ snapshot or user takeover.
 | `lease.renew` | `leaseId`, `expectedUserSequence`, optional `leaseDurationMs` | Extends an active lease from the current instant and emits `lease.renewed`. |
 | `lease.resume` | `leaseId`, `expectedUserSequence` | Reserved compatibility action. It returns `lease_resume_not_supported`: user yield is terminal, so the host must explicitly reacquire the exact tab. |
 | `lease.release` | `leaseId` | Releases a claimed tab; closes an agent-created tab unless `closeCreatedTab` is false. |
-| `navigate` | `leaseId`, `expectedUserSequence`, HTTP(S) `url` | Navigates only the leased tab. |
+| `navigate` | `leaseId`, `expectedUserSequence`, HTTP(S) `url`, or `back` / `forward` | Navigates only the leased tab; `back`/`forward` walk its history. |
 | `page.snapshot.read` | `leaseId` | Returns viewport-scoped nodes and summary while the lease remains active. `rendering` reports actual visibility/readiness; loaded DOM only, never proof absent replies do not exist. Scroll and read again for later feed items or replies. |
 | `page.element.click` | `leaseId`, `expectedUserSequence`, `snapshotId`, `nodeId` | Clicks a node from the exact observed snapshot. No arbitrary selector crosses the protocol. |
 | `page.element.fill` | `leaseId`, `expectedUserSequence`, `snapshotId`, `nodeId`, `value` | Replaces a current non-password editable node value and returns one outcome receipt. |

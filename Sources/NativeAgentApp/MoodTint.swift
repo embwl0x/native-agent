@@ -1,3 +1,4 @@
+import AppToolRuntime
 // MoodTint.swift
 // "Mood in the tint" — User and Agent approved the mocks 2026-09-14
 // (mockups/mood-tint/rest.png, warm.png, NOTE.md). This file is the whole
@@ -23,22 +24,9 @@
 // its own local pass — one tint, never two.
 
 import AppKit
+import Cognition
 import CognitiveSubstrate
 import SwiftUI
-
-// MARK: - The switch
-
-/// The revert seam. On for a fresh install (User: fresh installs turn every
-/// feature on; users switch off what they want), off in one flip, and the same
-/// key the agent reads and writes through `app_settings_list` /
-/// `app_setting_set`.
-enum MoodTintPreference {
-    static let key = "uiMoodTint"
-
-    static func isEnabled(_ defaults: UserDefaults = .standard) -> Bool {
-        defaults.object(forKey: key) == nil ? true : defaults.bool(forKey: key)
-    }
-}
 
 // MARK: - The weather
 
@@ -144,13 +132,7 @@ final class MoodTintWeather {
     /// cognition off the reading is `available: false` and the answer is 0:
     /// absence reads as absence, and the room drains to plain dark mode.
     private static func reading() async -> Double {
-        let reading = await NativeCognitionRuntime.shared.innerStateReading(
-            windowHours: CognitiveInnerStateReading.defaultWindowHours,
-            detail: .compact
-        )
-        guard reading.available, !reading.feltNodes.isEmpty else { return 0 }
-        let sum = reading.feltNodes.reduce(0.0) { $0 + $1.warmth }
-        return min(1, max(0, sum / Double(reading.feltNodes.count)))
+        await NativeAgentEngine.live.cognitionView.moodWarmth()
     }
 }
 

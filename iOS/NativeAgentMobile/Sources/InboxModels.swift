@@ -75,7 +75,8 @@ extension InboxItemRecord {
     /// producer cannot become a tappable iOS control until the signed Mac
     /// action router accepts it.
     var presentableActions: [InboxActionRecord] {
-        actions.filter { InboxActionPresentation.presentableActionIDs.contains($0.id) }
+        actions.filter { InboxActionPresentation.presentableActionIDs.contains($0.id)
+            || (source == "interaction" && $0.id.hasPrefix("interaction_choice_")) }
     }
 
     var severityColor: Color {
@@ -128,9 +129,11 @@ extension InboxItemRecord {
     var relativeCreatedAt: String {
         guard let date = createdDate else { return "" }
         let interval = Date().timeIntervalSince(date)
-        if interval < 60  { return "\(Int(interval))s ago" }
+        if interval < 60  { return "just now" }
         if interval < 3600 { return "\(Int(interval / 60))m ago" }
-        return "\(Int(interval / 3600))h ago"
+        if interval < 86_400 { return "\(Int(interval / 3600))h ago" }
+        if interval < 7 * 86_400 { return "\(Int(interval / 86_400))d ago" }
+        return date.formatted(.dateTime.month(.abbreviated).day())
     }
 
     func replacingStatus(_ nextStatus: String, readAt: String? = nil) -> InboxItemRecord {

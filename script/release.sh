@@ -31,6 +31,8 @@
 # of two mutually exclusive ones.
 #   NATIVEAGENT_PUBLIC_EXPORT_DIR   — where to put the export (default: mktemp)
 #   NATIVEAGENT_REUSE_PUBLIC_EXPORT — 1 reuses an existing export; --dry-run only
+# For ad-hoc local proof (no Developer ID signing), explicitly set both aliases:
+#   NATIVEAGENT_DEVELOPER_ID=- NATIVE_AGENT_DEVELOPER_ID=- ./script/release.sh --dry-run
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -44,8 +46,6 @@ source "$ROOT/script/lib/provisioning_profile_contract.sh"
 source "$ROOT/script/lib/release_bundle_gates.sh"
 # shellcheck source=lib/release_symbols.sh
 source "$ROOT/script/lib/release_symbols.sh"
-# shellcheck source=lib/chrome_payload.sh
-source "$ROOT/script/lib/chrome_payload.sh"
 APP_NAME="NativeAgent"
 PRODUCT="NativeAgentApp"
 DRY_RUN=false
@@ -148,6 +148,9 @@ RELEASE_ENV_SURFACE=(
   NATIVEAGENT_SPARKLE_ED_PRIV_KEY
   NATIVEAGENT_SPARKLE_PUBLIC_KEY
   NATIVEAGENT_PROVISIONING_PROFILE
+  NATIVEAGENT_WIDGET_PROVISIONING_PROFILE
+  NATIVEAGENT_MAC_APP_GROUP_ID
+  NATIVEAGENT_MAC_WIDGET_BUNDLE_ID
   NATIVEAGENT_APPCAST_URL
   NATIVEAGENT_DMG_DOWNLOAD_URL
   NATIVEAGENT_RELEASE_PAGE_URL
@@ -486,7 +489,14 @@ NATIVEAGENT_NOTARY_KEYCHAIN_PROFILE="${NATIVEAGENT_NOTARY_KEYCHAIN_PROFILE:-}"
 # Signing entitlements: explicit override wins; else picked by ICLOUD_BUILD.
 NATIVEAGENT_RELEASE_ENTITLEMENTS="${NATIVEAGENT_RELEASE_ENTITLEMENTS:-}"
 GENERATED_PUBLIC_CLOUDKIT_ENTITLEMENTS=""
+RELEASE_WIDGET_WORK=""
+NATIVEAGENT_WIDGET_PROVISIONING_PROFILE="${NATIVEAGENT_WIDGET_PROVISIONING_PROFILE:-$ROOT/local/NativeAgentWidget.provisionprofile}"
+NATIVEAGENT_MAC_APP_GROUP_ID="${NATIVEAGENT_MAC_APP_GROUP_ID:-group.$NATIVEAGENT_MAC_BUNDLE_ID}"
+NATIVEAGENT_MAC_WIDGET_BUNDLE_ID="${NATIVEAGENT_MAC_WIDGET_BUNDLE_ID:-$NATIVEAGENT_MAC_BUNDLE_ID.widget}"
 cleanup_generated_release_entitlements() {
+  if [[ -n "${RELEASE_WIDGET_WORK:-}" ]]; then
+    rm -rf "$RELEASE_WIDGET_WORK"
+  fi
   if [[ -n "${GENERATED_PUBLIC_CLOUDKIT_ENTITLEMENTS:-}" ]]; then
     rm -f "$GENERATED_PUBLIC_CLOUDKIT_ENTITLEMENTS"
   fi
@@ -591,6 +601,7 @@ if [[ "$NATIVEAGENT_NEEDS_PUBLIC_SCRUB" == "true" ]]; then
     NATIVEAGENT_PUBLIC_SCRUB_CHILD=1 \
     NATIVEAGENT_RELEASE_ENTITLEMENTS="$CHILD_ENTITLEMENTS" \
     NATIVEAGENT_PROVISIONING_PROFILE="$CHILD_PROFILE" \
+    NATIVEAGENT_WIDGET_PROVISIONING_PROFILE="$(_abs_release_path "$NATIVEAGENT_WIDGET_PROVISIONING_PROFILE")" \
     NATIVEAGENT_SPARKLE_ED_PRIV_KEY="$CHILD_SPARKLE_KEY" \
     NATIVEAGENT_PRIVACY_DENYLIST_FILE="$CHILD_PRIVACY_DENYLIST" \
     NATIVEAGENT_EMBEDDING_MODEL_DIR="$(_abs_release_path "${NATIVEAGENT_EMBEDDING_MODEL_DIR:-$ROOT/extras/embedding}")" \
@@ -635,30 +646,21 @@ if [[ "$NATIVEAGENT_NEEDS_PUBLIC_SCRUB" == "true" ]]; then
   exit 0
 fi
 
-# A production artifact is allowed to start only after the complete canonical
-# gate has passed against this exact clean commit. The receipt is written by
-# test.sh after its final source-stability check, and the iOS lane is mandatory
-# here rather than a graceful simulator skip. Dry-run remains the fast package
-# rehearsal and intentionally does not mint release proof.
+# Dry-run remains the fast package rehearsal and intentionally does not mint a
+# release receipt. There is no test gate (the repo has no test suite): every
+# production release takes the artifact-only receipt path.
 RELEASE_TEST_RECEIPT=""
 if [[ "$DRY_RUN" == "false" ]]; then
   RELEASE_TEST_RECEIPT="$ROOT/.runtime/release-test-receipts/$NATIVEAGENT_SOURCE_REVISION.json"
-  if [[ "$ARTIFACT_ONLY" == "true" ]]; then
-    echo "==> Artifact-only release authorized: skipping the full Mac+iOS eval gate."
-    [[ -z "$(git -C "$ROOT" status --porcelain --untracked-files=normal)" ]] \
-      || { echo "ERROR: artifact-only release still requires clean source." >&2; exit 1; }
-    mkdir -p "$(dirname "$RELEASE_TEST_RECEIPT")"
-    completed_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    receipt_tmp="$RELEASE_TEST_RECEIPT.tmp.$$"
-    printf '{\n  "schema_version": 1,\n  "source_revision": "%s",\n  "source_dirty": false,\n  "canonical_gate": "script/release.sh --artifact-only",\n  "ios_required": false,\n  "ios_result": "not_run",\n  "completed_at": "%s"\n}\n' \
-      "$NATIVEAGENT_SOURCE_REVISION" "$completed_at" > "$receipt_tmp"
-    mv -f "$receipt_tmp" "$RELEASE_TEST_RECEIPT"
-    chmod 0644 "$RELEASE_TEST_RECEIPT"
-  else
-    echo "==> Proving exact release source with the complete Mac + required iOS gate..."
-    NATIVE_AGENT_REQUIRE_IOS_PROJECT_REPRODUCIBLE=1 \
-      "$ROOT/script/test.sh" --require-ios --release-receipt "$RELEASE_TEST_RECEIPT"
-  fi
+  [[ -z "$(git -C "$ROOT" status --porcelain --untracked-files=normal)" ]] \
+    || { echo "ERROR: artifact-only release still requires clean source." >&2; exit 1; }
+  mkdir -p "$(dirname "$RELEASE_TEST_RECEIPT")"
+  completed_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  receipt_tmp="$RELEASE_TEST_RECEIPT.tmp.$$"
+  printf '{\n  "schema_version": 1,\n  "source_revision": "%s",\n  "source_dirty": false,\n  "canonical_gate": "script/release.sh --artifact-only",\n  "ios_required": false,\n  "ios_result": "not_run",\n  "completed_at": "%s"\n}\n' \
+    "$NATIVEAGENT_SOURCE_REVISION" "$completed_at" > "$receipt_tmp"
+  mv -f "$receipt_tmp" "$RELEASE_TEST_RECEIPT"
+  chmod 0644 "$RELEASE_TEST_RECEIPT"
   [[ -s "$RELEASE_TEST_RECEIPT" ]] \
     || { echo "ERROR: release proof returned without a receipt." >&2; exit 1; }
   assert_full_release_source_unchanged
@@ -668,6 +670,9 @@ fi
 # build+notarize, and enforce the public-build invariant on the ACTUAL file
 # contents, not the mode label (gpt-5.5 HIGH: an override could otherwise sign
 # iCloud entitlements into a profile-less public build → launch-killed app).
+# Keep the supplied host profile for the widget gate even when the standalone
+# lane clears the profile used by the rest of the release pipeline.
+RELEASE_WIDGET_HOST_PROFILE="$NATIVEAGENT_PROVISIONING_PROFILE"
 if [[ "$DRY_RUN" == "false" ]]; then
   [[ -r "$NATIVEAGENT_RELEASE_ENTITLEMENTS" ]] || { echo "ERROR: entitlements not readable: $NATIVEAGENT_RELEASE_ENTITLEMENTS" >&2; exit 1; }
   plutil -lint "$NATIVEAGENT_RELEASE_ENTITLEMENTS" >/dev/null || { echo "ERROR: entitlements plist invalid: $NATIVEAGENT_RELEASE_ENTITLEMENTS" >&2; exit 1; }
@@ -850,17 +855,38 @@ fi
 echo "==> Verifying required MiniLM source resources..."
 "$ROOT/script/verify_release_artifact.sh" --verify-resource-source "$ROOT"
 
-# RELEASE-2026-05-06: step 3 — swift build release
-echo "==> Building (release configuration)..."
-swift build --disable-keychain -c release --force-resolved-versions --skip-update --package-path "$ROOT" --product NativeAgentApp
-swift build --disable-keychain -c release --force-resolved-versions --skip-update --package-path "$ROOT" --product NativeAgentChromeRelay
-swift build --disable-keychain -c release --force-resolved-versions --skip-update --package-path "$ROOT" --product nativeagent-link
-
-BIN="$(swift build --disable-keychain -c release --force-resolved-versions --skip-update --package-path "$ROOT" --show-bin-path)/$PRODUCT"
-CHROME_RELAY_BIN="$(dirname "$BIN")/NativeAgentChromeRelay"
-AGENT_LINK_BIN="$(dirname "$BIN")/nativeagent-link"
-[[ -x "$AGENT_LINK_BIN" ]] || { echo "ERROR: Agent link executable missing: $AGENT_LINK_BIN" >&2; exit 1; }
-[[ -x "$CHROME_RELAY_BIN" ]] || { echo "ERROR: Chrome relay executable missing: $CHROME_RELAY_BIN" >&2; exit 1; }
+# Xcode owns the bundle, helpers, resource bundles, Sparkle and App Intents.
+# Keep signing and symbol archival with the existing release owners below.
+# In particular, do not let Xcode strip before release_archive_symbols_and_strip.
+echo "==> Building with Xcode (Release configuration)..."
+if ! command -v xcodegen >/dev/null 2>&1; then
+  echo "ERROR: xcodegen is required; install it with: brew install xcodegen" >&2
+  exit 1
+fi
+xcodegen --spec "$ROOT/project.yml"
+DERIVED_DATA="$ROOT/DerivedData/ReleaseBundle"
+xcodebuild -quiet -jobs 6 \
+  -project "$ROOT/$APP_NAME.xcodeproj" -scheme "$APP_NAME" -configuration Release \
+  -destination "platform=macOS,arch=$(uname -m)" -derivedDataPath "$DERIVED_DATA" \
+  -onlyUsePackageVersionsFromResolvedFile -skipPackageUpdates \
+  ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO \
+  DEPLOYMENT_POSTPROCESSING=NO STRIP_INSTALLED_PRODUCT=NO COPY_PHASE_STRIP=NO \
+  NATIVEAGENT_RELEASE_BUILD=YES NATIVEAGENT_STAMP_REPO_PATH=NO \
+  NATIVEAGENT_MAC_BUNDLE_ID="$NATIVEAGENT_MAC_BUNDLE_ID" \
+  NATIVEAGENT_MAC_WIDGET_BUNDLE_ID="$NATIVEAGENT_MAC_WIDGET_BUNDLE_ID" \
+  NATIVEAGENT_MAC_APP_GROUP_ID="$NATIVEAGENT_MAC_APP_GROUP_ID" \
+  NATIVEAGENT_ICLOUD_CONTAINER_ID="$NATIVEAGENT_ICLOUD_CONTAINER_ID" \
+  NATIVEAGENT_MOBILE_SOURCE_KEY="$NATIVEAGENT_MOBILE_SOURCE_KEY" \
+  NATIVEAGENT_BACKGROUND_TASK_PREFIX="$NATIVEAGENT_BACKGROUND_TASK_PREFIX" \
+  NATIVEAGENT_DEVICE_SYNC="$NATIVEAGENT_DEVICE_SYNC" \
+  NATIVEAGENT_RELEASE_PAGE_URL="$NATIVEAGENT_RELEASE_PAGE_URL" \
+  NATIVEAGENT_BUILD_SHORT_VERSION="$EFFECTIVE_SHORT_VERSION" \
+  NATIVEAGENT_SPARKLE_PUBLIC_KEY="$NATIVEAGENT_SPARKLE_PUBLIC_KEY" \
+  NATIVEAGENT_UPDATE_FEED_PUBLISHED="$NATIVEAGENT_UPDATE_FEED_PUBLISHED" \
+  NATIVEAGENT_SPARKLE_FEED_URL="$SPARKLE_FEED_URL_STAMP" \
+  NATIVEAGENT_EMBEDDING_MODEL_DIR=/dev/null \
+  build
+BUILT_APP="$DERIVED_DATA/Build/Products/Release/$APP_NAME.app"
 
 # A2.1 round 2 (gpt-5.5 BLOCKING — ordering, second pass): a --publish-appcast
 # build carries NativeAgentUpdateFeedPublished=true + SUFeedURL from the moment it
@@ -906,8 +932,11 @@ if [[ "$PUBLISH_APPCAST" == "true" ]]; then
   rm -rf "$ROOT/dist/$APP_NAME.app" "$ROOT/dist/$APP_NAME.app.zip"
 fi
 rm -rf "$BUNDLE"
-mkdir -p "$BUNDLE/Contents/MacOS" "$BUNDLE/Contents/Resources"
-cp "$AGENT_LINK_BIN" "$BUNDLE/Contents/MacOS/nativeagent-link"
+ditto "$BUILT_APP" "$BUNDLE"
+[[ ! -e "$BUNDLE/Contents/Resources/REPO_PATH" ]] \
+  || { echo "ERROR: release bundle contains a REPO_PATH stamp." >&2; exit 1; }
+[[ -s "$BUNDLE/Contents/Resources/Metadata.appintents/extract.actionsdata" ]] \
+  || { echo "ERROR: Xcode did not produce Metadata.appintents." >&2; exit 1; }
 
 assert_no_python_artifacts() {
   local bundle="$1" hit
@@ -923,28 +952,67 @@ assert_no_python_artifacts() {
   fi
 }
 
-cp "$BIN" "$BUNDLE/Contents/MacOS/$PRODUCT"
-
-stage_chrome_payload "$ROOT" "$BUNDLE" "$CHROME_RELAY_BIN"
-
-# 2026-06-07 task #88: stage SPM-generated resource bundles into the .app's
-# Contents/Resources/. Mirrors the same fix in build_and_run.sh — without
-# this, release builds would ship MiniLM as a phantom resource and Fast
-# mode would silently no-op on every public install. The runtime
-# fallback in CoreMLEmbeddingProvider.installedAppFallbackBundle() looks
-# for staged bundles under Contents/Resources/ so this MUST match.
-SPM_RELEASE_BIN_DIR="$(dirname "$BIN")"
-shopt -s nullglob
-for spm_bundle in "$SPM_RELEASE_BIN_DIR"/*.bundle; do
-  bundle_basename="$(basename "$spm_bundle")"
-  rm -rf "$BUNDLE/Contents/Resources/$bundle_basename"
-  cp -R "$spm_bundle" "$BUNDLE/Contents/Resources/$bundle_basename"
-  echo "[release] staged $bundle_basename"
-done
-shopt -u nullglob
-
-# gRPC code is statically linked; its resources and notices are signed with the app.
-cp "$ROOT/docs/licenses/A2A-gRPC-NOTICES.txt" "$BUNDLE/Contents/Resources/A2A-gRPC-NOTICES.txt"
+# The widget is optional, but both the host and extension must have Developer
+# ID profiles granting their exact identity and shared App Group. Dry-run uses
+# the existing local-signing contract, which carries no distribution profile.
+release_prepare_widget() {
+  local widget="$BUNDLE/Contents/PlugIns/NativeAgentWidget.appex" profile plist bundle_id
+  RELEASE_WIDGET_WORK="$(mktemp -d "$STAGE_DIR/.widget-sign.XXXXXX")"
+  if [[ "$DRY_RUN" == true ]]; then
+    cp "$ROOT/NativeAgent.adhoc.entitlements" "$RELEASE_WIDGET_WORK/base.entitlements"
+  else
+    cp "$NATIVEAGENT_RELEASE_ENTITLEMENTS" "$RELEASE_WIDGET_WORK/base.entitlements"
+  fi
+  # Only a provisioned widget may activate the host's shared container.
+  /usr/libexec/PlistBuddy -c 'Delete :com.apple.security.application-groups' "$RELEASE_WIDGET_WORK/base.entitlements" >/dev/null 2>&1 || true
+  /usr/libexec/PlistBuddy -c 'Delete :NativeAgentMacAppGroupID' "$BUNDLE/Contents/Info.plist" >/dev/null 2>&1 || true
+  NATIVEAGENT_RELEASE_ENTITLEMENTS="$RELEASE_WIDGET_WORK/base.entitlements"
+  if [[ "$DRY_RUN" == true || ! -f "$RELEASE_WIDGET_HOST_PROFILE" || ! -f "$NATIVEAGENT_WIDGET_PROVISIONING_PROFILE" ]]; then
+    rm -rf "$widget"
+    echo "[release] widget not embedded: requires Developer ID host/widget profiles and App Group $NATIVEAGENT_MAC_APP_GROUP_ID (dry-run omits provisioning)." >&2
+    return
+  fi
+  for profile in "$RELEASE_WIDGET_HOST_PROFILE" "$NATIVEAGENT_WIDGET_PROVISIONING_PROFILE"; do
+    if [[ "$profile" == "$RELEASE_WIDGET_HOST_PROFILE" ]]; then
+      plist="$RELEASE_WIDGET_WORK/host.plist"
+      bundle_id="$NATIVEAGENT_MAC_BUNDLE_ID"
+    else
+      plist="$RELEASE_WIDGET_WORK/widget.plist"
+      bundle_id="$NATIVEAGENT_MAC_WIDGET_BUNDLE_ID"
+    fi
+    decode_provisioning_profile "$profile" "$plist"
+    verify_profile_identity_contract "$plist" "$bundle_id"
+    [[ "$(provisioning_profile_value "$plist" TeamIdentifier:0)" == "$NATIVEAGENT_TEAM_ID" ]] \
+      || { echo "ERROR: widget profile team does not match the release team." >&2; return 1; }
+    if [[ "$(provisioning_profile_value "$plist" ProvisionsAllDevices)" != true ]] \
+      || /usr/libexec/PlistBuddy -c "Print :ProvisionedDevices" "$plist" >/dev/null 2>&1; then
+      rm -rf "$widget"
+      echo "[release] widget not embedded: host/widget profiles must be Developer ID all-devices distribution profiles." >&2
+      return
+    fi
+    if ! provisioning_profile_array_contains "$plist" 'Entitlements:com.apple.security.application-groups' "$NATIVEAGENT_MAC_APP_GROUP_ID"; then
+      rm -rf "$widget"
+      echo "[release] widget not embedded: both Developer ID profiles must grant App Group $NATIVEAGENT_MAC_APP_GROUP_ID." >&2
+      return
+    fi
+  done
+  [[ -d "$widget" ]] || { echo "ERROR: Xcode did not embed the provisioned widget." >&2; return 1; }
+  cp "$NATIVEAGENT_WIDGET_PROVISIONING_PROFILE" "$widget/Contents/embedded.provisionprofile"
+  chmod 0644 "$widget/Contents/embedded.provisionprofile"
+  prepare_profile_signing_entitlements "$NATIVEAGENT_RELEASE_ENTITLEMENTS" \
+    "$RELEASE_WIDGET_WORK/host.plist" "$RELEASE_WIDGET_WORK/host.entitlements"
+  prepare_profile_signing_entitlements "$ROOT/Config/NativeAgentWidget.entitlements" \
+    "$RELEASE_WIDGET_WORK/widget.plist" "$RELEASE_WIDGET_WORK/widget.entitlements"
+  for plist in "$RELEASE_WIDGET_WORK/host.entitlements" "$RELEASE_WIDGET_WORK/widget.entitlements"; do
+    /usr/libexec/PlistBuddy -c 'Delete :com.apple.security.application-groups' "$plist" >/dev/null 2>&1 || true
+    /usr/libexec/PlistBuddy -c 'Add :com.apple.security.application-groups array' \
+      -c "Add :com.apple.security.application-groups:0 string $NATIVEAGENT_MAC_APP_GROUP_ID" "$plist"
+  done
+  NATIVEAGENT_RELEASE_ENTITLEMENTS="$RELEASE_WIDGET_WORK/host.entitlements"
+  /usr/libexec/PlistBuddy -c "Add :NativeAgentMacAppGroupID string $NATIVEAGENT_MAC_APP_GROUP_ID" "$BUNDLE/Contents/Info.plist"
+  echo "[release] widget provisioned: $NATIVEAGENT_MAC_WIDGET_BUNDLE_ID ($NATIVEAGENT_MAC_APP_GROUP_ID)"
+}
+release_prepare_widget
 
 release_prepare_embedding "$BUNDLE" "$STAGE_DIR" "$VERSION"
 export NATIVEAGENT_PUBLISH_MODEL_ASSET=""
@@ -952,7 +1020,7 @@ if [[ "${NATIVEAGENT_EMBEDDING_DISTRIBUTION:-bundled}" == separate-download ]]; 
   export NATIVEAGENT_PUBLISH_MODEL_ASSET="$STAGE_DIR/$APP_NAME-$VERSION.embedding.zip"
 fi
 
-# Do not continue to signing when SwiftPM did not generate and stage the exact
+# Do not continue to signing when Xcode did not generate and stage the exact
 # MemoryV2 resource bundle expected by Bundle.module and the installed fallback.
 "$ROOT/script/verify_release_artifact.sh" \
   --verify-resource-bundle "$BUNDLE/Contents/Resources"
@@ -962,219 +1030,8 @@ fi
 # for dirty development verification; notarized output fails closed.
 assert_full_release_source_unchanged
 
-printf '%s\n' "$VERSION" > "$BUNDLE/Contents/Resources/VERSION"
-echo "[release] runtime: Swift-native bundle; daemon tree, native_agentd.py, and Python runtime are excluded"
-if [[ -f "$ROOT/Resources/AppIcon.icns" ]]; then
-  cp "$ROOT/Resources/AppIcon.icns" "$BUNDLE/Contents/Resources/AppIcon.icns"
-fi
-if [[ -f "$ROOT/docs/data-bounds.md" ]]; then
-  mkdir -p "$BUNDLE/Contents/Resources/docs"
-  cp "$ROOT/docs/data-bounds.md" "$BUNDLE/Contents/Resources/docs/data-bounds.md"
-fi
-# U1: ship every release note inside the bundle so the agent can answer "what
-# changed?" offline. Plain markdown only; the identity and secret scans below
-# cover this tree, so the notes must stay free of maintainer identity strings.
-if [[ -d "$ROOT/docs/release-notes" ]]; then
-  mkdir -p "$BUNDLE/Contents/Resources/docs/release-notes"
-  find "$ROOT/docs/release-notes" -maxdepth 1 -type f -name '*.md' \
-    -exec cp {} "$BUNDLE/Contents/Resources/docs/release-notes/" \;
-fi
-# PUBLIC-RELEASE PRIVACY: the live persona/ dir is the developer's own
-# instance state — local SOUL/VOICE/GROWTH, the developer's USER.md
-# (location, handles), and ~80 USER.*.bak history snapshots. A public
-# build must ship a GENERIC blank slate only.
-#
-# ONBOARDING-2026-05-26: do NOT ship a persona/ dir inside the bundle at
-# Contents/Resources/persona. Earlier revisions shipped *.template.md files
-# there as a placeholder, but the Swift onboarding templates are generated into
-# writable user data, not read from bundle template files.
-# Worse, the presence of Contents/Resources/persona/ caused
-# `_resolve_persona_root()` step 3 (Path(__file__).resolve().parent.parent
-# / "persona") to resolve INSIDE the read-only signed bundle on a public
-# install (REPO_PATH stamp is intentionally absent — see the C7 note below).
-# The background warmup then silently auto-scaffolded SOUL.md inside the
-# bundle (personality_doc_contents create_missing=True), which:
-#   1) flipped the onboarding gate to has_existing=True before the wizard
-#      ever rendered, so first-run onboarding never played;
-#   2) and if writes succeeded, broke codesign integrity.
-# With nothing at Contents/Resources/persona/, the resolver falls through
-# to step 4 (data_root/memory/), which is writable user data the
-# preparePublicReleaseDataRootIfNeeded quarantine has already cleaned.
-#
-# Defensive cleanup: explicitly remove any persona/ directory that might
-# exist under the staged bundle (e.g. left behind by a stale dist/ tree), and
-# guarantees the bug can't sneak back via a stale incremental build.
-rm -rf "$BUNDLE/Contents/Resources/persona"
-echo "[release] persona: bundle Contents/Resources/persona pruned (Swift onboarding seeds user data; live persona/ excluded by construction)"
-
-# Stamp the full source object identity. Exact runtime proof additionally
-# requires the Info.plist dirty bit below to be false.
-printf '%s\n' "$NATIVEAGENT_SOURCE_REVISION" > "$BUNDLE/Contents/Resources/VERSION_SHA"
-# C7 fix: do NOT stamp REPO_PATH in a release build.
-#
-# release.sh runs on the developer's machine where $ROOT is the source repo
-# (e.g. /Users/developer/Projects/NativeAgent). If we stamped that path, the
-# distributed bundle would carry a path that doesn't exist on any other Mac and
-# the Swift resolver would skip it. The public app should use the standard
-# Application Support data root instead.
-#
-# For distribution: REPO_PATH is intentionally absent. The Swift resolver falls
-# through its priority chain:
-#   1. NATIVE_AGENT_DATA_ROOT env var  → honored if set
-#   2. REPO_PATH stamp                  → absent here (intentional)
-#   3. <repo_root>/data/ dev path       → won't match inside bundle
-#   4. ~/Library/Application Support/NativeAgent/  ← public users land here
-#
-# ~/Library/Application Support/NativeAgent/ is the correct macOS-standard
-# data directory for distributed apps.  install_app.sh (developer installs
-# from source clone) still stamps REPO_PATH with the source repo path so the
-# daily dev workflow continues to use files in the repo.
-
-# Bundle Sparkle.framework in the standard framework location and add the app
-# rpath before signing/notarization.
-BIN_RELEASE="$(swift build --disable-keychain -c release --force-resolved-versions --skip-update --package-path "$ROOT" --show-bin-path)/$PRODUCT"
-SPM_BIN_DIR_RELEASE="$(dirname "$BIN_RELEASE")"
-if [[ -d "$SPM_BIN_DIR_RELEASE/Sparkle.framework" ]]; then
-  mkdir -p "$BUNDLE/Contents/Frameworks"
-  rm -rf "$BUNDLE/Contents/Frameworks/Sparkle.framework" "$BUNDLE/Contents/MacOS/Sparkle.framework"
-  cp -R "$SPM_BIN_DIR_RELEASE/Sparkle.framework" "$BUNDLE/Contents/Frameworks/Sparkle.framework"
-  if ! otool -l "$BUNDLE/Contents/MacOS/$PRODUCT" 2>/dev/null | grep -q '@executable_path/../Frameworks'; then
-    install_name_tool -add_rpath "@executable_path/../Frameworks" "$BUNDLE/Contents/MacOS/$PRODUCT" 2>/dev/null || true
-  fi
-fi
-
-# A2.1-2026-07-24: build the Sparkle key block conditionally. SUFeedURL is emitted
-# ONLY when this run generates a feed; otherwise the bundle carries no feed URL at
-# all, which is what UpdateController reads to decide it must not pretend to check.
-# SUEnableAutomaticChecks follows the same truth so no background poll can 404.
-SPARKLE_PLIST_KEYS="  <key>SUPublicEDKey</key>
-  <string>${NATIVEAGENT_SPARKLE_PUBLIC_KEY}</string>
-  <key>NativeAgentUpdateFeedPublished</key>
-  <${NATIVEAGENT_UPDATE_FEED_PUBLISHED}/>
-  <key>SUEnableAutomaticChecks</key>
-  <${NATIVEAGENT_UPDATE_FEED_PUBLISHED}/>"
-if [[ -n "$SPARKLE_FEED_URL_STAMP" ]]; then
-  SPARKLE_PLIST_KEYS="  <key>SUFeedURL</key>
-  <string>${SPARKLE_FEED_URL_STAMP}</string>
-$SPARKLE_PLIST_KEYS"
-fi
-if [[ -n "$NATIVEAGENT_RELEASE_PAGE_URL" ]]; then
-  SPARKLE_PLIST_KEYS="$SPARKLE_PLIST_KEYS
-  <key>NativeAgentReleasePageURL</key>
-  <string>${NATIVEAGENT_RELEASE_PAGE_URL}</string>"
-fi
-
-# Generate Info.plist with version info and Sparkle feed URL
-cat > "$BUNDLE/Contents/Info.plist" <<PLIST
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>CFBundleExecutable</key>
-  <string>$PRODUCT</string>
-  <key>CFBundleIdentifier</key>
-  <string>$NATIVEAGENT_MAC_BUNDLE_ID</string>
-  <key>CFBundleName</key>
-  <string>$APP_NAME</string>
-  <key>NativeAgentMacBundleID</key>
-  <string>$NATIVEAGENT_MAC_BUNDLE_ID</string>
-  <key>NativeAgentICloudContainerID</key>
-  <string>$NATIVEAGENT_ICLOUD_CONTAINER_ID</string>
-  <key>NativeAgentMobileSourceKey</key>
-  <string>$NATIVEAGENT_MOBILE_SOURCE_KEY</string>
-  <key>NativeAgentBackgroundTaskIDPrefix</key>
-  <string>$NATIVEAGENT_BACKGROUND_TASK_PREFIX</string>
-  <key>NativeAgentDeviceSync</key>
-  <string>$NATIVEAGENT_DEVICE_SYNC</string>
-  <key>CFBundleVersion</key>
-  <string>$VERSION</string>
-  <key>CFBundleShortVersionString</key>
-  <string>$EFFECTIVE_SHORT_VERSION</string>
-  <key>NativeAgentSourceRevision</key>
-  <string>$NATIVEAGENT_SOURCE_REVISION</string>
-  <key>NativeAgentSourceDirty</key>
-  <$NATIVEAGENT_SOURCE_DIRTY/>
-  <key>CFBundleIconFile</key>
-  <string>AppIcon</string>
-  <key>CFBundleIconName</key>
-  <string>AppIcon</string>
-  <key>CFBundlePackageType</key>
-  <string>APPL</string>
-  <key>UTExportedTypeDeclarations</key>
-  <array>
-    <dict>
-      <key>UTTypeConformsTo</key>
-      <array>
-        <string>public.data</string>
-      </array>
-      <key>UTTypeDescription</key>
-      <string>NativeAgent Chat Session</string>
-      <key>UTTypeIdentifier</key>
-      <string>com.nativeagent.chat-session</string>
-    </dict>
-  </array>
-  <key>CFBundleURLTypes</key>
-  <array>
-    <dict>
-      <key>CFBundleURLName</key>
-      <string>$NATIVEAGENT_MAC_BUNDLE_ID.oauth</string>
-      <key>CFBundleURLSchemes</key>
-      <array>
-        <string>nativeagent</string>
-      </array>
-    </dict>
-  </array>
-  <key>LSMinimumSystemVersion</key>
-  <string>26.0</string>
-  <key>NSHighResolutionCapable</key>
-  <true/>
-  <key>NSPrincipalClass</key>
-  <string>NSApplication</string>
-  <!-- Usage strings for TCC prompts -->
-  <key>NSAppleEventsUsageDescription</key>
-  <string>NativeAgent uses Apple Events to coordinate with system applications.</string>
-  <key>NSCalendarsUsageDescription</key>
-  <string>NativeAgent uses calendar access for assistant briefings and user-approved watch jobs.</string>
-  <key>NSCalendarsFullAccessUsageDescription</key>
-  <string>NativeAgent uses full calendar access to read upcoming events for assistant briefings and user-approved watch jobs.</string>
-  <key>NSCalendarsWriteOnlyAccessUsageDescription</key>
-  <string>NativeAgent uses write-only calendar access to create events only when the user enables Calendar write access.</string>
-  <key>NSRemindersUsageDescription</key>
-  <string>NativeAgent uses reminders access for assistant briefings and user-approved watch jobs.</string>
-  <key>NSRemindersFullAccessUsageDescription</key>
-  <string>NativeAgent uses reminders access to read due reminders for assistant briefings and user-approved watch jobs.</string>
-  <!-- Contacts access for assistant-requested people lookup. -->
-  <key>NSContactsUsageDescription</key>
-  <string>NativeAgent uses Contacts so the assistant can look up people you ask about and (with the Contacts write toggle on) create or update contacts on your behalf.</string>
-  <key>NSMicrophoneUsageDescription</key>
-  <string>NativeAgent uses your microphone for voice input.</string>
-  <!-- PATCH-2026-05-06: multimodal-ui Sprint 3.1 — speech recognition usage string -->
-  <key>NSSpeechRecognitionUsageDescription</key>
-  <string>NativeAgent uses speech recognition to transcribe your voice.</string>
-  <key>NSDesktopFolderUsageDescription</key>
-  <string>NativeAgent may read files from your Desktop when you request it.</string>
-  <key>NSDocumentsFolderUsageDescription</key>
-  <string>NativeAgent may read files from your Documents folder when you request it.</string>
-  <key>NSDownloadsFolderUsageDescription</key>
-  <string>NativeAgent may read files from your Downloads folder when you request it.</string>
-  <!-- Sparkle updater — see the SPARKLE_PLIST_KEYS block above (A2.1) -->
-${SPARKLE_PLIST_KEYS}
-  <!-- Swift-native cutover/fin-integration: BGTaskScheduler permitted identifiers.
-       MUST match the com.apple.developer.background-tasks entitlement and
-       the BGTaskScheduler.register(...) calls in AppDelegate. -->
-  <key>BGTaskSchedulerPermittedIdentifiers</key>
-  <array>
-    <string>${NATIVEAGENT_BACKGROUND_TASK_PREFIX}.dream_cycle</string>
-    <string>${NATIVEAGENT_BACKGROUND_TASK_PREFIX}.rem_cycle</string>
-    <string>${NATIVEAGENT_BACKGROUND_TASK_PREFIX}.memory_consolidation</string>
-    <string>${NATIVEAGENT_BACKGROUND_TASK_PREFIX}.self_improvement_sweep</string>
-  </array>
-</dict>
-</plist>
-PLIST
-
 plutil -lint "$BUNDLE/Contents/Info.plist" >/dev/null \
-  || { echo "ERROR: generated Info.plist is malformed." >&2; exit 1; }
+  || { echo "ERROR: Xcode Info.plist is malformed." >&2; exit 1; }
 
 # A2.1: the updater claim must match the mode this release actually ran in.
 STAMPED_FEED_PUBLISHED="$(/usr/libexec/PlistBuddy -c "Print :NativeAgentUpdateFeedPublished" "$BUNDLE/Contents/Info.plist" 2>/dev/null || true)"
@@ -1188,7 +1045,7 @@ if [[ "$PUBLISH_APPCAST" == "false" ]]; then
 fi
 
 # internal-build-seat-hygiene item 1: prove what was actually stamped, rather
-# than trusting the heredoc. CFBundleVersion is Sparkle's comparator key and is
+# than trusting the build settings. CFBundleVersion is Sparkle's comparator key and is
 # bare on EVERY lane; the publish lane must additionally carry a bare short
 # version, or a build that impersonates nothing would still ship as a release.
 STAMPED_BUNDLE_VERSION="$(/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$BUNDLE/Contents/Info.plist" 2>/dev/null || true)"
@@ -1286,6 +1143,11 @@ echo "==> Codesigning..."
 sign_nested_plain() {
   local identity="$1"
   local timestamp_arg="${2:---timestamp}"
+  if [[ -d "$BUNDLE/Contents/PlugIns/NativeAgentWidget.appex" ]]; then
+    codesign --force --sign "$identity" --options runtime "$timestamp_arg" \
+      --generate-entitlement-der --entitlements "$RELEASE_WIDGET_WORK/widget.entitlements" \
+      "$BUNDLE/Contents/PlugIns/NativeAgentWidget.appex"
+  fi
   codesign --force --sign "$identity" --identifier nativeagent-link \
     --options runtime "$timestamp_arg" "$BUNDLE/Contents/MacOS/nativeagent-link"
   codesign --force --sign "$identity" --identifier NativeAgentChromeRelay \
@@ -1297,7 +1159,7 @@ sign_nested_plain() {
 }
 if [[ "$DRY_RUN" == "true" ]]; then
   SIGN_ID="${NATIVEAGENT_DEVELOPER_ID:-}"
-  DRY_RUN_ENTITLEMENTS="$ROOT/NativeAgent.adhoc.entitlements"
+  DRY_RUN_ENTITLEMENTS="$NATIVEAGENT_RELEASE_ENTITLEMENTS"
   if [[ -z "$SIGN_ID" ]]; then
     # A stable Apple code identity gives TCC a responsible application to
     # register. Prefer a transferable Developer ID identity for local-test

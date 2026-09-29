@@ -11,6 +11,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import Studio
 
 /// The result of a standing-view lifecycle transition (2026-09-06): the view as
 /// it now stands, plus the persistence failure if the transition never reached

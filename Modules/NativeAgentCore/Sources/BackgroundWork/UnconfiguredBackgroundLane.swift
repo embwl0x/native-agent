@@ -1,0 +1,58 @@
+import Foundation
+import BackgroundLoops
+
+// C8 (2026-08-28): a surface lane that is not configured used to be ABSENT
+// from the scheduler entirely — `assembleAllLoops` appended it only when the
+// config existed. Absence is indistinguishable from "we forgot to build it":
+// Doctor has nothing to report on, the loops list in the app shows nothing, and
+// the honest answer ("Telegram is off because there is no token on disk") is
+// visible nowhere.
+//
+// The placeholder registers the real loop id and skips every tick with the
+// reason, so the lane appears in `status()` and in Doctor. The skip is NOT
+// health-neutral: it is a truthful outcome, and clearing a stale error on it is
+// correct.
+//
+// D3 (2026-09-10): this lane is HEALTHY, not dormant. "Telegram is off because
+// there is no token on disk" is a fact about the install, not a fault, and
+// `DoctorLoopHealth.dormancyVerdict` no longer applies the dormancy bound to a
+// loop whose last tick legitimately skipped. Visibility was the point of the
+// placeholder; the warning badge never was.
+
+public enum UnconfiguredBackgroundLane {
+    /// Placeholder for a surface lane whose configuration is missing.
+    public struct UnconfiguredLaneLoop: LoopRunner {
+        public let loopId: String
+        public let interval: TimeInterval
+        let reason: String
+
+        public var tickTimeoutOverride: TimeInterval? { 5 }
+
+        public func tickOutcome() async -> LoopTickOutcome {
+            .skipped(reason: reason)
+        }
+
+        public func tick() async { _ = await tickOutcome() }
+    }
+
+    /// Hourly is deliberate: the placeholder does nothing, so the only cost of
+    /// a tick is the outcome record, and an hourly cadence keeps `lastRun`
+    /// fresh enough that the lane reads as ALIVE-but-idle rather than stalled.
+    public static let unconfiguredLaneInterval: TimeInterval = 60 * 60
+
+    public static func unconfiguredLanePlaceholder(
+        loopId: String,
+        reason: String
+    ) -> UnconfiguredLaneLoop {
+        UnconfiguredLaneLoop(
+            loopId: loopId,
+            interval: unconfiguredLaneInterval,
+            reason: reason
+        )
+    }
+
+    public static let telegramUnconfiguredReason =
+        "telegram not configured (no enabled bot token in telegram/config.json)"
+    public static let slackUnconfiguredReason =
+        "slack not configured (no enabled Socket Mode config in slack/)"
+}

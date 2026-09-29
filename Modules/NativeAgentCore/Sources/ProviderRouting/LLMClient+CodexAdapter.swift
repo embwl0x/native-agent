@@ -1,6 +1,7 @@
 import Foundation
 @preconcurrency import Dispatch
 import NativeAgentCore
+import PersistenceCore
 
 #if DEBUG
 internal enum CodexAdapterDebugCounters {
@@ -520,6 +521,135 @@ public final class CodexAdapter: LLMAdapter {
                 terminator.fire()
                 task.cancel()
             }
+        }
+    }
+
+    // MARK: - Buffered text-only messages contract
+
+    /// The CLI carries no NativeAgent tools (`supportsTools` is false and
+    /// ProviderToolCapability admits the turn as text-only), so `tools` never
+    /// reaches the process.
+    public func complete(
+        prompt: String,
+        system: String?,
+        model: String,
+        tools: [LLMToolSchema]?
+    ) async throws -> String {
+        try await complete(prompt: prompt, system: system, model: model)
+    }
+
+    /// The conversation flattens into one role-prefixed prompt for the CLI's
+    /// stdin (tool blocks rendered as inline annotations). The CLI cannot see
+    /// images, so the model is told so and a trace row records the drop.
+    public func completeMessages(
+        messages: [LLMMessage],
+        system: String?,
+        model: String,
+        tools: [LLMToolSchema]?
+    ) async throws -> String {
+        let flattened = llmCompatibilityPrompt(messages: messages) { role in
+            role == .user ? "USER:" : "ASSISTANT:"
+        }
+        var combined = flattened.text
+        let imageCount = flattened.imageCount
+        if imageCount > 0 {
+            let note = "[NOTE TO ASSISTANT: \(imageCount) image(s) reached this turn — attached by the user, or produced by a tool you just ran — but the active provider/model cannot see images. Tell the user honestly that you could not view the attached image(s) or the image(s) a tool produced — do NOT guess or pretend to describe them.]"
+            combined = combined.isEmpty ? note : note + "\n" + combined
+            await Self.emitVisionUnsupportedTrace(
+                provider: self.providerId,
+                model: model,
+                imageCount: imageCount
+            )
+        }
+        return try await complete(prompt: combined, system: system, model: model, tools: tools)
+    }
+
+    /// Codex stdout arrives near process exit (see the caveat on this type),
+    /// so the messages stream is one blocking run, heartbeating while it runs,
+    /// yielded as a single delta.
+    public func messagesStreamKind(tools: [LLMToolSchema]?) -> LLMMessagesStreamKind { .bufferedText }
+
+    public func streamMessages(
+        messages: [LLMMessage],
+        system: String?,
+        model: String,
+        tools: [LLMToolSchema]?
+    ) -> AsyncThrowingStream<LLMMessageStreamEvent, Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task {
+                // The run yields nothing until the CLI exits, and
+                // ProviderStreamGuard's idle clock (90s default) only advances
+                // on a yield — so a healthy run past 90s died as "idle" under
+                // its own 180s timeout. A `.keepAlive` every 30s is guard-visible
+                // activity consumers ignore; same contract as the Anthropic
+                // adapter's buffered lane.
+                let heartbeat = Task {
+                    while !Task.isCancelled {
+                        try? await Task.sleep(nanoseconds: 30_000_000_000)
+                        if Task.isCancelled { break }
+                        continuation.yield(.keepAlive)
+                    }
+                }
+                defer { heartbeat.cancel() }
+                do {
+                    let reply = try await completeMessages(
+                        messages: messages,
+                        system: system,
+                        model: model,
+                        tools: tools
+                    )
+                    heartbeat.cancel()
+                    if !reply.isEmpty {
+                        continuation.yield(.textDelta(reply))
+                    }
+                    continuation.finish()
+                } catch {
+                    heartbeat.cancel()
+                    continuation.finish(throwing: ProviderFailure.normalize(error))
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
+    /// Tripwire row: an image attachment reached the CLI's flattened prompt
+    /// and got dropped. Mirrors `memory.commit` trace shape
+    /// (id/kind/title/status/payload/createdAt) and writes via the path-owned
+    /// appender to `<dataRoot>/traces/events.jsonl`.
+    private static func emitVisionUnsupportedTrace(
+        provider: String,
+        model: String,
+        imageCount: Int
+    ) async {
+        // Destination resolution mirrors LLMCallTraceRecorder.tracesPath: a
+        // non-nil override (test-only injection via LLMCallContext) wins,
+        // otherwise resolve the live default root at append time.
+        let dataRoot = LLMCallContext.traceDataRootOverride ?? PersistenceCore.defaultDataRoot()
+        let tracesPath = dataRoot
+            .appendingPathComponent("traces", isDirectory: true)
+            .appendingPathComponent("events.jsonl")
+        let row: JSONValue = .object([
+            "id": .string(UUID().uuidString.lowercased()),
+            "kind": .string("vision.attachment_unsupported"),
+            "title": .string("vision_attachment_unsupported"),
+            "status": .string("ok"),
+            "payload": .object([
+                "provider": .string(provider),
+                "model": .string(model),
+                "imageCount": .int(Int64(imageCount)),
+            ]),
+            "createdAt": .string(ISO8601DateFormatter().string(from: Date())),
+        ])
+        let persistence = SwiftNativePersistenceCore()
+        do {
+            try await appendPathOwnedJSONL(
+                row, to: tracesPath, using: persistence,
+                logLabel: "LLMAdapter.visionUnsupported"
+            )
+        } catch {
+            FileHandle.standardError.write(
+                Data("LLMAdapter: vision.attachment_unsupported trace append failed: \(error)\n".utf8)
+            )
         }
     }
 

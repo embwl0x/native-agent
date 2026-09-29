@@ -1,6 +1,8 @@
 // PATCH-2026-05-07: proactive-inbox-1 InboxSettingsView — trigger config + master enable
 import SwiftUI
+import NotificationInbox
 import Observation
+import TrustCenter
 
 /// A visible Inbox Policy outcome carries its own severity. Status text is
 /// user-facing copy and must never be treated as an error protocol.
@@ -102,7 +104,7 @@ struct InboxPolicyStatusSlot: Equatable {
 }
 
 /// Owns the policy surface's Inbox History route without becoming a second
-/// inbox store. The mounted history sheet projects `AppModel.inboxItems`, so a
+/// inbox store. The mounted history sheet projects `engine.inbox.items`, so a
 /// refresh made from policy updates the same cards, badges, and chat strip the
 /// rest of the app already observes.
 @MainActor @Observable
@@ -216,7 +218,6 @@ struct InboxSettingsView: View {
     @State private var inboxHistoryRoute = InboxHistoryRoute()
     /// The trigger read has come back once, either way: the header may speak.
     @State private var triggersRead = false
-    @AppStorage(NativeAgentShellPreference.classicShellKey) private var classicShell = false
 
     // File watcher watched paths (comma-separated editing)
     @State private var watchedPaths: String = ""
@@ -244,10 +245,10 @@ struct InboxSettingsView: View {
 
     var body: some View {
         ScrollView {
-            if classicShell { classicContent } else { aliveContent }
+            aliveContent
         }
-        // One save path for either shell's switch: a user flip writes, a
-        // programmatic load does not.
+        // One save path for the switch: a user flip writes, a programmatic
+        // load does not.
         .onChange(of: masterEnabled) { _, val in
             if suppressMasterSave {
                 suppressMasterSave = false
@@ -255,7 +256,7 @@ struct InboxSettingsView: View {
             }
             Task { await saveMaster(enabled: val) }
         }
-        .alivePageLine(classicShell ? nil : headerLine)
+        .alivePageLine(headerLine)
         // ui-taste-sweep 2026-06-07: was falling back to the bundle name.
         .navigationTitle("Notifications")
         .quietReadTask { await load() }
@@ -313,8 +314,7 @@ struct InboxSettingsView: View {
                             TriggerRowView(
                                 trigger: trigger,
                                 watchedPaths: trigger.name == "file_watch" ? $watchedPaths : .constant(""),
-                                onToggle: { enabled in await setTriggerEnabled(trigger.name, enabled: enabled) },
-                                alive: true
+                                onToggle: { enabled in await setTriggerEnabled(trigger.name, enabled: enabled) }
                             )
                         }
                     case .disabled:
@@ -404,116 +404,21 @@ struct InboxSettingsView: View {
             )
     }
 
-    // ── Classic shell: unchanged ──────────────────────────────────────────
-
-    private var classicContent: some View {
-            VStack(alignment: .leading, spacing: 24) {
-                // ── Master toggle ──────────────────────────────────────────
-                InboxSection(title: "Notifications from the agent") {
-                    Toggle("Let the agent raise things unasked", isOn: $masterEnabled)
-                        .disabled(masterToggleDisabled)
-
-                    Text("When this is on, \(agentDisplayName) can share observations, file changes, finished Desk tasks and check-ins without being asked.")
-                        .font(ShellType.label)
-                        .foregroundStyle(NativeAgentShell.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-
-                    Button("Notification history") {
-                        Task { await openInboxHistory() }
-                    }
-                    .disabled(inboxHistoryRoute.isLoading)
-
-                    // SUBSYSTEM #17 (2026-05-31): retired diagnostic UI + /v1/inbox/self_test
-
-                    if !statusSlot.entries.isEmpty {
-                        VStack(alignment: .leading, spacing: 4) {
-                            ForEach(statusSlot.entries, id: \.source) { entry in
-                                Text(entry.status.text)
-                                    .font(ShellType.label)
-                                    .foregroundStyle(statusColor(entry.status.tone))
-                                    .fixedSize(horizontal: false, vertical: true)
-                            }
-                        }
-                    }
-                }
-
-                // ── Triggers ───────────────────────────────────────────────
-                switch triggersPanelGate {
-                case .enabled:
-                    InboxSection(title: "When the agent sends a notification") {
-                        ForEach(triggers) { trigger in
-                            TriggerRowView(
-                                trigger: trigger,
-                                watchedPaths: trigger.name == "file_watch" ? $watchedPaths : .constant(""),
-                                onToggle: { enabled in await setTriggerEnabled(trigger.name, enabled: enabled) }
-                            )
-                        }
-                    }
-
-                    // File watcher path editor
-                    if triggers.first(where: { $0.name == "file_watch" })?.enabled == true {
-                        InboxSection(title: "Folders the agent watches") {
-                            Text("One folder path per line.")
-                                .font(ShellType.label)
-                                .foregroundStyle(NativeAgentShell.secondary)
-                            TextEditor(text: $watchedPaths)
-                                .accessibilityLabel("Folders the agent watches")
-                                .accessibilityHint("Enter one folder path per line.")
-                                .font(ShellType.code)
-                                .scrollContentBackground(.hidden)
-                                .frame(minHeight: 80)
-                                .padding(8)
-                                .background(
-                                    RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                        .fill(NativeAgentShell.quietFill)
-                                )
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                        .strokeBorder(NativeAgentShell.hairline, lineWidth: 1)
-                                )
-                            Button("Save paths") {
-                                Task { await saveWatchedPaths() }
-                            }
-                        }
-                    }
-                case .disabled:
-                    EmptyView()
-                case .loading:
-                    InboxSection(title: "When the agent sends a notification") {
-                        Text("Checking whether notifications from the agent are on…")
-                            .font(ShellType.label)
-                            .foregroundStyle(NativeAgentShell.secondary)
-                    }
-                case .unavailable(let detail):
-                    InboxSection(title: "When the agent sends a notification") {
-                        Text("The notification setting could not be read. Notification options are unavailable until it can be loaded.")
-                            .font(ShellType.label)
-                            .foregroundStyle(NativeAgentShell.trouble)
-                            .fixedSize(horizontal: false, vertical: true)
-                        Text(detail)
-                            .font(ShellType.caption)
-                            .foregroundStyle(NativeAgentShell.secondary)
-                            .lineLimit(3)
-                    }
-                }
-            }
-            .padding(.bottom, 32)
-            .frame(maxWidth: .infinity, alignment: .leading)
-    }
-
     // ── Data loading ──────────────────────────────────────────────────────
 
     func load() async {
         isLoading = true
         defer { isLoading = false }
-        // Load trust policy via raw dictionary to pick up inboxPolicy (not yet in Swift TrustPolicy struct)
+        // Load the raw trust policy to pick up inboxPolicy (not in the typed TrustPolicy)
         // PATCH-2026-05-29: surface-load-errors Do not swallow the /v1/trust fetch
         // with try?; a failed fetch left masterEnabled stale/false with no status.
         do {
-            let obj = try await client.getTrustRaw()
-            let ip = obj["inboxPolicy"] as? [String: Any]
+            let obj = try await appModel.engine.trust.rawPolicy()
             // TrustCenter+Defaults ships inboxPolicy.enabled TRUE.
-            let loaded = ip?["enabled"] as? Bool ?? true
+            var loaded = true
+            if case .object(let ip)? = obj["inboxPolicy"], case .bool(let enabled)? = ip["enabled"] {
+                loaded = enabled
+            }
             trustReadState = .loaded(enabled: loaded)
             statusSlot.clear(source: .settingsRead)
             // Suppress the master toggle's onChange save only when the value
@@ -604,17 +509,17 @@ struct InboxSettingsView: View {
 
     private func openInboxHistory() async {
         await inboxHistoryRoute.open(
-            read: { try await appModel.getInboxItems(unreadOnly: false) },
-            retainedItemCount: { appModel.inboxItems.count },
-            adopt: { appModel.inboxItems = $0 }
+            read: { try await appModel.engine.inbox.list() },
+            retainedItemCount: { appModel.engine.inbox.items.count },
+            adopt: { appModel.engine.inbox.items = $0 }
         )
     }
 
     private func refreshInboxHistory() async {
         _ = await inboxHistoryRoute.refresh(
-            read: { try await appModel.getInboxItems(unreadOnly: false) },
-            retainedItemCount: { appModel.inboxItems.count },
-            adopt: { appModel.inboxItems = $0 }
+            read: { try await appModel.engine.inbox.list() },
+            retainedItemCount: { appModel.engine.inbox.items.count },
+            adopt: { appModel.engine.inbox.items = $0 }
         )
     }
 
@@ -649,7 +554,7 @@ struct InboxHistoryView: View {
                         .padding(.vertical, 8)
                 }
 
-                switch InboxHistoryPresentation.content(items: appModel.inboxItems) {
+                switch InboxHistoryPresentation.content(items: appModel.engine.inbox.items) {
                 case .empty where route.isLoading:
                     ProgressView("Loading notification history…")
                         .font(ShellType.label)
@@ -790,76 +695,28 @@ struct TriggerRowView: View {
     // visual toggle when the server write fails.
     let onToggle: (Bool) async -> Bool
 
-    /// The Advanced shell's row: title, detail, haze switch. No glyph, and no
-    /// pulsing dot: the switch already says on, and nothing here animates
-    /// per frame.
-    let alive: Bool
-
     @State private var toggleState: InboxTriggerToggleStateMachine
 
-    init(trigger: InboxTriggerConfig, watchedPaths: Binding<String>, onToggle: @escaping (Bool) async -> Bool,
-         alive: Bool = false) {
+    init(trigger: InboxTriggerConfig, watchedPaths: Binding<String>, onToggle: @escaping (Bool) async -> Bool) {
         self.trigger = trigger
         self._watchedPaths = watchedPaths
         self.onToggle = onToggle
-        self.alive = alive
         self._toggleState = State(initialValue: InboxTriggerToggleStateMachine(serverEnabled: trigger.enabled))
     }
 
+    /// Title, detail, haze switch. No glyph, and no pulsing dot: the switch
+    /// already says on, and nothing here animates per frame.
     var body: some View {
-        Group {
-            if alive {
-                InboxAliveSwitchRow(
-                    title: trigger.displayName,
-                    detail: trigger.description,
-                    isOn: Binding(
-                        get: { toggleState.visualEnabled },
-                        set: { requestToggle($0) }
-                    ))
-            } else {
-                classicRow
-            }
-        }
-        .onChange(of: trigger.enabled) { _, val in
-            toggleState.synchronizeServer(enabled: val)
-        }
-    }
-
-    // PATCH-2026-05-07: polish-InboxSettingsView PulsingDot for enabled triggers
-    private var classicRow: some View {
-        HStack(alignment: .center, spacing: 8) {
-            ZStack(alignment: .bottomTrailing) {
-                Image(systemName: trigger.systemImage)
-                    .font(ShellType.body)
-                    .foregroundStyle(NativeAgentShell.tertiary)
-                    .frame(width: 22)
-                if toggleState.visualEnabled {
-                    PulsingDot(color: NativeAgentShell.calm, size: 6)
-                        .offset(x: 4, y: 4)
-                }
-            }
-
-            VStack(alignment: .leading, spacing: 2) {
-                Text(trigger.displayName)
-                    .font(ShellType.bodySemibold)
-                    .foregroundStyle(NativeAgentShell.text)
-                if let desc = trigger.description {
-                    Text(desc)
-                        .font(ShellType.label)
-                        .foregroundStyle(NativeAgentShell.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-            }
-
-            Spacer(minLength: 8)
-
-            Toggle("", isOn: Binding(
+        InboxAliveSwitchRow(
+            title: trigger.displayName,
+            detail: trigger.description,
+            isOn: Binding(
                 get: { toggleState.visualEnabled },
                 set: { requestToggle($0) }
             ))
-                .labelsHidden()
+        .onChange(of: trigger.enabled) { _, val in
+            toggleState.synchronizeServer(enabled: val)
         }
-        .frame(minHeight: 48)
     }
 
     private func requestToggle(_ enabled: Bool) {
@@ -902,9 +759,3 @@ private struct InboxAliveSwitchRow: View {
     }
 }
 
-// MARK: - Page kit (2026-09-03 Advanced refinement)
-
-/// One section of the page: the eyebrow the Advanced list uses, and the rows
-/// under it on one card. Replaces the stack of `NativePanel` material slabs
-/// this page carried; on the shell's one sheet those read as plates.
-private typealias InboxSection<Content: View> = SettingsCardSection<Content>

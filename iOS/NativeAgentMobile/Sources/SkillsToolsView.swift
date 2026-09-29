@@ -53,6 +53,8 @@ enum ToolCatalogPresentation {
     }
 }
 
+// MARK: - Skills & Tools
+
 private enum MobileSkillsToolsSection: String, CaseIterable, Identifiable {
     case skills = "Skills"
     case tools = "Tools"
@@ -86,39 +88,25 @@ struct SkillsToolsView: View {
         }
     }
 
-    private var content: some View {
-        VStack(spacing: 0) {
-            Picker("Skills and Tools page", selection: selection) {
-                ForEach(MobileSkillsToolsSection.allCases) { section in
-                    Text(section.rawValue).tag(section)
-                }
-            }
-            .pickerStyle(.menu)
-            .labelsHidden()
-            .padding(.horizontal)
-            .padding(.vertical, 8)
+    /// The page switch sits under the header; each page owns its own scroll,
+    /// pull-to-refresh and search.
+    private var picker: some View {
+        AliveSegmentedPicker(selection: selection, options: MobileSkillsToolsSection.allCases) { $0.rawValue }
+            .accessibilityElement(children: .contain)
+            .accessibilityLabel("Skills and Tools page")
             .accessibilityIdentifier("skills-tools-section-picker")
+    }
 
-            Divider()
-
+    private var content: some View {
+        Group {
             switch selection.wrappedValue {
             case .skills:
-                SkillLifecycleView()
+                SkillLifecycleView(accessory: AnyView(picker))
             case .tools:
-                MobileToolCatalogView()
+                MobileToolCatalogView(accessory: AnyView(picker))
             }
         }
-        .mobileReadingScreen()
-        .navigationTitle("Skills & Tools")
         .macSyncErrorBanner()
-        // E6: and how old that snapshot is.
-        .macSnapshotFreshnessBadge(group: "skills_snapshot")
-        // Sweep R4 C11.4: skills and tools are read straight from the last
-        // Mac snapshot, so "is the Mac reachable" decides whether this list
-        // is current.
-        .safeAreaInset(edge: .top, spacing: 0) {
-                MacStatusChip().frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 16)
-            }
     }
 }
 
@@ -129,6 +117,12 @@ private final class MobileToolCatalogStore: ObservableObject {
     @Published var error: String?
 
     func refresh(pairingStore: PairingStore) async {
+        #if DEBUG
+        if MobileDesignSamples.screen != nil {
+            tools = MobileToolDesignSample.tools
+            return
+        }
+        #endif
         guard pairingStore.isPaired else {
             error = "Pair iPhone with the Mac to see tools."
             return
@@ -148,7 +142,21 @@ private final class MobileToolCatalogStore: ObservableObject {
     }
 }
 
+#if DEBUG
+private enum MobileToolDesignSample {
+    static let tools: [ToolRecord] = [
+        ToolRecord(id: "t1", name: "calendar_read", kind: "connector", status: "available",
+                   description: "Look up upcoming events across your calendars.", autoRun: true),
+        ToolRecord(id: "t2", name: "web_search", kind: "builtin", status: "available",
+                   description: "Search the web and read the pages that answer the question.", autoRun: true),
+        ToolRecord(id: "t3", name: "shell_exec", kind: "builtin", status: "policy_locked",
+                   description: "Run a command in Terminal on the Mac.", autoRun: false),
+    ]
+}
+#endif
+
 private struct MobileToolCatalogView: View {
+    let accessory: AnyView
     @EnvironmentObject private var pairingStore: PairingStore
     @StateObject private var store = MobileToolCatalogStore()
     @State private var searchText = ""
@@ -158,7 +166,8 @@ private struct MobileToolCatalogView: View {
     }
 
     var body: some View {
-        Group {
+        AlivePage(title: "Skills & Tools", line: "What I can do, and how.",
+                 freshnessGroup: "skills_snapshot", accessory: accessory) {
             switch ToolCatalogPresentation.contentState(
                 isLoading: store.isLoading,
                 error: store.error,
@@ -166,132 +175,90 @@ private struct MobileToolCatalogView: View {
                 visibleCount: visibleTools.count
             ) {
             case .loading:
-                ProgressView("Loading tool catalog…")
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                ProgressView("Loading tools…")
+                    .foregroundStyle(AlivePalette.secondary)
+                    .frame(maxWidth: .infinity)
+                    .padding(.top, 40)
             case .syncError(let message):
-                MobileReadingEmptyState(
-                    title: "Tool catalog unavailable",
-                    systemImage: "icloud.slash",
-                    kind: .unavailable,
-                    description: message,
-                    action: retryAction
-                )
+                AliveCalmState(title: "Tools aren’t here yet", line: message,
+                               actionTitle: "Try again", action: retry)
             case .unpublished:
-                MobileReadingEmptyState(
-                    title: "No tools synced",
-                    systemImage: "wrench.and.screwdriver",
-                    kind: .unavailable,
-                    description: "The paired Mac has not published a readable tool catalog yet.",
-                    action: retryAction
-                )
+                AliveCalmState(title: "No tools yet",
+                               line: "The Mac hasn’t published a tool list this iPhone can read.",
+                               actionTitle: "Try again", action: retry)
             case .noMatches:
-                MobileReadingEmptyState(
-                    title: "No tools match",
-                    systemImage: "magnifyingglass",
-                    kind: .empty,
-                    description: "Try a different tool name, kind, or description."
-                )
+                AliveCalmState(title: "No tools match",
+                               line: "Try a different name or description.")
             case .content:
-                List(visibleTools) { tool in
-                    ToolCatalogRow(tool: tool)
+                AliveSection("Tools") {
+                    ForEach(Array(visibleTools.enumerated()), id: \.element.id) { index, tool in
+                        if index > 0 { AliveDivider() }
+                        ToolCatalogRow(tool: tool)
+                    }
                 }
-                .listStyle(.plain)
             }
         }
-        .searchable(text: $searchText, prompt: "Search tools")
+        // The search floats over the list, like Memories.
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            // Nothing to search until the Mac has published tools.
+            if !store.tools.isEmpty || !searchText.isEmpty {
+                AliveSearchField(prompt: "Search tools", text: $searchText)
+                    .padding(.horizontal, AliveMetrics.pageInset)
+                    .padding(.top, 6)
+                    .padding(.bottom, 8)
+            }
+        }
         .refreshable {
             await store.refresh(pairingStore: pairingStore)
         }
         .task {
             await store.refresh(pairingStore: pairingStore)
         }
-        .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
-                if store.isLoading {
-                    ProgressView()
-                        .controlSize(.small)
-                }
-            }
-        }
     }
 
-    private var retryAction: (title: String, systemImage: String, handler: () -> Void) {
-        (
-            title: "Try Again",
-            systemImage: "arrow.clockwise",
-            handler: {
-                Task { await store.refresh(pairingStore: pairingStore) }
-            }
-        )
+    private func retry() {
+        Task { await store.refresh(pairingStore: pairingStore) }
     }
 }
 
 private struct ToolCatalogRow: View {
     let tool: ToolRecord
 
-    private var statusColor: Color {
+    /// Status, how it runs and its kind, folded into one secondary line.
+    private var statusLine: String {
+        var parts: [String] = []
         switch ToolCatalogPresentation.status(for: tool) {
-        case .known(let status):
-            switch status.lowercased() {
-            case "active", "loaded", "available": return .green
-            case "policy locked", "blocked", "unavailable": return .orange
-            default: return NativeAgentPalette.agentAccent
-            }
-        case .unknown:
-            return .secondary
+        case .known(let value): parts.append(value.prefix(1).uppercased() + value.dropFirst().lowercased())
+        case .unknown: parts.append("Status unknown")
         }
+        switch ToolCatalogPresentation.automaticity(for: tool) {
+        case .automatic: parts.append("runs on its own")
+        case .manual: parts.append("asks first")
+        case .unknown: break
+        }
+        if let kind = tool.kind, !kind.isEmpty {
+            parts.append(kind.lowercased() == "builtin" ? "built in" : AliveWords.humanized(kind).lowercased())
+        }
+        return parts.joined(separator: " · ")
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 7) {
-            MobileAdaptiveRow(alignment: .firstTextBaseline) {
-                Text(tool.name)
-                    .font(.headline)
-                    .textSelection(.enabled)
-                Spacer()
-                Text(statusText)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
-                    .background(NativeAgentMobileTheme.Colors.quietFill, in: Capsule())
-            }
-
+        VStack(alignment: .leading, spacing: 4) {
+            Text(AliveWords.humanized(tool.name))
+                .font(.body)
+                .foregroundStyle(AlivePalette.text)
+                .textSelection(.enabled)
             if let description = tool.description, !description.isEmpty {
                 Text(description)
-                    .font(.body)
-                    .foregroundStyle(.secondary)
+                    .font(.subheadline)
+                    .foregroundStyle(AlivePalette.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
-
-            MobileAdaptiveRow(spacing: 12) {
-                if let kind = tool.kind, !kind.isEmpty {
-                    Label(kind, systemImage: "arrow.triangle.branch")
-                }
-                switch ToolCatalogPresentation.automaticity(for: tool) {
-                case .automatic:
-                    Label("Automatic", systemImage: "bolt.fill")
-                        .foregroundStyle(.secondary)
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 3)
-                        .background(NativeAgentMobileTheme.Colors.quietFill, in: Capsule())
-                case .manual:
-                    Label("Manual", systemImage: "hand.raised")
-                case .unknown:
-                    Label("Automation unknown", systemImage: "questionmark.circle")
-                }
-            }
-            .font(.caption)
-            .foregroundStyle(.tertiary)
+            Text(statusLine)
+                .font(.footnote)
+                .foregroundStyle(AlivePalette.secondary)
         }
-        .padding(.vertical, 5)
+        .aliveRow()
         .accessibilityElement(children: .combine)
-    }
-
-    private var statusText: String {
-        switch ToolCatalogPresentation.status(for: tool) {
-        case .known(let value): return value
-        case .unknown: return "Status unknown"
-        }
     }
 }

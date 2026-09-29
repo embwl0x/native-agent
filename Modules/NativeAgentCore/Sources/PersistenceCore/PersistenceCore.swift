@@ -1,3 +1,5 @@
+import CryptoKit
+import FeedPolicy
 import Foundation
 import Darwin
 import NativeAgentCore
@@ -8,13 +10,32 @@ import NativeAgentCore
 public enum PersistenceCoreError: Error, Equatable {
     case nonFiniteFloat(Double, path: String)
     case ioFailure(String)
+    /// A JSON file exists but does not parse. The file is left where it is
+    /// (the next successful write replaces it); `quarantine` is the copy of
+    /// its bytes kept beside it, or nil if that copy could not be written.
+    case corruptJSON(path: String, quarantine: String?)
+}
+
+extension PersistenceCoreError: LocalizedError {
+    public var errorDescription: String? {
+        switch self {
+        case .ioFailure(let message): return message
+        case .nonFiniteFloat: return nil
+        case .corruptJSON(let path, let quarantine):
+            return "\(path) is not valid JSON; original retained; "
+                + (quarantine.map { "quarantine copy: \($0)" } ?? "quarantine copy could not be written")
+        }
+    }
 }
 
 // MARK: - Protocol
 
 /// Atomic JSON / JSONL file IO using the stable NativeAgent file shapes.
 public protocol PersistenceCoreProtocol: Sendable {
-    func readJSON(_ path: URL, defaultValue: JSONValue) async -> JSONValue
+    /// The file's JSON, or `ifMissing` when no file exists. A file that exists
+    /// but cannot be read or parsed throws; an unparseable one first has its
+    /// bytes copied to `<name>.corrupt-<sha256 prefix>` beside it.
+    func readJSON(_ path: URL, ifMissing: JSONValue) async throws -> JSONValue
     func writeJSON(_ value: JSONValue, to path: URL) async throws
     func appendJSONL(_ record: JSONValue, to path: URL) async throws
     func tailJSONL(_ path: URL, limit: Int, maxBytes: Int?) async throws -> [JSONValue]
@@ -194,10 +215,53 @@ public final class SwiftNativePersistenceCore: PersistenceCoreProtocol {
     @TaskLocal static var atomicWriteDurabilityObserver:
         (@Sendable (AtomicWriteDurabilityPhase) -> Void)?
 
-    public func readJSON(_ path: URL, defaultValue: JSONValue) async -> JSONValue {
-        guard let data = try? Data(contentsOf: path) else { return defaultValue }
-        guard let parsed = try? JSONValue.parse(data) else { return defaultValue }
-        return parsed
+    public func readJSON(_ path: URL, ifMissing: JSONValue) async throws -> JSONValue {
+        let data: Data
+        do {
+            data = try Data(contentsOf: path)
+        } catch CocoaError.fileReadNoSuchFile {
+            return ifMissing
+        } catch {
+            NSLog("readJSON: %@ could not be read: %@", path.path, error.localizedDescription)
+            throw PersistenceCoreError.ioFailure("read \(path.path) failed: \(error.localizedDescription)")
+        }
+        do {
+            return try JSONValue.parse(data)
+        } catch {
+            let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+            var copy = path.deletingLastPathComponent()
+                .appendingPathComponent("\(path.lastPathComponent).corrupt-\(digest.prefix(12))")
+            var quarantine: String?
+            if Self.isPrivateQuarantine(copy, matching: data) {
+                quarantine = copy.path
+            } else {
+                var info = stat()
+                if lstat(copy.path, &info) == 0 || errno != ENOENT {
+                    copy = copy.appendingPathExtension(UUID().uuidString.lowercased())
+                }
+                do {
+                    try Self.writeDataAtomicDurable(data, to: copy)
+                    quarantine = copy.path
+                } catch { quarantine = nil }
+            }
+            NSLog("readJSON: %@ is not valid JSON (%d bytes); bytes kept at %@",
+                  path.path, data.count, quarantine ?? "nowhere (quarantine write failed)")
+            throw PersistenceCoreError.corruptJSON(path: path.path, quarantine: quarantine)
+        }
+    }
+
+    private static func isPrivateQuarantine(_ path: URL, matching data: Data) -> Bool {
+        let fd = open(path.path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK)
+        guard fd >= 0 else { return false }
+        defer { _ = close(fd) }
+        var info = stat()
+        guard fstat(fd, &info) == 0,
+              info.st_mode & S_IFMT == S_IFREG,
+              info.st_mode & 0o7777 == 0o600,
+              info.st_uid == geteuid(),
+              info.st_size == data.count else { return false }
+        let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: false)
+        return (try? handle.readToEnd()) == data
     }
 
     public func writeJSON(_ value: JSONValue, to path: URL) async throws {
@@ -212,12 +276,13 @@ public final class SwiftNativePersistenceCore: PersistenceCoreProtocol {
     }
 
     /// Synchronous entry point for callers that own their serialization and
-    /// hold a lock across the write (the chat session index). Same durability
-    /// tail as `writeJSON`: tmp fsync → rename → parent-directory fsync.
+    /// hold a lock across the write (the chat session index). Same tail as
+    /// `writeJSON` — tmp sync → rename → parent-directory sync — but both syncs
+    /// are F_FULLFSYNC: this is the writer for stores of record.
     public static func writeDataAtomicDurable(_ data: Data, to path: URL) throws {
         let dir = path.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        try atomicWrite(data, to: path)
+        try atomicWrite(data, to: path, fullFlush: true)
     }
 
     public func appendJSONL(_ record: JSONValue, to path: URL) async throws {
@@ -503,6 +568,12 @@ public final class SwiftNativePersistenceCore: PersistenceCoreProtocol {
         try appendBytes(data, to: path)
     }
 
+    /// `appendBytes` for stores outside this module that own their
+    /// serialization and hold the feed's lock (chat session retention, Studio).
+    public static func appendOwnedBytes(_ data: Data, to path: URL, durable: Bool = false) throws {
+        try appendBytes(data, to: path, durable: durable)
+    }
+
     /// Append bytes to a file, creating it if absent. Uses POSIX open(O_APPEND)
     /// so concurrent appenders interleave at line boundaries.
     /// `durable: true` adds an `F_FULLFSYNC` before the descriptor closes —
@@ -684,7 +755,11 @@ public final class SwiftNativePersistenceCore: PersistenceCoreProtocol {
     /// fsync-before-rename + parent-dir-fsync durability; their previous
     /// bare `Data.write(.atomic)` + replaceItemAt could lose the whole feed
     /// on power loss mid-trim (sweep 2026-08-21).
-    static func atomicWrite(_ data: Data, to path: URL) throws {
+    /// `fullFlush` (the durable writer only) makes both syncs F_FULLFSYNC.
+    /// Plain fsync stops at the drive's write cache, which a power cut can
+    /// still lose; the full flush costs ~4 ms each, so the generic writer on
+    /// the turn path keeps plain fsync.
+    package static func atomicWrite(_ data: Data, to path: URL, fullFlush: Bool = false) throws {
         let dir = path.deletingLastPathComponent()
         let name = path.lastPathComponent
         let pid = getpid()
@@ -713,6 +788,7 @@ public final class SwiftNativePersistenceCore: PersistenceCoreProtocol {
             }
         }
         try data.withUnsafeBytes { raw in
+            guard !raw.isEmpty else { return }
             var ptr = raw.baseAddress!
             var remaining = raw.count
             while remaining > 0 {
@@ -734,7 +810,12 @@ public final class SwiftNativePersistenceCore: PersistenceCoreProtocol {
         // (instead of logging) keeps the old file intact and lets the defer
         // unlink the temp (gpt-5.5 review: never rename over good data after
         // the OS reported writeback failure).
-        if fsync(fd) != 0 {
+        // With `fullFlush`, `fullSync` drops to plain fsync only where the
+        // filesystem does not implement F_FULLFSYNC — the documented pattern,
+        // not a silent downgrade.
+        if fullFlush {
+            try fullSync(fd: fd, path: tmpPath, syscalls: .system)
+        } else if fsync(fd) != 0 {
             let err = String(cString: strerror(errno))
             throw PersistenceCoreError.ioFailure("fsync(tmp) failed: \(err)")
         }
@@ -763,7 +844,9 @@ public final class SwiftNativePersistenceCore: PersistenceCoreProtocol {
             )
         }
         defer { _ = close(directoryFD) }
-        if fsync(directoryFD) != 0 {
+        if fullFlush {
+            try fullSync(fd: directoryFD, path: dir, syscalls: .system)
+        } else if fsync(directoryFD) != 0 {
             throw PersistenceCoreError.ioFailure(
                 "fsync(parent directory) failed: \(String(cString: strerror(errno)))"
             )

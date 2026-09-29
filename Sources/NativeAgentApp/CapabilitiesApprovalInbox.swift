@@ -1,11 +1,12 @@
 import Foundation
+import ApprovalInbox
 import NativeAgentShared
 
 /// The compact Capabilities inbox and the full Approvals screen are two views
 /// of one durable queue. A second tap is therefore an observed no-op, never a
 /// second request to execute the approved effect.
 enum CapabilitiesApprovalInboxResolution: Equatable, Sendable {
-    case applied(ApprovalRequest)
+    case applied(ApprovalRecord)
     case noOpInFlight(id: String)
     case noOpAlreadyResolved(id: String, status: String)
     case unavailable(String)

@@ -40,22 +40,6 @@ private enum MorePowerUserDestination: CaseIterable, Identifiable {
         case .macTools: "Mac Tools"
         }
     }
-
-    var systemImage: String {
-        switch self {
-        case .knowledgeGraph: "circle.hexagongrid"
-        case .turnInspector: "waveform.path.ecg"
-        case .macTools: "macbook.and.iphone"
-        }
-    }
-
-    var sourceDescription: String {
-        switch self {
-        case .knowledgeGraph: "Mac-published iCloud snapshot"
-        case .turnInspector: "Synced turn summaries"
-        case .macTools: "Paired-Mac policy and actions"
-        }
-    }
 }
 
 // MARK: - AdvancedView (hidden behind "More" tab)
@@ -67,6 +51,7 @@ struct AdvancedView: View {
         _deskTaskNavigationTarget = deskTaskNavigationTarget
     }
     @EnvironmentObject private var pairingStore: PairingStore
+    @EnvironmentObject private var bridgeClient: MacBridgeClient
     @StateObject private var store = AdvancedStore()
     @State private var showPairingRecovery = false
     @State private var showDesignScreen = MobileDesignSamples.screen != nil
@@ -77,119 +62,63 @@ struct AdvancedView: View {
 
     var body: some View {
         NavigationStack {
-            List {
+            AlivePage(title: "More", line: "Rooms, settings and tools.", style: .root) {
                 if PairingSkipPresentation.showsRecoveryAffordance(isPaired: pairingStore.isPaired) {
-                    Section {
-                        Button {
+                    AliveSection("Connection", surface: .none) {
+                        AliveCalmState(title: AliveConnection.unpaired,
+                                       line: "I live on your Mac. Pair this iPhone and I can reach you here.",
+                                       actionTitle: "Pair with Mac",
+                                       actionHint: "Opens pairing so this iPhone can reconnect to the Mac.") {
                             showPairingRecovery = true
-                        } label: {
-                            Label("Pair with Mac", systemImage: "link.badge.plus")
                         }
-                        .accessibilityHint("Opens pairing so this iPhone can reconnect to the Mac.")
-                    } header: {
-                        Label("Connection required", systemImage: "icloud.slash")
-                            .font(.headline)
                     }
                 }
 
-                // ── Manage — everything the Mac sidebar promotes to primary ──
-                Section {
-                    NavigationLink {
+                AliveSection("Rooms") {
+                    link("Scheduler", "Things set to happen later") { MobileSchedulerView() }
+                    AliveDivider()
+                    link("Helpers", "Run and manage helpers") { MobileHelpersView() }
+                    AliveDivider()
+                    link("Agents", "Conversations with other agents") { MobileAgentsView() }
+                    AliveDivider()
+                    link("Desk tasks", "Work I'm doing for you") {
                         WorkshopView(embedInNavigationStack: false)
-                    } label: {
-                        Label("Desk tasks", systemImage: "hammer").foregroundStyle(.primary)
                     }
-                    NavigationLink {
+                    AliveDivider()
+                    link("Skills & Tools", "What I know how to do") {
                         SkillsToolsView(embedInNavigationStack: false)
-                    } label: {
-                        Label("Skills & Tools", systemImage: "puzzlepiece.extension").foregroundStyle(.primary)
                     }
-                    NavigationLink {
-                        PersonalityDetailHostView()
-                    } label: {
-                        Label("Personality", systemImage: "person.crop.circle").foregroundStyle(.primary)
-                    }
-                    NavigationLink {
-                        ConnectorsHostView()
-                    } label: {
-                        Label("Connectors", systemImage: "point.3.connected.trianglepath.dotted").foregroundStyle(.primary)
-                    }
-                    NavigationLink {
-                        TrustHostView()
-                    } label: {
-                        Label("Trust", systemImage: "lock.shield").foregroundStyle(.primary)
-                    }
-                    NavigationLink {
-                        MacIntegrationView()
-                    } label: {
-                        Label("Mac Integration", systemImage: "macbook.and.iphone").foregroundStyle(.primary)
-                    }
-                    NavigationLink {
-                        ProviderSettingsView()
-                    } label: {
-                        Label("Providers", systemImage: "server.rack").foregroundStyle(.primary)
-                    }
-                    NavigationLink {
-                        SettingsViewFull()
-                    } label: {
-                        Label("Settings", systemImage: "gearshape").foregroundStyle(.primary)
-                    }
-                } header: {
-                    Label("Manage", systemImage: "slider.horizontal.3")
-                        .font(.headline)
+                    AliveDivider()
+                    link("Personality", "How I think and sound") { PersonalityDetailHostView() }
+                    AliveDivider()
+                    link("Connectors", "The services I can reach") { ConnectorsHostView() }
+                    AliveDivider()
+                    link("Trust", "What I may do on my own") { TrustHostView() }
                 }
 
-                // ── Power user — opt-in deep surfaces ──
-                Section {
-                    ForEach(MorePowerUserDestination.allCases) { destination in
-                        NavigationLink {
-                            powerUserDestination(destination)
-                        } label: {
-                            VStack(alignment: .leading, spacing: 4) {
-                                Label(destination.title, systemImage: destination.systemImage).foregroundStyle(.primary)
-                                Text(destination.sourceDescription)
-                                    .font(.callout)
-                                    .foregroundStyle(.secondary)
-                            }
-                        }
-                    }
-                } header: {
-                    Label("Power user", systemImage: "bolt.circle")
-                        .font(.headline)
+                AliveSection("Setup") {
+                    link("Telegram", "Telegram settings on your Mac") { TelegramView() }
+                    AliveDivider()
+                    link("Mac Integration", "Apps on your Mac I can use") { MacIntegrationView() }
+                    AliveDivider()
+                    link("Providers", "The models I think with") { ProviderSettingsView() }
+                    AliveDivider()
+                    link("Settings", "Appearance and the Mac link") { SettingsViewFull() }
                 }
 
-                // ── Diagnostics ──
-                Section {
-                    NavigationLink("Status") {
-                        StatusDetailView(store: store)
+                // Opt-in deep surfaces and diagnostics: lower and quieter.
+                AliveSection("Power user", footer: MoreAboutPresentation.text) {
+                    ForEach(Array(MorePowerUserDestination.allCases.enumerated()), id: \.element.id) { index, destination in
+                        if index > 0 { AliveDivider() }
+                        quietLink(destination.title) { powerUserDestination(destination) }
                     }
-                    NavigationLink("Runs Log") {
-                        RunsLogView(store: store)
-                    }
-                } header: {
-                    Label("Diagnostics", systemImage: "stethoscope")
-                        .font(.headline)
+                    AliveDivider()
+                    quietLink("Status") { StatusDetailView(store: store) }
+                    AliveDivider()
+                    quietLink("Runs Log") { RunsLogView(store: store) }
                 }
-
-                Section {
-                    MobileReadingSurface {
-                        MobileAdaptiveRow(spacing: 12) {
-                            Image(systemName: "info.circle")
-                                .foregroundStyle(.secondary)
-                            Text(MoreAboutPresentation.text)
-                                .font(.callout)
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                    .listRowBackground(Color.clear)
-                    .listRowSeparator(.hidden)
-                } header: {
-                    Label("About", systemImage: "info.circle")
-                        .font(.headline)
-                }
+                .padding(.top, 12)
             }
-            .mobileReadingScreen()
-            .navigationTitle("More")
             .navigationDestination(item: $deskTaskNavigationTarget) { intent in
                 WorkshopView(embedInNavigationStack: false, notifiedTaskID: intent.taskID)
                     .id(intent.id)
@@ -200,9 +129,6 @@ struct AdvancedView: View {
                     .allowsHitTesting(false)
             }
             #endif
-            .safeAreaInset(edge: .top, spacing: 0) {
-                MacStatusChip().frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 16)
-            }
             .sheet(isPresented: $showPairingRecovery) {
                 PairingView(onSkip: {
                     showPairingRecovery = false
@@ -213,6 +139,22 @@ struct AdvancedView: View {
             }
         }
         .macSyncErrorBanner()
+    }
+
+    private func link<Destination: View>(_ title: String, _ detail: String,
+                                         @ViewBuilder destination: @escaping () -> Destination) -> some View {
+        NavigationLink(destination: destination) {
+            AliveRow(title, detail: detail) { AliveChevron() }
+        }
+        .aliveRowButtonStyle()
+    }
+
+    private func quietLink<Destination: View>(_ title: String,
+                                              @ViewBuilder destination: @escaping () -> Destination) -> some View {
+        NavigationLink(destination: destination) {
+            AliveRow(title) { AliveChevron() }
+        }
+        .aliveRowButtonStyle()
     }
 
     @ViewBuilder
@@ -234,6 +176,10 @@ struct AdvancedView: View {
         case "desk": MobileDeskView()
         case "status": StatusDetailView(store: store)
         case "runs": RunsLogView(store: store)
+        case "personality": PersonalityDetailView(store: Self.sampleSettingsStore())
+        case "trust": TrustPolicyView(store: Self.sampleSettingsStore())
+        case "connectors": ConnectorsView(store: Self.sampleSettingsStore())
+        case "trust-empty": TrustPolicyView(store: SettingsStore())
         case "toast":
             VStack(spacing: 0) {
                 MacSnapshotFreshnessBadge(lastSyncedAt: nil)
@@ -246,6 +192,30 @@ struct AdvancedView: View {
         }
         #endif
     }
+
+    #if DEBUG
+    /// Process-local screenshot data for the Personality, Trust and Connectors rooms.
+    private static func sampleSettingsStore() -> SettingsStore {
+        let store = SettingsStore()
+        store.personality = PersonalityProfile(
+            name: "Sample", personaKind: "Companion",
+            essence: "A steady, curious presence that keeps the day simple and the next step clear.",
+            voice: "Plain and warm. Short sentences, one idea at a time, no filler.",
+            traits: PersonalityTraits(warmth: 0.8, directness: 0.7, humor: 0.45, proactivity: 0.6,
+                                      rigor: 0.75, autonomy: 0.55, creativity: 0.65, brevity: 0.7))
+        store.trustPolicy = TrustPolicy(
+            permissionLevel: "Standard", autonomyDefault: "Ask first", requireBackups: true,
+            outsideDefault: "Read only", developerMode: false,
+            workshopPolicy: TrustWorkshopPolicy(enabled: true, showTimeline: true),
+            trainingPolicy: TrustTrainingPolicy(autonomousTraining: false, dreamScheduler: true))
+        store.connectors = [
+            ConnectorRecord(id: "calendar", name: "Calendar", kind: "Calendar", enabled: true, healthStatus: "ok"),
+            ConnectorRecord(id: "github", name: "GitHub", kind: "Code", enabled: true, healthStatus: "connected"),
+            ConnectorRecord(id: "notes", name: "Notes", kind: "Notes", status: "idle", enabled: false),
+        ]
+        return store
+    }
+    #endif
 
     @ViewBuilder
     private func powerUserDestination(_ destination: MorePowerUserDestination) -> some View {
@@ -396,10 +366,15 @@ struct StatusDetailView: View {
 
     var body: some View {
         List {
+            AlivePageHeader(title: "Status", line: "How this iPhone, the Mac and I are doing.",
+                            style: .pushed)
+                .padding(.horizontal, 4)
+                .aliveListRow(top: 4, bottom: 6)
+            Group {
             if !cloudReplies.unverifiedRecords.isEmpty {
                 // 2026-09-08: a Mac record the phone could not verify is deferred, not
                 // hidden; name it so a person can see what is stuck and why.
-                Section("Unverified Mac records") {
+                Section {
                     ForEach(cloudReplies.unverifiedRecords) { record in
                         VStack(alignment: .leading, spacing: 4) {
                             Text(record.kind).font(.headline)
@@ -411,26 +386,22 @@ struct StatusDetailView: View {
                             Text(record.id).font(.caption).textSelection(.enabled)
                         }
                     }
-                }
+                } header: { AliveEyebrow("Unverified Mac records") }
             }
-            Section("Connection") {
+            Section {
                 MobileReadingStat(
                     label: "State",
-                    value: bridgeClient.bridgeStatus.displayName,
+                    value: AliveConnection.line(for: bridgeClient.bridgeStatus, paired: pairingStore.isPaired),
                     systemImage: "antenna.radiowaves.left.and.right",
                     tint: bridgeClient.bridgeStatus.color
                 )
-                .listRowBackground(Color.clear)
-                .listRowSeparator(.hidden)
 
                 MobileReadingStat(
-                    label: "Transport",
-                    value: pairingStore.usesICloudTransport ? "iCloud" : "Unpaired",
+                    label: "Pairing",
+                    value: pairingStore.usesICloudTransport ? "iCloud" : "Not paired",
                     systemImage: "network",
                     tint: NativeAgentPalette.agentAccent
                 )
-                .listRowBackground(Color.clear)
-                .listRowSeparator(.hidden)
 
                 if let lastSeen = bridgeClient.lastSeenAt {
                     LabeledContent("Last seen") {
@@ -450,15 +421,13 @@ struct StatusDetailView: View {
                         ? .orange
                         : NativeAgentPalette.agentAccent
                 )
-                .listRowBackground(Color.clear)
-                .listRowSeparator(.hidden)
                 if let detail = StatusConnectionPresentation.detail(for: syncState) {
                     Text(detail)
                         .font(.callout)
                         .foregroundStyle(.secondary)
                 }
-            }
-            Section("Mac") {
+            } header: { AliveEyebrow("Connection") }
+            Section {
                 switch MacHealthPresentation.snapshot(for: store.health) {
                 case .available(let health):
                     if let healthLoadError = store.healthLoadError {
@@ -472,8 +441,6 @@ struct StatusDetailView: View {
                         systemImage: "app.badge",
                         tint: NativeAgentPalette.agentAccent
                     )
-                    .listRowBackground(Color.clear)
-                    .listRowSeparator(.hidden)
 
                     MobileReadingStat(
                         label: "Version",
@@ -481,8 +448,6 @@ struct StatusDetailView: View {
                         systemImage: "tag",
                         tint: NativeAgentPalette.agentAccent
                     )
-                    .listRowBackground(Color.clear)
-                    .listRowSeparator(.hidden)
 
                     LabeledContent("OK") {
                         Image(systemName: health.ok ? "checkmark.circle.fill" : "xmark.circle.fill")
@@ -491,26 +456,27 @@ struct StatusDetailView: View {
                 case .unavailable:
                     Label(MacHealthPresentation.unavailableTitle, systemImage: "questionmark.circle")
                         .foregroundStyle(.secondary)
-                    Text(store.healthLoadError ?? MacHealthPresentation.unavailableDetail)
+                    // Unpaired, nothing is downloading: say what is true.
+                    Text(pairingStore.usesICloudTransport
+                         ? store.healthLoadError ?? MacHealthPresentation.unavailableDetail
+                         : AliveConnection.unpaired + ".")
                         .font(.callout)
                         .foregroundStyle(.secondary)
                 }
-            }
+            } header: { AliveEyebrow("Mac") }
             if let organism = sync.organismLivingStatus {
                 let organismState = OrganismStatusPresentation.snapshotState(for: organism)
-                Section(sync.agentDisplayName) {
+                Section {
                     if organismState.displaysDetails {
                         let needsAttention = organism.needsAttention == true
                         MobileReadingStat(
                         label: "Posture",
-                        value: organism.posture.capitalized,
+                        value: AliveWords.humanized(organism.posture.lowercased()),
                         systemImage: organism.needsUser
                             ? "person.crop.circle.badge.exclamationmark"
                             : (needsAttention ? "exclamationmark.triangle" : "waveform.path.ecg"),
                         tint: organism.needsUser ? .orange : (needsAttention ? .yellow : .green)
                     )
-                    .listRowBackground(Color.clear)
-                    .listRowSeparator(.hidden)
 
                     MobileReadingStat(
                         label: "Behavior",
@@ -518,8 +484,6 @@ struct StatusDetailView: View {
                         systemImage: "slider.horizontal.3",
                         tint: NativeAgentPalette.agentAccent
                     )
-                    .listRowBackground(Color.clear)
-                    .listRowSeparator(.hidden)
 
                     if let bodyLine = organism.bodyLine, !bodyLine.isEmpty {
                         Text(bodyLine)
@@ -555,7 +519,7 @@ struct StatusDetailView: View {
                             .foregroundStyle(.secondary)
                     }
                     if case .stale(let age) = organismState {
-                        Label("STALE · \(OrganismStatusPresentation.staleAgeText(age)) old — waiting for a newer Mac snapshot", systemImage: "clock.badge.exclamationmark")
+                        Label("\(OrganismStatusPresentation.staleAgeText(age)) old. Waiting for a newer Mac snapshot.", systemImage: "clock.badge.exclamationmark")
                             .font(.callout)
                             .foregroundStyle(.secondary)
                     }
@@ -580,14 +544,14 @@ struct StatusDetailView: View {
                             EmptyView()
                         }
                     }
-                }
+                } header: { AliveEyebrow(sync.agentDisplayName) }
                 let candidateSlice: OrganismStatusPresentation.ReflexCandidateSlice = organismState.displaysDetails
                     ? OrganismStatusPresentation.reflexCandidateSlice(
                         (organism.reflexCandidates ?? []).filter { !locallyFinalizedReflexIDs.contains($0.id) }
                     )
                     : .init(visible: [], hiddenCount: 0)
                 if !candidateSlice.visible.isEmpty {
-                    Section("Reflex review") {
+                    Section {
                         ForEach(candidateSlice.visible) { candidate in
                             VStack(alignment: .leading, spacing: 8) {
                                 MobileAdaptiveRow(alignment: .firstTextBaseline, spacing: 8) {
@@ -613,8 +577,7 @@ struct StatusDetailView: View {
                                     } label: {
                                         Label("Approve", systemImage: "checkmark")
                                     }
-                                    .buttonStyle(.bordered)
-                .tint(.secondary)
+                                    .aliveSecondaryButton()
                                     .disabled(!OrganismStatusPresentation.canApprove(candidate) || decidingReflexID == candidate.id)
 
                                     Button(role: .destructive) {
@@ -622,8 +585,7 @@ struct StatusDetailView: View {
                                     } label: {
                                         Label("Retire", systemImage: "archivebox")
                                     }
-                                    .buttonStyle(.bordered)
-                .tint(.secondary)
+                                    .aliveSecondaryButton()
                                     .disabled(decidingReflexID == candidate.id)
                                 }
                             }
@@ -635,17 +597,17 @@ struct StatusDetailView: View {
                             }
                         }
                         if candidateSlice.hiddenCount > 0 {
-                            Text("\(candidateSlice.hiddenCount) more reflex candidate\(candidateSlice.hiddenCount == 1 ? "" : "s") need review on the Mac.")
+                            Text(AliveWords.count(candidateSlice.hiddenCount, "more reflex candidate") + " need review on the Mac.")
                                 .font(.callout)
                                 .foregroundStyle(.secondary)
                         }
-                    }
+                    } header: { AliveEyebrow("Reflex review") }
                 }
                 let proposalSlice: OrganismStatusPresentation.DreamProposalSlice = organismState.displaysDetails
                     ? OrganismStatusPresentation.dreamProposalSlice(organism.standingViewProposals ?? [])
                     : .init(visible: [], hiddenCount: 0)
                 if !proposalSlice.visible.isEmpty {
-                    Section("Dream proposals") {
+                    Section {
                         ForEach(proposalSlice.visible) { proposal in
                             VStack(alignment: .leading, spacing: 6) {
                                 Text(proposal.title)
@@ -655,32 +617,33 @@ struct StatusDetailView: View {
                                     .foregroundStyle(.secondary)
                                     .fixedSize(horizontal: false, vertical: true)
                                 if !proposal.evidenceIDs.isEmpty {
-                                    Text("\(proposal.evidenceIDs.count) linked evidence item\(proposal.evidenceIDs.count == 1 ? "" : "s")")
+                                    Text(AliveWords.count(proposal.evidenceIDs.count, "linked evidence item"))
                                         .font(.caption)
-                                        .foregroundStyle(.tertiary)
+                                        .foregroundStyle(AlivePalette.secondary)
                                 }
                             }
                         }
                         if proposalSlice.hiddenCount > 0 {
-                            Text("\(proposalSlice.hiddenCount) more proposal\(proposalSlice.hiddenCount == 1 ? "" : "s") can be reviewed on the Mac.")
+                            Text(AliveWords.count(proposalSlice.hiddenCount, "more proposal") + " can be reviewed on the Mac.")
                                 .font(.callout)
                                 .foregroundStyle(.secondary)
                         }
-                    }
+                    } header: { AliveEyebrow("Dream proposals") }
                 }
             } else {
-                Section(sync.agentDisplayName) {
-                    Label("ABSENT — living status is not reporting yet", systemImage: "exclamationmark.triangle")
+                Section {
+                    Label("Not reporting yet", systemImage: "exclamationmark.triangle")
                         .foregroundStyle(.secondary)
                     Text("The phone has not received an agent status update yet.")
                         .font(.callout)
                         .foregroundStyle(.secondary)
-                }
+                } header: { AliveEyebrow(sync.agentDisplayName) }
             }
+            }
+            .listRowBackground(AlivePalette.fill)
         }
-        .mobileReadingScreen()
-        .navigationTitle("Status")
-        .navigationBarTitleDisplayMode(.inline)
+        .contentMargins(.top, 0, for: .scrollContent)
+        .alivePageChrome(title: "Status", root: false)
         .task { await store.refreshHealth() }
         .refreshable { await store.refreshHealth() }
     }
@@ -712,25 +675,16 @@ struct RunsLogView: View {
 
     var body: some View {
         List {
+            AlivePageHeader(title: "Runs Log", line: "What I've run on the Mac lately.", style: .pushed)
+                .padding(.horizontal, 4)
+                .aliveListRow(top: 4, bottom: 6)
             switch RunsLogPresentation.state(runs: store.runs, error: store.runsLoadError) {
             case .unavailable(let error):
-                MobileReadingEmptyState(
-                    title: "Runs are not available",
-                    systemImage: "exclamationmark.triangle",
-                    kind: .unavailable,
-                    description: error
-                )
-                .listRowBackground(Color.clear)
-                .listRowSeparator(.hidden)
+                AliveCalmState(title: "Runs are not available", line: error)
+                    .aliveListRow()
             case .empty:
-                MobileReadingEmptyState(
-                    title: "No Runs Yet",
-                    systemImage: "list.bullet.clipboard",
-                    kind: .empty,
-                    description: "The latest Mac run snapshot contains no runs."
-                )
-                .listRowBackground(Color.clear)
-                .listRowSeparator(.hidden)
+                AliveCalmState(title: "No runs yet", line: "The latest Mac run snapshot contains no runs.")
+                    .aliveListRow()
             case .content:
                 ForEach(store.runs) { run in
                     NavigationLink {
@@ -739,11 +693,11 @@ struct RunsLogView: View {
                         RunRowView(run: run)
                     }
                 }
+                .listRowBackground(AlivePalette.fill)
             }
         }
-        .mobileReadingScreen()
-        .navigationTitle("Runs Log")
-        .navigationBarTitleDisplayMode(.inline)
+        .contentMargins(.top, 0, for: .scrollContent)
+        .alivePageChrome(title: "Runs Log", root: false)
         .task { await store.refreshRuns() }
         .refreshable { await store.refreshRuns() }
         .onChange(of: sync.runs) { _, runs in
@@ -788,7 +742,7 @@ private struct RunRowView: View {
                     }
                 }
                 .font(.caption)
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(AlivePalette.secondary)
                 .accessibilityLabel("Recorded \(run.createdAt)")
             }
         }
@@ -806,6 +760,10 @@ struct RunDetailView: View {
 
     var body: some View {
         List {
+            AlivePageHeader(title: "Run detail", style: .pushed)
+                .padding(.horizontal, 4)
+                .aliveListRow(top: 4, bottom: 6)
+            Group {
             Section {
                 MobileAdaptiveRow(spacing: 12) {
                     Image(systemName: RunKindPresentation.icon(run.kind))
@@ -846,11 +804,11 @@ struct RunDetailView: View {
 
             let modelFacts = RunDetailPresentation.modelFacts(for: run)
             if !modelFacts.isEmpty {
-                Section("Model") {
+                Section {
                     ForEach(modelFacts) { fact in
                         LabeledContent(fact.label, value: fact.value)
                     }
-                }
+                } header: { AliveEyebrow("Model") }
             }
 
             if let prompt = RunDetailPromptPresentation.copyablePrompt(run.prompt) {
@@ -860,10 +818,7 @@ struct RunDetailView: View {
                     Text(RunDetailPromptPresentation.unavailableDescription)
                         .font(.footnote)
                         .foregroundStyle(.secondary)
-                } header: {
-                    Label("Prompt", systemImage: "text.bubble")
-                        .font(.headline)
-                }
+                } header: { AliveEyebrow("Prompt") }
             }
             if let error = run.error, !error.isEmpty {
                 Section {
@@ -871,19 +826,16 @@ struct RunDetailView: View {
                         .font(.system(.caption, design: .monospaced))
                         .foregroundStyle(.red)
                         .textSelection(.enabled)
-                } header: {
-                    Label("Error", systemImage: "exclamationmark.triangle")
-                        .font(.headline)
-                        .foregroundStyle(.red)
-                }
+                } header: { AliveEyebrow("Error") }
             }
             if let output = run.output, !output.isEmpty {
                 runTextSection("Output", systemImage: "text.alignleft", text: output)
             }
+            }
+            .listRowBackground(AlivePalette.fill)
         }
-        .mobileReadingScreen()
-        .navigationTitle("Run Detail")
-        .navigationBarTitleDisplayMode(.inline)
+        .contentMargins(.top, 0, for: .scrollContent)
+        .alivePageChrome(title: "Run Detail", root: false)
     }
 
     private func runTextSection(_ title: String, systemImage: String, text: String) -> some View {
@@ -900,9 +852,6 @@ struct RunDetailView: View {
                         )
                     }
                 }
-        } header: {
-            Label(title, systemImage: systemImage)
-                .font(.headline)
-        }
+        } header: { AliveEyebrow(title) }
     }
 }

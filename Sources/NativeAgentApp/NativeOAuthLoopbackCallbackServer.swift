@@ -1,27 +1,8 @@
+import ProviderRouting
 import Darwin
 import Foundation
 
-final class NativeOAuthLoopbackCallbackServer: @unchecked Sendable {
-    enum CallbackError: LocalizedError {
-        case timedOut
-        case canceled
-        case socket(String)
-        case malformedRequest
-
-        var errorDescription: String? {
-            switch self {
-            case .timedOut:
-                return "Timed out waiting for the OAuth callback."
-            case .canceled:
-                return "OAuth callback listener was canceled."
-            case .socket(let message):
-                return message
-            case .malformedRequest:
-                return "Browser callback request was malformed."
-            }
-        }
-    }
-
+final class NativeOAuthLoopbackCallbackServer: OAuthLoopbackSession, @unchecked Sendable {
     let redirectURI: URL
 
     private let fd: Int32
@@ -44,7 +25,7 @@ final class NativeOAuthLoopbackCallbackServer: @unchecked Sendable {
         self.displayName = displayName
         let opened = Darwin.socket(AF_INET, SOCK_STREAM, 0)
         guard opened >= 0 else {
-            throw CallbackError.socket("socket() failed: \(String(cString: strerror(errno)))")
+            throw OAuthLoopbackCallbackError.socket("socket() failed: \(String(cString: strerror(errno)))")
         }
         var socketFD: Int32? = opened
         do {
@@ -61,15 +42,15 @@ final class NativeOAuthLoopbackCallbackServer: @unchecked Sendable {
                 guard allowsPortFallback,
                       bindErrno == EADDRINUSE,
                       Self.bind(opened, port: 0) else {
-                    throw CallbackError.socket("bind() failed: \(String(cString: strerror(bindErrno)))")
+                    throw OAuthLoopbackCallbackError.socket("bind() failed: \(String(cString: strerror(bindErrno)))")
                 }
             }
             guard Darwin.listen(opened, 1) == 0 else {
-                throw CallbackError.socket("listen() failed: \(String(cString: strerror(errno)))")
+                throw OAuthLoopbackCallbackError.socket("listen() failed: \(String(cString: strerror(errno)))")
             }
             let resolvedPort = try Self.boundPort(opened)
             guard let uri = URL(string: "http://127.0.0.1:\(resolvedPort)\(path)") else {
-                throw CallbackError.socket("Could not build loopback redirect URI.")
+                throw OAuthLoopbackCallbackError.socket("Could not build loopback redirect URI.")
             }
             self.fd = opened
             self.port = resolvedPort
@@ -90,22 +71,22 @@ final class NativeOAuthLoopbackCallbackServer: @unchecked Sendable {
                 group.addTask {
                     let seconds = max(timeoutSeconds, 1)
                     try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
-                    self.finish(.failure(CallbackError.timedOut))
-                    throw CallbackError.timedOut
+                    self.finish(.failure(OAuthLoopbackCallbackError.timedOut))
+                    throw OAuthLoopbackCallbackError.timedOut
                 }
                 guard let url = try await group.next() else {
-                    throw CallbackError.canceled
+                    throw OAuthLoopbackCallbackError.canceled
                 }
                 group.cancelAll()
                 return url
             }
         } onCancel: {
-            self.finish(.failure(CallbackError.canceled))
+            self.finish(.failure(OAuthLoopbackCallbackError.canceled))
         }
     }
 
     func cancel() {
-        finish(.failure(CallbackError.canceled))
+        finish(.failure(OAuthLoopbackCallbackError.canceled))
     }
 
     private func acceptOnce(expectedState: String) async throws -> URL {
@@ -113,7 +94,7 @@ final class NativeOAuthLoopbackCallbackServer: @unchecked Sendable {
             lock.lock()
             if didFinish {
                 lock.unlock()
-                cont.resume(throwing: CallbackError.canceled)
+                cont.resume(throwing: OAuthLoopbackCallbackError.canceled)
                 return
             }
             continuation = cont
@@ -133,7 +114,7 @@ final class NativeOAuthLoopbackCallbackServer: @unchecked Sendable {
             var len = socklen_t(MemoryLayout<sockaddr>.size)
             let client = Darwin.accept(fd, &addr, &len)
             guard client >= 0 else {
-                finish(.failure(CallbackError.canceled))
+                finish(.failure(OAuthLoopbackCallbackError.canceled))
                 return
             }
             lock.lock()
@@ -184,44 +165,16 @@ final class NativeOAuthLoopbackCallbackServer: @unchecked Sendable {
             return nil
         }
         let target = String(parts[1])
-        guard let url = Self.validCallbackURL(
+        guard let url = OAuthLoopbackCallbackPolicy.validCallbackURL(
             target: target,
             path: path,
             port: port
-        ), Self.callbackMatchesState(url, expectedState: expectedState) else {
+        ), OAuthLoopbackCallbackPolicy.callbackMatchesState(url, expectedState: expectedState) else {
             writeHTTPResponse(client, ok: false)
             return nil
         }
         writeHTTPResponse(client, ok: true)
         return url
-    }
-
-    /// Only the exact state issued for this attempt may consume its listener.
-    static func callbackMatchesState(_ url: URL, expectedState: String) -> Bool {
-        let states = URLComponents(url: url, resolvingAgainstBaseURL: false)?
-            .queryItems?.filter { $0.name == "state" } ?? []
-        return !expectedState.isEmpty && states.count == 1 && states[0].value == expectedState
-    }
-
-    static func validCallbackURL(
-        target: String,
-        path: String,
-        port: UInt16
-    ) -> URL? {
-        guard target.hasPrefix("/"),
-              let url = URL(string: "http://127.0.0.1:\(port)\(target)"),
-              url.path == path,
-              let items = URLComponents(
-                  url: url,
-                  resolvingAgainstBaseURL: false
-              )?.queryItems else {
-            return nil
-        }
-        let hasResult = items.contains {
-            ($0.name == "code" || $0.name == "error")
-                && !($0.value ?? "").isEmpty
-        }
-        return hasResult ? url : nil
     }
 
     private func finish(_ result: Result<URL, Error>) {
@@ -291,7 +244,7 @@ final class NativeOAuthLoopbackCallbackServer: @unchecked Sendable {
             }
         }
         guard result == 0 else {
-            throw CallbackError.socket("getsockname() failed: \(String(cString: strerror(errno)))")
+            throw OAuthLoopbackCallbackError.socket("getsockname() failed: \(String(cString: strerror(errno)))")
         }
         return UInt16(bigEndian: addr.sin_port)
     }

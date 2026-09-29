@@ -68,26 +68,19 @@ also requires a current target inside the modal rather than moving its backdrop.
 Version 0.4.11 reads the current viewport, including the summary, instead of
 repeating a prefix of the entire document after every scroll. Offscreen feed
 articles do not spend the walk budget before visible replies. Container text
-includes its direct prose rather than repeating all offscreen descendants. Scroll replies
-allow a bounded 750 ms rendering interval and report whether the DOM changed;
+includes its direct prose rather than repeating all offscreen descendants.
+Glyph-fragmented plain text joins visible inline glyphs, preserving word spaces
+and omitting the individual glyph rows. Transparent glyphs contribute no text;
+containers with no visible glyphs emit no row. Controls and semantic boundaries
+prevent compaction.
+Scroll replies allow a bounded 750 ms rendering interval and report whether
+the DOM changed;
 they never claim that a website finished fetching its feed. Read again or use
 the existing bounded wait when the site is still loading.
 
 The app renews a still-valid tab lease near expiry when performing authorized
 browsing work. Idle expiry, user takeover and revocation remain terminal; there
 is no heartbeat that holds a tab indefinitely and no automatic reacquisition.
-
-Run the focused extension tests with:
-
-```bash
-node --test Extensions/NativeAgentChrome/tests/*.test.js
-```
-
-Run the relay framing tests with:
-
-```bash
-swift test --filter NativeAgentChromeRelayTests
-```
 
 Open **Trust** on NativeAgent's left rail and click **Set up Chrome** in the
 Chrome control permissions. The extension comes with the app; no second
@@ -112,6 +105,12 @@ open `chrome://extensions` and use the same three steps, selecting
 `Extensions/NativeAgentChrome` in that checkout instead. No source build is
 needed to load those extension files. If Chrome cannot be opened automatically,
 enter `chrome://extensions` in Chrome's address bar.
+
+After updating the extension source, reload NativeAgent at `chrome://extensions`
+and refresh the page being read so its content script is replaced. There is no
+JavaScript build step. `script/build_and_run.sh --build-only` bundles the source
+folder through `project.yml`; for an installed-folder setup, build and install
+the updated app before reloading the extension.
 
 The app registers
 the bundled host while Chrome control is enabled and removes the registration

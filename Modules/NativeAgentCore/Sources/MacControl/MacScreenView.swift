@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import TrustCenter
 #if canImport(CoreGraphics)
 import CoreGraphics
 #endif
@@ -746,6 +747,7 @@ public enum MacScreenViewBuilder {
         if let title = node.attributes.title, !title.isEmpty { return (title, "title") }
         // A popup button / checkbox often carries its meaning in its value.
         if !isSecretField(role: node.attributes.role, subrole: node.attributes.subrole, label: nil),
+           !scrollPositionRoles.contains(node.attributes.role),
            let value = node.attributes.value?.trimmingCharacters(in: .whitespacesAndNewlines),
            !value.isEmpty, value.count <= 60 {
             return (value, "value")
@@ -776,7 +778,9 @@ public enum MacScreenViewBuilder {
         }
         var best: (text: String, distance: Double, path: [Int])?
         for candidate in nodes {
-            guard textRoles.contains(candidate.attributes.role) else { continue }
+            // A scroll bar's thumb reads as a raw position (0.4012…), never a name.
+            guard textRoles.contains(candidate.attributes.role),
+                  !scrollPositionRoles.contains(candidate.attributes.role) else { continue }
             guard let text = candidate.attributes.title ?? candidate.attributes.value,
                   !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
             guard let other = candidate.attributes.frame, other.w > 0, other.h > 0 else { continue }
@@ -803,6 +807,9 @@ public enum MacScreenViewBuilder {
         if let best { return (best.text, "nearby_text") }
         return (nil, "none")
     }
+
+    /// A scroll bar and its thumb: their value is a position, not a name.
+    static let scrollPositionRoles: Set<String> = ["AXScrollBar", "AXValueIndicator"]
 
     /// Roles that carry readable prose rather than behaviour.
     public static let textRoles: Set<String> = [

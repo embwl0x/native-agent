@@ -1,37 +1,26 @@
-// U5 W-C (2026-06-11): process-wide cached DatabasePool for the KG SQLite store.
+// The Knowledge Graph's handle on memory.sqlite.
 //
-// Before this file, every KG read constructed a FRESH DatabasePool per query
-// (KnowledgeGraph+SQLite.swift:41/:67) and the indexer held its own private
-// pool — connection churn on every Graph-tab render and every chat search_kg
-// call. One actor now owns at most `maxEntries` pools keyed on the canonical
-// file path; the loader and the indexer resolve through it, so the whole
-// module shares one pool per memory.sqlite.
+// memory.sqlite has ONE owner: MemoryV2's MemoryStorage opens it, and its
+// migrator alone shapes it (every kg_* table included). The graph never opens
+// a connection or creates a table of its own — before 2026-09-26 this file
+// held a second DatabasePool writing the same file beside MemoryStorage's and
+// completed the kg_* schema itself. Now `pool(at:)` returns the owning
+// MemoryStorage's pool, reached through the owner the app installs at launch
+// (`installOwner`; MemoryV2 imports this module, so the dependency cannot
+// point the other way).
 //
 // Lifecycle (every add has a remove):
-//   - ADD: the first `pool(at:)` for a path opens the pool and completes the
-//     kg_* schema (idempotent IF NOT EXISTS) on that EXISTING file. The cache
-//     never creates the file itself, and since stable-failure #4 (Desk 751.7)
-//     nothing graph-side does — MemoryStorage owns store creation/migration.
-//   - REMOVE on file replace: every `pool(at:)` call re-stats the file; if the
-//     (device, inode) identity changed (atomic replace, restore-from-backup),
-//     the stale pool entry is dropped and a fresh pool is opened.
-//   - REMOVE on file deletion: a missing file drops the entry and throws
-//     `.databaseMissing`, so a later recreate reopens cleanly.
-//   - REMOVE on LRU overflow: at most `maxEntries` pools are retained
-//     (production uses exactly one path; the headroom is for tests that churn
-//     temp directories).
-//   - REMOVE on demand: `invalidate(path:)` / `invalidateAll()` for tests and
-//     restore flows.
-//   Dropping an entry releases the cache's reference; GRDB closes the pool's
-//   connections when the last reference goes away, and any in-flight caller
-//   holding a local reference finishes safely on the old pool first.
+//   - ADD: the first `pool(at:)` for a path asks the owner for its pool and
+//     remembers it. A missing file throws `.databaseMissing` without asking —
+//     the graph never causes a store to be created.
+//   - REMOVE on file deletion: a missing file drops the entry, so a later
+//     recreate resolves the owner again.
+//   - REMOVE on failure: an owner that throws leaves no entry; the next call
+//     asks again.
 //
-// Concurrency: `pool(at:)` is fully SYNCHRONOUS inside the actor — there is no
-// suspension point between the stat, the dictionary read, and the dictionary
-// write — so two concurrent callers can never interleave mid-decision; the
-// second caller always observes the first caller's completed entry.
-// DatabasePool itself is Sendable and thread-safe; sharing one instance across
-// tasks is GRDB's supported usage.
+// Concurrency: the first caller for a path parks a resolving Task in the
+// dictionary before its suspension point, so concurrent callers await the
+// same resolution instead of asking the owner twice.
 
 import Foundation
 import GRDB
@@ -42,96 +31,57 @@ public actor KnowledgeGraphPoolCache {
     public enum PoolError: Error, Sendable, Equatable {
         /// The database file does not exist at the given path.
         case databaseMissing(String)
+        /// No memory.sqlite owner was installed in this process.
+        case ownerNotInstalled(String)
     }
 
-    private struct Entry {
-        var pool: DatabasePool
-        var device: UInt64
-        var inode: UInt64
-        var lastUsed: UInt64
+    /// Resolves memory.sqlite's path to its owning storage's pool.
+    public typealias Owner = @Sendable (URL) async throws -> DatabasePool
+
+    private static let ownerLock = NSLock()
+    nonisolated(unsafe) private static var owner: Owner?
+
+    /// Install memory.sqlite's owner. Called once at launch, before any graph
+    /// read or write.
+    public static func installOwner(_ newOwner: @escaping Owner) {
+        ownerLock.lock()
+        owner = newOwner
+        ownerLock.unlock()
     }
 
-    private var entries: [String: Entry] = [:]
-    private var useClock: UInt64 = 0
-    private let maxEntries: Int
-
-    /// Production has exactly one memory.sqlite; the default headroom is for
-    /// tests that exercise multiple temp stores in one process.
-    public init(maxEntries: Int = 4) {
-        self.maxEntries = max(1, maxEntries)
+    private static func installedOwner() -> Owner? {
+        ownerLock.lock()
+        defer { ownerLock.unlock() }
+        return owner
     }
 
-    /// Return the cached pool for `url`, opening it (and completing the kg_*
-    /// schema) on first use, and transparently replacing it when the on-disk
-    /// file's identity changes (atomic replace / restore). Throws
-    /// `.databaseMissing` when the file does not exist — this cache never
-    /// CREATES a database file; store creation belongs to MemoryStorage's
-    /// migrator alone (stable-failure #4: a graph-created file carried no
-    /// migration ledger and bricked the next MemoryStorage init).
-    public func pool(at url: URL) throws -> DatabasePool {
+    private var entries: [String: Task<DatabasePool, Error>] = [:]
+
+    public init() {}
+
+    /// The owning MemoryStorage's pool for `url`. Throws `.databaseMissing`
+    /// when the file does not exist and `.ownerNotInstalled` when no owner
+    /// was installed; an owner failure propagates.
+    public func pool(at url: URL) async throws -> DatabasePool {
         let key = url.standardizedFileURL.path
-        guard let identity = Self.fileIdentity(path: key) else {
-            // File gone — drop any stale entry so a future recreate reopens.
+        guard FileManager.default.fileExists(atPath: key) else {
             entries.removeValue(forKey: key)
             throw PoolError.databaseMissing(key)
         }
-        useClock += 1
-        if var entry = entries[key] {
-            if entry.device == identity.device && entry.inode == identity.inode {
-                entry.lastUsed = useClock
-                entries[key] = entry
-                return entry.pool
-            }
-            // Same path, different file (replaced underneath us) — retire.
-            entries.removeValue(forKey: key)
+        if let pending = entries[key] {
+            return try await pending.value
         }
-        var config = Configuration()
-        config.foreignKeysEnabled = true
-        config.busyMode = .timeout(2)
-        // Same WAL bound as MemoryStorage's pool (gpt-5.5 review 2026-07-02):
-        // both pools write the same memory.sqlite; a cap on only one leaves
-        // KG-only write bursts free to push the WAL high-water mark back up.
-        config.prepareDatabase { db in
-            try db.execute(sql: "PRAGMA journal_size_limit = 4194304")
+        guard let owner = Self.installedOwner() else {
+            throw PoolError.ownerNotInstalled(key)
         }
-        let pool = try DatabasePool(path: key, configuration: config)
-        try SwiftNativeKnowledgeGraphIndexer.ensureSchema(pool)
-        if entries.count >= maxEntries,
-           let lru = entries.min(by: { $0.value.lastUsed < $1.value.lastUsed })?.key {
-            entries.removeValue(forKey: lru)
+        let target = URL(fileURLWithPath: key)
+        let resolving = Task { try await owner(target) }
+        entries[key] = resolving
+        do {
+            return try await resolving.value
+        } catch {
+            if entries[key] == resolving { entries.removeValue(forKey: key) }
+            throw error
         }
-        entries[key] = Entry(
-            pool: pool,
-            device: identity.device,
-            inode: identity.inode,
-            lastUsed: useClock
-        )
-        return pool
-    }
-
-    /// Drop the cached pool for a path (restore flows, tests). The next
-    /// `pool(at:)` reopens fresh.
-    public func invalidate(path: URL) {
-        entries.removeValue(forKey: path.standardizedFileURL.path)
-    }
-
-    /// Drop every cached pool (tests).
-    public func invalidateAll() {
-        entries.removeAll()
-    }
-
-    /// Test seam: number of live cached pools.
-    public func entryCount() -> Int { entries.count }
-
-    /// (device, inode) identity — changes on atomic replace (temp + rename) or
-    /// delete + recreate; does NOT change on in-place writes (SQLite mutates
-    /// the same inode; WAL checkpoints keep it). nil when the file is missing.
-    private static func fileIdentity(path: String) -> (device: UInt64, inode: UInt64)? {
-        guard let attrs = try? FileManager.default.attributesOfItem(atPath: path),
-              let inode = (attrs[.systemFileNumber] as? NSNumber)?.uint64Value,
-              let device = (attrs[.systemNumber] as? NSNumber)?.uint64Value else {
-            return nil
-        }
-        return (device, inode)
     }
 }

@@ -18,8 +18,7 @@
 // the operating-map snapshot family does NOT fetch /v1/agent/swarms (only smoke
 // scripts hit it), and the GET would only be safe to serve natively once the
 // cross-process flock wraps every Python write of swarms/runs.json (the
-// POST /v1/agent/swarms/run executor mutates it). Default OFF. See
-// CUTOVER_PLAN.md §6.55 for the named retirement prereqs.
+// POST /v1/agent/swarms/run executor mutates it). Default OFF.
 
 import Foundation
 import NativeAgentCore

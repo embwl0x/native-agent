@@ -44,7 +44,6 @@ struct InlineApprovalCard: View {
     @State private var resolved = false
     @State private var resolvedDecision = ""
     @State private var resolveError: String? = nil
-    @AppStorage(NativeAgentShellPreference.classicShellKey) private var classicShell = false
 
     private var meta: ChatMessageMetadata? { message.metadata }
     private var approvalId: String { meta?.approvalId ?? "" }
@@ -52,7 +51,7 @@ struct InlineApprovalCard: View {
     /// The daemon's own view of this approval, so a card recreated by a
     /// re-render cannot offer a second click on an already-resolved request.
     private var externalDecision: String? {
-        appModel.approvals.first(where: { $0.id == approvalId })?.status.lowercased()
+        appModel.engine.approvals.records.first(where: { $0.id == approvalId })?.status.lowercased()
     }
 
     private var state: InlineApprovalPresentation.State {
@@ -66,7 +65,7 @@ struct InlineApprovalCard: View {
 
     var body: some View {
         VStack(alignment: .leading) {
-            if classicShell { classicBody } else { shellBody }
+            shellBody
             if message.content.hasPrefix("Connect to Grok Bot?"),
                case .resolved(let decision) = state, decision == "approved" {
                 GrokSecureSetupCard(dataRoot: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot())
@@ -152,86 +151,6 @@ struct InlineApprovalCard: View {
             .joined(separator: "\n")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         return rest.isEmpty ? nil : rest
-    }
-
-    private var classicBody: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 6) {
-                Image(systemName: "lock.shield.fill")
-                    .foregroundStyle(.orange)
-                Text("Action needs approval")
-                    .font(.caption.weight(.semibold))
-                Spacer()
-            }
-            Text(message.content)
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-                .lineLimit(3)
-
-            // S.7: treat as resolved if local @State says so OR if the daemon
-            // no longer lists this approval as pending (prevents second-click
-            // after the view is recreated by a re-render).
-            let externalDecision = appModel.approvals
-                .first(where: { $0.id == approvalId })?
-                .status
-                .lowercased()
-            switch InlineApprovalPresentation.state(
-                approvalID: approvalId,
-                locallyResolved: resolved,
-                localDecision: resolvedDecision,
-                externalStatus: externalDecision
-            ) {
-            case .resolved(let decision):
-                let approved = decision == "approved"
-                let rejected = decision == "denied" || decision == "rejected"
-                let badge = approved ? "Approved" : (rejected ? "Rejected" : "Resolved")
-                let icon = approved ? "checkmark.circle.fill" : (rejected ? "xmark.circle.fill" : "checkmark.circle")
-                Label(badge, systemImage: icon)
-                    .font(.caption2.weight(.semibold))
-                    .foregroundStyle(approved ? Color.green : (rejected ? Color.red : Color.secondary))
-            case .pending:
-                HStack(spacing: 8) {
-                    Button {
-                        Task { await resolve("approved") }
-                    } label: {
-                        Label("Approve", systemImage: "checkmark")
-                            .font(.caption2)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .tint(.green)
-                    .disabled(resolving || approvalId.isEmpty)
-
-                    Button {
-                        Task { await resolve("denied") }
-                    } label: {
-                        Label("Reject", systemImage: "xmark")
-                            .font(.caption2)
-                    }
-                    .buttonStyle(.bordered)
-                    .tint(.red)
-                    .disabled(resolving || approvalId.isEmpty)
-                }
-            case .unavailable:
-                Label("Approval details unavailable", systemImage: "exclamationmark.triangle.fill")
-                    .font(.caption2.weight(.semibold))
-                    .foregroundStyle(.orange)
-            }
-            // B.3: show daemon error inline; card stays actionable
-            if let err = resolveError {
-                Text(err)
-                    .font(.caption2)
-                    .foregroundStyle(.red)
-                    .lineLimit(2)
-            }
-        }
-        .padding(10)
-        .frame(maxWidth: 440, alignment: .leading)
-        .background(Color.orange.opacity(0.07), in: RoundedRectangle(cornerRadius: NativeAgentRadius.panel, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: NativeAgentRadius.panel, style: .continuous)
-                .strokeBorder(Color.orange.opacity(0.25), lineWidth: 1)
-        }
-        .padding(.leading, 24)
     }
 
     private func resolve(_ decision: String) async {

@@ -27,18 +27,34 @@
 		<key>NSAllowsArbitraryLoads</key>
 		<false/>
 	</dict>
+	<key>NSCameraUsageDescription</key>
+	<string>Take a photo to share with your agent when you accept a camera request.</string>
+	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
+	<string>Let your agent know when you arrive at or leave places you enable, even while NativeAgent is closed.</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>Share your current location with your agent when you accept a phone request.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Listen to push-to-talk so you can dictate messages to your agent.</string>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>NativeAgentMobile lets you attach photos from your library so your agent can see them in chat.</string>
 	<key>NSSpeechRecognitionUsageDescription</key>
 	<string>Convert your voice to text so your agent can read what you said.</string>
+	<key>NSSupportsLiveActivities</key>
+	<true/>
+	<key>NSUserActivityTypes</key>
+	<array>
+		<string>INSendMessageIntent</string>
+	</array>
+	<key>NativeAgentAppGroupID</key>
+	<string>$(NATIVEAGENT_IOS_APP_GROUP_ID)</string>
 	<key>NativeAgentDeviceSync</key>
 	<string>cloudkit</string>
 	<key>NativeAgentICloudContainerID</key>
 	<string>$(NATIVEAGENT_ICLOUD_CONTAINER_ID)</string>
 	<key>NativeAgentMobileSourceKey</key>
 	<string>$(NATIVEAGENT_MOBILE_SOURCE_KEY)</string>
+	<key>NativeAgentNotificationGroup</key>
+	<string>group.$(NATIVEAGENT_IOS_BUNDLE_ID).notifications</string>
 	<key>NativeAgentPrivacyPolicyURL</key>
 	<string>$(NATIVEAGENT_PRIVACY_POLICY_URL)</string>
 	<key>NativeAgentSupportURL</key>
@@ -46,6 +62,7 @@
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>remote-notification</string>
+		<string>location</string>
 	</array>
 	<key>UILaunchScreen</key>
 	<dict/>

@@ -1,5 +1,4 @@
 import Foundation
-import MacControl
 import NativeAgentCore
 import PersistenceCore
 
@@ -49,14 +48,14 @@ public actor SwiftNativeTrustCenter: TrustCenterProtocol {
     }
 
     public func getTrust() async throws -> TrustPolicy {
-        return try Self.decodePolicy(.object(try await loadTrustPolicyChecked()))
+        return try TrustPolicy(policyObject: try await loadTrustPolicyChecked())
     }
 
     public func updateTrust(_ update: JSONValue) async throws -> TrustPolicy {
         guard case .object(let patch) = update else {
             throw TrustCenterError.invalidRequest
         }
-        return try Self.decodePolicy(.object(try await applyPolicyPatchChecked(patch)))
+        return try TrustPolicy(policyObject: try await applyPolicyPatchChecked(patch))
     }
 
     /// Canonical checked trust-policy mutation. Every patch is merged against
@@ -249,11 +248,6 @@ public actor SwiftNativeTrustCenter: TrustCenterProtocol {
         dataRoot
             .appendingPathComponent("trust", isDirectory: true)
             .appendingPathComponent("policy.json")
-    }
-
-    private nonisolated static func decodePolicy(_ value: JSONValue) throws -> TrustPolicy {
-        let data = try JSONEncoder().encode(value)
-        return try JSONDecoder().decode(TrustPolicy.self, from: data)
     }
 
     private nonisolated static func deepMerge(

@@ -2,10 +2,10 @@
 // (logs, macctl_bridge.json, browser_ipc.json/browser_ipc_token) go to <repo>/data/
 // rather than the legacy ~/Library/Application Support/NativeAgent/ path.
 //
-// Resolution priority (mirrors native_agentd._resolve_data_root):
-//   1. NATIVE_AGENT_DATA_ROOT env var (test / explicit override)
-//   2. <REPO_PATH stamp>/data/ when running from the installed .app bundle
-//   3. ~/Library/Application Support/NativeAgent/ (public release fallback)
+// One rule per kind of process, owned by PersistenceCore.defaultDataRoot:
+//   - NATIVE_AGENT_DATA_ROOT env var (tests / explicit override)
+//   - <REPO_PATH stamp>/data/ for a dev bundle
+//   - Application Support for the public release
 
 import Foundation
 import PersistenceCore
@@ -19,36 +19,10 @@ enum NativeAgentPaths {
         case failed(String)
     }
 
-    /// B6 (tightness-sweep 2026-07-17): this used to be a `static let` that
-    /// hand-rolled its own env → stamp → AppSupport precedence, independently
-    /// of `PersistenceCore.defaultDataRoot()` (which implements the same chain,
-    /// plus a dev CWD-walkup step). Two resolvers computing the "same" root
-    /// separately could split-root: an early first access here — before the
-    /// REPO_PATH stamp is readable — would permanently cache the AppSupport
-    /// fallback while the Core resolver later resolved the repo root, silently
-    /// sending Swift-side writes to two different `data/` roots.
-    ///
-    /// Delegate to the canonical process cache so app and Core share one
-    /// resolution. Bundle identity and the public fallback are also immutable
-    /// during a process; checking a message must not probe the bundle again.
+    /// Delegates to the canonical process cache so app and Core share one
+    /// resolution (B6, 2026-07-17: two resolvers used to split-root).
     static var dataRoot: URL {
-        // Review round 2 (HIGH): an unstamped PUBLIC-RELEASE bundle must never
-        // adopt a repo data root found by the resolver's dev CWD walk — that
-        // would read a private checkout's data/ AND bypass the blank-slate
-        // quarantine below, which only runs when the root is the AppSupport
-        // one. A public bundle has no REPO_PATH stamp by definition
-        // (isPublicReleaseBundle checks that), so its only legitimate roots
-        // are the env override or AppSupport. Stamped dev installs are
-        // unaffected — isPublicReleaseBundle is false for them.
-        // Round 3: match the Core resolver's env semantics exactly — an EMPTY
-        // NATIVE_AGENT_DATA_ROOT is "unset" there, so it must be "unset" here
-        // too, or an empty-env public launch would skip both the pin and the
-        // quarantine while Core still resolves its own way.
-        if isPublicReleaseBundle,
-           (ProcessInfo.processInfo.environment["NATIVE_AGENT_DATA_ROOT"] ?? "").isEmpty {
-            return applicationSupportDataRoot
-        }
-        return PersistenceCore.defaultDataRoot()
+        PersistenceCore.defaultDataRoot()
     }
 
     static func bridgeConfigRoot(dataRoot: URL) -> URL {
@@ -148,53 +122,9 @@ enum NativeAgentPaths {
         }
     }
 
-    /// BUG-C FIX: persona-root resolver mirroring daemon
-    /// `_resolve_persona_root` so Swift and
-    /// Python both read/write the SAME persona docs (SOUL.md, VOICE.md,
-    /// GROWTH.md, USER.md). The earlier BackgroundLoopsAssembly hardcoded
-    /// `<dataRoot>/persona`, which silently diverged from the daemon
-    /// whenever `NATIVE_AGENT_PERSONA_ROOT` was set or when running from a
-    /// stamped bundle that put persona/ in a sibling repo dir, not under
-    /// data/. REM cycle in Swift then mutated a phantom persona dir the
-    /// daemon never read.
-    ///
-    /// Resolution priority (sync with daemon `_resolve_persona_root`):
-    ///   1. `NATIVE_AGENT_PERSONA_ROOT` env var
-    ///   2. `<stamped_repo>/persona` if REPO_PATH stamp is readable AND
-    ///      `<stamped_repo>/persona` exists
-    ///   3. `<dataRoot>/memory` legacy fallback (mirrors daemon final
-    ///      fallback `_resolve_data_root() / "memory"`)
-    ///
-    /// Note: the daemon also has a step 3 ("`<repo_root>/persona`" from
-    /// `Path(__file__).parent.parent`) for dev runs from source. Swift
-    /// has no equivalent of `Path(__file__)` — the dev case is covered by
-    /// the stamped bundle path or by the env-var override, which is what
-    /// dev launchers already use. The legacy fallback differs intentionally
-    /// from `dataRoot`'s fallback (memory/ vs the data dir itself) to
-    /// match daemon behavior byte-for-byte.
-    /// B6 (tightness-sweep 2026-07-17): delegates to the single canonical
-    /// resolver, same rationale as `dataRoot` above. For the installed
-    /// (stamped) app both the old hand-rolled chain and
-    /// `PersistenceCore.defaultPersonaRoot()` resolve to `<repo>/persona`
-    /// (where SOUL.md lives); the Core resolver is strictly more correct in the
-    /// no-stamp dev/test case, where it finds `<repo>/persona` via the
-    /// SOUL.md-anchored repo walk instead of the old `<dataRoot>/memory`
-    /// cold-start fallback. One resolver, no split-root.
+    /// The persona root for `dataRoot`, from the one canonical rule.
     static var personaRoot: URL {
-        // Pass OUR guarded dataRoot (not the resolver's default) so a public
-        // bundle's persona chain is confined to the AppSupport root too — the
-        // persona resolver keys its sandbox/dev fallbacks off the dataRoot it
-        // is given (review round 2, same class as the dataRoot HIGH).
         PersistenceCore.defaultPersonaRoot(dataRoot: dataRoot)
-    }
-
-    /// Pure resolver used by tests that need to assert daemon-parity for a
-    /// hypothetical dataRoot without touching the cached `personaRoot`
-    /// `static let`. Mirrors the same precedence chain.
-    static func resolvePersonaRoot(dataRoot: URL, env: [String: String] = ProcessInfo.processInfo.environment) -> URL {
-        // B6: delegate to the single canonical resolver rather than hand-rolling
-        // a second (now-divergent) precedence chain.
-        PersistenceCore.defaultPersonaRoot(dataRoot: dataRoot, environment: env)
     }
 
     /// C5 fix: expose stamp validation as a public static method so

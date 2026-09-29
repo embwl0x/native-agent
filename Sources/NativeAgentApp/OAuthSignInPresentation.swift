@@ -1,3 +1,4 @@
+import ProviderRouting
 import Foundation
 
 /// The persisted-credential outcome shown by every OAuth sign-in control.

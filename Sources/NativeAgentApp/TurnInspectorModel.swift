@@ -1,5 +1,6 @@
 import Foundation
 import PersistenceCore
+import TurnTrace
 
 // MARK: - Turn Inspector W3 — testable grouping + replay-parse model
 //

@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import Desk
 
 // First-class GitHub project reads, safe write execution, and durable Desk
 // tracking. Tool/TrustCenter callers own approval before `mutate` can execute;
@@ -338,8 +339,8 @@ public extension GitHubConnectorActions {
     static func nextTrackingRefreshDeadline(
         after now: Date,
         dataRoot: URL = PersistenceCore.defaultDataRoot()
-    ) async -> Date? {
-        await GitHubProjectTracker.nextRefreshDeadline(after: now, dataRoot: dataRoot)
+    ) async throws -> Date? {
+        try await GitHubProjectTracker.nextRefreshDeadline(after: now, dataRoot: dataRoot)
     }
 }
 
@@ -648,7 +649,7 @@ private enum GitHubProjectTracker {
         guard let config = try? loadConfig(dataRoot: dataRoot) else { return false }
         if let snapshot = try? await loadSnapshot(dataRoot: dataRoot),
            let refreshed = DeskClock.parseISO(snapshot.refreshedAt) {
-            let due = await learnedDueInterval(
+            let due = try await learnedDueInterval(
                 dataRoot: dataRoot,
                 entities: snapshot.entities,
                 configuredSeconds: Double(config.refreshIntervalMinutes * 60),
@@ -660,12 +661,12 @@ private enum GitHubProjectTracker {
         return true
     }
 
-    static func nextRefreshDeadline(after now: Date, dataRoot: URL) async -> Date? {
+    static func nextRefreshDeadline(after now: Date, dataRoot: URL) async throws -> Date? {
         guard let config = try? loadConfig(dataRoot: dataRoot),
               let snapshot = try? await loadSnapshot(dataRoot: dataRoot),
               let refreshed = DeskClock.parseISO(snapshot.refreshedAt)
         else { return nil }
-        let interval = await learnedDueInterval(
+        let interval = try await learnedDueInterval(
             dataRoot: dataRoot,
             entities: snapshot.entities,
             configuredSeconds: Double(config.refreshIntervalMinutes * 60),
@@ -689,9 +690,9 @@ private enum GitHubProjectTracker {
         entities: [TrackingEntity],
         configuredSeconds: Double,
         now: Date
-    ) async -> Double {
+    ) async throws -> Double {
         guard !entities.isEmpty else { return configuredSeconds }
-        let stats = await DeskCadenceStore(dataRoot: dataRoot).load()
+        let stats = try await DeskCadenceStore(dataRoot: dataRoot).load()
         return DeskCadenceLearner.batchIntervalSeconds(
             refKeys: entities.map(\.key),
             stats: stats,

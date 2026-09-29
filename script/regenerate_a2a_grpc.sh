@@ -7,7 +7,7 @@ set -euo pipefail
 # swift build --disable-keychain -c release --product <generator>
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PROTO="$ROOT/script/proto/a2a-v1.0.0"
-OUT="$ROOT/Modules/NativeAgentCore/Sources/ChatOrchestration/Generated"
+OUT="$ROOT/Modules/NativeAgentCore/Sources/AgentLinkTransport/Generated"
 mkdir -p "$OUT"
 protoc -I "$PROTO" \
   --swift_out="Visibility=Public:$OUT" \

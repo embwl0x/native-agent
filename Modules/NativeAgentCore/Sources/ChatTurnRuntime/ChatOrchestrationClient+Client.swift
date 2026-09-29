@@ -1,0 +1,295 @@
+import Foundation
+import CryptoKit
+import NativeAgentCore
+import PersistenceCore
+import TurnTrace
+import PersonaEngine
+import MemoryV2
+import MCPDispatcher
+import ProviderRouting
+import TrustCenter
+import KnowledgeGraph
+import XConnector
+import Dispatcher
+import MacControl
+import SwarmRuns
+import MacIntegration
+import CognitiveSubstrate
+
+// MARK: - SwiftNative impl
+
+struct StructuredChatExecution: Sendable {
+    let response: ChatResponse
+    let turn: TurnEngineResult
+}
+
+/// SwiftNative ChatOrchestrationClient — composes the in-process Swift
+/// building blocks into a single chat()/chatStream() surface.
+public actor SwiftNativeChatOrchestrationClient: ChatOrchestrationClient {
+    /// See the protocol requirement: the turn started the promotion after its
+    /// assistant append; the surface that delivered the reply drains it here.
+    /// OPTIONAL, and starts nothing — no ticket, so this only awaits what is
+    /// already running and can never adopt a concurrent turn's pending capture
+    /// (Astra comb 3 review, findings 1 and 2, 2026-09-12).
+    public func drainDeferredMemoryPromotion() async {
+        await engine.awaitDeferredMemoryPromotion()
+    }
+
+    let engine: SwiftNativeTurnEngine
+    let tools: any ToolDispatchClient
+    let llm: any LLMClient
+    let history: SessionHistoryReader
+    let persistence: any PersistenceCoreProtocol
+    let dataRoot: URL
+    let activeToolsStore: ActiveToolsStore
+    let turnTraceBus: TurnTraceBus
+    let trust: SwiftNativeTrustCenter
+    let approvalFiler: (any ApprovalFiler)?
+    let approvalTimeoutSeconds: Double
+    let historyLimit: Int
+    let toolLoopMaxIterationsOverride: Int?
+    let turnWallClockSecondsOverride: TimeInterval?
+    let promoter: (any MemoryPromoting)?
+    let cognitiveObserver: (any CognitiveEventObserving)?
+    let cognitiveContextProvider: (any CognitiveContextProviding)?
+    let providerLifecycleObserverInstalled: Bool
+    let autocompactionConfig: ChatSessionAutocompactionConfig
+    let clock: @Sendable () -> Date
+
+    public init(
+        engine: SwiftNativeTurnEngine,
+        tools: any ToolDispatchClient,
+        llm: any LLMClient,
+        history: SessionHistoryReader = SessionHistoryReader(),
+        persistence: any PersistenceCoreProtocol = SwiftNativePersistenceCore(),
+        dataRoot: URL = PersistenceCore.defaultDataRoot(),
+        activeToolsStore: ActiveToolsStore? = nil,
+        turnTraceBus: TurnTraceBus? = nil,
+        trust: SwiftNativeTrustCenter? = nil,
+        approvalFiler: (any ApprovalFiler)? = nil,
+        approvalTimeoutSeconds: Double = 30,
+        historyLimit: Int = 400,
+        toolLoopMaxIterations: Int? = nil,
+        turnWallClockSeconds: TimeInterval? = nil,
+        promoter: (any MemoryPromoting)? = nil,
+        cognitiveObserver: (any CognitiveEventObserving)? = nil,
+        cognitiveContextProvider: (any CognitiveContextProviding)? = nil,
+        providerLifecycleObserverInstalled: Bool = false,
+        autocompactionConfig: ChatSessionAutocompactionConfig = .productionDefault(),
+        clock: @escaping @Sendable () -> Date = { Date() }
+    ) {
+        // The tool-call guard lets a read recur in one reply but never an
+        // action: parallel-safe tools are reads, and a bare `workspace` call
+        // is her home screen.
+        RunawayOutputDetector.registerReadOnlyCalls { name, bare in
+            ParallelToolDispatch.isParallelSafe(internalToolName: name) || (name == "workspace" && bare)
+        }
+        self.engine = engine
+        self.tools = tools
+        self.llm = llm
+        self.history = history
+        self.persistence = persistence
+        self.dataRoot = dataRoot
+        // The engine and client participate in one tool loop. Default to the
+        // engine's exact store rather than independently deriving another
+        // actor from dataRoot; direct test/custom constructions therefore
+        // cannot split same-turn load and cleanup state across two owners.
+        self.activeToolsStore = activeToolsStore ?? engine.activeToolsStore
+        self.turnTraceBus = turnTraceBus ?? engine.turnTraceBus
+        // Resolve trust against the SAME dataRoot the client is bound to.
+        // Default params can't reference other params in Swift, so this is an
+        // optional-then-resolve seam: production callers that pass nothing AND
+        // a default dataRoot get the identical SwiftNativeTrustCenter() they
+        // got before; tests that pass an override dataRoot stay hermetic.
+        self.trust = trust ?? SwiftNativeTrustCenter(dataRoot: dataRoot)
+        self.approvalFiler = approvalFiler
+        self.approvalTimeoutSeconds = approvalTimeoutSeconds
+        self.historyLimit = historyLimit
+        self.toolLoopMaxIterationsOverride = toolLoopMaxIterations
+        self.turnWallClockSecondsOverride = turnWallClockSeconds
+        self.promoter = promoter
+        self.cognitiveObserver = cognitiveObserver
+        let runtime = cognitiveObserver as? (any CognitiveRuntimeProviding)
+        self.cognitiveContextProvider = cognitiveContextProvider ?? runtime
+        self.providerLifecycleObserverInstalled = providerLifecycleObserverInstalled
+        self.autocompactionConfig = autocompactionConfig
+        self.clock = clock
+    }
+
+    // MARK: chat (non-streaming)
+
+    public func chat(
+        message: String,
+        sessionId: String?,
+        model: String,
+        reasoningEffort: String,
+        fileAccess: String,
+        attachments: [MultimodalAttachment],
+        suppressUserAppend: Bool
+    ) async throws -> ChatResponse {
+        return try await chat(
+            message: message,
+            sessionId: sessionId,
+            model: model,
+            reasoningEffort: reasoningEffort,
+            fileAccess: fileAccess,
+            attachments: attachments,
+            persona: nil,
+            suppressUserAppend: suppressUserAppend
+        )
+    }
+
+    public func chat(
+        message: String,
+        sessionId: String?,
+        model: String,
+        reasoningEffort: String,
+        fileAccess: String,
+        attachments: [MultimodalAttachment],
+        persona: String?,
+        surface: String,
+        suppressUserAppend: Bool
+    ) async throws -> ChatResponse {
+        return try await _chat(
+            message: message, sessionId: sessionId, model: model,
+            reasoningEffort: reasoningEffort, fileAccess: fileAccess,
+            attachments: attachments, persona: persona, surface: surface,
+            suppressUserAppend: suppressUserAppend,
+            progress: nil
+        )
+    }
+
+    public func chat(
+        message: String,
+        sessionId: String?,
+        model: String,
+        reasoningEffort: String,
+        fileAccess: String,
+        attachments: [MultimodalAttachment],
+        persona: String?,
+        surface: String,
+        suppressUserAppend: Bool,
+        progress: ChatOrchestrationProgressHandler?
+    ) async throws -> ChatResponse {
+        return try await _chat(
+            message: message, sessionId: sessionId, model: model,
+            reasoningEffort: reasoningEffort, fileAccess: fileAccess,
+            attachments: attachments, persona: persona, surface: surface,
+            suppressUserAppend: suppressUserAppend,
+            progress: progress
+        )
+    }
+
+    public func chat(
+        message: String,
+        sessionId: String?,
+        model: String,
+        reasoningEffort: String,
+        fileAccess: String,
+        attachments: [MultimodalAttachment],
+        persona: String?,
+        suppressUserAppend: Bool
+    ) async throws -> ChatResponse {
+        return try await _chat(
+            message: message, sessionId: sessionId, model: model,
+            reasoningEffort: reasoningEffort, fileAccess: fileAccess,
+            attachments: attachments, persona: persona, surface: "chat",
+            suppressUserAppend: suppressUserAppend,
+            progress: nil
+        )
+    }
+
+    private func _chat(
+        message: String,
+        sessionId: String?,
+        model: String,
+        reasoningEffort: String,
+        fileAccess: String,
+        attachments: [MultimodalAttachment],
+        persona: String?,
+        surface: String,
+        suppressUserAppend: Bool,
+        progress: ChatOrchestrationProgressHandler?
+    ) async throws -> ChatResponse {
+        // A turn that parks on a card has to be able to RECORD that it did, or
+        // the tool loop's `waitForInteraction` writes to nil, the waiting
+        // terminal is unreachable, and the turn ends with no final at all —
+        // which is what reached the Claude bridge as "stream ended without
+        // final reply" while the card sat in the conversation (2026-09-13).
+        // The bot entry binds its own before calling in; a nested call keeps
+        // the outer turn's execution, so this binds at most once per turn.
+        // The peer-provenance box has exactly this turn's lifetime — see
+        // PeerDataTaint. It is entered INDEPENDENTLY of the execution: piggy-
+        // backing it on the `ChatTurnExecution == nil` branch meant any caller
+        // that bound an execution first (the bot overload does) ran the whole
+        // turn with no taint box at all, so `markConsumed` latched onto
+        // nothing and the fence below it never closed.
+        if PeerDataTaint.current == nil {
+            return try await PeerDataTaint.withScope {
+                try await _chat(
+                    message: message, sessionId: sessionId, model: model,
+                    reasoningEffort: reasoningEffort, fileAccess: fileAccess,
+                    attachments: attachments, persona: persona, surface: surface,
+                    suppressUserAppend: suppressUserAppend, progress: progress
+                )
+            }
+        }
+        guard ChatTurnExecution.current != nil else {
+            return try await ChatTurnExecution.$current.withValue(ChatTurnExecution()) {
+                try await _chat(
+                    message: message, sessionId: sessionId, model: model,
+                    reasoningEffort: reasoningEffort, fileAccess: fileAccess,
+                    attachments: attachments, persona: persona, surface: surface,
+                    suppressUserAppend: suppressUserAppend, progress: progress
+                )
+            }
+        }
+        let admission = try await engine.checkedRouteAdmission(
+            for: surface,
+            requestedModel: model,
+            requestedReasoningEffort: reasoningEffort
+        )
+        // v2Prefix: the adapters read ONLY the task-local override (never
+        // `.effective`), so EVERY outer turn entry has to resolve it once and
+        // bind it. This is the non-streaming entry — the streaming facade wraps
+        // its own; an entry that forgot would silently ship v1 wire layout for a
+        // v2-shaped body.
+        let prefixShape = ConversationPrefixShape.effective
+        let prefixTelemetrySink = ConversationPrefixTelemetrySink()
+        return try await ConversationPrefixTelemetry.$sink.withValue(prefixTelemetrySink) {
+        try await ConversationPrefixShape.$override.withValue(prefixShape) {
+        try await LLMCallContext.$admittedModel.withValue(admission.modelId) {
+        try await LLMCallContext.$providerId.withValue(admission.providerId) {
+        try await LLMCallContext.$reasoningEffort.withValue(admission.reasoningEffort) {
+        try await LLMCallContext.$serviceTier.withValue(admission.serviceTier) {
+            let execution = try await executeStructuredChatStreaming(
+                message: message,
+                sessionId: sessionId,
+                model: admission.modelId,
+                reasoningEffort: admission.reasoningEffort,
+                fileAccess: fileAccess,
+                attachments: attachments,
+                persona: persona,
+                surface: surface,
+                suppressUserAppend: suppressUserAppend,
+                // Saved conversational evidence must not depend on whether
+                // this caller consumes live progress (bridge vs. Telegram).
+                persistToolMessages: true,
+                // chat() callers await the reply; deltas they draw (Telegram's
+                // draft) are a preview, not the answer.
+                rendersProse: false,
+                progress: progress,
+                noticeSink: { kind, text in await progress?(.notice(kind: kind, text: text)) }
+            )
+            var response = execution.response
+            let requested = model.trimmingCharacters(in: .whitespacesAndNewlines)
+            response.requestedModel = requested.isEmpty ? nil : requested
+            return response
+        }
+        }
+        }
+        }
+        }
+        }
+    }
+}

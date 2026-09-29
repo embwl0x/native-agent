@@ -258,8 +258,8 @@ public enum XConnectorActions {
         }
     }
 
-    private static func loadOAuth2TokenData() throws -> Data {
-        let path = oauth2TokenPath()
+    private static func loadOAuth2TokenData(dataRoot: URL = PersistenceCore.defaultDataRoot()) throws -> Data {
+        let path = oauth2TokenPath(dataRoot: dataRoot)
         guard FileManager.default.fileExists(atPath: path.path) else {
             throw XActionError(
                 "missing_oauth2_token",
@@ -278,10 +278,6 @@ public enum XConnectorActions {
             )
         }
         return obj
-    }
-
-    private static func saveOAuth2Token(_ tokens: [String: Any]) throws {
-        try saveOAuth2Token(tokens, to: oauth2TokenPath())
     }
 
     static func saveOAuth2Token(_ tokens: [String: Any], to path: URL) throws {
@@ -305,34 +301,93 @@ public enum XConnectorActions {
     /// other caller awaits the same Task's value, and once the Task
     /// completes (success or failure) `inFlight` is cleared so the next
     /// expired call can start fresh.
+    fileprivate struct Bearer: Sendable {
+        let accountID: String?
+        let accessToken: String
+
+        func check(account: String?, access: String?) throws {
+            guard let account, !account.isEmpty, account == accountID else {
+                guard account == nil, accountID == nil, access == accessToken else {
+                    throw XActionError("credentials_changed", detail: "X account changed — retry the request.")
+                }
+                return
+            }
+        }
+    }
+
     actor RefreshGate {
         static let shared = RefreshGate()
-        private var inFlight: Task<String, Error>?
+        private var inFlight: [String: Task<Bearer, Error>] = [:]
 
-        func resolveBearer(
-            using operation: @escaping @Sendable () async throws -> String
-        ) async throws -> String {
-            if let existing = inFlight {
+        fileprivate func resolveBearer(
+            path: URL,
+            using operation: @escaping @Sendable () async throws -> Bearer
+        ) async throws -> Bearer {
+            let key = path.standardizedFileURL.path
+            if let existing = inFlight[key] {
                 return try await existing.value
             }
             let task = Task { try await operation() }
-            inFlight = task
-            defer { inFlight = nil }
+            inFlight[key] = task
+            defer { inFlight[key] = nil }
             return try await task.value
         }
     }
 
-    private static func currentBearer() async throws -> String {
-        try await RefreshGate.shared.resolveBearer {
-            try await XConnectorActions.currentBearerLocked()
+    private static func currentBearer(dataRoot: URL = PersistenceCore.defaultDataRoot()) async throws -> String {
+        let original = try loadOAuth2Token(data: loadOAuth2TokenData(dataRoot: dataRoot))
+        let bearer = try await RefreshGate.shared.resolveBearer(path: oauth2TokenPath(dataRoot: dataRoot)) {
+            try await XConnectorActions.currentBearerLocked(dataRoot: dataRoot)
         }
+        try bearer.check(account: original["account_id"] as? String, access: original["access_token"] as? String)
+        let current = try loadOAuth2Token(data: loadOAuth2TokenData(dataRoot: dataRoot))
+        try bearer.check(account: current["account_id"] as? String, access: current["access_token"] as? String)
+        return bearer.accessToken
     }
 
-    fileprivate static func currentBearerLocked() async throws -> String {
-        let path = oauth2TokenPath()
+    public static func refreshCredential(dataRoot: URL) async throws {
+        _ = try await currentBearer(dataRoot: dataRoot)
+    }
+
+    public static func accountID(accessToken: String) async throws -> String {
+        let (status, data) = try await httpGET(URL(string: "\(apiBase)/2/users/me")!, bearer: accessToken)
+        guard status == 200,
+              let user = try parseJSONObject(data)["data"] as? [String: Any],
+              let id = user["id"] as? String, !id.isEmpty else {
+            throw XActionError("refresh_rejected", detail: "Could not verify the X account. Reconnect X in Connectors.")
+        }
+        return id
+    }
+
+    private static func hasRefreshBinding(_ tokens: [String: Any]) -> Bool {
+        guard let account = tokens["account_id"] as? String, !account.isEmpty else { return false }
+        return account == tokens["refresh_token_account_id"] as? String
+    }
+
+    public static func credentialStatus(dataRoot: URL) throws -> (configured: Bool, expiresAt: Date?, canRefresh: Bool) {
+        let tokens = try loadOAuth2Token(data: loadOAuth2TokenData(dataRoot: dataRoot))
+        let access = (tokens["access_token"] as? String) ?? ""
+        let refresh = (tokens["refresh_token"] as? String) ?? ""
+        if tokens["expires_at"] != nil && numericDouble(tokens["expires_at"]) == nil {
+            throw XActionError("invalid_expiry", detail: "X authorization has an invalid expiry.")
+        }
+        let hasRefresh = !refresh.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        let bound = hasRefreshBinding(tokens)
+        return (!access.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && (!hasRefresh || bound),
+                numericDouble(tokens["expires_at"]).map(Date.init(timeIntervalSince1970:)),
+                hasRefresh && bound)
+    }
+
+    public static func refreshRequiresSignIn(_ error: Error) -> Bool {
+        guard let error = error as? XActionError else { return false }
+        return ["missing_refresh_token", "refresh_disabled", "refresh_rejected"].contains(error.message)
+    }
+
+    fileprivate static func currentBearerLocked(dataRoot: URL = PersistenceCore.defaultDataRoot()) async throws -> Bearer {
+        let path = oauth2TokenPath(dataRoot: dataRoot)
         let persistence = SwiftNativePersistenceCore()
         let (originalData, originalFileNumber) = try await persistence.withFileLock(path) {
-            let data = try loadOAuth2TokenData()
+            let data = try loadOAuth2TokenData(dataRoot: dataRoot)
             let attributes = try FileManager.default.attributesOfItem(atPath: path.path)
             let fileNumber = (attributes[.systemFileNumber] as? NSNumber)?.uint64Value
             return (data, fileNumber)
@@ -341,18 +396,27 @@ public enum XConnectorActions {
         guard let accessToken = tokens["access_token"] as? String, !accessToken.isEmpty else {
             throw XActionError("missing_access_token", detail: "X OAuth2 token file is missing access_token.")
         }
-        let expiresAt = Double((tokens["expires_at"] as? String) ?? "") ?? 0
+        let accountID = tokens["account_id"] as? String
+        guard let expiresAt = numericDouble(tokens["expires_at"]) else {
+            guard tokens["expires_at"] == nil else {
+                throw XActionError("invalid_expiry", detail: "X authorization has an invalid expiry.")
+            }
+            return Bearer(accountID: accountID, accessToken: accessToken)
+        }
         let now = Date().timeIntervalSince1970
         if expiresAt > now + 60 {
-            return accessToken
+            return Bearer(accountID: accountID, accessToken: accessToken)
         }
 
         guard let refreshToken = tokens["refresh_token"] as? String, !refreshToken.isEmpty else {
             throw XActionError("missing_refresh_token", detail: "X OAuth2 token is expired and refresh_token is missing.")
         }
+        guard hasRefreshBinding(tokens) else {
+            throw XActionError("refresh_rejected", detail: "X rejected the saved authorization. Reconnect X in Connectors.")
+        }
         guard let credentials = resolveClientCredentials(
             environment: ProcessInfo.processInfo.environment,
-            dataRoot: PersistenceCore.defaultDataRoot()
+            dataRoot: dataRoot
         ) else {
             throw XActionError("refresh_disabled", detail: "I need the X app's sign-in details. Reconnect X in Connectors.")
         }
@@ -368,6 +432,10 @@ public enum XConnectorActions {
             ("client_id", credentials.id)
         ])
         guard status == 200 else {
+            let error = (try? parseJSONObject(data))?["error"] as? String
+            if status == 401 || (status == 400 && ["invalid_grant", "invalid_client", "unauthorized_client"].contains(error ?? "")) {
+                throw XActionError("refresh_rejected", detail: "X rejected the saved authorization. Reconnect X in Connectors.")
+            }
             throw XActionError("refresh_failed", detail: "X OAuth2 refresh HTTP \(status): \(bodyExcerpt(data))")
         }
         let obj = try parseJSONObject(data)
@@ -396,11 +464,11 @@ public enum XConnectorActions {
                   (try? Data(contentsOf: path)) == originalData else {
                 throw XActionError(
                     "credentials_changed",
-                    detail: "X authorization changed while refreshing. Retry with the current connection."
+                    detail: "X account changed — retry the request."
                 )
             }
-            try saveOAuth2Token(loadOAuth2Token(data: refreshedData))
-            return refreshedAccess
+            try saveOAuth2Token(loadOAuth2Token(data: refreshedData), to: path)
+            return Bearer(accountID: accountID, accessToken: refreshedAccess)
         }
     }
 
@@ -787,8 +855,8 @@ public enum XConnectorActions {
         URL(string: "\(apiBase)\(path)")!
     }
 
-    private static func oauth2TokenPath() -> URL {
-        PersistenceCore.defaultDataRoot()
+    private static func oauth2TokenPath(dataRoot: URL = PersistenceCore.defaultDataRoot()) -> URL {
+        dataRoot
             .appendingPathComponent("oauth_tokens", isDirectory: true)
             .appendingPathComponent("x.json")
     }

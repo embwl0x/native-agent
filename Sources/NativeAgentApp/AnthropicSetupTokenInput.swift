@@ -1,3 +1,4 @@
+import ProviderRouting
 // PATCH-2026-05-07: anthropic-setup-token Paste-token UI for the Anthropic
 // OAuth direct provider.
 //
@@ -114,7 +115,7 @@ struct AnthropicSetupTokenInput: View {
                 "auth_mode": "setup_token",
                 "saved_at": now,
             ]
-            try writeJSONObject(payload, to: path)
+            try NativeOAuthSupport.writeJSONObject(payload, to: path)
             return nil
         } catch {
             return "Failed to save setup-token: \(error.localizedDescription)"

@@ -94,6 +94,10 @@ extension CognitiveSubstrate {
             // reason: it is the one accepted-turn tick the substrate owns.
             remindedOfTurnsSinceSurfaced = min(
                 remindedOfTurnsSinceSurfaced + 1, Self.soundRutTurnCounterCap)
+            // The tick is durable state: a restart must not restore the rut
+            // counter one turn behind. Written with this ingest's persistence
+            // (below, or the resident microcycle's transaction).
+            capsulePresentationDirty = true
         }
         if contributesToLivedState, event.kind == .userMessageReceived {
             lastUserPresenceAt = now
@@ -211,6 +215,7 @@ extension CognitiveSubstrate {
                 )
             }
             try? await persistSnapshot()
+            await flushCapsulePresentationIfNeeded(at: now)
         }
         return true
     }

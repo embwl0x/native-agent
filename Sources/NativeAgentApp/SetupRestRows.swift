@@ -1,3 +1,4 @@
+import AppToolRuntime
 // The rest of Settings, on the Settings page.
 //
 // SetupView used to end in a door ("All settings") that pushed the old grouped
@@ -18,8 +19,10 @@
 //                                                  (SlimSettingsView.swift:405-415)
 //   Help and reference→ OnboardingTourReplayCoordinator, SlimSettingsDataLimitsReference
 //                                                  (SlimSettingsView.swift:362-385)
-//   About             → NativeAgentBuildIdentity + SlimSettingsView.buildIdentityLine
+//   About             → NativeAgentBuildIdentity + buildIdentityLine
 //                                                  (SlimSettingsView.swift:388-403)
+//   App status        → AppModel.health + lastRefreshError through
+//                       SlimSettingsStatusLinePresentation
 //
 // Devices and Integrations are deliberately absent: Telegram and iPhone already
 // have their own cards on this page (SetupView.swift:549-567) and the rail
@@ -65,6 +68,7 @@ struct SetupRestRows: View {
             updatesRow
             helpRow
             aboutRow
+            appStatusRow
         }
         .alert(
             "Can’t open data limits",
@@ -238,7 +242,7 @@ struct SetupRestRows: View {
         // bytes, and `buildIdentityLine` is the one spelling of it — a dev build
         // and a release build must never render identically in a bug report.
         let identity = NativeAgentBuildIdentity.current
-        let line = "\(Self.appName) \(SlimSettingsView.buildIdentityLine(identity))"
+        let line = "\(Self.appName) \(Self.buildIdentityLine(identity))"
         return SetupRestCard(
             title: "About",
             detail: line,
@@ -253,7 +257,58 @@ struct SetupRestRows: View {
         }
     }
 
+    // MARK: App status
+
+    /// Whether the runtime answered, and — when a refresh failed — the last
+    /// refresh error itself, whole and selectable, under the row.
+    private var appStatusRow: some View {
+        let state = SlimSettingsStatusLinePresentation.runtimeState(
+            runtimeOK: appModel.engine.doctor.health?.ok,
+            lastRefreshError: appModel.lastRefreshError
+        )
+        return VStack(alignment: .leading, spacing: 6) {
+            SetupRestCard(
+                title: "App status",
+                detail: state.text,
+                identifier: "setup.rest.appStatus"
+            ) {
+                EmptyView()
+            }
+            if let detail = state.detail {
+                Text(detail)
+                    .font(.system(size: 12))
+                    .foregroundStyle(NativeAgentShell.trouble)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+                    .accessibilityIdentifier("setup.rest.appStatus.error")
+            }
+        }
+    }
+
     // MARK: Copy helpers
+
+    /// One-line, paste-into-a-bug-report identity of the running bytes:
+    /// `0.3.7 (abc1234, modified)`. The revision is shown short; `modified` is
+    /// shown whenever the builder did not stamp clean-source truth, because an
+    /// unstamped bundle is exactly the case that must not be read as exact
+    /// proof of a commit (see NativeAgentBuildIdentity).
+    static func buildIdentityLine(_ identity: NativeAgentBuildIdentity) -> String {
+        var line = identity.version
+        var parenthetical: [String] = []
+        if let revision = identity.sourceRevision, !revision.isEmpty {
+            parenthetical.append(String(revision.prefix(7)))
+        }
+        if identity.sourceDirty {
+            parenthetical.append("modified")
+        }
+        if !parenthetical.isEmpty {
+            line += " (\(parenthetical.joined(separator: ", ")))"
+        }
+        if identity.build != identity.version {
+            line += " build \(identity.build)"
+        }
+        return line
+    }
 
     private static var appName: String {
         let info = Bundle.main.infoDictionary ?? [:]

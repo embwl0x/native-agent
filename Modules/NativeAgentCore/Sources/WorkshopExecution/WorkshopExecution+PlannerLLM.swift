@@ -1,3 +1,4 @@
+import SwarmRuns
 import Foundation
 import os
 import CryptoKit
@@ -241,9 +242,10 @@ public struct SwiftNativeWorkshopPlannerLLM: WorkshopPlannerLLM {
         }
         let resolvedModel = preference.model
         let resolvedEffort = preference.reasoningEffort
+        // S12a: the explicit route, never one inferred from the model name.
         let resolvedProvider = ProviderRoutingSurfaceLookup
             .value(routingSnapshot.activeProviders, routingSurface)
-            ?? router.inferProviderForModel(resolvedModel)
+            ?? routingSnapshot.activeProviders["chat"]
         let resolvedTier = preference.serviceTier
         // Re-check cancellation between router-prefs resolution and the LLM
         // call — both are `await` points and either could have been cancelled

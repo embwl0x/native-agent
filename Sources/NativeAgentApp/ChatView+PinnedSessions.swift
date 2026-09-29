@@ -1,7 +1,9 @@
 import Foundation
 import PersistenceCore
+import Transcripts
 import SwiftUI
 import UniformTypeIdentifiers
+import DeviceSync
 
 /// The mounted sidebar-row unpin route. It translates the canonical
 /// mirror-first store outcome into the explicit UI outcomes the row can show.
@@ -120,7 +122,7 @@ extension ChatView {
         guard ChatPinnedSnapshotPublication.request(
             encodedPinnedIDs: pinnedChatSessionIdsRaw,
             publish: { _ in
-                MacSyncEngine.shared.requestChatSnapshotPublication(
+                NativeAgentEngine.liveDeviceSync.engine.requestChatSnapshotPublication(
                     includeTranscripts: includeTranscripts
                 )
             }
@@ -132,8 +134,8 @@ extension ChatView {
     }
 
     func prunePinnedSessions() {
-        guard !appModel.chatSessions.isEmpty else { return }
-        let liveIds = Set(appModel.chatSessions.map(\.id))
+        guard !appModel.engine.transcripts.sessions.isEmpty else { return }
+        let liveIds = Set(appModel.engine.transcripts.sessions.map(\.id))
         // Prunes the HUMAN's list. Using the merged list here would write the
         // anchor into their pins on the first prune pass.
         let current = humanPinnedSessionIds()
@@ -144,7 +146,7 @@ extension ChatView {
     }
 
     func pinSession(_ sessionId: String, selectAfterPin: Bool = true) {
-        guard let session = appModel.chatSessions.first(where: { $0.id == sessionId }) else { return }
+        guard let session = appModel.engine.transcripts.sessions.first(where: { $0.id == sessionId }) else { return }
         // Explicitly pinning the anchor is allowed and meaningful: it says
         // "keep this one even after it stops being the live conversation".
         var ids = humanPinnedSessionIds()
@@ -166,7 +168,7 @@ extension ChatView {
             guard ChatPinnedSnapshotPublication.request(
                 encodedPinnedIDs: encoded,
                 publish: { _ in
-                    MacSyncEngine.shared.requestChatSnapshotPublication(includeTranscripts: false)
+                    NativeAgentEngine.liveDeviceSync.engine.requestChatSnapshotPublication(includeTranscripts: false)
                 }
             ) else {
                 showToast("Pinned tab closed locally, but its phone snapshot could not be verified")
@@ -229,7 +231,7 @@ extension ChatView {
         } else {
             sessionId = clean
         }
-        guard appModel.chatSessions.contains(where: { $0.id == sessionId }) else { return nil }
+        guard appModel.engine.transcripts.sessions.contains(where: { $0.id == sessionId }) else { return nil }
         return sessionId
     }
 }

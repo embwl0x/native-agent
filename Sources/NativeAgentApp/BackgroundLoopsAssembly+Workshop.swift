@@ -1,16 +1,20 @@
+import BackgroundWork
 import Foundation
 import NativeAgentCore
 import BackgroundLoops
+import Cognition
 import PersistenceCore
+import Desk
 import CognitiveSubstrate
 import TrustCenter
+import WorkshopExecution
 
 // Wave B — production wiring for the Workshop pump loop.
 //
 // The pump itself does ZERO LLM work (WorkshopPump.tick): a quiet day makes no
 // provider call. The one bounded session it may run goes through WorkshopSession
 // behind the WorkshopToolProfile membrane. All the app-layer dependencies the
-// PersistenceCore-only pump can't import (organism posture, trust policy) are
+// Core pump receives from the app (organism posture, trust policy) are
 // injected here, the same shape as makeMissionExecutorLoopRunner.
 
 extension BackgroundLoopsAssembly {
@@ -30,49 +34,22 @@ extension BackgroundLoopsAssembly {
             store: store,
             lease: BackgroundWorkLease(dataRoot: dataRoot),
             receiptLog: WorkshopReceiptLog(dataRoot: dataRoot),
-            sessionRunner: WorkshopSession(dataRoot: dataRoot, store: store),
+            sessionRunner: WorkshopSession(
+                dataRoot: dataRoot, store: store,
+                platform: AppWorkshopPumpPlatform(), effects: AppWorkshopSessionEffects()
+            ),
+            platform: AppWorkshopPumpPlatform(),
             posture: { await cognition.organismBehaviorPosture() },
             isEnabled: { await unattendedWorkAllowed(dataRoot: dataRoot) }
         )
     }
 
-    /// THE unattended-work gate. Every lane that works while nobody is looking
-    /// — standing bots (scheduled and event-woken), the Workshop pump, the
-    /// Workshop executor, background self-improvement proposals — asks this one
-    /// function, so "may the agent work unattended" has a single answer.
-    ///
-    /// Open when ANY of three hold (User, 2026-09-13: "Full Mac YOLO should open
-    /// up everything, nothing held back"):
-    ///   1. `enableAutonomy` is a literal boolean true (the Trust toggle), or
-    ///   2. the saved policy IS Full Mac — the same isFullMac rule the policy
-    ///      normalizer uses (`TrustCenter+PolicyLoading`), or
-    ///   3. checked Full Mac YOLO authority is admitted on this data root.
-    ///
-    /// Fails closed on a damaged policy: `loadTrustPolicy()` returns the
-    /// fail-closed shape (balanced / enableAutonomy false) and the YOLO door
-    /// refuses an unreadable snapshot.
     static func unattendedWorkAllowed(dataRoot: URL) async -> Bool {
-        let trust = SwiftNativeTrustCenter(dataRoot: dataRoot)
-        let policy = await trust.loadTrustPolicy()
-        if case .bool(true) = policy["enableAutonomy"] ?? .null { return true }
-        if isFullMacPolicy(policy) { return true }
-        return await isWideOpenTrust(dataRoot: dataRoot)
+        await WorkshopBackgroundWork.unattendedWorkAllowed(dataRoot: dataRoot)
     }
 
-    /// The isFullMac rule from `SwiftNativeTrustCenter.normalizedTrustPolicy`,
-    /// read off an already-loaded policy. Kept identical on purpose: the card
-    /// the person sees ("Full Mac") and the gate must agree.
     static func isFullMacPolicy(_ policy: [String: JSONValue]) -> Bool {
-        let permissionLevel: String = {
-            if case .string(let s)? = policy["permissionLevel"] { return s }
-            return ""
-        }()
-        if permissionLevel == "full_mac_os" { return true }
-        guard permissionLevel == "wide_open_receipts",
-              case .object(let filePolicy)? = policy["filePolicy"],
-              case .string("allow")? = filePolicy["outsideWorkspaceDefault"]
-        else { return false }
-        return true
+        WorkshopBackgroundWork.isFullMacPolicy(policy)
     }
 
     /// Event/deadline wrapper. Desk/trust/body mutations reconcile after one
@@ -88,61 +65,5 @@ extension BackgroundLoopsAssembly {
             dataRoot: dataRoot,
             cognitionRuntime: cognitionRuntime
         ))
-    }
-}
-
-struct WorkshopPumpLoopRunner: EventDeadlineLoopRunner {
-    let loopId = "workshop_pump"
-    let interval: TimeInterval = 24 * 60 * 60
-    var tickTimeoutOverride: TimeInterval? { 1800 }
-    let dataRoot: URL
-    let pump: WorkshopPump
-
-    func physiologyEvents() -> AsyncStream<Void> {
-        let store = SwiftNativeDeskStore(dataRoot: dataRoot)
-        return EventDeadlinePhysiology.storeAndFileEvents(
-            paths: [
-                store.opsPath,
-                store.statePath,
-                dataRoot.appendingPathComponent("trust/policy.json"),
-                dataRoot.appendingPathComponent("workshop/background_lease.json"),
-            ],
-            stores: [.desk],
-            loopId: loopId
-        )
-    }
-
-    func nextMeaningfulDeadline(after now: Date) async -> Date? {
-        guard let state = try? await SwiftNativeDeskStore(dataRoot: dataRoot).liveState() else {
-            return nil
-        }
-        return WorkshopPump.nextMeaningfulDeadline(from: state, after: now)
-    }
-
-    func tick() async {
-        _ = await tickOutcome()
-    }
-
-    func tickOutcome() async -> LoopTickOutcome {
-        switch await pump.tick() {
-        case .disabled:
-            return .skipped(reason: "Desk autonomy disabled")
-        case .organismUnavailable:
-            return .skipped(reason: "organism posture unavailable")
-        case .postureNotNormal:
-            return .skipped(reason: "organism posture not normal")
-        case .resourcePressure:
-            return .skipped(reason: "resource pressure")
-        case .quiet:
-            return .skipped(reason: "nothing due")
-        case .leaseHeld:
-            return .skipped(reason: "background-work lease held")
-        case .reservationRefused:
-            // The reservation could not be written, flushed or read back: the
-            // lane is broken, not idle. Doctor must see it (GPT-5.6, 2026-09-10).
-            return .failed(error: "Desk reservation refused: the attempt could not be persisted")
-        case .ran(let status):
-            return .completed(result: "Desk work session \(status.rawValue)")
-        }
     }
 }

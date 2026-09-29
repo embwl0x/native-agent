@@ -5,38 +5,6 @@ import NativeAgentCore
 import MemoryV2
 
 extension NativeClient {
-    func updateMemory(id: String, pinned: Bool, memory: SwiftNativeMemoryV2? = nil) async throws -> [String: Any] {
-        // The canonical patch merges only pinned inside its transaction and
-        // joins derived publication. Never replace a stale metadata snapshot.
-        let owner = memory ?? SwiftNativeMemoryV2.resolvedOwner(
-            dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()
-        )
-        do {
-            _ = try await owner.updateMemory(id: id, update: .object(["pinned": .bool(pinned)]))
-        } catch MemoryV2Error.recordNotFound {
-            throw NSError(domain: "NativeAgent", code: 404, userInfo: [
-                NSLocalizedDescriptionKey: "memory id not found: \(id)"
-            ])
-        }
-        return ["status": "ok"]
-    }
-
-    func deleteMemory(id: String, memory: SwiftNativeMemoryV2? = nil) async throws -> [String: Any] {
-        // Foreground completion joins the canonical owner's derived updates;
-        // the storage's atomic result preserves missing-row behavior.
-        let owner = memory ?? SwiftNativeMemoryV2.resolvedOwner(
-            dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()
-        )
-        let ok = try await owner.deleteMemoryIfPresent(id: id)
-        guard ok else {
-            throw NSError(domain: "NativeAgent", code: 404, userInfo: [
-                NSLocalizedDescriptionKey: "memory id not found: \(id)"
-            ])
-        }
-        return ["status": "ok"]
-    }
-
-
     func consolidateMemory() async throws -> [String: Any] {
         // Use the same MemoryConsolidator as the background loop.
         return try await triggerMemoryConsolidation(dryRun: false)
@@ -46,38 +14,17 @@ extension NativeClient {
     //
     // The resolved canonical owner embeds + inserts through MemoryStorage
     // with the same tombstone gate for both default and alternate roots.
-    // The `layer` parameter is preserved on the round-tripped record
-    // (Core may omit it; the shared decoder requires it).
+    @discardableResult
     func addMemory(
         text: String,
-        layer: String = "semantic",
         source: String = "mac.slash-remember",
         metadata: JSONValue? = nil,
         memory: SwiftNativeMemoryV2? = nil
-    ) async throws -> MemoryRecord {
+    ) async throws -> MemoryV2.MemoryRecord {
         let owner = memory ?? SwiftNativeMemoryV2.resolvedOwner(
             dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()
         )
-        let core = try await owner.store(
-            content: text,
-            source: source,
-            metadata: metadata
-        )
-        var obj: [String: JSONValue] = [
-            "id": .string(core.id),
-            "text": .string(core.text),
-            "layer": .string(core.layer ?? layer),
-            "createdAt": .string(core.createdAt),
-            "importance": .double(core.importance ?? 0),
-            "confidence": .double(core.confidence ?? 0),
-        ]
-        if let v = core.sourceRunId { obj["sourceRunId"] = .string(v) }
-        if let v = core.status { obj["status"] = .string(v) }
-        if let v = core.pinned { obj["pinned"] = .bool(v) }
-        if let v = core.tags { obj["tags"] = .array(v.map { .string($0) }) }
-        if let v = core.updatedAt { obj["updatedAt"] = .string(v) }
-        let data = try JSONValue.object(obj).serializedData(pretty: false)
-        return try JSONDecoder.nativeAgent.decode(MemoryRecord.self, from: data)
+        return try await owner.store(content: text, source: source, metadata: metadata)
     }
 
     func postNote(
@@ -133,7 +80,7 @@ extension NativeClient {
         )
         let persistence = SwiftNativePersistenceCore()
         try await persistence.withFileLock(path) {
-            let current = await persistence.readJSON(path, defaultValue: .object([:]))
+            let current = try await persistence.readJSON(path, ifMissing: .object([:]))
             var root: [String: JSONValue]
             if case .object(let obj) = current { root = obj } else { root = [:] }
             root[key] = .string(value)

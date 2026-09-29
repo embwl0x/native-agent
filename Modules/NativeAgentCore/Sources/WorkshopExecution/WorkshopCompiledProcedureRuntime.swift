@@ -1,6 +1,8 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import Desk
+import Procedures
 
 public enum WorkshopCompiledProcedureRuntimeError: Error, LocalizedError, Sendable, Equatable {
     case policyDenied
@@ -235,7 +237,7 @@ public struct WorkshopCompiledLocalFileCopyInvocation: Sendable {
                 executor: executor
             )
         }
-        guard let finalRecord = await runner.getWorkshopExecution(executionID) else {
+        guard let finalRecord = try await runner.getWorkshopExecution(executionID) else {
             throw WorkshopCompiledProcedureRuntimeError.canonicalRecordMissing
         }
         let deskAlias: String? = if let handle = finalRecord.deskHandle,
@@ -307,7 +309,7 @@ public struct WorkshopCompiledLocalFileCopyInvocation: Sendable {
         let terminal: Set<String> = [
             "completed", "done", "succeeded", "failed", "cancelled", "canceled",
         ]
-        if let current = await runner.getWorkshopExecution(executionID),
+        if let current = try await runner.getWorkshopExecution(executionID),
            terminal.contains(current.status.lowercased()) {
             return current
         }
@@ -319,13 +321,13 @@ public struct WorkshopCompiledLocalFileCopyInvocation: Sendable {
             let changes = FileChangeEvents(paths: [runner.executionRecordPath(executionID)])
             defer { changes.cancel() }
             // Close the registration race without a timer or poll.
-            if let current = await runner.getWorkshopExecution(executionID),
+            if let current = try await runner.getWorkshopExecution(executionID),
                terminal.contains(current.status.lowercased()) {
                 return current
             }
             for await _ in changes.stream {
                 try Task.checkCancellation()
-                if let current = await runner.getWorkshopExecution(executionID),
+                if let current = try await runner.getWorkshopExecution(executionID),
                    terminal.contains(current.status.lowercased()) {
                     return current
                 }

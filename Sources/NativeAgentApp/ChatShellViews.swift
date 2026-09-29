@@ -1,5 +1,6 @@
 import SwiftUI
 import NativeAgentShared
+import TrustCenter
 
 // ui-simplify 2026-09-02 (Lane A): the room's furniture.
 //
@@ -18,6 +19,9 @@ struct ShellRoomHeader: View {
     /// Simple view: the settled posture line is the composer's to say; the
     /// dot still shows when something waits or went wrong.
     var showsPosture = true
+    /// Simple view has no conversations list; this is its one way to start a
+    /// fresh thread besides /new (User 09-27). The phone follows the Mac.
+    var onNewChat: (() -> Void)? = nil
 
     // Full Mac has no timer (2026-09-10), so nothing in the header goes
     // stale on a clock; policy changes come from AppModel observation.
@@ -31,6 +35,19 @@ struct ShellRoomHeader: View {
                 .foregroundStyle(NativeAgentShell.text)
                 .lineLimit(1)
                 .accessibilityAddTraits(.isHeader)
+
+            if let onNewChat {
+                Button(action: onNewChat) {
+                    Image(systemName: "square.and.pencil")
+                        .font(ShellType.bodyMedium)
+                        .foregroundStyle(NativeAgentShell.secondary)
+                        .frame(width: 28, height: 28)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help("New chat")
+                .accessibilityLabel("New chat")
+            }
 
             Spacer(minLength: 12)
 
@@ -116,29 +133,23 @@ struct ShellConversationRow: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
+        // The native List draws selection and takes the click (User 09-27:
+        // all controls Mac native); the row is just its words and the pin.
         HStack(spacing: 8) {
-            Button(action: onSelect) {
-                HStack(spacing: 8) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(ChatShellConversationRow.title(for: session))
-                            .font(ShellType.bodySemibold)
-                            .foregroundStyle(NativeAgentShell.text)
-                            .lineLimit(1)
-                            .truncationMode(.tail)
-                        Text(ChatShellConversationRow.subtitle(for: session))
-                            .font(ShellType.labelMedium)
-                            .foregroundStyle(NativeAgentShell.secondary)
-                            .lineLimit(1)
-                    }
-                    Spacer(minLength: 4)
-                }
-                .frame(maxWidth: .infinity, minHeight: NativeAgentShellLayout.listRowHeight, alignment: .leading)
-                .contentShape(Rectangle())
+            VStack(alignment: .leading, spacing: 2) {
+                Text(ChatShellConversationRow.title(for: session))
+                    .font(ShellType.bodySemibold)
+                    .foregroundStyle(NativeAgentShell.text)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                Text(ChatShellConversationRow.subtitle(for: session))
+                    .font(ShellType.labelMedium)
+                    .foregroundStyle(NativeAgentShell.secondary)
+                    .lineLimit(1)
             }
-            .buttonStyle(.plain)
-            .accessibilityLabel(ChatShellConversationRow.title(for: session))
+            .accessibilityElement(children: .combine)
             .accessibilityValue(selected ? "Selected" : "Not selected")
-            .accessibilityHint("Opens this conversation")
+            Spacer(minLength: 4)
             Button(action: onTogglePin) {
                 Image(systemName: isPinned ? "pin.fill" : "pin")
                     .font(ShellType.labelMedium)
@@ -152,53 +163,10 @@ struct ShellConversationRow: View {
             .help(isPinned ? "Unpin" : "Pin to the top")
             .accessibilityLabel(isPinned ? "Unpin conversation" : "Pin conversation to the top")
         }
-            .padding(.leading, 14)
-            .padding(.trailing, 10)
-            .frame(
-                maxWidth: .infinity,
-                minHeight: NativeAgentShellLayout.listRowHeight,
-                alignment: .leading
-            )
-            // Agent, 2026-09-02: "bar means here" in both columns. A flat wash
-            // and the same 2pt bar the rail uses, 4pt in; no rounded tile, no
-            // accent. Teal is the send button and needs-you, nothing else.
-            // The column pads its content 12pt; the wash runs to the column's
-            // edges and the bar sits 4pt in from the edge, same as the rail.
-            .background {
-                Rectangle()
-                    .fill(selected
-                        ? AnyShapeStyle(Color.primary.opacity(0.06))
-                        : AnyShapeStyle(Color.primary.opacity(hovering ? 0.035 : 0)))
-                    .padding(.horizontal, -12)
-            }
-            .overlay(alignment: .leading) {
-                // Same bar, same rule as the rail: the selected row is the only
-                // one that draws it, so it travels. Reduce Motion cross-fades.
-                let bar = RoundedRectangle(cornerRadius: 1, style: .continuous)
-                    .fill(NativeAgentShell.text)
-                    .frame(width: 2, height: 20)
-                    .padding(.leading, NativeAgentShellLayout.barInset - 12)
-                if reduceMotion {
-                    bar.opacity(selected ? 1 : 0)
-                        .animation(NativeAgentMotion.crossfade, value: selected)
-                } else if selected {
-                    bar.matchedGeometryEffect(
-                        id: ShellConversationRow.selectionBarID,
-                        in: barNamespace
-                    )
-                }
-            }
-            .contentShape(Rectangle())
+        .frame(maxWidth: .infinity, minHeight: NativeAgentShellLayout.listRowHeight, alignment: .leading)
+        .contentShape(Rectangle())
         .onHover { hovering = $0 }
         .onDisappear { hovering = false }
-        .animation(
-            NativeAgentMotion.respecting(NativeAgentMotion.quick, reduceMotion: reduceMotion),
-            value: hovering
-        )
-        .animation(
-            NativeAgentMotion.respecting(NativeAgentMotion.standard, reduceMotion: reduceMotion),
-            value: selected
-        )
         .accessibilityElement(children: .contain)
     }
 }

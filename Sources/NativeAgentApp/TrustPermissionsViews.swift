@@ -9,11 +9,13 @@ import UniformTypeIdentifiers
 import NativeAgentShared
 import MemoryV2
 import PersistenceCore
+import ChromeControl
 #if canImport(CoreSpotlight)
 import CoreSpotlight
 #endif
 #if canImport(CloudKit)
 import CloudKit
+import TrustCenter
 #endif
 
 struct ChromeControlPermissionsView: View {
@@ -24,7 +26,7 @@ struct ChromeControlPermissionsView: View {
     @State private var connectionState: ChromeControlConnectionState = .extensionNotLoaded
 
     private var fullMacActive: Bool {
-        appModel.trustPolicy.map(AppModel.fullMacGrantIsActive) ?? false
+        appModel.engine.trust.policy.map(AppModel.fullMacGrantIsActive) ?? false
     }
 
     private var isOn: Bool { enabled || fullMacActive }
@@ -85,11 +87,11 @@ struct ChromeControlPermissionsView: View {
             }
             .task {
                 syncFromPolicy()
-                for await state in await ChromeControlRuntime.shared.connectionStates() {
+                for await state in await NativeAgentEngine.live.chrome.connectionStates() {
                     connectionState = state
                 }
             }
-            .onChange(of: appModel.trustPolicy) { _, _ in
+            .onChange(of: appModel.engine.trust.policy) { _, _ in
                 if !isSaving { syncFromPolicy() }
             }
 
@@ -132,7 +134,7 @@ struct ChromeControlPermissionsView: View {
     }
 
     private func syncFromPolicy() {
-        enabled = appModel.trustPolicy?.chromeControlPolicy?.enabled ?? false
+        enabled = appModel.engine.trust.policy?.chromeControlPolicy?.enabled ?? false
     }
 
     private func setUpChrome() {
@@ -185,7 +187,7 @@ struct MultimodalPermissionsView: View {
             )
         }
         .task { syncDraftPolicy() }
-        .onChange(of: appModel.trustPolicy) { _, _ in
+        .onChange(of: appModel.engine.trust.policy) { _, _ in
             if !isSaving { syncDraftPolicy() }
         }
     }
@@ -210,7 +212,7 @@ struct MultimodalPermissionsView: View {
     }
 
     private func syncDraftPolicy() {
-        if let policy = appModel.trustPolicy?.multimodalPolicy {
+        if let policy = appModel.engine.trust.policy?.multimodalPolicy {
             draftPolicy = policy
         }
     }
@@ -375,8 +377,8 @@ struct TrainingPermissionsView: View {
                 FeatureNote("Practice only ever suggests. Changes to my personality and voice never apply without your approval.")
             }
         }
-        .task(id: appModel.trustPolicy) {
-            let policy = appModel.trustPolicy
+        .task(id: appModel.engine.trust.policy) {
+            let policy = appModel.engine.trust.policy
             guard !completedInitialRead || loadedPolicy != policy else { return }
             if !isSaving {
                 syncDraftsFromPolicy()
@@ -409,12 +411,12 @@ struct TrainingPermissionsView: View {
         let root = appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot()
         let allowed = await BackgroundLoopsAssembly.unattendedWorkAllowed(dataRoot: root)
         guard !Task.isCancelled, unattendedReadGate.accepts(request) else { return }
-        unattendedForced = allowed && !(appModel.trustPolicy?.enableAutonomy ?? false)
+        unattendedForced = allowed && !(appModel.engine.trust.policy?.enableAutonomy ?? false)
     }
 
     private func refreshDreamComposite() async {
         let request = dreamReadGate.begin()
-        let enabled = await appModel.client.swiftDreamCompositeEnabled()
+        let enabled = await appModel.engine.cognitionView.dreamEnabled()
         guard !Task.isCancelled, dreamReadGate.accepts(request) else { return }
         draftDreamComposite = enabled
     }
@@ -430,13 +432,13 @@ struct TrainingPermissionsView: View {
     }
 
     private func syncDraftsFromPolicy() {
-        if let trustPolicy = appModel.trustPolicy {
+        if let trustPolicy = appModel.engine.trust.policy {
             draftEnableAutonomy = trustPolicy.enableAutonomy
         } else if let summary = appModel.improvementSummary {
-            draftEnableAutonomy = summary.trustEnabled ?? summary.enabled
+            draftEnableAutonomy = summary.trustEnabled ?? summary.enabled ?? false
         }
-        draftTraining = appModel.trustPolicy?.trainingPolicy ?? TrustTrainingPolicy()
-        draftPromotion = appModel.trustPolicy?.promotionPolicy ?? TrustPromotionPolicy()
+        draftTraining = appModel.engine.trust.policy?.trainingPolicy ?? TrustTrainingPolicy()
+        draftPromotion = appModel.engine.trust.policy?.promotionPolicy ?? TrustPromotionPolicy()
     }
 
     private func saveEnableAutonomy(_ enabled: Bool) async {
@@ -447,7 +449,7 @@ struct TrainingPermissionsView: View {
     }
 
     private func saveAll(training: TrustTrainingPolicy, promotion: TrustPromotionPolicy) async {
-        guard let policy = appModel.trustPolicy else { return }
+        guard let policy = appModel.engine.trust.policy else { return }
         isSaving = true
         await appModel.saveTrustPolicyWithPromotion(
             permissionLevel: policy.permissionLevel,
@@ -504,7 +506,7 @@ struct WorkshopPermissionsView: View {
             FeatureNote("Desk tasks follow the same approval rules as the rest of my tools. In Full Mac, allowed actions run without asking you again; narrower modes may ask before I send or delete anything.")
         }
         .task { syncDraftPolicy() }
-        .onChange(of: appModel.trustPolicy) { _, _ in
+        .onChange(of: appModel.engine.trust.policy) { _, _ in
             if !isSaving { syncDraftPolicy() }
         }
     }
@@ -519,7 +521,7 @@ struct WorkshopPermissionsView: View {
     }
 
     private func syncDraftPolicy() {
-        draftPolicy = appModel.trustPolicy?.workshopPolicy ?? TrustWorkshopPolicy()
+        draftPolicy = appModel.engine.trust.policy?.workshopPolicy ?? TrustWorkshopPolicy()
     }
 }
 
@@ -530,7 +532,7 @@ struct LivingMemoryPermissionsView: View {
     @State private var isSaving = false
 
     private var pendingCount: Int {
-        appModel.memoryProposals.filter { $0.status == "pending" }.count
+        appModel.engine.memory.proposals.filter { $0.status == "pending" }.count
     }
 
     /// Alive glass (2026-09-23): one group card of switch rows. Titles match
@@ -633,13 +635,13 @@ struct LivingMemoryPermissionsView: View {
             FeatureNote("What I remember, how I recall it, and how I tidy myself up are all set here. Suggested memory changes wait for you in Memory; suggested changes to how I behave wait in Self-Improvement.")
         }
         .task { syncDraftFromPolicy() }
-        .onChange(of: appModel.trustPolicy) { _, _ in
+        .onChange(of: appModel.engine.trust.policy) { _, _ in
             if !isSaving { syncDraftFromPolicy() }
         }
     }
 
     private func syncDraftFromPolicy() {
-        draftPolicy = appModel.trustPolicy?.memoryPolicy ?? TrustMemoryPolicy()
+        draftPolicy = appModel.engine.trust.policy?.memoryPolicy ?? TrustMemoryPolicy()
     }
 
     private func saveMemoryPolicy(_ policy: TrustMemoryPolicy) async {

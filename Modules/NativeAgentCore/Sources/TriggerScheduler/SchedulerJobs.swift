@@ -1,8 +1,13 @@
+import FeedPolicy
+import Privacy
 import Foundation
 import NativeAgentCore
 import PersistenceCore
 import WorkshopExecution
 
+// Canonical job storage for the Mac UI, phone actions and agent tools. Native
+// pause/resume and in-place editing supersede the historical parity audits below.
+//
 // MARK: - Subsystem #17 WAVE 33 W18 (2026-06-01): scheduler-job create write port
 //                       WAVE 35 W14 (2026-06-02): cancel write port (+ update audit)
 //                       WAVE 36 W18 (2026-06-02): fire_now audit (§6.138 — nothing to port)
@@ -31,8 +36,7 @@ import WorkshopExecution
 //       mutations of an existing job are `cancel_job` (above) and the internal
 //       `scheduler_loop` advancing nextRunAt/lastRunAt each tick. Per AUDIT-FIRST
 //       there is NOTHING to port for "update" — inventing an updateJob would
-//       create a Swift behavior with no daemon parity reference. KEPT_NO_NATIVE_IMPL;
-//       retirement_path documented in CUTOVER_PLAN §6.117.
+//       create a Swift behavior with no daemon parity reference. KEPT_NO_NATIVE_IMPL.
 // The audit (script/audit_v1_routes.py) lists `/v1/scheduler/jobs` GET as
 // LEGACY and POST at L52993.
 //
@@ -61,8 +65,7 @@ import WorkshopExecution
 //         - `/v1/missions/triggers/<name>/fire_now` — Swift-native (wave 21);
 //           daemon route retired wave 28; Swift-native is the only path.
 //   Pinned by SchedulerFireNowAuditTests so a future wave does not re-open this
-//   by inventing a Swift `runJob`/`fireJob`. retirement_path documented in
-//   CUTOVER_PLAN §6.138.
+//   by inventing a Swift `runJob`/`fireJob`.
 //
 // WAVE 39 W17 — `/v1/scheduler/jobs/<id>/run` audit (cluster
 // `/v1/scheduler/jobs/<id>/run port`, §6.201):
@@ -116,7 +119,6 @@ import WorkshopExecution
 //     parity reference (the exact anti-pattern W14 avoided for "update").
 //     Disposition: KEPT_NO_NATIVE_IMPL. Pinned by SchedulerJobListTests +
 //     SchedulerFireNowAuditTests so a future wave does not re-open this.
-//     retirement_path documented in CUTOVER_PLAN §6.180.
 //
 // SCOPE / BOUNDARY:
 //   - FULLY native for all eight job kinds: notify, connector_action, dream,
@@ -142,8 +144,6 @@ import WorkshopExecution
 //     APP) rather than the live personality profile name from
 //     agent_display_name(). The production caller always supplies an explicit
 //     name + title, so this only differs for a name-less notify job.
-//
-// See CUTOVER_PLAN.md §6.96.
 
 // MARK: - Errors (scheduler-job specific)
 
@@ -157,8 +157,7 @@ extension TriggerSchedulerError {
 
 // MARK: - Protocol extension
 
-/// The job-create surface. Kept on its own protocol so compatibility fallbacks
-/// and the SwiftNative impl share one contract.
+/// The canonical scheduled-job read/write surface shared by every caller.
 public protocol SchedulerJobWriter: Sendable {
     /// Mirrors POST /v1/scheduler/jobs → create_job(body). `body` is the raw
     /// request dict (name/kind/interval_seconds/schedule/payload/run_at/...).
@@ -178,14 +177,14 @@ public protocol SchedulerJobWriter: Sendable {
     /// `{"ok": true, "job": <updated job>}` and appends a scheduler activity
     /// receipt, exactly like `cancelJob`.
     ///
-    /// Disabling stamps the SAME `enabled=false` + `cancelledAt` tombstone
-    /// `cancelJob` writes, and enabling strips `cancelledAt`. That is not
-    /// decoration: `SchedulerDueJobRunner`'s passive bootstrap pass
-    /// (`ensureDefaultCycleJobs`) forces `enabled=true` on its default cycle
-    /// jobs and only honors a row it can see was deliberately switched off —
-    /// the tombstone IS that signal. Writing a bare `enabled=false` would give
-    /// the user a toggle that silently flips itself back on the next pass.
+    /// Disabling stamps `enabled=false` + `pausedAt`; enabling clears both
+    /// `pausedAt` and `cancelledAt`. The passive default-cycle bootstrap
+    /// honors both markers, so neither flips itself back on.
     func setJobEnabled(jobId: String, enabled: Bool) async throws -> JSONValue
+
+    /// Edit configuration in place under the canonical jobs lock. Runtime
+    /// history and enablement are preserved; only a new schedule moves nextRunAt.
+    func updateJob(jobId: String, changes: [String: JSONValue]) async throws -> JSONValue
 
     /// Mirrors `Daemon.list_jobs` — the READ side of
     /// `/v1/scheduler/jobs` (GET) and the `scheduler.list_jobs` connector action.
@@ -454,6 +453,7 @@ extension SwiftNativeTriggerScheduler: SchedulerJobWriter {
                     // keeps the match set byte-identical to the daemon.
                     if SchedulerJobNormalizer.pyStrForId(obj["id"]) == jobId {
                         obj["enabled"] = .bool(false)
+                        obj.removeValue(forKey: "pausedAt")
                         obj["cancelledAt"] = .string(SwiftNativeTriggerScheduler.isoTimestamp(now()))
                         jobs[idx] = .object(obj)
                         matched = .object(obj)
@@ -528,8 +528,7 @@ extension SwiftNativeTriggerScheduler: SchedulerJobWriter {
     }
 
     /// Pause / resume one scheduled job. Same locked read-modify-write and
-    /// activity receipt as `cancelJob`; see the protocol doc for why disabling
-    /// writes the `cancelledAt` tombstone rather than a bare `enabled=false`.
+    /// activity receipt as `cancelJob`, with a separate pause marker.
     public func setJobEnabled(jobId: String, enabled: Bool) async throws -> JSONValue {
         if jobId.isEmpty {
             throw TriggerSchedulerError.schedulerInvalid("jobId is required")
@@ -545,13 +544,12 @@ extension SwiftNativeTriggerScheduler: SchedulerJobWriter {
                     if SchedulerJobNormalizer.pyStrForId(obj["id"]) == jobId {
                         obj["enabled"] = .bool(enabled)
                         if enabled {
-                            // An explicit resume clears the tombstone, the same
-                            // way ensureDefaultCycleJobs(reactivateCancelled:)
-                            // does — otherwise the bootstrap pass keeps reading
-                            // this row as deliberately switched off.
+                            // Resume also clears a cancel (and legacy pauses,
+                            // which were stored as cancels).
+                            obj.removeValue(forKey: "pausedAt")
                             obj.removeValue(forKey: "cancelledAt")
                         } else {
-                            obj["cancelledAt"] =
+                            obj["pausedAt"] =
                                 .string(SwiftNativeTriggerScheduler.isoTimestamp(now()))
                         }
                         jobs[idx] = .object(obj)
@@ -607,6 +605,129 @@ extension SwiftNativeTriggerScheduler: SchedulerJobWriter {
         }
 
         return .object(["ok": .bool(true), "job": updatedTarget])
+    }
+
+    public func updateJob(jobId: String, changes: [String: JSONValue]) async throws -> JSONValue {
+        guard !jobId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw TriggerSchedulerError.schedulerInvalid("jobId is required")
+        }
+        let changes = changes.filter { $0.value != .null }
+        let allowed: Set<String> = ["name", "kind", "payload", "schedule", "interval_seconds"]
+        guard !changes.isEmpty, Set(changes.keys).isSubset(of: allowed) else {
+            throw TriggerSchedulerError.schedulerInvalid("Supply at least one of name, kind, payload, schedule, interval_seconds; other fields cannot be edited.")
+        }
+        if let name = changes["name"] {
+            guard case .string(let value) = name,
+                  !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  value.count <= 160 else {
+                throw TriggerSchedulerError.schedulerInvalid("name must contain 1-160 characters")
+            }
+        }
+        if let kind = changes["kind"] {
+            guard case .string(let value) = kind,
+                  SchedulerJobNormalizer.allowedKinds.contains(value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()) else {
+                throw TriggerSchedulerError.schedulerInvalid("kind must name a supported scheduled job kind")
+            }
+        }
+        if let payload = changes["payload"] {
+            guard case .object = payload else {
+                throw TriggerSchedulerError.schedulerInvalid("payload must be an object")
+            }
+        }
+        if let schedule = changes["schedule"] {
+            switch schedule {
+            case .object, .string: break
+            default:
+                throw TriggerSchedulerError.schedulerInvalid("schedule must be an object or ISO-8601 datetime string")
+            }
+        }
+        if let interval = changes["interval_seconds"] {
+            guard case .int(let seconds) = interval, seconds >= 60 else {
+                throw TriggerSchedulerError.schedulerInvalid("interval_seconds must be an integer of at least 60")
+            }
+            guard changes["schedule"] == nil else {
+                throw TriggerSchedulerError.schedulerInvalid("Supply schedule or interval_seconds, not both.")
+            }
+        }
+
+        let updated = try await runSerialized {
+            [persistence, jobsPath, now, uuid, connectorActionIDs] () async throws -> JSONValue in
+            try await persistence.withFileLock(jobsPath) {
+                var jobs = try Self.readJobsChecked(at: jobsPath)
+                guard let index = jobs.firstIndex(where: {
+                    guard case .object(let row) = $0 else { return false }
+                    return SchedulerJobNormalizer.pyStrForId(row["id"]) == jobId
+                }), case .object(var existing) = jobs[index] else {
+                    throw TriggerSchedulerError.schedulerInvalid("Unknown scheduled job: \(jobId)")
+                }
+                var body = existing
+                for (key, value) in changes { body[key] = value }
+                let newKind = SchedulerJobNormalizer.string(changes["kind"])?
+                    .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                let kindChanged = newKind != nil && newKind != SchedulerJobNormalizer.string(existing["kind"])
+                if kindChanged, changes["payload"] == nil {
+                    throw TriggerSchedulerError.schedulerInvalid("Changing kind requires the complete payload for the new kind.")
+                }
+                if !kindChanged, case .object(let patch)? = changes["payload"],
+                   case .object(var payload)? = existing["payload"] {
+                    payload.merge(patch) { _, new in new }
+                    body["payload"] = .object(payload)
+                }
+                let rescheduled = changes["schedule"] != nil || changes["interval_seconds"] != nil
+                if let interval = changes["interval_seconds"] {
+                    body["schedule"] = .object(["type": .string("every"), "interval_seconds": interval])
+                }
+                if rescheduled {
+                    body.removeValue(forKey: "oneShot")
+                    body.removeValue(forKey: "one_shot")
+                    if case .object(var payload)? = body["payload"] {
+                        payload.removeValue(forKey: "one_shot")
+                        body["payload"] = .object(payload)
+                    }
+                    body.removeValue(forKey: "run_at")
+                    body.removeValue(forKey: "runAt")
+                }
+                guard case .object(let normalized) = try SchedulerJobNormalizer.normalize(
+                    body: body, now: now, uuid: uuid,
+                    displayNameFallback: Self.displayNameFallback,
+                    connectorActionIDs: connectorActionIDs
+                ) else {
+                    throw TriggerSchedulerError.schedulerInvalid("scheduler update returned no job")
+                }
+                if changes["name"] != nil { existing["name"] = normalized["name"] }
+                if changes["kind"] != nil { existing["kind"] = normalized["kind"] }
+                if changes["payload"] != nil || rescheduled { existing["payload"] = normalized["payload"] }
+                if rescheduled {
+                    for key in ["schedule", "intervalSeconds", "oneShot", "nextRunAt", "nextRunAtEpoch"] {
+                        existing[key] = normalized[key]
+                    }
+                    existing.removeValue(forKey: "nextRunAtISO")
+                }
+                jobs[index] = .object(existing)
+                do {
+                    try await persistence.writeJSON(.array(jobs), to: jobsPath)
+                } catch {
+                    throw TriggerSchedulerError.persistenceFailure(String(describing: error))
+                }
+                return .object(existing)
+            }
+        }
+        let event: JSONValue = .object([
+            "id": .string(uuid()), "kind": .string("scheduler"),
+            "title": .string("Scheduled job updated"),
+            "detail": .string(SchedulerSecretRedactor.redactText(jobId)),
+            "status": .string("ok"), "executionId": .null,
+            "payload": SchedulerSecretRedactor.redactValue(.object(["jobId": .string(jobId)])),
+            "createdAt": .string(Self.isoTimestamp(now())),
+        ])
+        let eventPath = activityPath
+        let eventPersistence = persistence
+        try await eventPersistence.withFileLock(eventPath) {
+            try await appendJSONLCapped(event, to: eventPath, using: eventPersistence,
+                                       maxLines: JSONLLineCaps.activityEvents,
+                                       logLabel: "SchedulerJobs.update.activity", takeLock: false)
+        }
+        return .object(["ok": .bool(true), "job": updated])
     }
 
     /// Faithful port of Daemon.list_jobs:
@@ -736,13 +857,31 @@ enum SchedulerJobNormalizer {
 
         // schedule resolution.
         var schedule: [String: JSONValue]
-        if case .object(let raw)? = body["schedule"] {
+        let scheduleShapes = "schedule must be an ISO-8601 datetime string or an object with type 'once' and at, type 'every' and an interval, or type 'hourly', 'daily', 'weekly', 'monthly', or 'cron'; alternatively supply interval_seconds or run_at"
+        switch body["schedule"] {
+        case .object(let raw):
             schedule = raw
-        } else {
+        case .string(let raw):
+            let at = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard parseISO(at) != nil else {
+                throw TriggerSchedulerError.schedulerInvalid(scheduleShapes)
+            }
+            schedule = ["type": .string("once"), "at": .string(at)]
+        case nil, .null?:
+            let hasInterval = [body["interval_seconds"], body["intervalSeconds"], payload["interval_seconds"]]
+                .contains(where: { $0.map(truthy) == true })
+            let hasRunAt = [body["run_at"], body["runAt"], body["nextRunAt"]]
+                .contains(where: { $0.map(truthy) == true })
+            // No schedule at all must not silently become hourly.
+            guard hasInterval || hasRunAt else {
+                throw TriggerSchedulerError.schedulerInvalid(scheduleShapes)
+            }
             // _scheduler_schedule_from_legacy_body({**body, one_shot from payload if present}, interval)
             var legacyBody = body
             if let os = payload["one_shot"] { legacyBody["one_shot"] = os }
             schedule = scheduleFromLegacyBody(legacyBody, interval: interval)
+        default:
+            throw TriggerSchedulerError.schedulerInvalid(scheduleShapes)
         }
 
         if string(schedule["type"]) == "every" {

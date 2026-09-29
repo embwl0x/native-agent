@@ -1,4 +1,5 @@
 import SwiftUI
+import KnowledgeGraph
 
 // ---------------------------------------------------------------------------
 // MARK: - Entity row
@@ -6,7 +7,7 @@ import SwiftUI
 
 // PATCH-2026-05-07: polish-KnowledgeGraphView static type helpers promoted to internal for detail view
 struct KGEntityRow: View {
-    let entity: KGEntity
+    let entity: KnowledgeGraphEntity
 
     var body: some View {
         HStack(spacing: NativeAgentSpacing.sm) {
@@ -20,7 +21,7 @@ struct KGEntityRow: View {
                     .foregroundStyle(.secondary)
             }
             Spacer()
-            if let count = entity.mention_count, count > 1 {
+            if let count = entity.mentionCount, count > 1 {
                 // ui-taste-sweep 2026-06-07: bare "8" with no context — a
                 // user has no idea what the number means. Now: icon + count
                 // + tooltip so it reads as "this entity was mentioned 8
@@ -71,12 +72,12 @@ struct KGEntityRow: View {
 // ---------------------------------------------------------------------------
 
 struct KGEntityDetailView: View {
-    let entity: KGEntity
-    let api: NativeClient
+    let entity: KnowledgeGraphEntity
+    let memory: MemoryFacade
     let selectableEntityIDs: Set<String>
     let onSelectEntity: (String) -> Void
 
-    @State private var neighbors: KGNeighborsResponse? = nil
+    @State private var neighbors: KnowledgeGraphNeighborhood? = nil
     @State private var loading = false
     @State private var loadError: String? = nil
     @State private var loadGate = LatestAsyncRequestGate()
@@ -100,13 +101,13 @@ struct KGEntityDetailView: View {
                             Spacer()
                             StatusBadge(text: entity.type.capitalized, status: "info")
                         }
-                        if let count = entity.mention_count {
+                        if let count = entity.mentionCount {
                             LabeledRow(label: "Mentions", value: "\(count)")
                         }
-                        if let first = entity.first_seen {
+                        if let first = entity.firstSeen {
                             LabeledRow(label: "First seen", value: String(first.prefix(10)))
                         }
-                        if let last = entity.last_seen {
+                        if let last = entity.lastSeen {
                             LabeledRow(label: "Last seen", value: String(last.prefix(10)))
                         }
                         if let aliases = entity.aliases, !aliases.isEmpty {
@@ -222,7 +223,7 @@ struct KGEntityDetailView: View {
         loadError = nil
         neighbors = nil
         do {
-            let loaded = try await api.getKGEntity(id: entity.id)
+            let loaded = try await memory.neighborhood(entityID: entity.id)
             guard !Task.isCancelled, loadGate.accepts(request) else { return }
             neighbors = loaded
         } catch {
@@ -247,8 +248,8 @@ private struct LabeledRow: View {
 }
 
 private struct KGEdgeRow: View {
-    let edge: KGEdge
-    let entities: [String: KGEntity]
+    let edge: KnowledgeGraphEdge
+    let entities: [String: KnowledgeGraphEntity]
     let rootId: String
     let selectableEntityIDs: Set<String>
     let onSelectEntity: (String) -> Void

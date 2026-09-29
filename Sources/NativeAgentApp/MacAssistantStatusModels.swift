@@ -1,39 +1,5 @@
 import Foundation
-
-struct MacAssistantStatusResponse: Decodable, Hashable {
-    var status: String
-    var summary: String?
-    var access: [MacAssistantAccessItem]
-    var watchTemplates: [MacAssistantWatchTemplate]
-    var blockedAccessCount: Int?
-    var templateAttentionCount: Int?
-    var schedulerActions: [String]?
-    var createsJobs: Bool?
-    var createdAt: String?
-}
-
-struct MacAssistantAccessItem: Identifiable, Decodable, Hashable {
-    var id: String
-    var title: String
-    var status: String
-    var detail: String?
-    var setupRoute: String?
-    var requiredFor: [String]?
-    var actionIds: [String]?
-    var toolNames: [String]?
-    var nextStep: String?
-}
-
-struct MacAssistantWatchTemplate: Identifiable, Decodable, Hashable {
-    var id: String
-    var title: String
-    var status: String
-    var summary: String?
-    var scheduleLabel: String?
-    var sources: [String]?
-    var requiredAccess: [String]?
-    var actionIds: [String]?
-}
+import MacAssistantStatus
 
 /// The watch panel must distinguish a current inventory from one that merely
 /// survived a failed refresh. Keeping this presentation state outside SwiftUI
@@ -41,11 +7,11 @@ struct MacAssistantWatchTemplate: Identifiable, Decodable, Hashable {
 /// being mistaken for current permission/readiness evidence.
 enum MacAssistantWatchSetupLoadState: Equatable {
     case loading
-    case current(MacAssistantStatusResponse)
-    case stale(MacAssistantStatusResponse, message: String)
+    case current(MacAssistantStatusResult)
+    case stale(MacAssistantStatusResult, message: String)
     case unavailable(message: String)
 
-    var response: MacAssistantStatusResponse? {
+    var response: MacAssistantStatusResult? {
         switch self {
         case .current(let response), .stale(let response, _): response
         case .loading, .unavailable: nil

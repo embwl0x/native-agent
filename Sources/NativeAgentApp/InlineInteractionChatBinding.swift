@@ -1,3 +1,6 @@
+import AppToolRuntime
+import AppToolRuntime
+import NativeAgentCore
 import ChatOrchestration
 import Foundation
 import MacIntegration
@@ -443,7 +446,7 @@ final class InlineInteractionChatBinding {
             // Trust's own Chrome switch, as the page's toggle writes it; then
             // the same Set up Chrome the page runs. Chrome is the owner: the
             // card settles when the extension connects.
-            let policy = appModel.trustPolicy
+            let policy = appModel.engine.trust.policy
             if policy?.chromeControlPolicy?.enabled != true,
                !(policy.map(AppModel.fullMacGrantIsActive) ?? false) {
                 await appModel.saveChromeControlEnabled(true)
@@ -667,8 +670,8 @@ final class InlineInteractionChatBinding {
         _ categories: [String],
         appModel: AppModel
     ) async {
-        await AppChatToolDispatcher.applyMacControlCategoryGrant(
-            categories, appModel: appModel, dataRoot: dataRoot, logTag: "interaction"
+        await AppToolExecutor.applyMacControlCategoryGrant(
+            categories, appModel: AppQuietSettingsHost(appModel), dataRoot: dataRoot, logTag: "interaction"
         )
     }
 
@@ -688,11 +691,11 @@ final class InlineInteractionChatBinding {
             )
             return
         }
-        await AppChatToolDispatcher.applyCapabilityFlagGrant(
-            policyKey: flag.policyKey, appModel: appModel,
+        await AppToolExecutor.applyCapabilityFlagGrant(
+            policyKey: flag.policyKey, appModel: AppQuietSettingsHost(appModel),
             dataRoot: dataRoot, logTag: "interaction", requireFullMac: false
         )
-        if flag.id != "screen_capture" || appModel.trustPolicy?.multimodalPolicy?.screen_capture == true,
+        if flag.id != "screen_capture" || appModel.engine.trust.policy?.multimodalPolicy?.screen_capture == true,
            await SystemPermissionPreflight.askMacOSForCard([flag.id], mode: nil) {
             watchUntilGranted(interaction.id, sessionID: sessionID)
             return
@@ -721,6 +724,7 @@ final class InlineInteractionChatBinding {
             // browser does, and the card settles on Providers' answer.
             let root = appModel.dataRootOverride ?? dataRoot
             let result = await NativeOAuthFlow.startOAuthFlow(
+                platform: NativeOAuthPlatform.self,
                 providerId: signIn.oauthProviderID, dataRoot: root
             )
             if result.ok {

@@ -1,3 +1,4 @@
+import ProviderRouting
 // Swift-native cutover (2026-06-02): OAuth flow is driven entirely in-process by
 // `NativeOAuthFlow` — provider-native OAuth for Anthropic/Grok via the
 // registered `nativeagent://oauth/...` callback, and (since 2026-07-05) the
@@ -190,6 +191,7 @@ struct OAuthSignInButton: View {
         print("[oauth-signin] starting native flow for \(provider.id)")
 
         let result = await NativeOAuthFlow.startOAuthFlow(
+            platform: NativeOAuthPlatform.self,
             providerId: provider.id,
             dataRoot: oauthDataRoot
         )
@@ -250,8 +252,8 @@ struct OAuthSignInButton: View {
                 appModel.codexDeviceLogin = login
                 authStatusText = codexDeviceLoginStatusText(login)
                 if login.running != true {
-                    let auth = try? await appModel.client.getCodexAuthStatus()
-                    appModel.codexAuthStatus = auth
+                    let auth = try? await appModel.engine.providers.codexAuthStatus()
+                    appModel.engine.providers.codexAuth = auth
                     await appModel.loadProvidersForChat()
                     if auth?.appOwnedLoggedIn == true {
                         status = .complete

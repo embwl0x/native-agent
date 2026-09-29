@@ -137,7 +137,6 @@ struct MCPHubView: View {
     @State private var expandedTool: Set<String> = []
     @State private var inputValidationErrors: [String: String] = [:]
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @AppStorage(NativeAgentShellPreference.classicShellKey) private var classicShell = false
 
     private func valuesKey(for tool: MCPToolRecord) -> String {
         "\(tool.name)|\(schemaFingerprint(tool.inputSchema))"
@@ -178,11 +177,6 @@ struct MCPHubView: View {
             }
             .padding(.bottom, 32)
             .frame(maxWidth: .infinity, alignment: .leading)
-            // The new shell's `ShellPageFrame` already insets the column; the
-            // classic shell hands a page the bare pane, so the page keeps its
-            // own margin there.
-            .padding(.horizontal, classicShell ? 20 : 0)
-            .padding(.top, classicShell ? 20 : 0)
         }
         .navigationTitle("MCP Hub")
         .pageActions {

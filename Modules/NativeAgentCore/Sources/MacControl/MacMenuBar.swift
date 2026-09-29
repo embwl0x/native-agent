@@ -325,10 +325,10 @@ public enum MacMenuBar {
                 + candidates.joined(separator: ", ") + ". Say which one."
         case .notFound(let nearest):
             guard !nearest.isEmpty else {
-                return "There is no \"\(raw)\" in this app's menu bar."
+                return "There is no \"\(raw)\" in this app's menu bar. Read the menu again and use a path it shows."
             }
             return "There is no \"\(raw)\" in this app's menu bar. What is there: "
-                + nearest.joined(separator: ", ") + "."
+                + nearest.joined(separator: ", ") + ". Read the menu again and choose an exact path."
         }
     }
 

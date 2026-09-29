@@ -374,7 +374,7 @@ public actor SwiftNativeSelfImprovement: SelfImprovementProtocol {
     /// re-sort by `createdAt`; the daemon does not, and Swift parity matters.
     public func listImprovementsLocal() async throws -> [ImprovementRun] {
         let path = dataRoot.appendingPathComponent("improvements/runs.json")
-        let raw = await persistence.readJSON(path, defaultValue: .array([]))
+        let raw = try await persistence.readJSON(path, ifMissing: .array([]))
         guard case .array(let arr) = raw else { return [] }
         let decoder = JSONDecoder()
         // Reverse first, then decode in that order — file-order-reversed.
@@ -425,7 +425,7 @@ public actor SwiftNativeSelfImprovement: SelfImprovementProtocol {
         // the 12 OLDEST staged runs. `runs` here is file-order-reversed, so
         // re-read runs.json in raw file order for parity on this field.
         let runsPath = dataRoot.appendingPathComponent("improvements/runs.json")
-        let rawRunsJV = await persistence.readJSON(runsPath, defaultValue: .array([]))
+        let rawRunsJV = try await persistence.readJSON(runsPath, ifMissing: .array([]))
         let stagedAllFileOrder: [ImprovementRun]
         if case .array(let arr) = rawRunsJV {
             let decoder = JSONDecoder()
@@ -502,7 +502,7 @@ public actor SwiftNativeSelfImprovement: SelfImprovementProtocol {
     public func markStaleImprovementsLocal() async throws -> Int {
         let path = dataRoot.appendingPathComponent("improvements/runs.json")
         return try await withPathLock(path) { [persistence] in
-            let raw = await persistence.readJSON(path, defaultValue: .array([]))
+            let raw = try await persistence.readJSON(path, ifMissing: .array([]))
             guard case .array(let arr) = raw else { return 0 }
 
             var changed = 0
@@ -560,7 +560,7 @@ public actor SwiftNativeSelfImprovement: SelfImprovementProtocol {
         ]
         let path = dataRoot.appendingPathComponent("improvements/runs.json")
         return try await withPathLock(path) { [persistence] in
-            let raw = await persistence.readJSON(path, defaultValue: .array([]))
+            let raw = try await persistence.readJSON(path, ifMissing: .array([]))
             guard case .array(let arr) = raw else { return 0 }
 
             var changed = 0
@@ -590,9 +590,9 @@ public actor SwiftNativeSelfImprovement: SelfImprovementProtocol {
     /// write via `_write_improvements_locked`, so a local read of it is exactly
     /// as authoritative as the daemon's `/v1/improvements/commit_seq` route
     /// (same file, atomic writes) without an HTTP hop.
-    public func improvementsCommitSeqLocal() async -> Int {
+    public func improvementsCommitSeqLocal() async throws -> Int {
         let path = dataRoot.appendingPathComponent("improvements/runs.commit")
-        let raw = await persistence.readJSON(path, defaultValue: .object([:]))
+        let raw = try await persistence.readJSON(path, ifMissing: .object([:]))
         guard case .object(let obj) = raw else { return 0 }
         switch obj["seq"] {
         case .int(let n): return n > 0 ? Int(n) : 0
@@ -631,10 +631,10 @@ public actor SwiftNativeSelfImprovement: SelfImprovementProtocol {
         // straddled the read. seq < 2, an ODD seq, or a seq that moved between
         // the two reads all mean "a writer was mid-update / freshness not
         // provable" -> return nil so the caller fails closed/retries later.
-        let seq1 = await improvementsCommitSeqLocal()
+        let seq1 = try await improvementsCommitSeqLocal()
         guard seq1 >= 2, seq1 % 2 == 0 else { return nil }
         let runs = try await listImprovementsLocal()
-        let seq2 = await improvementsCommitSeqLocal()
+        let seq2 = try await improvementsCommitSeqLocal()
         guard seq1 == seq2 else { return nil }
         return runs
     }

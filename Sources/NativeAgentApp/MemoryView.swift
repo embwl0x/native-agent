@@ -15,6 +15,7 @@ import CoreSpotlight
 #endif
 #if canImport(CloudKit)
 import CloudKit
+import DeviceSync
 #endif
 
 @MainActor
@@ -42,128 +43,59 @@ final class MemoryMenuActionController {
     }
 }
 
-struct MemoryView: View {
+/// The memory store's upkeep and its status, as one fold at the foot of the
+/// Memories page: consolidate, tidy (hygiene), rebuild the Spotlight index,
+/// check again, and the status block with its Advanced diagnostics. The same
+/// calls, the same operations and the same status panel the classic Memory
+/// page carried in its Actions menu and header.
+struct MemoryUpkeepPanel: View {
     @Environment(AppModel.self) private var appModel
-    @State private var query = ""
-    @State private var memoryProposalMessage: String?
-    @State private var selectedTab: MemoryViewTab
-    /// nil until the rejected-history read lands or fails; the empty state only
-    /// claims "nothing rejected" once a successful read says so.
-    @State private var loadedRejectedProposals: [MemoryProposalRecord]?
-    @State private var rejectedProposalsError: String?
-
-    // PATCH-2026-06-06: activity-flatten — when ActivityView drills into the
-    // "Memory Proposals" section, the user wants to land on the pending
-    // proposal queue, not the active-memory list. Default stays `.active` so
-    // existing call sites are unchanged.
-    init(
-        initialTab: MemoryViewTab = .active,
-        menuActionController: MemoryMenuActionController = .init()
-    ) {
-        _selectedTab = State(initialValue: initialTab)
-        _menuActionController = State(initialValue: menuActionController)
-    }
+    @State private var menuActionController = MemoryMenuActionController()
     @State private var spotlightStatus: String?
     @State private var cloudKitStatus: String = "checking…"
     @State private var isReindexing = false
     @State private var nativeStack: MemoryV2NativeStackSnapshot = .empty
-    @State private var semanticSearchTask: Task<Void, Never>?
     @State private var isRefreshing = false
     @State private var refreshNotice: MemoryToolbarRefreshPresentation?
-    @State private var menuActionController: MemoryMenuActionController
 
-    private var filteredMemories: [MemoryRecord] {
-        MemorySearchPresentation.displayedRecords(
-            appModel.memories,
-            query: query,
-            semanticResults: appModel.memorySearchResults,
-            resultQuery: appModel.memorySearchResultQuery
-        ) { memory, lower in
-            memory.text.lowercased().contains(lower) || memory.layer.lowercased().contains(lower)
-        }
-    }
-
-    private var pendingMemoryProposals: [MemoryProposalRecord] {
-        appModel.memoryProposals.filter { $0.status == "pending" }
-    }
-
-    private var memorySearchPresentation: MemorySearchPresentation {
-        MemorySearchPresentation.resolve(
-            query: query,
-            resultCount: filteredMemories.count,
-            isLoading: appModel.memorySearchIsLoading
-                && MemorySearchPresentation.matchesCurrentQuery(
-                    query,
-                    resultQuery: appModel.memorySearchResultQuery
-                ),
-            error: MemorySearchPresentation.matchesCurrentQuery(
-                query,
-                resultQuery: appModel.memorySearchResultQuery
-            )
-                ? appModel.memorySearchError
-                : nil
-        )
-    }
-
-    private var currentMemorySearchError: String? {
-        guard MemorySearchPresentation.matchesCurrentQuery(
-            query,
-            resultQuery: appModel.memorySearchResultQuery
-        ) else {
-            return nil
-        }
-        return appModel.memorySearchError
-    }
-
-    /// Astra comb 4, lane4 finding 1: this used to filter
-    /// `appModel.memoryProposals`, which `getMemoryProposals()` populates with
-    /// PENDING rows only — so the Deleted tab told the person nothing had ever
-    /// been rejected while 381 rejected proposals sat in `proposals`. Rejected
-    /// history has its own read, the same one the newer Memories page uses.
-    private var rejectedMemoryProposals: [MemoryProposalRecord] {
-        loadedRejectedProposals ?? appModel.memoryProposals.filter { $0.status == "rejected" }
-    }
+    private var busy: Bool { menuActionController.runningAction != nil || isReindexing || isRefreshing }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             EmbeddingModelDownloadRow()
-            HStack {
-                // UI-5: "semantic recall" is a backend word. The search box is
-                // the first thing on the page, so it says what it does.
-                TextField("Search your memories", text: $query)
-                    .textFieldStyle(.roundedBorder)
-                Menu {
-                    Button(
-                        menuActionController.runningAction == .consolidate ? "Consolidating memory…" : "Consolidate memory",
-                        systemImage: "arrow.triangle.merge"
-                    ) {
-                        Task { await menuActionController.run(.consolidate, appModel: appModel) }
-                    }
-                    .disabled(menuActionController.runningAction != nil || isReindexing)
-                    Button(
-                        menuActionController.runningAction == .hygiene ? "Running hygiene…" : "Run hygiene",
-                        systemImage: "sparkles"
-                    ) {
-                        Task { await menuActionController.run(.hygiene, appModel: appModel) }
-                    }
-                    .disabled(menuActionController.runningAction != nil || isReindexing)
-                    Button(isReindexing ? "Reindexing Spotlight…" : "Reindex Spotlight", systemImage: "magnifyingglass") {
-                        Task { await reindexSpotlight() }
-                    }
-                    .disabled(isReindexing || menuActionController.runningAction != nil)
-                } label: {
-                    Label("Actions", systemImage: "ellipsis.circle")
+
+            HStack(spacing: 8) {
+                Button(menuActionController.runningAction == .consolidate ? "Consolidating…" : "Consolidate now") {
+                    Task { await menuActionController.run(.consolidate, appModel: appModel) }
                 }
-                .menuStyle(.borderlessButton)
-                .fixedSize()
+                .accessibilityIdentifier("memories.upkeep.consolidate")
+                Button(menuActionController.runningAction == .hygiene ? "Tidying…" : "Run hygiene") {
+                    Task { await menuActionController.run(.hygiene, appModel: appModel) }
+                }
+                .accessibilityIdentifier("memories.upkeep.hygiene")
+                Button(isReindexing ? "Reindexing Spotlight…" : "Reindex Spotlight") {
+                    Task { await reindexSpotlight() }
+                }
+                .accessibilityIdentifier("memories.upkeep.reindex")
+                Button(isRefreshing ? "Checking…" : "Check again") {
+                    Task { await refreshMemorySurface() }
+                }
+                .accessibilityIdentifier("memories.upkeep.refresh")
+            }
+            .buttonStyle(.bordered)
+            .tint(NativeAgentShell.text)
+            .controlSize(.small)
+            .disabled(busy)
+
+            ForEach(notices, id: \.text) { notice in
+                Text(notice.text)
+                    .font(.system(size: 13))
+                    .foregroundStyle(notice.adverse ? NativeAgentShell.trouble : NativeAgentShell.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
 
-            // 2026-07-23 B2.5b: the triple status readout (Apple-Native Stack
-            // panel + MemoryV2SummaryBar + standalone cloudKitBadge) collapses
-            // into ONE status block. The summary counts/backend/hygiene fold
-            // into the top of the stack panel; the standalone iCloud badge is
-            // dropped because CloudKit already renders as a stack row. No datum
-            // shown before disappears.
+            // One memory status block; its Advanced diagnostics fold keeps
+            // every backend row, the data root and the Spotlight reindex.
             MemoryV2NativeStackPanel(
                 snapshot: nativeStack,
                 cloudKitStatus: cloudKitStatus,
@@ -172,114 +104,40 @@ struct MemoryView: View {
                 isReindexing: isReindexing,
                 onReindex: { Task { await reindexSpotlight() } }
             )
-
-            Picker("Tab", selection: $selectedTab) {
-                ForEach(MemoryViewTab.allCases) { tab in
-                    Label(tab.title, systemImage: tab.systemImage).tag(tab)
-                }
-            }
-            .pickerStyle(.segmented)
-            .hazeTinted(.segments)
-            .labelsHidden()
-
-            if let spotlightStatus, !spotlightStatus.isEmpty {
-                Label(spotlightStatus, systemImage: "magnifyingglass.circle")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-
-            if let searchError = currentMemorySearchError, !searchError.isEmpty {
-                Label(searchError, systemImage: "exclamationmark.triangle")
-                    .font(.caption)
-                    .foregroundStyle(.orange)
-            }
-
-            if let memoryProposalMessage, !memoryProposalMessage.isEmpty {
-                Label(memoryProposalMessage, systemImage: "checkmark.circle")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-
-            if let refreshNotice {
-                Label(refreshNotice.text, systemImage: refreshNotice.systemImage)
-                    .font(.caption)
-                    .foregroundStyle(refreshNotice.isAdverse ? .orange : .secondary)
-            }
-
-            if let menuActionFeedback = menuActionController.feedback {
-                Label(menuActionFeedback.message, systemImage: menuActionFeedback.isAdverse
-                    ? "exclamationmark.triangle"
-                    : "checkmark.circle")
-                    .font(.caption)
-                    .foregroundStyle(menuActionFeedback.isAdverse ? .orange : .secondary)
-            }
-
-            // F2: surface the "panel disabled / not implemented" envelope so
-            // the user sees a feature-disabled badge instead of a fake success
-            // toast for hygiene / consolidate.
-            if let disabled = appModel.memoryFeatureDisabledMessage, !disabled.isEmpty {
-                Label(disabled, systemImage: "exclamationmark.triangle")
-                    .font(.caption)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
-                    .background(Color.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 6))
-                    .foregroundStyle(.orange)
-            }
-
-            // Taste pass 2026-07-24: the hygiene last-run/next-run line moved
-            // into MemoryV2NativeStackPanel's status line (B2.5b: one memory
-            // status block); a second copy here read as duplicate chrome.
-
-            switch selectedTab {
-            case .active: activeTab
-            case .pending: pendingTab
-            case .tombstones: tombstonesTab
-            }
-        }
-        .padding()
-        .task(id: selectedTab) {
-            guard selectedTab == .tombstones else { return }
-            await loadRejectedProposals()
-        }
-        .navigationTitle("Memory")
-        .motionArrival(when: appModel.panelRefreshStatus[.memories] != nil)
-        .pageActions {
-            Button("Refresh", systemImage: "arrow.clockwise") {
-                Task { await refreshMemorySurface() }
-            }
-            .disabled(isRefreshing)
         }
         .task { await refreshCloudKitStatus() }
-        // 2026-06-07: the user caught Memory page showing "ready, not loaded"
-        // even with Fast mode on — the snapshot loads once on .task and
-        // never refreshes. If the page opened before the launch-time
-        // detached warmup finished (~100-900ms), the cached snapshot
-        // never updates. Poll only during that transient ready/not-loaded
-        // state, then stop so an idle Memory page does not wake the app on a
-        // forever cadence.
+        // Fast mode warms MiniLM at process launch. Follow that one startup
+        // attempt for at most ten seconds and read only runtime state; the
+        // full memory/Spotlight snapshot is intentionally not rescanned.
         .task {
             await refreshNativeStack()
-            // Fast mode warms MiniLM at process launch. Follow that one startup
-            // attempt for at most ten seconds and read only runtime state; the
-            // full memory/Spotlight snapshot is intentionally not rescanned.
-            for _ in 0..<10 where shouldContinueNativeStackStartupPoll() {
+            for _ in 0..<10 where nativeStack.shouldPollEmbeddingStartup {
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
                 if Task.isCancelled { return }
-                await refreshNativeEmbeddingRuntime()
+                var snapshot = nativeStack
+                await snapshot.refreshEmbeddingRuntime()
+                nativeStack = snapshot
             }
         }
-        // The owner starts its generation gate before its debounce. That makes
-        // a new keystroke immediately invalidate old results instead of showing
-        // a previous query beneath the current search text.
-        .onChange(of: query) { _, newValue in
-            semanticSearchTask?.cancel()
-            semanticSearchTask = Task {
-                await appModel.runMemorySemanticSearch(query: newValue)
-            }
+    }
+
+    /// Every result line the upkeep has to say, in the order it happened.
+    private var notices: [(text: String, adverse: Bool)] {
+        var lines: [(text: String, adverse: Bool)] = []
+        if let feedback = menuActionController.feedback {
+            lines.append((feedback.message, feedback.isAdverse))
         }
-        .onDisappear {
-            semanticSearchTask?.cancel()
+        if let spotlightStatus, !spotlightStatus.isEmpty {
+            lines.append((spotlightStatus, false))
         }
+        if let refreshNotice {
+            lines.append((refreshNotice.text, refreshNotice.isAdverse))
+        }
+        // F2: a disabled hygiene / consolidate says so instead of a fake success.
+        if let disabled = appModel.memoryFeatureDisabledMessage, !disabled.isEmpty {
+            lines.append((disabled, true))
+        }
+        return lines
     }
 
     @MainActor
@@ -289,15 +147,13 @@ struct MemoryView: View {
         )
     }
 
-    /// The toolbar claims to refresh the Memory page, not merely its list.
-    /// Keep the list/proposal/status reader, the native status snapshot, and
-    /// the CloudKit account status in one user-triggered transaction.
+    /// The list/proposal/status reader, the native status snapshot, and the
+    /// CloudKit account status, in one user-triggered transaction.
     @MainActor
     private func refreshMemorySurface() async {
         guard !isRefreshing else { return }
         isRefreshing = true
         defer { isRefreshing = false }
-
         let refreshed = await MemoryToolbarRefreshOperation.run(
             appModel: appModel,
             dataRoot: appModel.dataRootOverride ?? NativeAgentPaths.dataRoot
@@ -305,125 +161,6 @@ struct MemoryView: View {
         nativeStack = refreshed.nativeStack
         await refreshCloudKitStatus()
         refreshNotice = refreshed.presentation
-    }
-
-    @MainActor
-    private func refreshNativeEmbeddingRuntime() async {
-        var snapshot = nativeStack
-        await snapshot.refreshEmbeddingRuntime()
-        nativeStack = snapshot
-    }
-
-    @MainActor
-    private func shouldContinueNativeStackStartupPoll() -> Bool {
-        nativeStack.shouldPollEmbeddingStartup
-    }
-
-    // Dead-weight sweep 2026-07-03: the bulk Pin/Archive/Delete bar (v2
-    // stubs since 2026-06-10), the JSON-export toast stub, and the row
-    // selection checkboxes that existed only to feed them are removed.
-    // Per-row Pin/Delete cover the live operations; bulk ops return with
-    // real wiring if v2 ever lands them.
-
-    @ViewBuilder
-    private var activeTab: some View {
-        switch memorySearchPresentation {
-        case .searching:
-            ProgressView("Searching memories…")
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-        case .unavailable(let detail):
-            NativeEmptyState(
-                title: "Memory search unavailable",
-                detail: "\(detail) No text matches were found either.",
-                systemImage: "exclamationmark.triangle"
-            )
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-        case .allMemories, .empty:
-            if filteredMemories.isEmpty {
-                NativeEmptyState(
-                    title: query.isEmpty ? "No Memories Yet" : "No Matches",
-                    detail: query.isEmpty
-                        ? "Memories appear here as the agent learns from your conversations. Start chatting and useful facts will show up."
-                        : "Nothing in memory matches \(query.isEmpty ? "" : "“\(query)”"). Clear the search box to see all memories.",
-                    systemImage: query.isEmpty ? "brain" : "magnifyingglass"
-                )
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else {
-                List(filteredMemories) { memory in
-                    MemoryRowEditor(memory: memory)
-                }
-            }
-        case .results:
-            List(filteredMemories) { memory in
-                MemoryRowEditor(memory: memory)
-            }
-        }
-    }
-
-    @ViewBuilder
-    private var pendingTab: some View {
-        if pendingMemoryProposals.isEmpty {
-            NativeEmptyState(
-                title: "No Pending Proposals",
-                detail: "When the agent wants to keep a new durable fact, it shows up here for your approval.",
-                systemImage: "tray"
-            )
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-        } else {
-            MemoryProposalReviewPanel(
-                proposals: pendingMemoryProposals,
-                statusMessage: $memoryProposalMessage
-            )
-        }
-    }
-
-    @MainActor
-    private func loadRejectedProposals() async {
-        do {
-            let rejected = try await appModel.client.getRejectedMemoryProposals()
-            guard !Task.isCancelled else { return }
-            loadedRejectedProposals = rejected
-            rejectedProposalsError = nil
-        } catch {
-            guard !Task.isCancelled else { return }
-            rejectedProposalsError = "Could not read rejected memory history."
-        }
-    }
-
-    @ViewBuilder
-    private var tombstonesTab: some View {
-        if let rejectedProposalsError, loadedRejectedProposals == nil {
-            NativeEmptyState(
-                title: "Deleted history unavailable",
-                detail: rejectedProposalsError,
-                systemImage: "exclamationmark.triangle"
-            )
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-        } else if loadedRejectedProposals == nil {
-            ProgressView("Reading deleted memories…")
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-        } else if rejectedMemoryProposals.isEmpty {
-            NativeEmptyState(
-                title: "Nothing Deleted",
-                detail: "Rejected memory proposals are kept here so the same fact can't sneak back in. Nothing rejected yet.",
-                systemImage: "xmark.bin"
-            )
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-        } else {
-            List(rejectedMemoryProposals) { proposal in
-                VStack(alignment: .leading, spacing: 4) {
-                    Label("rejected", systemImage: "xmark.bin")
-                        .font(.caption)
-                        .foregroundStyle(.red)
-                    Text(proposal.display_text ?? proposal.fact_text)
-                        .textSelection(.enabled)
-                    Text("seen \(proposal.recurrence_count)x")
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                }
-                .padding(.vertical, 4)
-            }
-        }
     }
 
     @MainActor
@@ -448,7 +185,7 @@ struct MemoryView: View {
             return
         }
         #if canImport(CloudKit)
-        let statusText = await withCKTimeout("MemoryView.refreshCloudKitStatus") {
+        let statusText = await withCKTimeout("MemoryUpkeepPanel.refreshCloudKitStatus") {
             let status = try await CKContainer.default().accountStatus()
             switch status {
             case .available: return "available"
@@ -467,92 +204,6 @@ struct MemoryView: View {
 
     static func localTimestamp(_ iso: String) -> String {
         UserDisplayFormatters.mediumDateTime(iso)
-    }
-}
-
-private struct MemoryProposalReviewPanel: View {
-    @Environment(AppModel.self) private var appModel
-    let proposals: [MemoryProposalRecord]
-    @Binding var statusMessage: String?
-
-    var body: some View {
-        NativePanel(title: "Memory Proposals", systemImage: "brain.head.profile") {
-            VStack(alignment: .leading, spacing: 10) {
-                // UI-5: "USER.md" and "the graph" are file and backend names.
-                // The filename still ships, inside Advanced Diagnostics on the
-                // memory status panel.
-                Text("Review the lasting facts the agent wants to keep in your long-term memory profile. Short-lived project details are stored automatically without asking.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 8) {
-                        ForEach(proposals) { proposal in
-                            MemoryProposalReviewRow(
-                                proposal: proposal,
-                                onApprove: { decide(proposal, approve: true) },
-                                onReject: { decide(proposal, approve: false) }
-                            )
-                        }
-                    }
-                }
-                .frame(maxHeight: 360)
-            }
-        }
-    }
-
-    private func decide(_ proposal: MemoryProposalRecord, approve: Bool) {
-        Task {
-            do {
-                let result: [String: Any]
-                if approve {
-                    result = try await appModel.approveMemoryProposal(id: proposal.proposal_id)
-                } else {
-                    result = try await appModel.rejectMemoryProposal(id: proposal.proposal_id)
-                }
-                statusMessage = (result["status"] as? String) == "pending_approval"
-                    ? "Memory decision queued"
-                    : (approve ? "Memory proposal approved" : "Memory proposal rejected")
-            } catch {
-                statusMessage = "Memory proposal failed: \(error.localizedDescription)"
-            }
-        }
-    }
-}
-
-private struct MemoryProposalReviewRow: View {
-    let proposal: MemoryProposalRecord
-    let onApprove: () -> Void
-    let onReject: () -> Void
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Label("memory", systemImage: "brain.head.profile")
-                    .font(NativeAgentFont.tag)
-                    .foregroundStyle(.green)
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 2)
-                    .background(.green.opacity(0.12), in: Capsule())
-                Text(proposal.evidenceSummary)
-                    .font(NativeAgentFont.label)
-                    .foregroundStyle(.secondary)
-                Spacer()
-            }
-            Text(proposal.display_text ?? proposal.fact_text)
-                .font(NativeAgentFont.body)
-                .textSelection(.enabled)
-            HStack(spacing: 10) {
-                Button("Deny", systemImage: "xmark", action: onReject)
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                Button("Approve", systemImage: "checkmark", action: onApprove)
-                    .buttonStyle(.borderedProminent)
-                    .hazeTinted(.button)
-                    .controlSize(.small)
-            }
-        }
-        .padding(NativeAgentSpacing.sm)
-        .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 }
 
@@ -596,160 +247,6 @@ struct MemoryFullTextView: View {
     }
 }
 
-private struct MemoryRowEditor: View {
-    let memory: MemoryRecord
-    @Environment(AppModel.self) private var appModel
-    @State private var showingDeleteConfirmation = false
-    @State private var showingFullText = false
-    @State private var isDeleting = false
-    @State private var isPinning = false
-    @State private var pinFeedback: MemoryRowEditorPinOutcome?
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            headerRow
-            if let pinFeedback {
-                Label(
-                    pinFeedback.message,
-                    systemImage: pinFeedback.systemImage
-                )
-                .font(.caption)
-                .foregroundStyle(
-                    pinFeedback.isAdverse || pinFeedback.isPendingApproval ? .orange : .secondary
-                )
-                .accessibilityLabel(pinFeedback.message)
-            }
-            Text(memory.text)
-                .textSelection(.enabled)
-                .lineLimit(2)
-            if let tags = memory.tags, !tags.isEmpty {
-                tagChipsRow(tags)
-            }
-            provenanceLine
-        }
-        .padding(.vertical, 4)
-        .sheet(isPresented: $showingFullText) {
-            MemoryFullTextView(text: memory.text)
-        }
-        .confirmationDialog(
-            "Delete this memory?",
-            isPresented: $showingDeleteConfirmation,
-            titleVisibility: .visible
-        ) {
-            Button("Delete Memory", role: .destructive) {
-                Task { await deleteConfirmedMemory() }
-            }
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text("\u{201c}\(MemoryDeletionPresentation.preview(for: memory.text))\u{201d}\n\nThis cannot be undone.")
-        }
-    }
-
-    @ViewBuilder
-    private var headerRow: some View {
-        HStack {
-            Label(memory.layer.capitalized, systemImage: memory.pinned == true ? "pin.fill" : "brain")
-                .font(.caption)
-                .foregroundStyle(memory.pinned == true ? .orange : .secondary)
-            Spacer()
-            Button("Read", systemImage: "doc.text.magnifyingglass") {
-                showingFullText = true
-            }
-            .help("Read the full saved memory")
-            .accessibilityLabel("Read full memory")
-            Button(
-                isPinning ? "Updating…" : (memory.pinned == true ? "Unpin" : "Pin"),
-                systemImage: isPinning ? "hourglass" : (memory.pinned == true ? "pin.slash" : "pin")
-            ) {
-                Task { await togglePin() }
-            }
-            .disabled(isPinning)
-            Button(isDeleting ? "Deleting\u{2026}" : "Delete", systemImage: isDeleting ? "hourglass" : "trash") {
-                showingDeleteConfirmation = true
-            }
-            .foregroundStyle(.red)
-            .disabled(isDeleting)
-        }
-        .buttonStyle(.borderless)
-    }
-
-    @MainActor
-    private func togglePin() async {
-        guard !isPinning else { return }
-        isPinning = true
-        defer { isPinning = false }
-        pinFeedback = await appModel.pinMemory(memory, pinned: !(memory.pinned ?? false))
-    }
-
-    @ViewBuilder
-    private func tagChipsRow(_ tags: [String]) -> some View {
-        HStack(spacing: 4) {
-            ForEach(tags, id: \.self) { tag in
-                Text(tag)
-                    .font(.caption2)
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 2)
-                    .background(Color.secondary.opacity(0.12), in: Capsule())
-            }
-        }
-    }
-
-    @ViewBuilder
-    private var provenanceLine: some View {
-        // The record exposes saved/updated time, not last retrieval or usage.
-        let source = memory.sourceRunId ?? "manual"
-        let conf = String(format: "%.0f%%", memory.confidence * 100)
-        let when = MemoryRowTimestampPresentation.label(createdAt: memory.createdAt, updatedAt: memory.updatedAt)
-        Text("\(source) · conf \(conf) · \(when)")
-            .font(.caption2)
-            .foregroundStyle(.secondary)
-    }
-
-    @MainActor
-    private func deleteConfirmedMemory() async {
-        guard !isDeleting else { return }
-        isDeleting = true
-        defer { isDeleting = false }
-
-        await appModel.deleteMemory(memory)
-        if appModel.statusText.hasPrefix("Memory delete failed:") {
-            appModel.systemToasts.push(error: appModel.statusText)
-        }
-    }
-}
-
-enum MemoryRowTimestampPresentation {
-    static func label(createdAt: String, updatedAt: String?) -> String {
-        let updated = updatedAt?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let hasUpdate = !updated.isEmpty
-        let timestamp = hasUpdate ? updated : createdAt.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard UserDisplayFormatters.parseISOTimestamp(timestamp) != nil else {
-            return hasUpdate ? "update time unavailable" : "save time unavailable"
-        }
-        let relative = UserDisplayFormatters.relativeISOTimestamp(
-            timestamp,
-            unitsStyle: .abbreviated,
-            fallback: "time unavailable"
-        )
-        return "\(hasUpdate ? "updated" : "saved") \(relative)"
-    }
-}
-
-enum MemoryDeletionPresentation {
-    static let previewCharacterLimit = 96
-
-    static func preview(for text: String, maxCharacters: Int = previewCharacterLimit) -> String {
-        guard maxCharacters > 0 else { return "" }
-        let normalized = text
-            .split(whereSeparator: { $0.isWhitespace })
-            .joined(separator: " ")
-        let candidate = normalized.isEmpty ? "Empty memory" : normalized
-        guard candidate.count > maxCharacters else { return candidate }
-        guard maxCharacters > 1 else { return "\u{2026}" }
-        return String(candidate.prefix(maxCharacters - 1)) + "\u{2026}"
-    }
-}
-
 /// The explicit toolbar refresh has three independently-read boundaries:
 /// app-model content, the native store snapshot, and the optional CloudKit
 /// account state. A failed store probe wins over a generic successful refresh
@@ -782,7 +279,7 @@ struct MemoryToolbarRefreshPresentation: Equatable {
     }
 }
 
-/// The state-bearing core of MemoryView's explicit toolbar action. Keeping it
+/// The state-bearing core of the memory upkeep's Check again action. Keeping it
 /// separate from the SwiftUI closure makes the mounted control's real reads
 /// executable with an injected data root, without inventing an in-memory
 /// substitute for the MemoryV2 store.
@@ -1082,25 +579,21 @@ struct MemoryV2NativeStackSnapshot: Sendable, Equatable {
         // actually looks. Result: page perpetually said "pending .mlpackage"
         // even with a fully staged model. Now we ask the runtime's own
         // resolver — single source of truth, both `bundled` and
-        // installedAppFallbackBundle paths covered. Falls back to the
-        // <dataRoot>/extras/coreml legacy path for users who staged the
-        // model manually.
-        if let installed = CoreMLEmbeddingProvider.installedExtrasModel(root: dataRoot) {
-            snap.coreMLReady = true
-            snap.coreMLModelLabel = installed.modelID + " (installed)"
-            snap.embedderDimensions = installed.dimensions
-        } else if CoreMLEmbeddingProvider.bundledResourcesAvailable() {
-            snap.coreMLReady = true
-            snap.coreMLModelLabel = CoreMLEmbeddingProvider.bundledModelID + " (bundled)"
-        } else {
-            let extrasURL = dataRoot
-                .appendingPathComponent("extras", isDirectory: true)
-                .appendingPathComponent("coreml", isDirectory: true)
-                .appendingPathComponent("MiniLM_L6_v2.mlpackage", isDirectory: true)
-            if FileManager.default.fileExists(atPath: extrasURL.path) {
+        // installedAppFallbackBundle paths covered. An installed model whose
+        // manifest is unusable is NOT ready and never reads as the bundled
+        // MiniLM (S12, 2026-09-26); refreshEmbeddingRuntime() below carries
+        // the reason as the load error.
+        do {
+            if let installed = try CoreMLEmbeddingProvider.installedExtrasModel(root: dataRoot) {
                 snap.coreMLReady = true
-                snap.coreMLModelLabel = "all-MiniLM-L6-v2 (extras)"
+                snap.coreMLModelLabel = installed.modelID + " (installed)"
+                snap.embedderDimensions = installed.dimensions
+            } else if CoreMLEmbeddingProvider.bundledResourcesAvailable() {
+                snap.coreMLReady = true
+                snap.coreMLModelLabel = CoreMLEmbeddingProvider.bundledModelID + " (bundled)"
             }
+        } catch {
+            snap.coreMLModelLabel = "installed model did not load"
         }
 
         // Runtime truth fields — the disk probe above tells us if
@@ -1548,7 +1041,7 @@ private struct MemoryV2SummaryBar: View {
         let accepted = report.distilledFactsAdded ?? 0
         let decayed = report.decayedMemories ?? 0
         let changed = merged + archived + accepted + decayed
-        let runLabel = report.createdAt.map { "last hygiene \(MemoryView.localTimestamp($0))" } ?? "last hygiene"
+        let runLabel = report.createdAt.map { "last hygiene \(MemoryUpkeepPanel.localTimestamp($0))" } ?? "last hygiene"
         let scanned = "scanned \(before) \(before == 1 ? "memory" : "memories") / \(processed) \(processed == 1 ? "proposal" : "proposals")"
         var parts: [String] = []
         if merged > 0 { parts.append("merged \(merged)") }
@@ -1574,7 +1067,7 @@ private struct MemoryV2SummaryBar: View {
     // hygiene line below the tab picker; it belongs in this panel's single
     // status line (B2.5b: one memory status block).
     private static func nextSuffix(for report: MemoryHygieneReport) -> String {
-        report.nextScheduled.map { " · next \(MemoryView.localTimestamp($0))" } ?? ""
+        report.nextScheduled.map { " · next \(MemoryUpkeepPanel.localTimestamp($0))" } ?? ""
     }
 
     var body: some View {

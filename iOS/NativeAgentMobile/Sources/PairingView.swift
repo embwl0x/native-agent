@@ -12,13 +12,18 @@ enum IOSPairingPresentation {
     }
     private static var macPairingRoute: String { "\(appName) Settings on your Mac → Pair iPhone / iPad" }
     static let title = "Pair with the Mac app to get started."
-    /// The operating requirement, stated at pairing: this phone is a window
-    /// onto the Mac, so the Mac has to be up for anything to happen.
+    /// The operating requirement, stated at pairing, in the agent's own voice:
+    /// this phone is a window onto the Mac, so the Mac has to be up.
     static var macDependence: String {
-        "The agent runs on your Mac. Keep it awake with \(appName) running for replies and actions from your phone."
+        "I run on your Mac. Keep it awake with \(appName) open and I can answer you here."
     }
-    static var iCloudReadyDetail: String { "1. Open \(appName) on your Mac.\n2. Use the same Apple Account on both devices.\n3. Wait for the pairing key, then tap Connect." }
-    static let iCloudUnavailableDetail = "1. Open iPhone Settings -> Apple Account.\n2. Sign in with the same account as your Mac and turn on iCloud Drive.\n3. Return here to pair."
+    static var iCloudReadySteps: [String] { ["Open \(appName) on your Mac.", "Use the same Apple Account on both.", "Wait for the pairing key, then tap Connect."] }
+    static let iCloudUnavailableSteps = ["Open Settings → Apple Account.", "Sign in with your Mac’s account and turn on iCloud Drive.", "Come back here to pair."]
+    static var iCloudReadyDetail: String { numbered(iCloudReadySteps) }
+    static var iCloudUnavailableDetail: String { numbered(iCloudUnavailableSteps) }
+    private static func numbered(_ steps: [String]) -> String {
+        steps.enumerated().map { "\($0.offset + 1). \($0.element)" }.joined(separator: "\n")
+    }
     static var manualSectionTitle: String { "Pairing key from \(appName)" }
     static var manualSectionDetail: String { "Open \(macPairingRoute), then tap Check for Mac. Keep the Mac app open and both devices connected to the internet." }
     static var missingKeyMessage: String { "The Mac’s pairing details haven’t arrived. Open \(macPairingRoute), check that both devices are online, then tap Check for Mac again." }
@@ -40,96 +45,76 @@ struct PairingView: View {
     var body: some View {
         NavigationStack {
             ScrollView {
-                VStack(spacing: 32) {
-                    if !phoneCode.isEmpty {
-                        Text("This phone’s code").font(.headline)
-                        Text(phoneCode).font(.caption.monospaced()).textSelection(.enabled)
-                        Text("On your Mac, open Settings → Pair iPhone / iPad. Match this code and choose Pair, then tap Connect again.")
-                            .font(.subheadline)
-                    }
-                    Spacer(minLength: 24)
-
-                    Image(systemName: "brain.head.profile")
-                        .resizable()
-                        .scaledToFit()
-                        .frame(width: 56, height: 56)
-                        .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
-
-                    VStack(spacing: 8) {
-                        Text("NativeAgent Mobile").font(.title2.weight(.semibold))
-                        Text(IOSPairingPresentation.title)
-                            .font(.body)
-                            .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
-                            .multilineTextAlignment(.center)
+                VStack(alignment: .leading, spacing: 28) {
+                    VStack(alignment: .leading, spacing: 12) {
+                        AlivePageHeader(title: "Welcome.")
                         Text(IOSPairingPresentation.macDependence)
-                            .font(.subheadline)
-                            .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
-                            .multilineTextAlignment(.center)
+                            .font(.body)
+                            .lineSpacing(4)
+                            .foregroundStyle(AlivePalette.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
                             .accessibilityIdentifier("pairing.mac-dependence")
                     }
+                    .padding(.top, 24)
+
+                    if !phoneCode.isEmpty {
+                        AliveCard {
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text("This phone’s code").font(.headline).foregroundStyle(AlivePalette.text)
+                                Text(phoneCode).font(.callout.monospaced()).textSelection(.enabled)
+                                    .foregroundStyle(AlivePalette.text)
+                                Text("On your Mac, open Settings → Pair iPhone / iPad, match this code and choose Pair. Then tap Connect again.")
+                                    .font(.subheadline).foregroundStyle(AlivePalette.secondary)
+                            }
+                            .aliveRow()
+                        }
+                    }
+
+                    stepsCard
 
                     if let error = errorMessage {
                         Text(error)
                             .foregroundStyle(.red)
                             .font(.callout)
-                            .multilineTextAlignment(.center)
-                            .padding(.horizontal)
                     }
 
-                    if bridge.available {
-                        VStack(spacing: 16) {
-                            Image(systemName: "icloud.fill")
-                                .font(.system(size: 36))
-                                .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
-                            Text("iCloud detected")
-                                .font(.headline)
-                            Text(IOSPairingPresentation.iCloudReadyDetail)
-                                .font(.subheadline)
-                                .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
-                                .multilineTextAlignment(.leading)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .padding(.horizontal, 32)
+                    // One way forward: Connect once the Mac's key is here,
+                    // otherwise look for it again.
+                    let canConnect = bridge.available && pairingStore.isICloudSigned
+                    Button {
+                        if canConnect { connectViaICloud() } else { checkForMac() }
+                    } label: {
+                        Text(isCheckingForMac ? "Checking for Mac…" : canConnect ? "Connect" : "Check for Mac")
+                            .font(.body.weight(.semibold))
+                            .foregroundStyle(.white)
+                            .frame(maxWidth: .infinity, minHeight: 52)
+                            .contentShape(Capsule())
+                            .aliveGlass(in: Capsule(), interactive: true,
+                                        tint: HazeColor(stored: hazeColorRaw).control(dark: true, labelled: true))
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(isCheckingForMac)
 
-                            Button {
-                                connectViaICloud()
-                            } label: {
-                                Label(
-                                    pairingStore.isICloudSigned
-                                        ? "Connect via iCloud"
-                                        : "Waiting for pairing key…",
-                                    systemImage: "checkmark.icloud"
-                                )
-                                .frame(maxWidth: .infinity)
-                            }
-                            .buttonStyle(.borderedProminent)
-                    .foregroundStyle(NativeAgentMobileTheme.Colors.onAccent)
-                            .tint(pairingStore.isICloudSigned ? NativeAgentPalette.agentAccent : .gray)
-                            .controlSize(.large)
-                            .padding(.horizontal, 32)
-                            .disabled(!pairingStore.isICloudSigned)
+                    VStack(alignment: .leading, spacing: 8) {
+                        if let err = iCloudSecretError {
+                            Text(err).foregroundStyle(.red).font(.footnote)
                         }
-                    } else {
-                        Text(IOSPairingPresentation.iCloudUnavailableDetail)
-                            .font(.callout)
-                            .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
-                            .multilineTextAlignment(.leading)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(.horizontal, 32)
+                        Text(IOSPairingPresentation.manualSectionDetail)
+                            .font(.footnote)
+                            .foregroundStyle(AlivePalette.secondary)
                     }
-
-                    iCloudSyncPairingSection
-
-                    Spacer(minLength: 24)
                 }
+                .padding(.horizontal, 24)
+                .padding(.bottom, 32)
+                .frame(maxWidth: 560)
+                .frame(maxWidth: .infinity)
             }
-            .mobileReadingScreen()
-            .navigationTitle("Pair with Mac")
-            .navigationBarTitleDisplayMode(.inline)
+            .alivePageChrome(title: "Pair with Mac", root: false)
             .toolbar {
                 if let skip = onSkip {
                     ToolbarItem(placement: .navigationBarTrailing) {
                         Button("Skip") { skip() }
-                            .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
+                            .foregroundStyle(AlivePalette.text)
                     }
                 }
             }
@@ -137,53 +122,59 @@ struct PairingView: View {
         }
     }
 
-    @ViewBuilder
-    private var iCloudSyncPairingSection: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Divider().padding(.horizontal, 48)
+    @AppStorage(HazeColor.key) private var hazeColorRaw = HazeColor.defaultValue.rawValue
 
-            VStack(alignment: .leading, spacing: 8) {
-                Label(IOSPairingPresentation.manualSectionTitle, systemImage: "lock.icloud")
-                    .font(.headline)
-                    .padding(.horizontal, 32)
-
-                Text(IOSPairingPresentation.manualSectionDetail)
-                    .font(.callout)
-                    .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
-                    .padding(.horizontal, 32)
-            }
-
-            MobileReadingSurface {
-                MobileAdaptiveRow(spacing: 8) {
-                    Image(systemName: pairingStore.isICloudSigned ? "checkmark.circle" : "icloud.slash")
-                        .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
-                    Text(isCheckingForMac ? "Checking for Mac…" : pairingStore.isICloudSigned ? "Mac pairing details available" : !bridge.available ? "iCloud is unavailable. Check your Apple Account and internet connection." : "Waiting for the Mac’s pairing details")
+    /// The steps as one card: three numbered steps, then whether the Mac's
+    /// pairing key has arrived.
+    private var stepsCard: some View {
+        let steps = bridge.available ? IOSPairingPresentation.iCloudReadySteps : IOSPairingPresentation.iCloudUnavailableSteps
+        return AliveCard {
+            ForEach(Array(steps.enumerated()), id: \.offset) { index, step in
+                if index > 0 { AliveDivider() }
+                HStack(alignment: .center, spacing: 14) {
+                    Text("\(index + 1)")
+                        .font(.system(.subheadline, design: .serif).weight(.semibold))
+                        .foregroundStyle(AlivePalette.text)
+                        .frame(width: 28, height: 28)
+                        .background(AlivePalette.fill, in: Circle())
+                        .overlay(Circle().strokeBorder(AlivePalette.highlight, lineWidth: 1))
+                    Text(step)
                         .font(.body)
-                        .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
+                        .foregroundStyle(AlivePalette.text)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
+                .aliveRow()
             }
-            .padding(.horizontal, 32)
-
-            Button("Check for Mac") {
-                Task {
-                    isCheckingForMac = true
-                    iCloudSecretError = nil
-                    await pairingStore.refreshFromKVS()
-                    await bridge.drainDeviceTransport()
-                    isCheckingForMac = false
-                    if !pairingStore.isICloudSigned {
-                        iCloudSecretError = bridge.available
-                            ? IOSPairingPresentation.missingKeyMessage
-                            : IOSPairingPresentation.iCloudUnavailableDetail
-                    }
+            AliveDivider()
+            HStack(spacing: 10) {
+                if isCheckingForMac {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Image(systemName: pairingStore.isICloudSigned ? "checkmark.circle.fill" : bridge.available ? "clock" : "icloud.slash")
+                        .foregroundStyle(pairingStore.isICloudSigned
+                                         ? AnyShapeStyle(HazeColor(stored: hazeColorRaw).swatch)
+                                         : AnyShapeStyle(AlivePalette.secondary))
+                        .frame(width: 28)
                 }
+                Text(isCheckingForMac ? "Checking for Mac…" : pairingStore.isICloudSigned ? "Pairing key is here" : !bridge.available ? "iCloud is unavailable on this phone." : "Waiting for the Mac’s pairing key")
+                    .font(.subheadline)
+                    .foregroundStyle(AlivePalette.secondary)
             }
-            .buttonStyle(.bordered)
-            .padding(.horizontal, 32)
-            .disabled(isCheckingForMac)
+            .aliveRow()
+        }
+    }
 
-            if let err = iCloudSecretError {
-                Text(err).foregroundStyle(.red).font(.caption).padding(.horizontal, 32)
+    private func checkForMac() {
+        Task {
+            isCheckingForMac = true
+            iCloudSecretError = nil
+            await pairingStore.refreshFromKVS()
+            await bridge.drainDeviceTransport()
+            isCheckingForMac = false
+            if !pairingStore.isICloudSigned {
+                iCloudSecretError = bridge.available
+                    ? IOSPairingPresentation.missingKeyMessage
+                    : IOSPairingPresentation.iCloudUnavailableDetail
             }
         }
     }

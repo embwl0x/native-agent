@@ -1,3 +1,5 @@
+import Transcripts
+import Privacy
 import Foundation
 import Observation
 import Darwin
@@ -40,38 +42,16 @@ import WorkflowOrchestration
 import Skills
 import Connectors
 import Browser
+import DeviceSync
 
 @MainActor
 extension AppModel {
-    /// Read per-session messages without going through `activeChatSessionId`.
-    /// Used by detached chat panels and any code that needs to inspect a
-    /// non-active session (e.g. sidebar streaming-indicator badges).
-    func chatMessages(for sessionId: String) -> [ChatMessage] {
-        chatMessagesBySession[sessionId] ?? []
-    }
-
-    /// Write per-session messages without affecting the active session's
-    /// view. Detached panels write here; the singleton `chatMessages`
-    /// setter routes through this with `activeChatSessionId` as the key.
-    func setChatMessages(_ messages: [ChatMessage], for sessionId: String) {
-        chatMessagesBySession[sessionId] = messages
-    }
-
     func latestContextReceipt(for sessionId: String) -> ContextReceipt? {
         latestContextReceiptBySession[sessionId]
     }
 
     func setLatestContextReceipt(_ receipt: ContextReceipt?, for sessionId: String) {
         latestContextReceiptBySession[sessionId] = receipt
-    }
-
-    func chatTurnLifecycle(for sessionId: String) -> MacChatTurnLifecycleState? {
-        chatTurnLifecycleBySession[sessionId]
-    }
-
-    /// What the agent is looking at in this session, if it is driving the Mac.
-    func macScreenPreview(for sessionId: String) -> MacChatScreenPreview? {
-        macScreenPreviewBySession[sessionId]
     }
 
     /// The one intake for the live computer pane, fenced on the same exact
@@ -81,12 +61,12 @@ extension AppModel {
         _ update: MacScreenPreviewUpdate,
         identity: MacChatTurnIdentity
     ) {
-        guard activeChatTurnLifecycleIDsBySession[identity.sessionId] == identity.turnId else { return }
+        guard engine.turns.activeTurnIDsBySession[identity.sessionId] == identity.turnId else { return }
         guard let merged = MacChatScreenPreview.merged(
-            macScreenPreviewBySession[identity.sessionId],
+            engine.turns.screenPreviewBySession[identity.sessionId],
             update: update
         ) else { return }
-        macScreenPreviewBySession[identity.sessionId] = merged
+        engine.turns.screenPreviewBySession[identity.sessionId] = merged
     }
 
     /// Reload the resident mind after a profile repair, but never underneath a
@@ -96,7 +76,7 @@ extension AppModel {
     /// is the app's existing record of which sessions own a live turn, so it
     /// is the gate, and the turn's own close drains the deferral.
     func refreshResidentMindAfterProfileRepair() async {
-        guard activeChatTurnLifecycleIDsBySession.isEmpty else {
+        guard engine.turns.activeTurnIDsBySession.isEmpty else {
             residentRefreshPendingAfterActiveTurns = true
             return
         }
@@ -107,7 +87,7 @@ extension AppModel {
     /// Runs a deferred resident refresh once the last live turn has closed.
     func drainPendingResidentRefreshIfTurnsIdle() {
         guard residentRefreshPendingAfterActiveTurns,
-              activeChatTurnLifecycleIDsBySession.isEmpty else { return }
+              engine.turns.activeTurnIDsBySession.isEmpty else { return }
         residentRefreshPendingAfterActiveTurns = false
         Task { await self.applyProfileRepairToResidentMind() }
     }
@@ -142,463 +122,32 @@ extension AppModel {
         await client.refreshResidentMindAfterOnboardingTransition()
     }
 
-    /// Opens the exact generation for one accepted Mac turn. This is the only
-    /// constructor for active lifecycle authority; every later event must name
-    /// the same session and turn id.
-    @discardableResult
-    func beginChatTurnLifecycle(
-        sessionId: String,
-        turnId: String,
-        at instant: Date
-    ) -> MacChatTurnIdentity? {
-        guard !sessionId.isEmpty, !turnId.isEmpty else { return nil }
-        let identity = MacChatTurnIdentity(sessionId: sessionId, turnId: turnId)
-        activeChatTurnLifecycleIDsBySession[sessionId] = turnId
-        // A new turn starts with nothing on the glass. The previous turn's last
-        // frame is not what this turn is looking at.
-        macScreenPreviewBySession.removeValue(forKey: sessionId)
-        chatTurnLifecycleBySession[sessionId] = MacChatTurnLifecycleState(
-            identity: identity,
-            startedAt: instant
-        )
-        return identity
-    }
-
-    /// The one reducer entry for live, terminal, and cancellation evidence.
-    /// Exact identity is checked before observable state changes.
-    @discardableResult
-    func applyChatTurnLifecycleInput(
-        _ input: MacChatTurnLifecycleInput
-    ) -> MacChatTurnLifecycleState? {
-        let sessionId = input.identity.sessionId
-        guard activeChatTurnLifecycleIDsBySession[sessionId] == input.identity.turnId,
-              let state = chatTurnLifecycleBySession[sessionId],
-              state.identity == input.identity else {
-            return nil
-        }
-        let reduced = MacChatTurnLifecycleReducer.reduce(state, input: input)
-        if reduced != state {
-            chatTurnLifecycleBySession[sessionId] = reduced
-        }
-        return reduced
-    }
-
-    /// Existing notice and tool activity converges on the lifecycle reducer;
-    /// no second event bus or raw payload store is introduced.
-    func receiveChatTurnActivity(_ activity: MacChatTurnActivity) {
-        guard applyChatTurnLifecycleInput(MacChatTurnLifecycleInput(
-            identity: activity.identity,
-            kind: .activity(activity),
-            occurredAt: activity.occurredAt
-        )) != nil else { return }
-
-        // Preserve the existing user-visible notice/toast contract. Tool
-        // activity shares this typed intake but does not create new chatter.
-        guard case .notice(let kind) = activity.source,
-              let text = activity.userVisibleNoticeText,
-              !text.isEmpty else { return }
-        NotificationCenter.default.post(
-            name: .nativeAgentTurnNotice,
-            object: nil,
-            userInfo: [
-                "kind": kind,
-                "text": text,
-                "sessionId": activity.identity.sessionId,
-            ]
-        )
-    }
-
-    @discardableResult
-    func requestChatTurnCancellation(
-        sessionId: String,
-        turnId: String,
-        at instant: Date
-    ) -> MacChatTurnLifecycleState? {
-        applyChatTurnLifecycleInput(MacChatTurnLifecycleInput(
-            identity: MacChatTurnIdentity(sessionId: sessionId, turnId: turnId),
-            kind: .cancellationRequested,
-            occurredAt: instant
-        ))
-    }
-
-    /// How often a pure stream-progress bump may touch the observable
-    /// lifecycle. 2026-09-14 (snappiness).
-    static let chatStreamProgressCoalesceSeconds: TimeInterval = 1.0
-
-    /// Fourteen publications a second each rewrote `chatTurnLifecycleBySession`
-    /// with a new accumulated length and movement instant, and ChatView reads
-    /// that dictionary (`showThinkingRow`, and the card host under it) — so
-    /// every chunk invalidated the whole Chat screen and re-projected the
-    /// working card for a number nobody can read faster than the card's own
-    /// one-second readout schedule. A bump that only moves the length and the
-    /// clock is coalesced to 1 Hz; anything that could change the card's PHASE
-    /// (the first chunk after a tool call, a retry, a turn not in `.working`)
-    /// goes straight through, so the card never lags what the turn is doing.
-    @discardableResult
-    func recordChatTurnStreamProgress(
-        identity: MacChatTurnIdentity,
-        accumulatedUTF16Length: Int,
-        at instant: Date
-    ) -> MacChatTurnLifecycleState? {
-        let sessionId = identity.sessionId
-        if chatTurnLifecycleBySession[sessionId]?.presentation.phase == .working,
-           let last = chatStreamProgressAppliedAt[sessionId],
-           last.turnId == identity.turnId,
-           instant.timeIntervalSince(last.at) < Self.chatStreamProgressCoalesceSeconds {
-            return nil
-        }
-        chatStreamProgressAppliedAt[sessionId] = (identity.turnId, instant)
-        return applyChatTurnLifecycleInput(MacChatTurnLifecycleInput(
-            identity: identity,
-            kind: .streamProgress(accumulatedUTF16Length: accumulatedUTF16Length),
-            occurredAt: instant
-        ))
-    }
-
-    /// Closes process-local intake. A stream/task that exits without already
-    /// carrying terminal proof becomes outcome-unknown; closure alone is never
-    /// relabeled completed, failed, or canceled.
-    @discardableResult
-    func closeChatTurnLifecycleIntake(
-        sessionId: String,
-        turnId: String,
-        at instant: Date
-    ) -> MacChatTurnLifecycleState? {
-        guard activeChatTurnLifecycleIDsBySession[sessionId] == turnId,
-              var state = chatTurnLifecycleBySession[sessionId],
-              state.identity.turnId == turnId else { return nil }
-        if !state.presentation.isTerminal {
-            state = MacChatTurnLifecycleReducer.reduce(
-                state,
-                input: MacChatTurnLifecycleInput(
-                    identity: state.identity,
-                    kind: .outcomeUnknown(
-                        reason: "I'm not sure that finished \u{2014} if my answer isn't here, say it again and I'll pick it up."
-                    ),
-                    occurredAt: instant
-                )
-            )
-            chatTurnLifecycleBySession[sessionId] = state
-        }
-        activeChatTurnLifecycleIDsBySession.removeValue(forKey: sessionId)
-        // The pane is a live view of work in flight. Nothing is in flight now,
-        // so the screenshot of the user's desktop stops being held in memory.
-        macScreenPreviewBySession.removeValue(forKey: sessionId)
-        drainPendingResidentRefreshIfTurnsIdle()
-        return state
-    }
-
-    /// Drops only the named turn's transient activity slot. Used when a
-    /// placeholder session reconciles into a separately active canonical
-    /// session and must not overwrite that session's evidence.
-    func discardChatTurnLifecycleIntake(sessionId: String, turnId: String) {
-        guard activeChatTurnLifecycleIDsBySession[sessionId] == turnId else { return }
-        activeChatTurnLifecycleIDsBySession.removeValue(forKey: sessionId)
-        if chatTurnLifecycleBySession[sessionId]?.identity.turnId == turnId {
-            chatTurnLifecycleBySession.removeValue(forKey: sessionId)
-        }
-        // The discarded turn's frame goes with it; nothing will close this key.
-        macScreenPreviewBySession.removeValue(forKey: sessionId)
-        drainPendingResidentRefreshIfTurnsIdle()
-    }
-
-    /// Moves a placeholder session's exact activity generation alongside the
-    /// existing chat/task dictionaries. A populated destination owned by a
-    /// different turn wins and the placeholder evidence is discarded.
-    @discardableResult
-    func migrateChatTurnLifecycleIntake(
-        from oldSessionId: String,
-        to newSessionId: String,
-        turnId: String
-    ) -> MacChatTurnLifecycleState? {
-        guard oldSessionId != newSessionId,
-              activeChatTurnLifecycleIDsBySession[oldSessionId] == turnId
-        else { return nil }
-        if let destinationTurn = activeChatTurnLifecycleIDsBySession[newSessionId],
-           destinationTurn != turnId {
-            discardChatTurnLifecycleIntake(sessionId: oldSessionId, turnId: turnId)
-            return nil
-        }
-
-        activeChatTurnLifecycleIDsBySession.removeValue(forKey: oldSessionId)
-        activeChatTurnLifecycleIDsBySession[newSessionId] = turnId
-        // The live computer pane moves with the turn. Rekeyed in the SAME step
-        // as the lifecycle: left behind, the old entry's frame would be a
-        // screenshot of the desktop retained under a key nothing closes any
-        // more, while the card under the new key lost the picture it was
-        // showing a moment ago.
-        if let carried = macScreenPreviewBySession.removeValue(forKey: oldSessionId) {
-            macScreenPreviewBySession[newSessionId] = carried
-        }
-        if let oldState = chatTurnLifecycleBySession.removeValue(forKey: oldSessionId),
-           oldState.identity.turnId == turnId {
-            let reboundIdentity = MacChatTurnIdentity(
-                sessionId: newSessionId,
-                turnId: turnId
-            )
-            let rebound = MacChatTurnLifecycleState(
-                identity: reboundIdentity,
-                presentation: oldState.presentation,
-                cancellationRequestedAt: oldState.cancellationRequestedAt,
-                terminalEvidence: oldState.terminalEvidence
-            )
-            chatTurnLifecycleBySession[newSessionId] = rebound
-            return rebound
-        }
-        return nil
-    }
-
-    @discardableResult
-    func persistChatTurnLifecycleBegin(identity: MacChatTurnIdentity) async -> Bool {
-        guard let state = chatTurnLifecycleBySession[identity.sessionId],
-              state.identity == identity else { return false }
-        do {
-            try await chatTurnLifecycleStore.begin(state)
-            return true
-        } catch {
-            logChatTurnLifecyclePersistenceFailure("begin", error: error)
-            return false
-        }
-    }
-
-    @discardableResult
-    func persistChatTurnLifecycleUpdate(identity: MacChatTurnIdentity) async -> Bool {
-        guard let state = chatTurnLifecycleBySession[identity.sessionId],
-              state.identity == identity else { return false }
-        do {
-            let retained = try await chatTurnLifecycleStore.update(state)
-            if !retained {
-                // The durable owner no longer contains this exact turn. Keep
-                // the in-memory projection for the current process, but force
-                // the next admission/reload through canonical repair instead
-                // of permanently treating the ledger as reconciled.
-                chatTurnLifecycleRepairCompleted = false
-                logChatTurnLifecyclePersistenceFailure(
-                    "update",
-                    error: MacChatTurnLifecycleStoreError.missingExactTurn
-                )
-            }
-            return retained
-        } catch {
-            chatTurnLifecycleRepairCompleted = false
-            logChatTurnLifecyclePersistenceFailure("update", error: error)
-            return false
-        }
-    }
-
-    @discardableResult
-    func settleChatTurnLifecycle(
-        identity: MacChatTurnIdentity,
-        kind: MacChatTurnLifecycleInput.Kind,
-        at instant: Date = Date()
-    ) async -> MacChatTurnLifecycleState? {
-        guard let state = applyChatTurnLifecycleInput(MacChatTurnLifecycleInput(
-            identity: identity,
-            kind: kind,
-            occurredAt: instant
-        )) else { return nil }
-        _ = await persistChatTurnLifecycleUpdate(identity: state.identity)
-        return state
-    }
-
-    @discardableResult
-    func persistChatTurnLifecycleMigration(
-        state: MacChatTurnLifecycleState,
-        from oldSessionId: String
-    ) async -> Bool {
-        var lastError: Error?
-        for _ in 0..<2 {
-            do {
-                guard try await chatTurnLifecycleStore.migrate(
-                    state: state,
-                    from: oldSessionId
-                ) else {
-                    chatTurnLifecycleRepairCompleted = false
-                    logChatTurnLifecyclePersistenceFailure(
-                        "migrate",
-                        error: MacChatTurnLifecycleStoreError.missingExactTurn
-                    )
-                    return false
-                }
-                return true
-            } catch {
-                lastError = error
-            }
-        }
-        logChatTurnLifecyclePersistenceFailure(
-            "migrate",
-            error: lastError ?? MacChatTurnLifecycleStoreError.missingExactTurn
-        )
-        chatTurnLifecycleRepairCompleted = false
-        return false
-    }
-
-    /// Roll back a lifecycle reservation that failed before provider admission.
-    /// No turn was accepted at this point, so removing the exact snapshot is
-    /// safer than leaving a repairable orphan that never performed work.
-    func abandonChatTurnLifecycleBeforeAdmission(identity: MacChatTurnIdentity) async {
-        discardChatTurnLifecycleIntake(
-            sessionId: identity.sessionId,
-            turnId: identity.turnId
-        )
-        do {
-            try await chatTurnLifecycleStore.remove(
-                sessionId: identity.sessionId,
-                turnId: identity.turnId
-            )
-        } catch {
-            logChatTurnLifecyclePersistenceFailure("admission_rollback", error: error)
-        }
-    }
-
-    func readCanonicalChatTurnTerminalProof(
-        identity: MacChatTurnIdentity
-    ) async -> MacChatTurnTranscriptTerminalProof {
-        do {
-            return try await chatTurnTranscriptProofReader.proof(for: identity)
-        } catch {
-            logChatTurnLifecyclePersistenceFailure("transcript_proof", error: error)
-            return .unavailable
-        }
-    }
-
-    /// One bounded launch repair. Existing terminal records carry their closed
-    /// proof; nonterminal records are settled from the canonical transcript's
-    /// exact turnTraceId/outcomeObservation, or outcome-unknown when absent.
-    @discardableResult
-    func repairChatTurnLifecyclesIfNeeded(
-        knownSessionIds: Set<String>,
-        at instant: Date = Date(),
-        loadProof: @MainActor (MacChatTurnIdentity) async -> MacChatTurnTranscriptTerminalProof
-    ) async -> Bool {
-        guard !chatTurnLifecycleRepairCompleted else { return true }
-        let records: [MacChatPersistedTurnLifecycle]
-        do {
-            records = try await chatTurnLifecycleStore.records()
-        } catch {
-            logChatTurnLifecyclePersistenceFailure("repair_load", error: error)
-            return false
-        }
-        var hasPendingRepairWork = false
-        var repairPersistenceFailed = false
-
-        for record in records {
-            guard knownSessionIds.contains(record.sessionId) else {
-                // Session-index reconciliation is independently bounded at
-                // launch, so a transcript can briefly exist before its index
-                // row. Settle the snapshot itself, but keep it for a later
-                // reload instead of treating index absence as deletion.
-                //
-                // Repair stays pending only while this record still has
-                // outcome work left. A record we settle here — or one that
-                // already carries closed terminal evidence — needs nothing
-                // more, so a DELETED session's terminal tombstone must not
-                // pin the flag false for the remaining life of the process.
-                guard activeChatTurnLifecycleIDsBySession[record.sessionId] == nil else {
-                    // A live turn in this process still owns the outcome.
-                    hasPendingRepairWork = true
-                    continue
-                }
-                guard !record.isTerminal else { continue }
-                let proof = await loadProof(record.identity)
-                guard activeChatTurnLifecycleIDsBySession[record.sessionId] == nil else {
-                    hasPendingRepairWork = true
-                    continue
-                }
-                guard let repaired = MacChatTurnLifecycleRestartRepair.repair(
-                    record: record,
-                    transcriptProof: proof,
-                    at: instant
-                ) else {
-                    hasPendingRepairWork = true
-                    continue
-                }
-                do {
-                    if try await chatTurnLifecycleStore.update(repaired) == false {
-                        repairPersistenceFailed = true
-                    }
-                } catch {
-                    repairPersistenceFailed = true
-                    logChatTurnLifecyclePersistenceFailure("repair_unindexed", error: error)
-                }
-                continue
-            }
-            // Indexed and live: the running turn already owns both its
-            // in-memory projection and its own terminal settlement, so it
-            // needs no later repair pass.
-            guard activeChatTurnLifecycleIDsBySession[record.sessionId] == nil else {
-                continue
-            }
-            let proof = record.isTerminal ? .absent : await loadProof(record.identity)
-            guard let repaired = MacChatTurnLifecycleRestartRepair.repair(
-                record: record,
-                transcriptProof: proof,
-                at: instant
-            ) else { continue }
-            guard activeChatTurnLifecycleIDsBySession[record.sessionId] == nil else {
-                continue
-            }
-            // This is the one lifecycle write that does not pass through the
-            // reducer or the store, both of which refuse to mutate a terminal.
-            // Honour the same immutability here: an in-memory terminal for
-            // THIS exact turn is settled truth the user has already seen, and
-            // a durable row that lagged behind it (or a transiently
-            // unreadable transcript yielding `.unavailable`) must never
-            // downgrade a proven completed/failed/canceled turn to
-            // outcome-unknown. Re-persist that truth instead of recomputing it.
-            let liveState = chatTurnLifecycleBySession[record.sessionId]
-            let liveTerminalWins = liveState?.identity == record.identity
-                && liveState?.presentation.isTerminal == true
-            let settled = liveTerminalWins ? (liveState ?? repaired) : repaired
-            if !liveTerminalWins {
-                chatTurnLifecycleBySession[record.sessionId] = settled
-            }
-            if !record.isTerminal {
-                do {
-                    if try await chatTurnLifecycleStore.update(settled) == false {
-                        repairPersistenceFailed = true
-                    }
-                } catch {
-                    repairPersistenceFailed = true
-                    logChatTurnLifecyclePersistenceFailure("repair_update", error: error)
-                }
-            }
-        }
-        chatTurnLifecycleRepairCompleted = !hasPendingRepairWork && !repairPersistenceFailed
-        return !repairPersistenceFailed
-    }
-
-    private func logChatTurnLifecyclePersistenceFailure(_ operation: String, error: Error) {
-        let safe = NativeAppSecretRedactor.redactText(String(describing: error))
-        NSLog("Mac chat turn lifecycle %@ failed: %@", operation, safe)
-    }
-
     /// Drop a session's cached messages + receipt. Called when a session is
     /// deleted from the sidebar. The dict would otherwise grow unbounded as
     /// the user creates and discards sessions across a long-running app.
     func pruneSessionChatState(_ sessionId: String) {
-        let activeLifecycleTurnId = activeChatTurnLifecycleIDsBySession[sessionId]
+        let activeLifecycleTurnId = engine.turns.activeTurnIDsBySession[sessionId]
         let lifecycleTurnId = activeLifecycleTurnId == nil
-            ? chatTurnLifecycleBySession[sessionId]?.identity.turnId
+            ? engine.turns.lifecycleBySession[sessionId]?.identity.turnId
             : nil
-        chatMessagesBySession.removeValue(forKey: sessionId)
+        engine.transcripts.messagesBySession.removeValue(forKey: sessionId)
         latestContextReceiptBySession.removeValue(forKey: sessionId)
         detachedChatRefreshStatus.removeValue(forKey: sessionId)
         detachedChatContextReceiptRefreshStatus.removeValue(forKey: sessionId)
-        queuedChatTurnsBySession.removeValue(forKey: sessionId)
-        pausedChatQueueSessions.remove(sessionId)
-        chatQueuePauseReasons.removeValue(forKey: sessionId)
+        engine.turns.queuedBySession.removeValue(forKey: sessionId)
+        engine.turns.pausedQueueSessions.remove(sessionId)
+        engine.turns.queuePauseReasons.removeValue(forKey: sessionId)
         // A Stop/Archive can reach pruning before its joined producer has
         // persisted terminal proof. Preserve that one exact authority until
         // normal task cleanup closes it; stale-session pruning will remove the
         // terminal projection on a later bounded session-index refresh.
         if activeLifecycleTurnId == nil {
-            chatTurnLifecycleBySession.removeValue(forKey: sessionId)
-            activeChatTurnLifecycleIDsBySession.removeValue(forKey: sessionId)
+            engine.turns.lifecycleBySession.removeValue(forKey: sessionId)
+            engine.turns.activeTurnIDsBySession.removeValue(forKey: sessionId)
         }
         if let lifecycleTurnId {
-            Task { [chatTurnLifecycleStore] in
-                try? await chatTurnLifecycleStore.remove(
+            Task { [lifecycleStore = engine.turns.lifecycleStore] in
+                try? await lifecycleStore.remove(
                     sessionId: sessionId,
                     turnId: lifecycleTurnId
                 )
@@ -614,19 +163,19 @@ extension AppModel {
     /// still being written. No-op when nothing is stale, so it is safe to
     /// call from the existing low-frequency session-list refresh.
     func pruneStaleSessionChatState(knownSessionIds: Set<String>) {
-        let cached = Set(chatMessagesBySession.keys)
+        let cached = Set(engine.transcripts.messagesBySession.keys)
             .union(latestContextReceiptBySession.keys)
             .union(detachedChatRefreshStatus.keys)
             .union(detachedChatContextReceiptRefreshStatus.keys)
-            .union(queuedChatTurnsBySession.keys)
-            .union(pausedChatQueueSessions)
-            .union(chatTurnLifecycleBySession.keys)
-            .union(activeChatTurnLifecycleIDsBySession.keys)
+            .union(engine.turns.queuedBySession.keys)
+            .union(engine.turns.pausedQueueSessions)
+            .union(engine.turns.lifecycleBySession.keys)
+            .union(engine.turns.activeTurnIDsBySession.keys)
         for sessionId in cached {
             guard !knownSessionIds.contains(sessionId),
                   sessionId != activeChatSessionId,
-                  !streamingSessions.contains(sessionId),
-                  !busySessions.contains(sessionId),
+                  !engine.turns.streamingSessions.contains(sessionId),
+                  !engine.turns.busySessions.contains(sessionId),
                   !DetachedChatWindowController.shared.isDetached(sessionId)
             else { continue }
             pruneSessionChatState(sessionId)
@@ -648,7 +197,7 @@ extension AppModel {
     func loadDetachedSessionMessages(_ sessionId: String) async {
         await loadDetachedSessionMessages(
             sessionId,
-            loadMessages: { [client] in try await client.getChatMessages(sessionId: $0) },
+            loadMessages: { [transcripts = engine.transcripts] in try await transcripts.loadMessages(sessionId: $0, cached: true) },
             loadReceipt: { [client] in try await client.getLatestContextReceipt(sessionId: $0) })
     }
 
@@ -661,11 +210,11 @@ extension AppModel {
         guard !sessionId.isEmpty else { return }
         // Skip if a stream is already populating this slot — overwriting
         // would clobber live deltas (mirrors selectChatSession's guard).
-        if streamingSessions.contains(sessionId),
-           !(chatMessagesBySession[sessionId] ?? []).isEmpty {
+        if engine.turns.streamingSessions.contains(sessionId),
+           !(engine.transcripts.messagesBySession[sessionId] ?? []).isEmpty {
             return
         }
-        let lifecycleAtLoadStart = chatTurnLifecycle(for: sessionId)
+        let lifecycleAtLoadStart = engine.turns.lifecycle(for: sessionId)
         var messageFailures: [String] = []
         let fetched: [ChatMessage]?
         do {
@@ -681,9 +230,9 @@ extension AppModel {
         // disk snapshot now would drop the live optimistic + streaming
         // bubbles and the by-id delta updates would then miss. Only seed
         // the slot when no stream has taken ownership of it.
-        let streamTookOver = streamingSessions.contains(sessionId)
-            && !(chatMessagesBySession[sessionId] ?? []).isEmpty
-        let lifecycleAfterMessages = chatTurnLifecycle(for: sessionId)
+        let streamTookOver = engine.turns.streamingSessions.contains(sessionId)
+            && !(engine.transcripts.messagesBySession[sessionId] ?? []).isEmpty
+        let lifecycleAfterMessages = engine.turns.lifecycle(for: sessionId)
         guard !streamTookOver,
               lifecycleAfterMessages == nil || lifecycleAfterMessages == lifecycleAtLoadStart
         else { return }
@@ -706,8 +255,8 @@ extension AppModel {
         // Recheck AFTER this separate await too. A new turn may now own the
         // slot, or may already have completed and cleared its streaming flag.
         // Retained lifecycle evidence covers both without another generation.
-        let lifecycleAfterReceipt = chatTurnLifecycle(for: sessionId)
-        guard !streamingSessions.contains(sessionId),
+        let lifecycleAfterReceipt = engine.turns.lifecycle(for: sessionId)
+        guard !engine.turns.streamingSessions.contains(sessionId),
               lifecycleAfterReceipt == nil || lifecycleAfterReceipt == lifecycleAtLoadStart
         else { return }
         if let receipt { setLatestContextReceipt(receipt, for: sessionId) }
@@ -735,7 +284,7 @@ extension AppModel {
         // published transcript set is chosen from the pins as they were before
         // this save, so publishing the new tab without them put an empty
         // conversation on the phone until some unrelated edge republished.
-        MacSyncEngine.shared.requestChatSnapshotPublication(includeTranscripts: added)
+        NativeAgentEngine.liveDeviceSync.engine.requestChatSnapshotPublication(includeTranscripts: added)
     }
 
     /// Per-session message mutators. Used by `_sendChatBody` so optimistic
@@ -748,7 +297,7 @@ extension AppModel {
     /// is no longer needed — but the reinjection mechanism remains as a
     /// defensive idempotent double-write (guarded by !contains checks).
     func appendChatMessage(_ msg: ChatMessage, to sessionId: String) {
-        var arr = chatMessagesBySession[sessionId] ?? []
+        var arr = engine.transcripts.messagesBySession[sessionId] ?? []
         arr.append(msg)
         // chat-smoothness phase 6: the append seam is the ONLY place bubble
         // entrance animates — every genuine insert (optimistic send, streaming
@@ -756,28 +305,28 @@ extension AppModel {
         // replaces (end-of-turn disk refresh, session load) stay instant so the
         // optimistic→daemon id swap never animates a teardown/rebuild.
         withAnimation(NativeAgentMotion.standard) {
-            chatMessagesBySession[sessionId] = arr
+            engine.transcripts.messagesBySession[sessionId] = arr
         }
     }
 
     func removeChatMessage(id messageId: String, from sessionId: String) {
-        guard var arr = chatMessagesBySession[sessionId] else { return }
+        guard var arr = engine.transcripts.messagesBySession[sessionId] else { return }
         arr.removeAll { $0.id == messageId }
-        chatMessagesBySession[sessionId] = arr
+        engine.transcripts.messagesBySession[sessionId] = arr
     }
 
     /// chat-smoothness phase 1 (the user, 2026-06-12): word-by-word flow, coalesced.
     /// ONE tunable knob for the Mac streaming cadence — raise for calmer
     /// ripple, lower for snappier. 70ms ≈ word-arrival rhythm at typical
     /// model token rates without hammering the renderer.
-    static let chatStreamCoalesceSeconds: TimeInterval = 0.07
+    static let chatStreamCoalesceSeconds = ChatStreamAccumulator.publishInterval
 
     func updateChatMessageContent(id messageId: String, in sessionId: String, content: String) {
         // THE STREAMING CASE FIRST (2026-09-13): the row being rewritten is the
         // last one on all but a handful of calls, and that case needs neither
         // the linear id search nor a mutated copy of the whole transcript.
-        if setTailChatMessageContent(content, id: messageId, in: sessionId) { return }
-        guard var arr = chatMessagesBySession[sessionId],
+        if engine.transcripts.setTailMessageContent(content, id: messageId, in: sessionId) { return }
+        guard var arr = engine.transcripts.messagesBySession[sessionId],
               let idx = arr.firstIndex(where: { $0.id == messageId }) else { return }
         arr[idx].content = content
         // 2026-09-06: only a rewrite of the FINAL row may keep the message
@@ -785,116 +334,50 @@ extension AppModel {
         // interior row — a streaming reply with a slash command's system
         // message appended behind it — must invalidate the whole cache.
         if idx == arr.count - 1 {
-            setChatMessagesTailOnly(arr, for: sessionId)
+            engine.transcripts.setMessagesTailOnly(arr, for: sessionId)
         } else {
-            chatMessagesBySession[sessionId] = arr
+            engine.transcripts.messagesBySession[sessionId] = arr
         }
     }
 
-    func clearStreamingBubbleState(_ sessionId: String) {
-        streamingTexts[sessionId] = nil
-        streamingBubbleIds[sessionId] = nil
-        streamingUserTurnIds[sessionId] = nil
-        streamingUserTurnTexts[sessionId] = nil
-        replyingSessions.remove(sessionId)
-    }
-
-    /// True iff the active chat session has work in flight.
-    var isBusy: Bool { busySessions.contains(activeChatSessionId) }
-    /// True iff the active chat session is actively streaming a response.
-    var isChatStreaming: Bool { streamingSessions.contains(activeChatSessionId) }
-
-    /// The live-task-backed running set used by pinned conversation tabs.
-    /// `streamingSessions` is intentionally a broad runtime marker while a
-    /// producer unwinds, migrates a placeholder, or processes Stop. A tab's
-    /// green dot is a narrower claim: this exact session still has an
-    /// in-flight chat task. Intersecting the two owners prevents a stale
-    /// marker from becoming permanent "running" chrome.
-    var pinnedTabRunningSessionIDs: Set<String> {
-        Set(Set(chatTasks.keys).intersection(streamingSessions).filter {
-            !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        })
-    }
-
-    /// Clears one exact task generation after its producer has reached a
-    /// terminal path. Generation matching prevents a late completion or
-    /// failure from clearing the running marker for a newer turn.
-    @discardableResult
-    func finishChatTurnRuntime(sessionId: String, generation: Int) -> Bool {
-        guard chatTaskGenerations[sessionId] == generation else { return false }
-        streamingSessions.remove(sessionId)
-        busySessions.remove(sessionId)
-        chatTasks[sessionId] = nil
-        chatTaskGenerations[sessionId] = nil
-        return true
-    }
+    /// Visible activity; the runtime sets retain ownership during a settled reply.
+    var isBusy: Bool { engine.turns.isBusy(activeChatSessionId) }
+    /// Whether the active chat should render its live response treatment.
+    var isChatStreaming: Bool { engine.turns.isStreaming(activeChatSessionId) }
 
     /// Back-compat: the single "running" session id many UI sites still ask
     /// about. We return the active session if it's running, else any other
     /// running session (so "another session running" banners can still
-    /// detect work). Prefer `isSessionStreaming(_:)` in new code.
+    /// detect work). Prefer `engine.turns.isStreaming(_:)` in new code.
     var currentChatTaskSessionId: String? {
-        if streamingSessions.contains(activeChatSessionId) { return activeChatSessionId }
-        return streamingSessions.first
+        if engine.turns.isStreaming(activeChatSessionId) { return activeChatSessionId }
+        return engine.turns.streamingSessions.first { engine.turns.isStreaming($0) }
     }
-    /// True if any session anywhere is streaming.
-    var anySessionStreaming: Bool { !streamingSessions.isEmpty }
-
     /// The exact runtime projection mounted by the "other sessions running"
     /// banner. It excludes only the foreground session, preserves canonical
     /// session-list order, and retains an unknown running id until the user can
     /// stop it or a lifecycle path clears it.
     var otherRunningChatSessionIDs: [String] {
         MacChatOtherSessionsProjection.otherRunning(
-            streamingSessionIDs: liveStreamingSessionIDs,
+            streamingSessionIDs: engine.turns.liveStreamingSessionIDs,
             activeSessionID: activeChatSessionId,
-            canonicalSessionIDs: chatSessions.map(\.id)
+            canonicalSessionIDs: engine.transcripts.sessions.map(\.id)
         )
     }
 
-    func isSessionBusy(_ sessionId: String) -> Bool {
-        guard !sessionId.isEmpty else { return false }
-        return busySessions.contains(sessionId)
-    }
-
-    func isSessionStreaming(_ sessionId: String) -> Bool {
-        guard !sessionId.isEmpty else { return false }
-        return streamingSessions.contains(sessionId)
-    }
-
-    func queuedChatTurns(for sessionId: String) -> [QueuedChatTurn] {
-        guard !sessionId.isEmpty else { return [] }
-        return queuedChatTurnsBySession[sessionId] ?? []
-    }
-
-    func isChatQueuePaused(_ sessionId: String) -> Bool {
-        pausedChatQueueSessions.contains(sessionId)
-    }
-
-    /// Why the queue paused, when it paused because the next turn could not
-    /// start. Nil for a Stop-pause and for a queue that is running.
-    func chatQueuePauseReason(_ sessionId: String) -> String? {
-        guard isChatQueuePaused(sessionId) else { return nil }
-        guard let reason = chatQueuePauseReasons[sessionId]?
-            .trimmingCharacters(in: .whitespacesAndNewlines), !reason.isEmpty
-        else { return nil }
-        return reason
-    }
     // Fix 2: chat draft and pending attachments keyed by sessionId so they survive tab changes
 }
 
 // MARK: - Per-instance state that cannot live on AppModel
 //
 // Swift extensions cannot add stored properties, and `AppModel.swift` is not
-// this change's to edit. Both owners below are per-AppModel and strictly
+// this change's to edit. The owner below is per-AppModel and strictly
 // non-observable, so reading them during a SwiftUI view update cannot
 // invalidate that update. Entries are pruned as soon as their owner dies.
 
 @MainActor
 private final class AppModelLiveState {
     weak var owner: AppModel?
-    /// First instant each `streamingSessions` id was observed.
-    var streamingSeenAt: [String: Date] = [:]
     /// Installed at most once by `installDefaultsBackedSettingsObserver()`.
     var defaultsObserver: NSObjectProtocol?
     /// Re-entrancy guard: every setter in the reloaded block writes back to
@@ -925,51 +408,8 @@ private func liveState(for model: AppModel) -> AppModelLiveState {
     return fresh
 }
 
-/// The provider stream guard's own hard wall ceiling. A turn cannot outlive
-/// it, so neither can a "running" marker for that turn. Resolved once.
-private enum MacChatStreamingMarkerCeiling {
-    static let seconds: TimeInterval = ProviderStreamGuardConfig.fromEnvironment().wallTimeout
-}
-
 @MainActor
 extension AppModel {
-
-    // MARK: - Streaming marker expiry
-
-    /// Seconds a `streamingSessions` marker may stand before it is treated as
-    /// a ghost. Zero (guard disabled) means never expire.
-    static var streamingMarkerCeilingSeconds: TimeInterval {
-        MacChatStreamingMarkerCeiling.seconds
-    }
-
-    /// `streamingSessions` filtered to markers young enough to still belong to
-    /// a live turn.
-    ///
-    /// `finishChatTurnRuntime` returns early when the generation no longer
-    /// matches — correctly, since clearing there would wipe a NEWER turn's
-    /// marker — so a turn that dies between the generation bump and its own
-    /// cleanup leaves its id in `streamingSessions` forever, and the "other
-    /// sessions running" banner never comes down. Ids are stamped on first
-    /// observation (the insert sites are in `AppModel+ChatActions.swift`,
-    /// outside this change) and un-stamped the moment they leave the set, so a
-    /// re-started session always starts a fresh clock. Live turns are
-    /// untouched: nothing legitimate outlives the provider guard's ceiling.
-    var liveStreamingSessionIDs: Set<String> {
-        let state = liveState(for: self)
-        let current = streamingSessions
-        if state.streamingSeenAt.count != current.count {
-            state.streamingSeenAt = state.streamingSeenAt.filter { current.contains($0.key) }
-        }
-        let ceiling = Self.streamingMarkerCeilingSeconds
-        let now = Date()
-        var live: Set<String> = []
-        for id in current {
-            let seenAt = state.streamingSeenAt[id] ?? now
-            state.streamingSeenAt[id] = seenAt
-            if ceiling <= 0 || now.timeIntervalSince(seenAt) <= ceiling { live.insert(id) }
-        }
-        return live
-    }
 
     // MARK: - Defaults-backed settings, kept live
 

@@ -1,5 +1,7 @@
 import Foundation
 import PersistenceCore
+import Desk
+import GitHubConnector
 import WorkshopExecution
 
 // MARK: - Desk presentation facts
@@ -513,21 +515,6 @@ enum DeskItemPresentation {
     /// The whole-board store failure is rendered next to lane failures, so it
     /// shares their precise bounded-error contract instead of creating a second
     /// arbitrary limit at the top of the Desk.
-    static func boundedLoadFailure(_ detail: String) -> String {
-        DeskLaneState<DeskItem>.boundedReason(detail)
-    }
-
-    /// Maps the actual Desk-store read failure into the banner's visible,
-    /// bounded state. A custom error may provide no localized detail; that is
-    /// still a failure, never an empty or clear desk.
-    static func loadFailure(_ error: any Error) -> String {
-        let detail = error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
-        let visibleDetail = detail.isEmpty
-            ? "The storage read failed without details."
-            : detail
-        return boundedLoadFailure("Couldn't load the bench: \(visibleDetail)")
-    }
-
     struct Freshness: Sendable, Equatable {
         let text: String
         let isStale: Bool

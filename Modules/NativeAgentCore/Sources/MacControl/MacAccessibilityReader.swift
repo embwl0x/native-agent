@@ -62,6 +62,9 @@ public struct MacAXAttributes: Sendable, Equatable {
     public let selected: Bool?
     public let frame: MacAXFrame?
     public let actions: [String]
+    /// An editable field's placeholder ("Search Maps") — what a person sees in
+    /// it and calls it by, when its AX name says something else.
+    public let placeholder: String?
 
     public init(
         role: String,
@@ -71,8 +74,10 @@ public struct MacAXAttributes: Sendable, Equatable {
         enabled: Bool = true,
         selected: Bool? = nil,
         frame: MacAXFrame? = nil,
-        actions: [String] = []
+        actions: [String] = [],
+        placeholder: String? = nil
     ) {
+        self.placeholder = placeholder
         self.role = role
         self.subrole = subrole
         self.title = title
@@ -90,10 +95,18 @@ public struct MacAXAttributes: Sendable, Equatable {
 public struct MacAXNode: Sendable, Equatable {
     public let attributes: MacAXAttributes
     public let path: [Int]
+    /// Source reference retained for exact raw reads, never serialized.
+    let element: MacAXElementRef?
 
-    public init(attributes: MacAXAttributes, path: [Int]) {
+    public init(attributes: MacAXAttributes, path: [Int], element: MacAXElementRef? = nil) {
         self.attributes = attributes
         self.path = path
+        self.element = element
+    }
+
+    public static func == (lhs: Self, rhs: Self) -> Bool {
+        // Source references are reminted; snapshot equality remains semantic.
+        lhs.attributes == rhs.attributes && lhs.path == rhs.path
     }
 
     public func toJSON(valueChars: Int = MacAXLimits.hardValueChars) -> JSONValue {
@@ -323,8 +336,8 @@ public struct MacAXLimits: Sendable, Equatable {
     public static let hardValueChars = 200
     public static let hardMaxMatches = 20
 
-    public let maxNodes: Int
-    public let maxDepth: Int
+    public private(set) var maxNodes: Int
+    public private(set) var maxDepth: Int
     public let valueChars: Int
     public let maxMatches: Int
 
@@ -339,6 +352,19 @@ public struct MacAXLimits: Sendable, Equatable {
         self.valueChars = max(1, min(valueChars, MacAXLimits.hardValueChars))
         self.maxMatches = max(1, min(maxMatches, MacAXLimits.hardMaxMatches))
     }
+
+    /// The deeper budget for a web page the ordinary walk had to cut: pages
+    /// nest controls under hundreds of unnamed groups (Claude's simulator
+    /// toolbar sits past 12 levels and 400 nodes). Same bound the name seek
+    /// uses. Only the page-first walk takes it, and only after a cut.
+    public static let deepPageMaxNodes = 1_200
+    public static let deepPageMaxDepth = 64
+    public static let deepPage: MacAXLimits = {
+        var limits = MacAXLimits()
+        limits.maxNodes = deepPageMaxNodes
+        limits.maxDepth = deepPageMaxDepth
+        return limits
+    }()
 }
 
 /// Result of a bounded walk. Truncation is REPORTED, never silent.
@@ -660,7 +686,7 @@ public enum MacAccessibilityReader {
             // The menu bar belongs to the APP, not the window: a window read
             // never spends its budget there (the `menu` organ reads it).
             if attributes.role == "AXMenuBar", !item.path.isEmpty { continue }
-            nodes.append(MacAXNode(attributes: attributes, path: item.path))
+            nodes.append(MacAXNode(attributes: attributes, path: item.path, element: item.ref))
 
             if item.depth >= limits.maxDepth {
                 // Count-only: never materialize the child array just to report
@@ -755,6 +781,22 @@ public enum MacAccessibilityReader {
         maxDepth: Int = MacAccessibilityReader.findFirstMaxDepth,
         nodeBudget: Int = MacAccessibilityReader.findFirstNodeBudget
     ) -> FindFirstResult {
+        findFirst(source: source, root: root, maxDepth: maxDepth, nodeBudget: nodeBudget) { _, attributes in
+            attributes.role == role
+        }
+    }
+
+    /// The same bounded breadth-first search with a caller's predicate — used
+    /// to skip a hollow `AXWebArea` (Claude.app carries an empty overlay web
+    /// view ahead of the real page) and to find a control by NAME when the
+    /// ordinary walk's caps stopped short of it.
+    public static func findFirst(
+        source: any MacAXElementSource,
+        root: MacAXElementRef,
+        maxDepth: Int,
+        nodeBudget: Int,
+        where matches: (MacAXElementRef, MacAXAttributes) -> Bool
+    ) -> FindFirstResult {
         var queue: [(ref: MacAXElementRef, path: [Int], depth: Int)] = [(root, [], 1)]
         var visited = 0
         var index = 0
@@ -775,7 +817,7 @@ public enum MacAccessibilityReader {
             // It stays as the loop's own hard stop: a runaway search is worse
             // than a redundant comparison.
             if visited > max(1, nodeBudget) { return .nodeCap }
-            if let attributes = source.attributes(of: item.ref), attributes.role == role {
+            if let attributes = source.attributes(of: item.ref), matches(item.ref, attributes) {
                 // The ROOT itself matching is a real answer — a window that IS
                 // the web area needs no descent.
                 return .found(ref: item.ref, path: item.path)
@@ -1234,7 +1276,9 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
             enabled: MacAXAttributeRead.copyBool(element, kAXEnabledAttribute) ?? true,
             selected: MacAXAttributeRead.copyBool(element, kAXSelectedAttribute),
             frame: MacAXAttributeRead.copyFrame(element),
-            actions: MacAXAttributeRead.copyActions(element)
+            actions: MacAXAttributeRead.copyActions(element),
+            placeholder: MacAXAttributeRead.placeholderRoles.contains(role)
+                ? MacAXAttributeRead.copyString(element, kAXPlaceholderValueAttribute) : nil
         )
     }
 

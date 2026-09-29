@@ -4,7 +4,7 @@ import SwiftUI
 /// this copy as a named presentation contract prevents its only authority cue
 /// from disappearing during a visual-only edit to the footer.
 enum AutonomyMacOnlyNoticePresentation {
-    static let message = "Applying training changes and approving learned behavior remain local-admin actions on the Mac."
+    static let message = "Applying training changes and approving learned behavior happen only on your Mac."
     static let systemImage = "lock.circle"
 }
 
@@ -48,6 +48,7 @@ enum AutonomyScreenPresentation {
     }
 }
 
+
 /// iPhone's read-only Self-Improvement drilldown.
 ///
 /// The old screen owned a second store and polled three snapshot files the
@@ -56,6 +57,7 @@ enum AutonomyScreenPresentation {
 /// training/promotion projections; this view now reads that same resident
 /// state and relies on the engine's KVS/push/foreground refresh owner.
 struct AutonomyView: View {
+    @EnvironmentObject private var pairingStore: PairingStore
     @ObservedObject private var sync = iCloudSyncEngine.shared
 
     private var trainingProposals: [TrainingProposalSummary] {
@@ -63,7 +65,10 @@ struct AutonomyView: View {
     }
 
     private var promotionCandidates: [PromotionCandidateSummary] {
-        sync.promotionCandidates
+        #if DEBUG
+        if MobileDesignSamples.screen != nil, sync.promotionCandidates.isEmpty { return AutonomyDesignSample.candidates }
+        #endif
+        return sync.promotionCandidates
     }
 
     private var actionableCount: Int {
@@ -79,76 +84,69 @@ struct AutonomyView: View {
     }
 
     var body: some View {
-        List {
-            Section {
-                MobileReadingSurface {
-                    MobileAdaptiveRow(spacing: 12) {
-                        Image(systemName: "wand.and.stars")
-                            .font(.title2)
-                            .foregroundStyle(.secondary)
-                        VStack(alignment: .leading, spacing: 3) {
-                            Text(screenState.title)
-                                .font(.headline)
-                            Text(screenState.detail)
-                                .font(.callout)
-                                .foregroundStyle(.secondary)
+        AlivePage(title: "Self-Improvement", line: "Changes I’ve proposed to how I work.",
+                 freshnessGroup: "training_proposals") {
+            switch screenState {
+            case .awaitingPublication:
+                AliveCalmState(title: "Waiting for the Mac", line: screenState.detail)
+            case .clear where trainingProposals.isEmpty && promotionCandidates.isEmpty:
+                AliveCalmState(
+                    title: "Nothing to review",
+                    line: "When I propose a change to how I work, or want to keep something I learned, it shows up here."
+                )
+            default:
+                if case .awaitingReview(let count) = screenState {
+                    HStack(spacing: 8) {
+                        AliveStatusDot(state: .here).scaleEffect(0.75)
+                        Text(count == 1 ? "1 waiting on you" : "\(count) waiting on you")
+                            .font(.subheadline.weight(.medium))
+                            .foregroundStyle(AlivePalette.text)
+                    }
+                    .padding(.horizontal, 4)
+                    .padding(.top, -12)
+                    .accessibilityElement(children: .combine)
+                }
+
+                if !trainingProposals.isEmpty {
+                    AliveSection("Proposed changes") {
+                        ForEach(Array(trainingProposals.enumerated()), id: \.element.id) { index, proposal in
+                            if index > 0 { AliveDivider() }
+                            TrainingProposalRow(proposal: proposal)
                         }
                     }
                 }
-                .listRowBackground(Color.clear)
-                .listRowSeparator(.hidden)
-            }
 
-            if screenState != .awaitingPublication, !trainingProposals.isEmpty {
-                Section("Training Proposals") {
-                    ForEach(trainingProposals) { proposal in
-                        TrainingProposalRow(proposal: proposal)
+                if !promotionCandidates.isEmpty {
+                    AliveSection("Things I learned",
+                                 footer: pairingStore.isPaired ? nil : AliveConnection.pairToChange + ".") {
+                        ForEach(Array(promotionCandidates.enumerated()), id: \.element.id) { index, candidate in
+                            if index > 0 { AliveDivider() }
+                            PromotionCandidateRow(candidate: candidate)
+                        }
                     }
                 }
             }
 
-            if screenState != .awaitingPublication, !promotionCandidates.isEmpty {
-                Section("Promotion Candidates") {
-                    ForEach(promotionCandidates) { candidate in
-                        PromotionCandidateRow(candidate: candidate)
-                    }
-                }
-            }
-
-            if screenState == .clear, trainingProposals.isEmpty && promotionCandidates.isEmpty {
-                Section {
-                    MobileReadingEmptyState(
-                        title: "No Self-Improvement Proposals",
-                        systemImage: "wand.and.stars",
-                        kind: .empty,
-                        description: "\(sync.agentDisplayName)'s training proposals and learned-behavior promotion candidates will appear here when the Mac publishes them."
-                    )
-                    .frame(minHeight: 200)
-                    .listRowBackground(Color.clear)
-                    .listRowSeparator(.hidden)
-                }
-            }
-
-            Section {
-                Label(
-                    AutonomyMacOnlyNoticePresentation.message,
-                    systemImage: AutonomyMacOnlyNoticePresentation.systemImage
-                )
-                .font(.callout)
-                .foregroundStyle(.secondary)
-            }
+            AliveFootnote(
+                AutonomyMacOnlyNoticePresentation.message,
+                systemImage: AutonomyMacOnlyNoticePresentation.systemImage
+            )
         }
-        .listStyle(.insetGrouped)
-        .mobileReadingScreen()
-        .navigationTitle("Self-Improvement")
         .macSyncErrorBanner()
-        // E6: freshness of the Mac snapshot behind this list.
-        .macSnapshotFreshnessBadge(group: "training_proposals")
-        .navigationBarTitleDisplayMode(.inline)
         .refreshable { await sync.refreshActivitySnapshot() }
         .task { await sync.refreshActivitySnapshot() }
     }
 }
+
+#if DEBUG
+/// `-designScreen autonomy`: one learned behaviour waiting on a decision.
+private enum AutonomyDesignSample {
+    static let candidates: [PromotionCandidateSummary] = try! JSONDecoder().decode(
+        [PromotionCandidateSummary].self,
+        from: Data(#"[{"id":"design-promotion","title":"Offer a short recap after long research threads","status":"pending","decision":"STAGE_FOR_HUMAN","source":"conversation_review","score":0.82}]"#.utf8)
+    )
+}
+#endif
 
 enum PromotionCandidateDecisionPresentation {
     static func controlsAllowed(isHumanActionable: Bool) -> Bool {
@@ -159,89 +157,91 @@ enum PromotionCandidateDecisionPresentation {
 private struct TrainingProposalRow: View {
     let proposal: TrainingProposalSummary
 
+    /// Status, where it lands and what kind, as one line of words.
+    private var statusLine: String {
+        var parts = [AliveWords.humanized(proposal.status.lowercased())]
+        if let target = proposal.targetDoc, !target.isEmpty { parts.append("for \(target)") }
+        if let kind = proposal.kind, !kind.isEmpty { parts.append(AliveWords.humanized(kind).lowercased()) }
+        return parts.joined(separator: " · ")
+    }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 7) {
-            MobileAdaptiveRow(alignment: .firstTextBaseline) {
-                Text(proposal.targetDoc ?? proposal.title)
-                    .font(.headline)
-                    .fixedSize(horizontal: false, vertical: true)
-                Spacer(minLength: 8)
-                StatusBadge(status: proposal.status)
-            }
+        VStack(alignment: .leading, spacing: 5) {
+            Text(proposal.title)
+                .font(.body.weight(.medium))
+                .foregroundStyle(AlivePalette.text)
+                .fixedSize(horizontal: false, vertical: true)
             if let proposed = proposal.proposed, !proposed.isEmpty {
                 Text(proposed)
-                    .font(.body)
+                    .font(.subheadline)
+                    .foregroundStyle(AlivePalette.text)
                     .fixedSize(horizontal: false, vertical: true)
             }
             if let rationale = proposal.rationale, !rationale.isEmpty {
                 Text(rationale)
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
+                    .font(.subheadline)
+                    .foregroundStyle(AlivePalette.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
-            if let kind = proposal.kind, !kind.isEmpty {
-                Label(kind.replacingOccurrences(of: "_", with: " "), systemImage: "doc.text.magnifyingglass")
-                    .font(.caption)
-                    .foregroundStyle(.tertiary)
-            }
+            Text(statusLine)
+                .font(.footnote)
+                .foregroundStyle(AlivePalette.secondary)
+                .padding(.top, 2)
         }
-        .padding(.vertical, 5)
+        .aliveRow()
     }
 }
 
 private struct PromotionCandidateRow: View {
+    @EnvironmentObject private var pairingStore: PairingStore
     let candidate: PromotionCandidateSummary
     @State private var isDeciding = false
     @State private var decisionError: String?
 
+    /// Status, where it came from and how sure I am, as one line of words.
+    private var statusLine: String {
+        var parts = [AliveWords.humanized(candidate.status.lowercased())]
+        if let source = candidate.source, !source.isEmpty { parts.append("from \(AliveWords.humanized(source).lowercased())") }
+        if let score = candidate.score { parts.append("\(Int((score * 100).rounded()))% sure") }
+        return parts.joined(separator: " · ")
+    }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 7) {
-            MobileAdaptiveRow(alignment: .firstTextBaseline) {
-                Text(candidate.title)
-                    .font(.headline)
-                    .fixedSize(horizontal: false, vertical: true)
-                Spacer(minLength: 8)
-                StatusBadge(status: candidate.status)
-            }
-            MobileAdaptiveRow(spacing: 12) {
-                if let source = candidate.source, !source.isEmpty {
-                    Label(source.replacingOccurrences(of: "_", with: " "), systemImage: "arrow.triangle.branch")
-                }
-                if let score = candidate.score {
-                    Label("\(Int((score * 100).rounded()))%", systemImage: "chart.bar.fill")
-                }
-                if let decision = candidate.decision, !decision.isEmpty {
-                    Label(decision.replacingOccurrences(of: "_", with: " ").lowercased(), systemImage: "person.crop.circle.badge.questionmark")
-                }
-            }
-            .font(.caption)
-            .foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: 5) {
+            Text(candidate.title)
+                .font(.body.weight(.medium))
+                .foregroundStyle(AlivePalette.text)
+                .fixedSize(horizontal: false, vertical: true)
+            Text(statusLine)
+                .font(.footnote)
+                .foregroundStyle(AlivePalette.secondary)
             if PromotionCandidateDecisionPresentation.controlsAllowed(
                 isHumanActionable: candidate.isHumanActionable
             ) {
-                MobileAdaptiveRow {
-                    Button("Approve", systemImage: "checkmark") {
+                HStack(spacing: 10) {
+                    Button("Approve") {
                         decide(approve: true)
                     }
-                    .buttonStyle(.borderedProminent)
+                    .alivePrimaryButton()
                     .disabled(isDeciding)
-                    Button("Reject", systemImage: "xmark") {
+                    Button("Reject") {
                         decide(approve: false)
                     }
-                    .buttonStyle(.bordered)
-                .tint(.secondary)
-                    .tint(NativeAgentMobileTheme.Colors.accentText)
+                    .aliveSecondaryButton()
                     .disabled(isDeciding)
-                    if isDeciding { ProgressView() }
+                    if isDeciding { ProgressView().controlSize(.small) }
                 }
+                .aliveUnavailable(!pairingStore.isPaired)
+                .padding(.top, 6)
                 if let decisionError {
                     Text(decisionError)
-                        .font(.callout)
-                        .foregroundStyle(.red)
+                        .font(.footnote)
+                        .foregroundStyle(NativeAgentMobileTheme.Colors.trouble)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
         }
-        .padding(.vertical, 5)
+        .aliveRow()
     }
 
     private func decide(approve: Bool) {

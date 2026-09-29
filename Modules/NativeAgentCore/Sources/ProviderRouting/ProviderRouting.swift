@@ -69,7 +69,11 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
         at path: URL,
         description: String
     ) throws -> [String: JSONValue] {
-        guard FileManager.default.fileExists(atPath: path.path) else { return [:] }
+        do {
+            _ = try FileManager.default.attributesOfItem(atPath: path.path)
+        } catch CocoaError.fileReadNoSuchFile {
+            return [:]
+        }
         let data: Data
         do {
             data = try Data(contentsOf: path)
@@ -85,7 +89,28 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
         guard case .object(let object) = value else {
             throw ProviderRoutingError.underlying("saved \(description) state must be a JSON object")
         }
+        if description == "surface preference" {
+            try validateSurfacePreferences(object)
+        }
         return object
+    }
+
+    private nonisolated static func validateSurfacePreferences(_ root: [String: JSONValue]) throws {
+        for (surface, value) in root {
+            if case .string = value { continue } // Supported legacy model pin.
+            guard case .object(let fields) = value else {
+                throw ProviderRoutingError.underlying("saved surface preference for \(surface) must be a string or object")
+            }
+            for field in ["model", "reasoningEffort", "reasoning_effort", "serviceTier", "service_tier"] {
+                guard let value = fields[field] else { continue }
+                guard case .string = value else {
+                    throw ProviderRoutingError.underlying("saved surface preference \(surface).\(field) must be a string")
+                }
+            }
+            if let fast = fields["fastMode"], case .bool = fast {} else if fields["fastMode"] != nil {
+                throw ProviderRoutingError.underlying("saved surface preference \(surface).fastMode must be a boolean")
+            }
+        }
     }
 
     public nonisolated static func loadActiveProviderStateChecked(
@@ -93,6 +118,44 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
     ) throws -> [String: String] {
         let raw = try loadProviderStateObjectChecked(at: path, description: "active-provider")
         return try loadActiveProviderObjectChecked(raw)
+    }
+
+    public nonisolated static func validateProviderConfiguration(_ fields: [String: JSONValue]) throws {
+        for field in ["auth_mode", "authMode", "api_key", "apiKey", "key", "access_token", "accessToken",
+                      "refresh_token", "id_token", "setup_token", "token", "default_model", "defaultModel", "model", "token_type", "scope"] {
+            guard let value = fields[field] else { continue }
+            guard case .string = value else {
+                throw ProviderRoutingError.underlying("saved provider field \(field) must be a string")
+            }
+        }
+        if let tokens = fields["tokens"] {
+            guard case .object(let object) = tokens else {
+                throw ProviderRoutingError.underlying("saved provider tokens must be an object")
+            }
+            try validateProviderConfiguration(object)
+        }
+        for field in ["expires_at", "expires_in"] {
+            guard let value = fields[field] else { continue }
+            switch value {
+            case .string, .int, .double: break
+            default: throw ProviderRoutingError.underlying("saved provider field \(field) has an invalid type")
+            }
+        }
+    }
+
+    public nonisolated static func loadProviderRegistryChecked(at path: URL) throws -> [JSONValue]? {
+        do {
+            _ = try FileManager.default.attributesOfItem(atPath: path.path)
+        } catch CocoaError.fileReadNoSuchFile { return nil }
+        let data = try Data(contentsOf: path)
+        guard case .array(let rows) = try JSONValue.parse(data) else {
+            throw ProviderRoutingError.underlying("The saved provider registry is not an array.")
+        }
+        let providers = try JSONDecoder().decode([Provider].self, from: data)
+        guard providers.allSatisfy({ !$0.id.isEmpty }), Set(providers.map(\.id)).count == providers.count else {
+            throw ProviderRoutingError.underlying("The saved provider registry has missing or duplicate ids.")
+        }
+        return rows
     }
 
     private struct PendingSurfaceConfiguration: Sendable {
@@ -143,6 +206,7 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
             self.activeBaseHash = try optionalHash(json["activeBaseHash"])
             self.surfaces = surfaces
             self.active = active
+            try SwiftNativeProviderRouting.validateSurfacePreferences(surfaces)
             _ = try SwiftNativeProviderRouting.loadActiveProviderObjectChecked(active)
         }
     }
@@ -326,6 +390,7 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
     // MARK: Provider management
 
     public func listProviders() async throws -> [Provider] {
+        _ = try Self.loadProviderRegistryChecked(at: providersDir.appendingPathComponent("registry.json"))
         let openRouterModels = await OpenRouterModelCatalog.providerJSONModels(dataRoot: dataRoot)
         let moonshotModels = await MoonshotModelCatalog.providerJSONModels(dataRoot: dataRoot)
         return nativeListProviders(openRouterModels: openRouterModels, moonshotModels: moonshotModels)
@@ -365,20 +430,38 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
         guard case .object(let body) = config else {
             throw ProviderRoutingError.invalidRequest
         }
+        guard !id.isEmpty, id.unicodeScalars.allSatisfy({ CharacterSet.alphanumerics.contains($0) || "_-".unicodeScalars.contains($0) }) else {
+            throw ProviderRoutingError.invalidRequest
+        }
+        try Self.validateProviderConfiguration(body)
+        try ProviderStateValidation.credentialFields(body)
         let path = providersDir.appendingPathComponent("\(id).json")
         try FileManager.default.createDirectory(at: providersDir, withIntermediateDirectories: true)
         try await persistence.withFileLock(path) {
+            _ = try ProviderStateValidation.dataIfPresent(at: path)
             var entry = try Self.loadProviderStateObjectChecked(
                 at: path,
                 description: "provider \(id) configuration"
             )
+            try Self.validateProviderConfiguration(entry)
+            try ProviderStateValidation.credentialFields(entry)
             if let mode = Self.firstString(body, keys: ["auth_mode", "authMode"]) {
                 entry["auth_mode"] = .string(mode)
             }
+            let oldReference = Self.firstString(entry, keys: [ProviderAPIKeyStore.referenceField])
+            var newReference: String?
             if let apiKey = Self.firstString(body, keys: ["api_key", "apiKey", "key"]) {
-                entry["api_key"] = .string(apiKey)
+                let reference = try ProviderAPIKeyStore.insert(apiKey)
+                newReference = reference
+                entry[ProviderAPIKeyStore.referenceField] = .string(reference)
+                entry.removeValue(forKey: "api_key")
             }
             if let accessToken = Self.firstString(body, keys: ["access_token", "accessToken"]) {
+                // A pasted/setup token is a new sign-in with no refresh grant.
+                for key in ["tokens", "refresh_token", "id_token", "account_id", "account", "user_info",
+                            "oauth_account_identity", "refresh_token_account_identity", "expires_at", "expires_in"] {
+                    entry.removeValue(forKey: key)
+                }
                 entry["access_token"] = .string(accessToken)
             }
             if let model = Self.firstString(body, keys: ["default_model", "defaultModel", "model"]) {
@@ -387,7 +470,41 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
             if entry["auth_mode"] == nil {
                 entry["auth_mode"] = .string(id.contains("oauth") ? "oauth" : "api_key")
             }
-            try await persistence.writeJSON(.object(entry), to: path)
+            do {
+                try await persistence.writeJSON(.object(entry), to: path)
+            } catch {
+                // writeJSON can fail after rename. Delete the new item only
+                // when checked readback proves its reference was not committed.
+                if let newReference {
+                    var unreferenced = false
+                    do {
+                        let saved = try JSONDecoder().decode(JSONValue.self, from: Data(contentsOf: path))
+                        if case .object(let object) = saved {
+                            unreferenced = Self.firstString(object, keys: [ProviderAPIKeyStore.referenceField]) != newReference
+                        }
+                    } catch {
+                        let failure = error as NSError
+                        unreferenced = failure.domain == NSCocoaErrorDomain
+                            && failure.code == NSFileReadNoSuchFileError
+                    }
+                    if unreferenced {
+                        do {
+                            try ProviderAPIKeyStore.delete(newReference)
+                        } catch {
+                            NSLog("provider_credentials: save failed; unused Keychain item cleanup failed")
+                        }
+                    }
+                }
+                throw error
+            }
+            if newReference != nil, let oldReference {
+                do {
+                    try ProviderAPIKeyStore.delete(oldReference)
+                } catch {
+                    // Cleanup cannot turn a committed rotation into a failed save.
+                    NSLog("provider_credentials: key saved; unused Keychain item cleanup failed")
+                }
+            }
         }
         // Freshen the authenticated model catalog for providers whose live
         // `/models` list needs credentials. Both refresh paths are non-fatal
@@ -449,16 +566,14 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
         let model = Self.firstString(obj, keys: ["model"])
         let effort = Self.firstString(obj, keys: ["reasoningEffort", "reasoning_effort"])
         let serviceTier = Self.firstString(obj, keys: ["serviceTier", "service_tier"])
-        let inferredProvider: String? = {
-            guard case .bool(let infer)? = obj["inferProvider"], infer, let model else { return nil }
-            return inferProviderForModel(model)
-        }()
+        // S12a: the `inferProvider` body flag (write a route read off the
+        // model's name) is gone; a model save keeps the surface's chosen route.
         try await saveSurfaceConfiguration(
             surface: surface,
             model: model,
             reasoningEffort: effort,
             serviceTier: serviceTier,
-            providerId: inferredProvider
+            providerId: nil
         )
         return try await modelPreferencesFromComputed()
     }
@@ -477,14 +592,22 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
         seedMissingControls: Bool = false,
         overwriteExisting: Bool = true,
         reconcilePinnedModelWithProvider: Bool = false,
-        clearOverride: Bool = false
+        clearOverride: Bool = false,
+        selectionValidator: (@Sendable (String, String) throws -> Void)? = nil
     ) async throws {
         let surface = canonicalRoutingSurface(surface)
         guard MODEL_SURFACES.contains(surface) else { throw ProviderRoutingError.invalidRequest }
         guard !clearOverride || surface != "chat" else { throw ProviderRoutingError.invalidRequest }
         if let providerId {
-            guard !providerId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                throw ProviderRoutingError.invalidRequest
+            guard Self.connectableProviderIds.contains(where: { Self.normalizeProviderId($0) == Self.normalizeProviderId(providerId) }) else {
+                throw ProviderRoutingError.providerNotFound
+            }
+            let configuration = try Self.loadProviderStateObjectChecked(
+                at: providersDir.appendingPathComponent("\(providerId).json"), description: "provider configuration"
+            )
+            try Self.validateProviderConfiguration(configuration)
+            guard providerReadiness(id: providerId).ready else {
+                throw ProviderRoutingError.configurationFailed("\(providerId) is not connected. Connect it in Providers first.")
             }
         }
         try FileManager.default.createDirectory(
@@ -503,6 +626,25 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
                 description: "active-provider"
             )
             _ = try Self.loadActiveProviderObjectChecked(activeRoot)
+
+            if let model, !clearOverride {
+                let active = WorkshopSurfaceVocabulary.canonicalizeSurfaceKeys(
+                    try Self.loadActiveProviderObjectChecked(activeRoot)
+                )
+                let current = await self.selectionRoutingSnapshot(
+                    surfaces: WorkshopSurfaceVocabulary.canonicalizeSurfaceKeys(surfaceRoot),
+                    active: active
+                )
+                guard let route = providerId ?? current.activeProviders[surface],
+                      Self.connectableProviderIds.contains(where: { Self.normalizeProviderId($0) == Self.normalizeProviderId(route) }),
+                      !Self.normalizeModelIdStatic(model, fallback: "").isEmpty else {
+                    throw ProviderRoutingError.configurationFailed("Choose a valid model on a configured account.")
+                }
+                if let family = self.inferProviderForModel(model), !Self.providerCanServeModel(route, inferredProvider: family) {
+                    throw ProviderRoutingError.configurationFailed("\(route) does not serve \(model). Pick a model that account offers.")
+                }
+                try selectionValidator?(route, model)
+            }
 
             // Bare provider switch (setActiveProvider): decide INSIDE this
             // lock whether the currently pinned model can ride the new
@@ -606,6 +748,16 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
         }
     }
 
+    private func selectionRoutingSnapshot(surfaces: [String: JSONValue], active: [String: String]) -> ProviderRoutingSnapshot {
+        let cache = providerConfigCache(for: Set(Self.soleConnectedProbeIds).union(active.values))
+        return routingSnapshot(
+            surfaces: surfaces, activeProviders: active,
+            soleConnectedProvider: soleConnectedProviderFamily(cache: cache),
+            soleConnectedRoute: soleConnectedProviderID(cache: cache),
+            configCache: cache
+        )
+    }
+
     /// Canonical raw-pin mutation. `seedMissingControls` exists only for the
     /// established Mac picker contract; all persistence and corruption
     /// handling still remain owned here.
@@ -684,8 +836,8 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
     }
 
     private func nativeListProviders(
-        openRouterModels: [[String: JSONValue]] = [],
-        moonshotModels: [[String: JSONValue]] = []
+        openRouterModels: [[String: JSONValue]]? = nil,
+        moonshotModels: [[String: JSONValue]]? = nil
     ) -> [Provider] {
         var byId: [String: Provider] = [:]
 
@@ -731,10 +883,12 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
                 moonshotModels: moonshotModels
             )
         }
-        if !openRouterModels.isEmpty, let provider = byId["openrouter"] {
+        // A fetched list replaces a registry row's saved one even when empty:
+        // a stale saved list must not stand in for the provider's (S12a).
+        if let openRouterModels, let provider = byId["openrouter"] {
             byId["openrouter"] = providerReplacingModels(provider, models: openRouterModels)
         }
-        if !moonshotModels.isEmpty, let provider = byId["moonshot"] {
+        if let moonshotModels, let provider = byId["moonshot"] {
             byId["moonshot"] = providerReplacingModels(provider, models: moonshotModels)
         }
 
@@ -745,8 +899,8 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
 
     private func synthesizeProvider(
         id: String,
-        openRouterModels: [[String: JSONValue]] = [],
-        moonshotModels: [[String: JSONValue]] = []
+        openRouterModels: [[String: JSONValue]]? = nil,
+        moonshotModels: [[String: JSONValue]]? = nil
     ) -> Provider {
         let readiness = providerReadiness(id: id)
         return Provider(
@@ -804,24 +958,15 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
         id: String,
         cache: ProviderConfigCache? = nil
     ) -> (ready: Bool, state: String, detail: String) {
-        let includeEnvironment = dataRoot.standardizedFileURL
-            == PersistenceCore.defaultDataRoot().standardizedFileURL
         /// API-key presence for `id`, reading the provider config from the
-        /// snapshot's read when there is one. Precedence stays the resolver's.
-        func keyReady(_ envVar: String) -> Bool {
+        /// snapshot's read when there is one.
+        func keyReady() -> Bool {
             if let read = cache?.reads[id] {
-                return LLMCredentialResolver.resolveAPIKey(
-                    envVar: envVar,
-                    providerConfigObject: read.object,
-                    dataRoot: dataRoot,
-                    includeEnvironment: includeEnvironment
-                ) != nil
+                return LLMCredentialResolver.resolveAPIKey(providerConfigObject: read.object) != nil
             }
             return LLMCredentialResolver.resolveAPIKey(
-                envVar: envVar,
                 providerConfigFile: "\(id).json",
-                dataRoot: dataRoot,
-                includeEnvironment: includeEnvironment
+                dataRoot: dataRoot
             ) != nil
         }
         switch id {
@@ -844,19 +989,19 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
             )
             return (result.0, "needs_oauth", result.1)
         case "openai":
-            let ready = keyReady("OPENAI_API_KEY")
+            let ready = keyReady()
             return (ready, "needs_key", ready ? "API key available" : "No OpenAI API key configured")
         case "anthropic":
-            let ready = keyReady("ANTHROPIC_API_KEY")
+            let ready = keyReady()
             return (ready, "needs_key", ready ? "API key available" : "No Anthropic API key configured")
         case "openrouter":
-            let ready = keyReady("OPENROUTER_API_KEY")
+            let ready = keyReady()
             return (ready, "needs_key", ready ? "API key available" : "No OpenRouter API key configured")
         case "moonshot":
-            let ready = keyReady("MOONSHOT_API_KEY")
+            let ready = keyReady()
             return (ready, "needs_key", ready ? "Moonshot API key available" : "No Moonshot API key configured")
         case "kimi-code":
-            let ready = keyReady("KIMI_CODE_API_KEY")
+            let ready = keyReady()
             return (ready, "needs_key", ready ? "Kimi Code API key available" : "No Kimi Code API key configured")
         default:
             if let read = cache?.reads[id] {
@@ -942,27 +1087,22 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
         return nil
     }
 
+    /// `openRouterModels` / `moonshotModels` are the provider's fetched list
+    /// when the caller read it (empty = the fetch had nothing), nil when it did
+    /// not. S12a: an empty fetch used to be papered over with a compiled-in
+    /// list. Unread, OpenRouter offers nothing and Moonshot its shipped rows —
+    /// the same table routing validates Moonshot picks against.
     private nonisolated func modelsForProvider(
         _ id: String,
-        openRouterModels: [[String: JSONValue]] = [],
-        moonshotModels: [[String: JSONValue]] = []
+        openRouterModels: [[String: JSONValue]]? = nil,
+        moonshotModels: [[String: JSONValue]]? = nil
     ) -> [[String: JSONValue]] {
         let openai = FirstPartyModelCatalog.publicOpenAIModels.map { $0.providerJSON() }
         let accountOpenAI = FirstPartyModelCatalog.chatGPTAccountFallbackModels.map { $0.providerJSON() }
         let anthropic = FirstPartyModelCatalog.anthropicModels.map { $0.providerJSON() }
-        let openrouter: [[String: JSONValue]] = openRouterModels.isEmpty
-            ? OpenRouterModelCatalog.fallbackModels().map { $0.providerJSON() }
-            : openRouterModels
+        let openrouter = openRouterModels ?? []
         let xai = FirstPartyModelCatalog.xAIModels.map { $0.providerJSON() }
-        let moonshot = moonshotModels.isEmpty
-            ? MoonshotModelCatalog.fallbackModels().map { model -> [String: JSONValue] in
-                var object = model.providerJSON()
-                object["default_reasoning_effort"] = .string(MoonshotModelCatalog.defaultReasoningEffort(for: model.id))
-                object["supported_reasoning_efforts"] = .array(MoonshotModelCatalog.supportedReasoningEfforts(for: model.id).map(JSONValue.string))
-                object["supports_fast"] = .bool(false)
-                return object
-            }
-            : moonshotModels
+        let moonshot = moonshotModels ?? FirstPartyModelCatalog.moonshotModels.map { $0.providerJSON() }
         switch id {
         case "openai": return openai
         case "openai_oauth_direct", "codex": return accountOpenAI
@@ -994,11 +1134,6 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
         return ModelPreferences(
             surfaceModels: .object(current),
             defaultModel: prefs["chat"]?.model,
-            // This envelope has no failover executor. Returning a plausible
-            // non-empty chain invited readers to present it as a live recovery
-            // policy even though no turn could consume it. Keep the Codable
-            // field for older callers, but do not manufacture dead policy.
-            fallbackChain: nil,
             extras: .object([
                 "current": .object(current),
                 "status": .string("ok"),
@@ -1196,6 +1331,7 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
         let surfaceModels = Self.dropping(retiredPickSurfaces, from: parsedSurfaceModels)
         let surfaceEfforts = Self.dropping(retiredPickSurfaces, from: parsedSurfaceEfforts)
         let surfaceServiceTiers = Self.dropping(retiredPickSurfaces, from: parsedSurfaceServiceTiers)
+        let routesBeforeRetirement = activeProviders
         let activeProviders = activeProviders.filter {
             // Chat's own route is never dropped: it is the answer everything
             // else inherits, and losing it would strand the whole install.
@@ -1264,7 +1400,7 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
         // member, so the first member carrying one IS the override) and
         // otherwise Chat's. A per-surface key written by anything else is a pin
         // the page shows, never a way to split a group's routing.
-        struct CanonicalTuple {
+        struct CanonicalTuple: Equatable {
             let model: String
             let effort: String
             let serviceTier: String
@@ -1276,24 +1412,52 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
             serviceTier: chatServiceTier,
             provider: chatRoute
         )
-        func savedTuple(for surface: String) -> CanonicalTuple? {
-            guard let saved = Self.stringFrom(surfaceModels, key: surface) else { return nil }
+        func tuple(
+            for surface: String,
+            models: JSONValue,
+            efforts: JSONValue,
+            tiers: JSONValue,
+            routes: [String: String]
+        ) -> CanonicalTuple? {
+            guard let saved = Self.stringFrom(models, key: surface) else { return nil }
             let model = Self.normalizeModelIdStatic(saved, fallback: "")
             guard !model.isEmpty else { return nil }
-            let provider = activeProviders[surface] ?? chatRoute
+            let provider = routes[surface] ?? chatRoute
             return CanonicalTuple(
                 model: model,
                 effort: Self.normalizeReasoningEffortStatic(
-                    Self.stringFrom(surfaceEfforts, key: surface) ?? chatEffort,
+                    Self.stringFrom(efforts, key: surface) ?? chatEffort,
                     fallback: chatEffort,
                     model: model,
                     providerID: provider
                 ),
                 serviceTier: Self.normalizeServiceTierStatic(
-                    Self.stringFrom(surfaceServiceTiers, key: surface) ?? chatServiceTier
+                    Self.stringFrom(tiers, key: surface) ?? chatServiceTier
                 ),
                 provider: provider
             )
+        }
+        func savedTuple(for surface: String) -> CanonicalTuple? {
+            tuple(for: surface, models: surfaceModels, efforts: surfaceEfforts,
+                  tiers: surfaceServiceTiers, routes: activeProviders)
+        }
+        // A retired pick refuses only where it was IN EFFECT: a Work or Memory
+        // and mind override (the same tuple on every member, all now retired),
+        // judged by the same unanimity rule as below over the picks as saved.
+        // Dropping it used to hand those members Chat's model without a word
+        // (S12, 2026-09-26). A lone per-surface key never routed anything — its
+        // group follows Chat — so it keeps its notice on the Providers row but
+        // refuses nothing, and never blocks the rest of its group.
+        var retiredOverrideSurfaces: Set<String> = []
+        for group in ProviderSurfaceGroups.all where group.id != ProviderSurfaceGroups.chat.id {
+            guard group.surfaces.allSatisfy(retiredPickSurfaces.contains) else { continue }
+            let saved = group.surfaces.map {
+                tuple(for: $0, models: parsedSurfaceModels, efforts: parsedSurfaceEfforts,
+                      tiers: parsedSurfaceServiceTiers, routes: routesBeforeRetirement)
+            }
+            if let first = saved.first ?? nil, saved.allSatisfy({ $0 == first }) {
+                retiredOverrideSurfaces.formUnion(group.surfaces)
+            }
         }
         var canonicalByGroup: [String: CanonicalTuple] = [:]
         for group in ProviderSurfaceGroups.all {
@@ -1328,6 +1492,7 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
 
         var out: [String: SurfacePreference] = [:]
         var resolvedProviders: [String: String] = [:]
+        var mismatchedPicks: [String: String] = [:]
         for surface in MODEL_SURFACES {
             // The group's tuple, and only the group's (User, 2026-09-13, second
             // review). The Providers page offers three choices and says
@@ -1355,20 +1520,23 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
             // the surfaces inheriting from a retired Chat pick.
             // A pick that cannot be used never falls back to anything: not for
             // this surface, not for the group it inherits from, not for Chat.
-            let groupMembers = ProviderSurfaceGroups.members(of: surface)
-            let unusableBlocksFallback = unusablePicks[surface] != nil
+            let unusableBlocksFallback = retiredOverrideSurfaces.contains(surface)
                 || unusablePicks["chat"] != nil
-                || groupMembers.contains { unusablePicks[$0] != nil }
             let model = canonical.model.isEmpty
                 ? (unusableBlocksFallback
                     ? ""
                     : (route.flatMap { defaultModelForProvider($0, savedDefaults: savedDefaults) } ?? ""))
                 : canonical.model
-            let effectiveModel = providerCompatibleModel(
-                model,
-                activeProvider: route,
-                savedDefaults: savedDefaults
-            )
+            // A model its route cannot serve is refused, never swapped for the
+            // route's own default (S12, 2026-09-26): the surface is unset and
+            // says why, on the Providers row and in the turn refusal.
+            var effectiveModel = retiredOverrideSurfaces.contains(surface) ? "" : model
+            if !effectiveModel.isEmpty, let route,
+               let family = inferProviderForModel(model),
+               !Self.providerCanServeModel(route, inferredProvider: family) {
+                mismatchedPicks[surface] = "\(model) isn't available on \(route). Choose one."
+                effectiveModel = ""
+            }
             let effort = Self.normalizeReasoningEffortStatic(
                 canonical.effort,
                 fallback: DEFAULT_REASONING_EFFORT,
@@ -1395,7 +1563,7 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
             preferences: out,
             activeProviders: resolvedProviders,
             pinnedModels: pinnedModels,
-            unusablePicks: unusablePicks
+            unusablePicks: unusablePicks.merging(mismatchedPicks) { saved, _ in saved }
         )
     }
 
@@ -1469,19 +1637,6 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
             return "moonshot"
         }
         return nil
-    }
-
-    private nonisolated func providerCompatibleModel(
-        _ model: String,
-        activeProvider: String?,
-        savedDefaults: [String: SavedProviderDefault]? = nil
-    ) -> String {
-        guard let activeProvider,
-              let inferredProvider = inferProviderForModel(model),
-              !Self.providerCanServeModel(activeProvider, inferredProvider: inferredProvider) else {
-            return model
-        }
-        return defaultModelForProvider(activeProvider, savedDefaults: savedDefaults) ?? model
     }
 
     /// The model a route answers with when nobody has picked one: the saved
@@ -1622,10 +1777,21 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
                         unreadable: "provider \(trimmedId) configuration could not be read"
                     )
                 }
-                guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                guard var object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
                     return ProviderConfigRead(
                         unreadable: "provider \(trimmedId) configuration is not a JSON object"
                     )
+                }
+                guard case .object(let fields) = try JSONValue.parse(data) else {
+                    return ProviderConfigRead(unreadable: "provider configuration is malformed")
+                }
+                try Self.validateProviderConfiguration(fields)
+                // Resolve the Keychain reference under the config writer's lock
+                // so readiness and model settings share one credential generation.
+                if object[ProviderAPIKeyStore.referenceField] != nil {
+                    let key = LLMCredentialResolver.resolveAPIKey(providerConfigObject: object)
+                    object.removeValue(forKey: ProviderAPIKeyStore.referenceField)
+                    object["api_key"] = key
                 }
                 return ProviderConfigRead(object: object)
             }
@@ -1995,7 +2161,7 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
                 if expDate > Date() {
                     return (true, "Signed in (valid)")
                 }
-                if !refresh.isEmpty {
+                if !refresh.isEmpty && OAuthRefreshBinding.permitsRefresh(obj, provider: "openai_oauth_direct") {
                     return (true, "Access expired - refresh on next chat")
                 }
                 continue
@@ -2043,27 +2209,9 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
         } else {
             parsed = nil
         }
-        guard let obj = parsed else {
-            return (false, "anthropic_oauth_direct.json missing or malformed")
-        }
-        let topAccess = (obj["access_token"] as? String) ?? ""
-        let nestedAccess = ((obj["tokens"] as? [String: Any])?["access_token"] as? String) ?? ""
-        let setupToken = (obj["setup_token"] as? String) ?? ""
-        let access = !topAccess.isEmpty ? topAccess : (!nestedAccess.isEmpty ? nestedAccess : setupToken)
-        if access.isEmpty {
-            return (false, "no access_token or setup_token - sign in required")
-        }
-        let refresh = (obj["refresh_token"] as? String) ?? ""
-        if let expDate = parseAuthExpiresAt(obj["expires_at"]) {
-            if expDate > Date() {
-                return (true, "Signed in (valid)")
-            }
-            if !refresh.isEmpty {
-                return (true, "Access expired - refresh on next chat")
-            }
-            return (false, "Access expired and no refresh_token - re-auth required")
-        }
-        return (true, "Signed in")
+        // The adapter that serves the calls decides (see credentialStatus).
+        let status = AnthropicOAuthDirectAdapter.credentialStatus(parsed)
+        return (status.usable, status.detail)
     }
 
     /// `preRead` is the routing snapshot's single locked read of this file; nil
@@ -2084,13 +2232,10 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
         guard let obj = parsed else {
             return (false, "xai_oauth_direct.json missing or malformed")
         }
-        let access = ((obj["access_token"] as? String)
-            ?? ((obj["tokens"] as? [String: Any])?["access_token"] as? String)
-            ?? "")
+        let tokens = OAuthRefreshBinding.tokenSet(obj, provider: "xai_oauth_direct")
+        let access = ((tokens["access_token"] as? String) ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        let refresh = ((obj["refresh_token"] as? String)
-            ?? ((obj["tokens"] as? [String: Any])?["refresh_token"] as? String)
-            ?? "")
+        let refresh = ((tokens["refresh_token"] as? String) ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !access.isEmpty else {
             return (false, "no access_token - sign in required")
@@ -2099,12 +2244,13 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
             if expDate > Date() {
                 return (true, "Signed in (valid)")
             }
-            if !refresh.isEmpty {
+            if !refresh.isEmpty && OAuthRefreshBinding.permitsRefresh(obj, provider: "xai_oauth_direct") {
                 return (true, "Access expired - refresh on next chat")
             }
             return (false, "Access expired and no refresh_token - re-auth required")
         }
-        return refresh.isEmpty ? (true, "Signed in") : (true, "Signed in (refresh available)")
+        let canRefresh = !refresh.isEmpty && OAuthRefreshBinding.permitsRefresh(obj, provider: "xai_oauth_direct")
+        return canRefresh ? (true, "Signed in (refresh available)") : (true, "Signed in")
     }
 
     /// Decodes persisted OAuth expiry values in the shared app/routing compatibility order.

@@ -532,12 +532,12 @@ public actor WorkshopExecutorLoop {
         await ensureOrphansReconciled()
         guard let claimed = try await claim(trimmed) else {
             // Mirror the daemon's typed refusal.
-            let current = await getRecord(trimmed)
+            let current = try await getRecord(trimmed)
             guard let current else { throw WorkshopExecutionError.invalidRequest("Workshop execution not found: \(trimmed)") }
             throw WorkshopExecutionError.invalidRequest("Workshop execution \(trimmed) cannot be started (status=\(current.status))")
         }
         await runClaimedWorkshopExecution(claimed)
-        return await getRecord(trimmed) ?? claimed
+        return try await getRecord(trimmed) ?? claimed
     }
 
     // MARK: claim (W6 race fix + queue-level serialization)
@@ -596,7 +596,7 @@ public actor WorkshopExecutorLoop {
         let executionRecordJSON = executionRecordPath(executionId)
         let nowStr = SwiftNativeWorkshopRunner.isoTimestamp(now())
         let work: @Sendable () async throws -> WorkshopExecutionRecord? = { [persistence, self] in
-            let raw = await persistence.readJSON(executionRecordJSON, defaultValue: .null)
+            let raw = try await persistence.readJSON(executionRecordJSON, ifMissing: .null)
             // The claimed slot and the execution we dispatch must have the
             // same identity. A mismatched payload must not redirect the run
             // while leaving this directory stuck in running.
@@ -610,7 +610,11 @@ public actor WorkshopExecutorLoop {
             // enclosing queue-level flock serializes claimers across
             // Workshop executions (blocker #4), so this count cannot be concurrently
             // stale-read by another claimer.
-            let runningCount = await self.scanQueue()
+            let queue = await self.scanQueue()
+            if let corrupt = queue.first(where: { $0.status == "corrupt" }) {
+                throw WorkshopExecutionError.persistenceFailure(String(describing: corrupt.result))
+            }
+            let runningCount = queue
                 .filter { $0.status == "running" && $0.id != executionId }
                 .count
             guard runningCount < self.maxActive else { return nil }
@@ -698,7 +702,7 @@ public actor WorkshopExecutorLoop {
     /// in here and return.
     private func runSteps(executionId: String, afterStepId: String?) async throws {
         var skipping = (afterStepId != nil)
-        guard let planSource = await getRecord(executionId) else { return }
+        guard let planSource = try await getRecord(executionId) else { return }
         // A parent/pass cancellation may requeue after earlier steps committed.
         // Their outcomes and receipts are durable, so a later claim skips them
         // instead of replaying side effects or double-counting completion.
@@ -1269,7 +1273,7 @@ public actor WorkshopExecutorLoop {
                     for await _ in changes.stream {
                         try Task.checkCancellation()
                         cancellationReadObserver?()
-                        let raw = await persistence.readJSON(executionRecordJSON, defaultValue: .null)
+                        let raw = try await persistence.readJSON(executionRecordJSON, ifMissing: .null)
                         if case .object(let obj) = raw,
                            case .string(let status)? = obj["status"],
                            status == "cancelled" {
@@ -1353,7 +1357,7 @@ public actor WorkshopExecutorLoop {
         // Reclaim orphans before a resume flips a blocked step to running, so
         // the first reclaim can't race a concurrent resume (gpt-5.5 review).
         await ensureOrphansReconciled()
-        guard let execution = await getRecord(executionId) else {
+        guard let execution = try await getRecord(executionId) else {
             throw WorkshopExecutionError.invalidRequest("Workshop execution not found: \(executionId)")
         }
         let existing = Self.lastStepRecord(execution, stepId: stepId)
@@ -1544,15 +1548,15 @@ public actor WorkshopExecutorLoop {
             await releaseClaimAfterParentCancellation(executionId)
             throw CancellationError()
         }
-        return await getRecord(executionId) ?? execution
+        return try await getRecord(executionId) ?? execution
     }
 
     // MARK: helpers
 
-    private func getRecord(_ executionId: String) async -> WorkshopExecutionRecord? {
+    private func getRecord(_ executionId: String) async throws -> WorkshopExecutionRecord? {
         guard (try? await WorkshopStorageMigrator.prepareForReading(dataRoot: root)) != nil else { return nil }
         guard SwiftNativeWorkshopRunner.isSafeExecutionID(executionId) else { return nil }
-        let raw = await persistence.readJSON(executionRecordPath(executionId), defaultValue: .null)
+        let raw = try await persistence.readJSON(executionRecordPath(executionId), ifMissing: .null)
         guard case .object(let obj) = raw,
               case .string(let gotId)? = obj["id"], gotId == executionId else { return nil }
         return SwiftNativeWorkshopRunner.recordFromJSON(obj)
@@ -1692,9 +1696,10 @@ public actor WorkshopExecutorLoop {
         let known = await queue.recordedSources()
         var reconciled = 0
         for entry in recent {
-            let raw = await persistence.readJSON(
-                ExecutionRecordFile.resolve(in: entry.url), defaultValue: .null
-            )
+            // A corrupt record is logged and quarantined by readJSON; the scan skips it.
+            guard let raw = try? await persistence.readJSON(
+                ExecutionRecordFile.resolve(in: entry.url), ifMissing: .null
+            ) else { continue }
             guard case .object(let object) = raw,
                   case .string(let id)? = object["id"], !id.isEmpty else { continue }
             let record = SwiftNativeWorkshopRunner.recordFromJSON(object)
@@ -1729,8 +1734,9 @@ public actor WorkshopExecutorLoop {
         for sub in entries {
             let isDir = (try? sub.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
             guard isDir else { continue }
-            let raw = await persistence.readJSON(
-                ExecutionRecordFile.resolve(in: sub, fileManager: fm), defaultValue: .null)
+            let raw = await SwiftNativeWorkshopRunner.readQueueRecord(
+                ExecutionRecordFile.resolve(in: sub, fileManager: fm),
+                id: sub.lastPathComponent, persistence: persistence)
             guard case .object(let obj) = raw,
                   case .string(let gotId)? = obj["id"], gotId == sub.lastPathComponent else { continue }
             out.append(SwiftNativeWorkshopRunner.recordFromJSON(obj))
@@ -1767,7 +1773,7 @@ public actor WorkshopExecutorLoop {
         let executionRecordJSON = executionRecordPath(executionId)
         let nowStr = SwiftNativeWorkshopRunner.isoTimestamp(now())
         let work: @Sendable () async throws -> (WorkshopExecutionRecord?, Bool) = { [persistence] in
-            let raw = await persistence.readJSON(executionRecordJSON, defaultValue: .null)
+            let raw = try await persistence.readJSON(executionRecordJSON, ifMissing: .null)
             guard case .object(let obj) = raw,
                   case .string(let gotId)? = obj["id"], gotId == executionId else {
                 return (nil, false)
@@ -1804,7 +1810,7 @@ public actor WorkshopExecutorLoop {
         guard SwiftNativeWorkshopRunner.isSafeExecutionID(executionId) else { return nil }
         let executionRecordJSON = executionRecordPath(executionId)
         let work: @Sendable () async throws -> WorkshopExecutionRecord? = { [persistence] in
-            let raw = await persistence.readJSON(executionRecordJSON, defaultValue: .null)
+            let raw = try await persistence.readJSON(executionRecordJSON, ifMissing: .null)
             guard case .object(let obj) = raw,
                   case .string(let gotId)? = obj["id"], gotId == executionId else {
                 return nil

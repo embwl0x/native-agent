@@ -25,12 +25,6 @@ public final class OpenAIAdapter: LLMAdapter {
         dataRootOverride ?? PersistenceCore.defaultDataRoot()
     }
 
-    private var includesProcessEnvironmentCredentials: Bool {
-        dataRootOverride == nil
-            || credentialRoot.standardizedFileURL
-                == PersistenceCore.defaultDataRoot().standardizedFileURL
-    }
-
     public init(
         session: URLSession = .shared,
         endpoint: URL = URL(string: "https://api.openai.com/v1/chat/completions")!,
@@ -73,10 +67,8 @@ public final class OpenAIAdapter: LLMAdapter {
     ) async throws -> String {
         guard let key = apiKeyOverride
                 ?? LLMCredentialResolver.resolveAPIKey(
-                    envVar: "OPENAI_API_KEY",
                     providerConfigFile: "openai.json",
-                    dataRoot: credentialRoot,
-                    includeEnvironment: includesProcessEnvironmentCredentials),
+                    dataRoot: credentialRoot),
               !key.isEmpty else {
             throw LLMError.notConfigured(provider: "openai")
         }
@@ -142,7 +134,7 @@ public final class OpenAIAdapter: LLMAdapter {
             }
         }
         guard hasImage || hasToolBlocks else {
-            // Text-only: reproduce the LLMAdapter default flatten EXACTLY.
+            // Text-only: the role-prefixed flatten (llmCompatibilityPrompt), unchanged.
             let flattened = llmCompatibilityPrompt(messages: messages) { role in
                 role == .user ? "USER:" : "ASSISTANT:"
             }
@@ -152,10 +144,8 @@ public final class OpenAIAdapter: LLMAdapter {
 
         guard let key = apiKeyOverride
                 ?? LLMCredentialResolver.resolveAPIKey(
-                    envVar: "OPENAI_API_KEY",
                     providerConfigFile: "openai.json",
-                    dataRoot: credentialRoot,
-                    includeEnvironment: includesProcessEnvironmentCredentials),
+                    dataRoot: credentialRoot),
               !key.isEmpty else {
             throw LLMError.notConfigured(provider: "openai")
         }
@@ -230,6 +220,8 @@ public final class OpenAIAdapter: LLMAdapter {
 
     // MARK: - Structured streaming (tool calls)
 
+    public func messagesStreamKind(tools: [LLMToolSchema]?) -> LLMMessagesStreamKind { .incremental }
+
     /// F-B2 (2026-08-02): the api-key OpenAI lane had NO `streamMessages`
     /// override, so it fell through to the protocol default — one
     /// `completeMessages` round-trip yielded as a single `.textDelta`, and a
@@ -246,7 +238,6 @@ public final class OpenAIAdapter: LLMAdapter {
         let endpoint = self.endpoint
         let apiKeyOverride = self.apiKeyOverride
         let credentialRoot = self.credentialRoot
-        let includesProcessEnvironmentCredentials = self.includesProcessEnvironmentCredentials
         let telemetry = self.telemetry
         let providerId = self.providerId
         return AsyncThrowingStream { continuation in
@@ -254,10 +245,8 @@ public final class OpenAIAdapter: LLMAdapter {
                 do {
                     guard let key = apiKeyOverride
                             ?? LLMCredentialResolver.resolveAPIKey(
-                                envVar: "OPENAI_API_KEY",
                                 providerConfigFile: "openai.json",
-                                dataRoot: credentialRoot,
-                                includeEnvironment: includesProcessEnvironmentCredentials),
+                                dataRoot: credentialRoot),
                           !key.isEmpty else {
                         throw LLMError.notConfigured(provider: "openai")
                     }

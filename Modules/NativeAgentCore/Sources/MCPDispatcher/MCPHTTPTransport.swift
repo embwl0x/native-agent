@@ -1,3 +1,4 @@
+import NativeAgentCore
 import Foundation
 import PersistenceCore
 

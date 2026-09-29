@@ -358,13 +358,14 @@ extension CognitiveSubstrate {
             )
         }
         publishAttentionProjection(at: workspace.generatedAt)
+        var flushedPresentation = false
         do {
             if configuration.persistenceEnabled {
                 // Resident sensory admission defers its per-event affect and
                 // node writes here. Affect, thought seeds, nodes, pruning, and
                 // the receipt are one canonical SQLite transaction—not four
                 // sequential commits for one physiological settlement.
-                let artifacts: [CognitiveArtifactWrite] = configuration.affectEnabled
+                var artifacts: [CognitiveArtifactWrite] = configuration.affectEnabled
                     ? [CognitiveArtifactWrite(
                         kind: "affect",
                         id: stableArtifactID("affect"),
@@ -376,6 +377,19 @@ extension CognitiveSubstrate {
                         )
                     )]
                     : []
+                // The resident ingest's accepted-turn tick (and any unflushed
+                // cadence move) rides the same transaction.
+                if capsulePresentationDirty {
+                    capsulePresentationDirty = false
+                    flushedPresentation = true
+                    artifacts.append(CognitiveArtifactWrite(
+                        kind: "capsule_presentation",
+                        id: stableArtifactID("capsule_presentation"),
+                        status: "current",
+                        score: 0,
+                        payload: capsulePresentationArtifactPayload(at: workspace.generatedAt)
+                    ))
+                }
                 let seedRows = configuration.thoughtSeedsEnabled
                     ? thoughtSeeds.values.map {
                         CognitiveArtifactReplacement(
@@ -410,6 +424,7 @@ extension CognitiveSubstrate {
             }
         } catch {
             if dirtySince == nil { dirtySince = priorDirtySince }
+            if flushedPresentation { capsulePresentationDirty = true }
             if thoughtSeedRevision != priorThoughtSeedRevision,
                thoughtSeedRevision == priorThoughtSeedRevision &+ 1 {
                 thoughtSeeds = priorThoughtSeeds

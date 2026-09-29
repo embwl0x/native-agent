@@ -46,7 +46,7 @@ extension MacAppleScriptBridge {
         with timeout of 4 seconds
         tell application "Messages"
             \(selection)
-            set output to ""
+            set output to ((count of chatList) as text) & linefeed
             set countChat to 0
             repeat with c in chatList
                 if countChat ≥ \(limit) then exit repeat
@@ -77,12 +77,21 @@ extension MacAppleScriptBridge {
         """
         do {
             let raw = try await runAppleScript(source)
-            let threads = parseMessagesMetadata(raw)
+            let lines = raw.split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: false)
+            guard let first = lines.first, let total = Int(first), total >= 0 else {
+                return .object([
+                    "status": .string("failed"), "integration": .string("messages"),
+                    "reason": .string("invalid_thread_count"),
+                    "message": .string("Messages returned an unreadable conversation count. Open Messages, then retry messages_recent_threads."),
+                ])
+            }
+            let threads = parseMessagesMetadata(lines.count > 1 ? String(lines[1]) : "")
             if threadID != nil && threads.isEmpty {
                 return failedEnvelope(integration: "messages", reason: "thread_not_found")
             }
             var result: [String: JSONValue] = [
                 "status": .string("completed"), "count": .int(Int64(threads.count)),
+                "total": .int(Int64(total)), "has_more": .bool(total > threads.count),
                 "threads": .array(threads), "ordering": .string("Messages app order; recency is not provided by this interface."),
                 "history_status": .string("select_conversation"),
                 "history_note": .string("Open a conversation to read a bounded page of its local history. List previews are metadata, not an empty transcript."),
@@ -398,8 +407,28 @@ extension MacAppleScriptBridge {
         // append was passed — rename-only path).
         let bodyStmt: String
         if let body = body {
-            let bodyAS = escapeForAppleScript(body)
-            bodyStmt = "set body of targetNote to \"\(bodyAS)\""
+            if body.isEmpty {
+                // Notes derives its name from the first HTML line. Clearing
+                // content must keep that line, read from the exact note by ID.
+                bodyStmt = """
+                set titleHTML to ""
+                repeat with titleCharacter in characters of ((name of targetNote) as text)
+                    set titleText to titleCharacter as text
+                    if titleText is "&" then
+                        set titleText to "&amp;"
+                    else if titleText is "<" then
+                        set titleText to "&lt;"
+                    else if titleText is ">" then
+                        set titleText to "&gt;"
+                    end if
+                    set titleHTML to titleHTML & titleText
+                end repeat
+                set body of targetNote to "<div>" & titleHTML & "</div>"
+                """
+            } else {
+                let bodyAS = escapeForAppleScript(body)
+                bodyStmt = "set body of targetNote to \"\(bodyAS)\""
+            }
         } else if let append = append {
             let appendAS = escapeForAppleScript(append)
             bodyStmt = "set body of targetNote to ((body of targetNote) as string) & return & \"\(appendAS)\""
@@ -452,4 +481,5 @@ extension MacAppleScriptBridge {
             return failedEnvelope(integration: "notes", error: error)
         }
     }
+
 }

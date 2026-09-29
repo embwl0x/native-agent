@@ -57,15 +57,9 @@ extension MemoryConsolidationGate {
 
     /// True when the live store carries THIS run's applied marker. Any read
     /// failure answers false: an unreadable store is not proof of a swap.
-    static func swapMarkerApplied(livePath: URL, runId: String) -> Bool {
-        var config = Configuration()
-        config.busyMode = .timeout(5)
-        config.readonly = true
-        guard let queue = try? DatabaseQueue(path: livePath.path, configuration: config) else {
-            return false
-        }
-        defer { try? queue.close() }
-        let found = try? queue.read { db -> Bool in
+    /// Read through the live MemoryStorage's own pool.
+    static func swapMarkerApplied(liveStorage: MemoryStorage, runId: String) -> Bool {
+        let found = try? liveStorage.dbPool.read { db -> Bool in
             guard try db.tableExists(appliedMarkerTable) else { return false }
             return try Bool.fetchOne(
                 db,

@@ -2,19 +2,11 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
-// MARK: - PersonaRoot resolution contract (Fix 1 — canonical path FIRST)
+// MARK: - PersonaRoot resolution contract
 //
-// Resolution order (priority high → low):
-//   1. `<dataRoot>/persona/Agent/` — optional fully seeded installed-app
-//      persona root. Wins only when SOUL.md exists there. A lone generated
-//      USER.md never makes this directory active.
-//   2. `NATIVE_AGENT_PERSONA_ROOT` env override — for dev / CI overrides.
-//   3. `<stamped_repo>/persona/Agent/` — stamped REPO_PATH from the running
-//      bundle; used as SEED on first install when dataRoot is empty.
-//   4. `<dev_repo>/persona/` — dev repo fallback (git checkout, Package.swift
-//      marker present, NOT inside a .app bundle).
-//
-// LITERAL-TILDE GOTCHA: see existing comment below in PersonaRootResolver.
+// One rule, owned by `PersistenceCore.defaultPersonaRoot`: a checkout's
+// `data/` (every dev install) keeps its persona at `<repo>/persona`; any other
+// data root holds it at `<dataRoot>/persona`.
 
 // MARK: - Errors
 
@@ -56,27 +48,6 @@ public struct PersonaDoc: Sendable, Equatable, Codable {
 }
 
 // MARK: - Persona-root resolver
-//
-// Mirrors the retired daemon `_resolve_persona_root()` in
-// priority order:
-//   1. NATIVE_AGENT_PERSONA_ROOT env var (LITERAL — no `~` expansion).
-//   2. <stamped_repo>/persona/ if Resources/REPO_PATH is stamped (installed
-//      bundle path), provided the dir exists.
-//   3. <repo_root>/persona/ if it exists AND is NOT inside a `.app` bundle
-//      (Python: `_path_inside_app_bundle` guard — prevents the first-run
-//      onboarding break where SOUL.md silently auto-creates inside the
-//      read-only signed bundle).
-//   4. <data_root>/memory/ legacy fallback.
-//
-// LITERAL-TILDE GOTCHA (production bug already paid for in
-// `PersistenceCore.defaultDataRoot`): every
-// `URL(fileURLWithPath:)` / `URL(fileURLWithFileSystemRepresentation:)`
-// variant silently expands a leading `~`. Python's `Path(env)` does NOT.
-// The only Foundation constructor that preserves the literal tilde is
-// `URLComponents(scheme: "file", path: raw)` — that path bypasses the
-// implicit tilde expansion entirely. The env-var branch below MUST use
-// the URLComponents path; this is pinned by
-// `resolvePersonaRoot_envVar_preserves_literal_tilde`.
 
 public enum PersonaRootResolver {
     /// Resolve persona strictly inside an injected data root.
@@ -84,204 +55,18 @@ public enum PersonaRootResolver {
     /// Secondary runtimes and hermetic tests must not fall through to the
     /// process environment, a stamped repository, or the developer checkout:
     /// those are production seed sources and can expose the personal persona
-    /// to an otherwise isolated body. A valid identity subdirectory still
-    /// requires SOUL.md; otherwise the isolated parent is returned.
-    public static func resolveIsolated(
-        dataRoot: URL,
-        fileManager: FileManager = .default
-    ) -> URL {
-        let parent = dataRoot.standardizedFileURL
-            .appendingPathComponent("persona", isDirectory: true)
-        return firstSeededPersonaDirectory(in: parent, fileManager: fileManager) ?? parent
+    /// to an otherwise isolated body. Always `<dataRoot>/persona`.
+    public static func resolveIsolated(dataRoot: URL) -> URL {
+        dataRoot.standardizedFileURL.appendingPathComponent("persona", isDirectory: true)
     }
 
-    /// Resolve the persona root using the 4-step priority chain. `fileManager`
-    /// + `environment` are injectable so tests can pin behavior without
-    /// touching ProcessInfo / the real filesystem.
+    /// The persona root this process runs: `PersistenceCore.defaultPersonaRoot`
+    /// for the given data root.
     public static func resolve(
         fileManager: FileManager = .default,
-        environment: [String: String] = ProcessInfo.processInfo.environment,
-        repoRoot: URL? = nil,
-        bundleBases: [URL]? = nil,
         dataRootProvider: () -> URL = { PersistenceCore.defaultDataRoot() }
     ) -> URL {
-        let dataRoot = dataRootProvider()
-
-        // Step 1 — optional installed-app identity subdir:
-        // <dataRoot>/persona/<identity>/. Wins only when SOUL.md exists there —
-        // SOUL.md is the identity-doc marker.
-        //
-        // HOTFIX 2026-06-03, kept after the 2026-06-18 USER.md cleanup:
-        // this previously matched on ANY marker, including a lone USER.md.
-        // USER.md is a generated memory projection, not an identity-root
-        // marker. SOUL.md is the identity doc, so requiring it here prevents
-        // a partial persona dir from silently winning over the real root.
-        let canonicalParent = dataRoot.appendingPathComponent("persona", isDirectory: true)
-        if let canonicalDir = firstSeededPersonaDirectory(in: canonicalParent, fileManager: fileManager) {
-            return canonicalDir
-        }
-        if fileManager.fileExists(
-            atPath: canonicalParent.appendingPathComponent("SOUL.md").path
-        ) {
-            return canonicalParent
-        }
-
-        // Step 2 — env var override (dev / CI). Accepted as LITERAL path;
-        // no `~` expansion (see tilde gotcha note at top of file).
-        if let raw = environment["NATIVE_AGENT_PERSONA_ROOT"], !raw.isEmpty {
-            var components = URLComponents()
-            components.scheme = "file"
-            components.path = raw
-            if let url = components.url {
-                return url
-            }
-            // Defensive fallback — accepts the tilde-expansion divergence
-            // rather than crashing on a malformed path.
-            return URL(fileURLWithPath: raw)
-        }
-
-        // Step 3 — stamped REPO_PATH from the running bundle: seed source
-        // when the canonical dataRoot dir is empty (first install). Prefer
-        // <stamped_repo>/persona/<identity>/ only when it has SOUL.md; some legacy
-        // checkouts have identity subdirs as notes-only storage, and accepting
-        // that empty identity dir makes first-run onboarding reopen even though
-        // the real Agent docs live at <stamped_repo>/persona/.
-        if let stamped = stampedRepoFromBundle(fileManager: fileManager, bundleBases: bundleBases) {
-            let personaParent = stamped.appendingPathComponent("persona", isDirectory: true)
-            if let personaDir = firstSeededPersonaDirectory(in: personaParent, fileManager: fileManager) {
-                return personaDir
-            }
-            // Fallback to stamped/persona/ (without Agent subdir) for legacy layouts.
-            let personaDirLegacy = personaParent
-            if fileManager.fileExists(atPath: personaDirLegacy.path) {
-                return personaDirLegacy
-            }
-        }
-
-        // Step 4 — repo_root/persona/, IF it exists AND is NOT inside a `.app`
-        // bundle. `repoRoot` is injectable for tests.
-        let resolvedRepo = repoRoot ?? findRepoRoot(fileManager: fileManager)
-        if let repo = resolvedRepo {
-            let personaDir = repo.appendingPathComponent("persona", isDirectory: true)
-            if fileManager.fileExists(atPath: personaDir.path)
-                && !pathInsideAppBundle(personaDir) {
-                return personaDir
-            }
-        }
-
-        // Final fallback: return the canonical location even if empty.
-        // Callers handle an empty/missing directory gracefully.
-        return canonicalParent
-    }
-
-    // MARK: - helpers
-
-    /// `<App>.app/Contents/...` detector — matches the retired
-    /// `_path_inside_app_bundle` at the retired daemon.
-    /// Public for test access; not part of the migration API.
-    public static func pathInsideAppBundle(_ candidate: URL) -> Bool {
-        let resolved = candidate.resolvingSymlinksInPath()
-        var url = resolved
-        while url.path != "/" {
-            if url.lastPathComponent == "Contents" {
-                let grand = url.deletingLastPathComponent()
-                if grand.pathExtension == "app" || grand.lastPathComponent.hasSuffix(".app") {
-                    return true
-                }
-            }
-            let parent = url.deletingLastPathComponent()
-            if parent.path == url.path { break }
-            url = parent
-        }
-        return false
-    }
-
-    /// Walk up from CWD looking for a directory containing `Package.swift`.
-    /// Returns nil if no match is found. Used as a dev fallback when no
-    /// explicit `repoRoot` is injected.
-    ///
-    /// DAEMON KILLED 2026-06-02: was an `&& exists`
-    /// check; that file is gone. Package.swift alone is the dev-repo marker
-    /// now, mirroring NativeAgentPaths.isValidRepoStamp and the matching fix
-    /// in PersistenceCore (commit 8c10fcc8). Without this fix the persona
-    /// root resolver silently falls through to `<dataRoot>/memory`.
-    private static func findRepoRoot(fileManager: FileManager) -> URL? {
-        let cwd = URL(fileURLWithPath: fileManager.currentDirectoryPath)
-        var dir = cwd
-        for _ in 0..<8 {
-            let pkg = dir.appendingPathComponent("Package.swift")
-            if fileManager.fileExists(atPath: pkg.path) {
-                return dir
-            }
-            let parent = dir.deletingLastPathComponent()
-            if parent.path == dir.path { break }
-            dir = parent
-        }
-        return nil
-    }
-
-    /// Marker files that prove a stamped REPO_PATH target is a real
-    /// NativeAgent source repo. MUST stay in sync with:
-    ///   - the retired daemon::REPO_MARKER_FILES
-    ///   - PersistenceCore's private `repoMarkerFiles`
-    ///   - Sources/NativeAgentApp/NativeAgentPaths.swift::isValidRepoStamp
-    /// Without this validation, a stale/tampered stamp pointing at any
-    /// directory that happens to have a `persona/` subdir would be
-    /// silently accepted — Python rejects via `_validate_stamped_repo_path`
-    /// and falls through to step 3.
-    private static let repoMarkerFiles: [String] = [
-        "persona/SOUL.template.md",
-        "script/init_persona.sh",
-        // DAEMON KILLED 2026-06-02: was "the retired daemon". Replaced
-        // with Package.swift so bundle-stamp validation still passes after
-        // the daemon was deleted (matches PersistenceCore commit 8c10fcc8).
-        // Without this, _stampedRepoFromBundle returns nil → persona root
-        // falls through to legacy `<dataRoot>/memory`.
-        "Package.swift",
-    ]
-
-    /// Mirrors PersistenceCore's `_stampedRepoFromBundle` — reads a `REPO_PATH`
-    /// stamp file inside Bundle.main's Resources hierarchy and returns the
-    /// canonicalized target IFF all `repoMarkerFiles` are present (matches
-    /// Python's `_validate_stamped_repo_path`). Returns nil outside a
-    /// stamped bundle (dev, `swift test` runner) OR when the stamp target
-    /// fails marker validation.
-    private static func stampedRepoFromBundle(
-        fileManager: FileManager,
-        bundleBases: [URL]? = nil
-    ) -> URL? {
-        let bases: [URL]
-        if let injected = bundleBases {
-            bases = injected
-        } else {
-            let main = Bundle.main
-            var defaults: [URL] = []
-            if let res = main.resourceURL { defaults.append(res) }
-            defaults.append(main.bundleURL
-                .appendingPathComponent("Contents", isDirectory: true)
-                .appendingPathComponent("Resources", isDirectory: true))
-            defaults.append(main.bundleURL)
-            bases = defaults
-        }
-        for base in bases {
-            let stamp = base.appendingPathComponent("REPO_PATH")
-            guard fileManager.fileExists(atPath: stamp.path) else { continue }
-            guard let data = try? Data(contentsOf: stamp) else { continue }
-            guard let text = String(data: data, encoding: .utf8) else { continue }
-            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-            if trimmed.isEmpty { continue }
-            let canonical = URL(fileURLWithPath: trimmed).resolvingSymlinksInPath()
-            guard fileManager.fileExists(atPath: canonical.path) else { continue }
-            var allMarkersExist = true
-            for marker in repoMarkerFiles {
-                let m = canonical.appendingPathComponent(marker)
-                if !fileManager.fileExists(atPath: m.path) {
-                    allMarkersExist = false; break
-                }
-            }
-            if allMarkersExist { return canonical }
-        }
-        return nil
+        PersistenceCore.defaultPersonaRoot(dataRoot: dataRootProvider(), fileManager: fileManager)
     }
 }
 

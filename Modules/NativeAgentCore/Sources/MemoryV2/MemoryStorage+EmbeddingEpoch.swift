@@ -26,7 +26,7 @@ extension MemoryStorage {
         guard !FileManager.default.fileExists(atPath: destination.path) else {
             throw MemoryStorageError.databaseUnavailable("frozen-copy destination already exists")
         }
-        try MemoryConsolidationGate.onlineBackup(from: path, to: destination)
+        try MemoryConsolidationGate.onlineBackup(from: dbPool, to: destination)
         return try MemoryStorage(dataRoot: dataRoot, memoryLimit: memoryLimit)
     }
 

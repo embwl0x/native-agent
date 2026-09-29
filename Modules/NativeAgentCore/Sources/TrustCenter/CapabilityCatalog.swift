@@ -962,7 +962,7 @@ public actor SwiftNativeCatalogWrites {
     ///   prune) and >=4 Swift emitters during the cutover, and trace payloads
     ///   can exceed PIPE_BUF so O_APPEND atomicity alone does not prevent torn
     ///   lines, nor does it protect the non-atomic prune `os.replace` against
-    ///   in-flight appenders. See docs/CUTOVER_PLAN.md §6.96.
+    ///   in-flight appenders.
     private func emitCatalogTrace(
         kind: String,
         title: String,

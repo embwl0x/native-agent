@@ -7,6 +7,7 @@ import Speech
 import AVFoundation
 import UniformTypeIdentifiers
 import ChatOrchestration
+import ToolRegistry
 import NativeAgentCore
 import NativeAgentShared
 import MemoryV2
@@ -16,6 +17,7 @@ import CoreSpotlight
 #endif
 #if canImport(CloudKit)
 import CloudKit
+import TrustCenter
 #endif
 
 struct ToolsView: View {
@@ -50,13 +52,13 @@ struct ToolsView: View {
                 }
 
                 catalogContent(ChatToolCatalogPresentation.catalogState(
-                    catalog: appModel.chatToolCatalog,
-                    loadFailed: appModel.chatToolCatalogLoadFailed,
-                    loadError: appModel.chatToolCatalogLoadError
+                    catalog: appModel.engine.tools.catalog,
+                    loadFailed: appModel.engine.tools.catalogLoadError != nil,
+                    loadError: appModel.engine.tools.catalogLoadError
                 ))
 
-                if !appModel.tools.isEmpty {
-                    AuthoredToolsSection(tools: appModel.tools, appModel: appModel)
+                if !appModel.engine.tools.authored.isEmpty {
+                    AuthoredToolsSection(tools: appModel.engine.tools.authored, appModel: appModel)
                 }
 
                 if !appModel.toolOperationStatusReceipts.isEmpty {
@@ -131,7 +133,7 @@ struct ToolsView: View {
                 ChatToolCatalogSection(
                     catalog: catalog,
                     bucketResult: bucketResult,
-                    trustPolicy: appModel.trustPolicy,
+                    trustPolicy: appModel.engine.trust.policy,
                     trustRefreshStatus: appModel.panelRefreshStatus[.tools],
                     jumpToTrust: jumpToTrust
                 )
@@ -140,7 +142,7 @@ struct ToolsView: View {
                     catalog: catalog,
                     bucketResult: bucketResult,
                     staleDetail: detail,
-                    trustPolicy: appModel.trustPolicy,
+                    trustPolicy: appModel.engine.trust.policy,
                     trustRefreshStatus: appModel.panelRefreshStatus[.tools],
                     jumpToTrust: jumpToTrust
                 )
@@ -435,12 +437,6 @@ enum ChatToolCatalogPresentation {
         }
         if tool.name.hasPrefix("mcp__") { return .mcp }
         if let bucket = SwiftToolDispatcher.catalogBucket(forRegisteredToolNamed: tool.name) {
-            if bucket == .core, catalog.currentlyLoaded.contains(tool.name) {
-                return .alwaysOn
-            }
-            return bucket
-        }
-        if let bucket = AppChatToolDispatcher.catalogBucket(forRegisteredToolNamed: tool.name) {
             if bucket == .core, catalog.currentlyLoaded.contains(tool.name) {
                 return .alwaysOn
             }
@@ -836,7 +832,7 @@ enum AuthoredToolPresentation {
     /// receipts. Keep their distinct lifecycle labels explicit rather than
     /// borrowing the catalog's availability wording.
     static func statusBadge(for tool: ToolRecord) -> ChatToolCatalogPresentation.ToolStatusBadge {
-        let status = (tool.status ?? "")
+        let status = tool.status
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
         switch status {

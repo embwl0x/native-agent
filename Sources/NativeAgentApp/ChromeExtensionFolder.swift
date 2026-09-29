@@ -1,5 +1,6 @@
 import Foundation
 import AppKit
+import ChromeControl
 import PersistenceCore
 
 /// The Chrome extension ships inside the app bundle, and Chrome's "Load
@@ -84,9 +85,11 @@ enum ChromeExtensionFolder {
     }
 
     /// At launch: only refresh a copy the person already set up, so an app
-    /// update reaches Chrome. Never creates the folder unasked.
+    /// update reaches Chrome. Never creates the folder unasked. Both shipped
+    /// installs share this folder, so only Chrome's registered host refreshes it.
     static func refreshIfPresent() {
-        guard FileManager.default.fileExists(atPath: visible.path) else { return }
+        guard FileManager.default.fileExists(atPath: visible.path),
+              ChromeNativeHostRegistration.ownsOrUnclaimed() else { return }
         prepare()
     }
 }

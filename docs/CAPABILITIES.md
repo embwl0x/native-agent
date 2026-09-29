@@ -357,7 +357,7 @@ and live account proof.
   captions in all three geometries) before any model, trace, or synced sink
   sees the screen. Typed secret arguments reduce to count+digest everywhere
   they persist.
-- `mac_wake` and `mac_nudge` dismiss a non-locked screensaver or wake a
+- `mac_wake` dismisses a non-locked screensaver or wakes a
   sleeping display; any readable lock evidence refuses, fail-closed, and a
   refusal carries no image or text.
 
@@ -520,8 +520,8 @@ defense-in-depth, not a containment boundary. Read
 - The Organism Kernel and CognitiveSubstrate are experimental. The code default
   is off, but a fresh install enables their shared master path by itself once
   onboarding is complete and the Chat surface has a configured provider
-  (`NativeCognitionRuntime.swift:811`, `:1732`); **Settings → Advanced →
-  Subconscious** is the switch from then on.
+  (`NativeCognitionRuntime.swift:811`, `:1732`); **Settings → An inner life**
+  is the switch from then on.
 - Connector depth varies; a configured OAuth flow is not automatically a
   complete integration.
 - The public Mac release is notarized, Sparkle-updatable, and published through

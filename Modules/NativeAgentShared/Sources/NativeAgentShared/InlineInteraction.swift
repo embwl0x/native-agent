@@ -657,6 +657,8 @@ public struct InlineInteraction: Codable, Sendable, Equatable, Identifiable {
 /// Wire constants shared by the writer, the renderer, and the resolver, so
 /// none of them re-guesses the other's spelling.
 public enum InlineInteractionWire {
+    /// Posted only after a durable card write; object is its originating session.
+    public static let changedNotification = Notification.Name("NativeAgent.inlineInteractionChanged")
     /// `metadata.kind` on the persisted `role: "tool"` row. PRESERVED after
     /// settlement, so "GitHub connected" stays a compact card in scrollback.
     public static let transcriptKind = "inline_interaction"

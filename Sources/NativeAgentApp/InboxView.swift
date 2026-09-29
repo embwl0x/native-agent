@@ -3,113 +3,13 @@ import SwiftUI
 import Observation
 import NativeAgentShared
 import NativeAgentCore
+import NotificationInbox
+import DeviceSync
 
 // MARK: - Models
 
-/// The inbox reader deliberately keeps cards with a bad optional source rather
-/// than dropping the whole record. Preserve why the source is unavailable so
-/// the visible provenance badge does not turn a bad wire value into silence.
-enum InboxSourceReadState: Hashable {
-    case present
-    case missing
-    case malformed
-}
-
-struct InboxItemRecord: Identifiable, Codable, Hashable {
-    let id: String
-    let created_at: String
-    let source: String
-    let sourceReadState: InboxSourceReadState
-    let severity: String      // info | important | actionable
-    let title: String
-    let summary: String
-    let detail: String?
-    let relatedWorkshopExecutionId: String?
-    let related_approval_id: String?
-    let related_paths: [String]?
-    let related_groups: [InboxRelatedGroup]?
-    let actions: [InboxActionRecord]
-    // ui-honesty 2026-06-10: `var` so the UI can patch a row to "read" locally
-    // after a successful read action, without waiting on a full reload.
-    var status: String        // unread | read | archived | dismissed
-    let read_at: String?
-
-    enum CodingKeys: String, CodingKey {
-        case id, created_at, source, severity, title, summary, detail
-        case relatedWorkshopExecutionId = "related_mission_id" // compatibility wire ID
-        case related_approval_id, related_paths, related_groups
-        case actions, status, read_at
-    }
-
-    /// Wave 4 (phase A) read-both: accept the FUTURE `related_execution_id`
-    /// spelling as well as the on-wire `related_mission_id` above. Decode-only —
-    /// `encode(to:)` below still writes `related_mission_id`, so the inbox
-    /// snapshot a 0.3.7 iOS install reads is byte-identical.
-    private enum FutureCodingKeys: String, CodingKey {
-        case related_execution_id
-    }
-
-    init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        id = try c.decode(String.self, forKey: .id)
-        created_at = (try? c.decode(String.self, forKey: .created_at)) ?? ""
-        if !c.contains(.source) {
-            source = ""
-            sourceReadState = .missing
-        } else if let decodedSource = try? c.decode(String.self, forKey: .source) {
-            source = decodedSource
-            sourceReadState = .present
-        } else {
-            source = ""
-            sourceReadState = .malformed
-        }
-        severity = (try? c.decode(String.self, forKey: .severity)) ?? "info"
-        title = (try? c.decode(String.self, forKey: .title)) ?? ""
-        summary = (try? c.decode(String.self, forKey: .summary)) ?? ""
-        detail = try? c.decodeIfPresent(String.self, forKey: .detail)
-        let futureRelatedExecutionId: String? = {
-            guard let future = try? decoder.container(keyedBy: FutureCodingKeys.self) else {
-                return nil
-            }
-            return try? future.decodeIfPresent(String.self, forKey: .related_execution_id)
-        }()
-        relatedWorkshopExecutionId = futureRelatedExecutionId
-            ?? (try? c.decodeIfPresent(String.self, forKey: .relatedWorkshopExecutionId))
-            ?? nil
-        related_approval_id = try? c.decodeIfPresent(String.self, forKey: .related_approval_id)
-        related_paths = try? c.decodeIfPresent([String].self, forKey: .related_paths)
-        related_groups = try? c.decodeIfPresent([InboxRelatedGroup].self, forKey: .related_groups)
-        actions = (try? c.decode([InboxActionRecord].self, forKey: .actions)) ?? []
-        status = (try? c.decode(String.self, forKey: .status)) ?? "unread"
-        read_at = try? c.decodeIfPresent(String.self, forKey: .read_at)
-    }
-
-    func encode(to encoder: Encoder) throws {
-        var c = encoder.container(keyedBy: CodingKeys.self)
-        try c.encode(id, forKey: .id)
-        try c.encode(created_at, forKey: .created_at)
-        try c.encode(source, forKey: .source)
-        try c.encode(severity, forKey: .severity)
-        try c.encode(title, forKey: .title)
-        try c.encode(summary, forKey: .summary)
-        try c.encodeIfPresent(detail, forKey: .detail)
-        try c.encodeIfPresent(relatedWorkshopExecutionId, forKey: .relatedWorkshopExecutionId)
-        try c.encodeIfPresent(related_approval_id, forKey: .related_approval_id)
-        try c.encodeIfPresent(related_paths, forKey: .related_paths)
-        try c.encodeIfPresent(related_groups, forKey: .related_groups)
-        try c.encode(actions, forKey: .actions)
-        try c.encode(status, forKey: .status)
-        try c.encodeIfPresent(read_at, forKey: .read_at)
-    }
-
-    var normalizedStatus: String {
-        status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-    }
-
-    var isUnread: Bool { normalizedStatus == "unread" }
-    var isActivityPending: Bool {
-        normalizedStatus == "unread" || normalizedStatus == "active"
-    }
+/// Presentation over the core inbox card (`NotificationInbox.InboxItemRecord`).
+extension InboxItemRecord {
     var isHiddenFromDefaultInbox: Bool {
         normalizedStatus == "archived" || normalizedStatus == "dismissed"
     }
@@ -343,6 +243,7 @@ enum InboxVisibleActionsPresentation {
     ]).union(HeartbeatCardAction.ids)
 
     static func actions(for item: InboxItemRecord) -> [InboxActionRecord] {
+        guard !item.isHiddenFromDefaultInbox else { return [] }
         var seen: Set<String> = []
         var visible: [InboxActionRecord] = []
 
@@ -788,12 +689,6 @@ enum InboxDetailActionPresentation {
     }
 }
 
-/// The only route from a persisted digest card to its Review Groups controls.
-/// New cards use the structured wire; prose remains compatibility for existing
-/// JSONL cards only.
-extension InboxItemRecord: InboxDigestItem {}
-extension InboxRelatedGroup: InboxDigestGroup {}
-
 enum InboxDetailGroupProjection {
     static func groups(item: InboxItemRecord, allItems: [InboxItemRecord]) -> [InboxRelatedGroup] {
         InboxDigestGroupProjection.groups(item: item, allItems: allItems)
@@ -917,7 +812,7 @@ enum InboxLanePresentation {
     }
 }
 
-/// `AppModel.inboxItems` is a shared snapshot for badges and compact surfaces;
+/// `engine.inbox.items` is a shared snapshot for badges and compact surfaces;
 /// the mounted Inbox also owns an action-time copy. A confirmed reload can
 /// remove a card before a stale shared snapshot arrives, so that old snapshot
 /// must not put the resolved card back on screen.
@@ -1196,7 +1091,7 @@ struct InboxView: View {
             }
         }
         .task { await load() }
-        .onChange(of: appModel.inboxItems) { _, latest in
+        .onChange(of: appModel.engine.inbox.items) { _, latest in
             inboxLoadState.replaceItems(latest)
         }
     }
@@ -1258,16 +1153,16 @@ struct InboxView: View {
 
     func load() async {
         let loaded = await inboxLoadState.reload {
-            try await client.getInboxItems(unreadOnly: false)
+            try await appModel.engine.inbox.list()
         }
-        if loaded && appModel.inboxItems != inboxLoadState.items {
-            appModel.inboxItems = inboxLoadState.items
+        if loaded && appModel.engine.inbox.items != inboxLoadState.items {
+            appModel.engine.inbox.items = inboxLoadState.items
         }
     }
 
     func loadAndSync() async {
         await load()
-        await MacSyncEngine.shared.writeSnapshots()
+        await NativeAgentEngine.liveDeviceSync.engine.writeSnapshots()
     }
 
     // ui-honesty 2026-06-10: after the detail sheet's "read" action succeeds,
@@ -1275,10 +1170,7 @@ struct InboxView: View {
     // — the unread dot/bold clear immediately without a full reload.
     private func markRead(_ id: String) {
         inboxLoadState.markRead(id)
-        if let idx = appModel.inboxItems.firstIndex(where: { $0.id == id }),
-           appModel.inboxItems[idx].isUnread {
-            appModel.inboxItems[idx].status = "read"
-        }
+        appModel.engine.inbox.markRead(id)
     }
 }
 
@@ -1359,7 +1251,16 @@ struct InboxListRow: View {
         InboxVisibleActionsPresentation.actions(for: item)
     }
 
+    @ViewBuilder
     var body: some View {
+        if item.source == InteractionCardDelivery.source {
+            InteractionInboxCard(item: item)
+        } else {
+            ordinaryRow
+        }
+    }
+
+    private var ordinaryRow: some View {
         GlassCard(tint: item.isUnread ? item.severityColor : nil, scrollRow: true) {
             VStack(alignment: .leading, spacing: 10) {
                 HStack(alignment: .top, spacing: 10) {
@@ -1393,26 +1294,30 @@ struct InboxListRow: View {
                 }
 
                 if !visibleActions.isEmpty {
-                    ScrollView(.horizontal, showsIndicators: false) {
-                        HStack(spacing: 8) {
-                            ForEach(visibleActions, id: \.id) { action in
-                                if isPrimaryAction(action.id) {
-                                    Button(action.label) {
-                                        runAction(action.id)
-                                    }
-                                    .buttonStyle(.borderedProminent)
-                                    .tint(.orange)
-                                    .controlSize(.small)
-                                    .disabled(actionFlight.isInFlight)
-                                } else {
-                                    Button(action.label) {
-                                        runAction(action.id)
-                                    }
-                                    .buttonStyle(.bordered)
-                                    .controlSize(.small)
-                                    .disabled(actionFlight.isInFlight)
+                    // One main button, the rest in the Mac's own menu (User 09-27:
+                    // all controls native; no sideways-scrolling button strip).
+                    let primary = visibleActions.filter { isPrimaryAction($0.id) }
+                    let others = visibleActions.filter { !isPrimaryAction($0.id) }
+                    HStack(spacing: 8) {
+                        ForEach(primary, id: \.id) { action in
+                            Button(action.label) { runAction(action.id) }
+                                .buttonStyle(.borderedProminent)
+                                .controlSize(.small)
+                                .disabled(actionFlight.isInFlight)
+                        }
+                        if !others.isEmpty {
+                            Menu {
+                                ForEach(others, id: \.id) { action in
+                                    Button(action.label) { runAction(action.id) }
                                 }
+                            } label: {
+                                Label(primary.isEmpty ? "Actions" : "More", systemImage: "ellipsis.circle")
                             }
+                            .menuStyle(.button)
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            .fixedSize()
+                            .disabled(actionFlight.isInFlight)
                         }
                     }
                 }

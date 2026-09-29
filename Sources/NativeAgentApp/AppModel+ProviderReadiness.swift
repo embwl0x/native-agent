@@ -57,9 +57,8 @@ extension AppModel {
     /// contract directly: a resolvable binary with no auth on disk must NOT
     /// count as a usable provider.
     ///
-    /// Process-global credential sources (`~/.codex/auth.json`, environment API
-    /// keys) are consulted only when `dataRoot` is the installed app's real data
-    /// root. A test or secondary runtime with an injected root must not inherit
+    /// The process-global credential source (`~/.codex/auth.json`) is
+    /// consulted only when `dataRoot` is the installed app's real data root. A test or secondary runtime with an injected root must not inherit
     /// the developer's personal credentials and report a provider its root does
     /// not own — the same hermeticity rule the organism evidence path uses.
     nonisolated static func hasAnyUsableProvider(
@@ -121,11 +120,6 @@ extension AppModel {
                 .appendingPathComponent("auth.json")
             if codexAuthFileIsUsable(homeCodexAuth) { return true }
         }
-
-        // 4. Environment API keys the credential resolver honors.
-        let keyVars = ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY",
-                       "MOONSHOT_API_KEY", "KIMI_CODE_API_KEY", "XAI_API_KEY"]
-        if keyVars.contains(where: { environment[$0]?.isEmpty == false }) { return true }
 
         // FIRSTRUN-1: deliberately NO bare-binary branch here. `codex` being
         // installed says nothing about whether the user can send a message; an

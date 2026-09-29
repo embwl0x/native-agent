@@ -42,6 +42,23 @@ enum MacAXAttributeRead {
         if let own = copyString(element, kAXTitleAttribute) ?? copyString(element, kAXDescriptionAttribute) {
             return own
         }
+        let fallback = copyCaption(element, role: role)
+        guard fallback == nil, hintNamedRoles.contains(role) else { return fallback }
+        // Last resort for a control that names itself nowhere else: its
+        // placeholder ("Reply to Claude…") or its tooltip. Controls only — the
+        // hundreds of unnamed groups in a web page never pay the two reads.
+        return copyString(element, kAXPlaceholderValueAttribute) ?? copyString(element, kAXHelpAttribute)
+    }
+
+    /// Fields that answer to their placeholder as a second name.
+    static let placeholderRoles: Set<String> = ["AXTextField", "AXTextArea", "AXComboBox", "AXSearchField"]
+
+    private static let hintNamedRoles: Set<String> = [
+        "AXButton", "AXTextField", "AXTextArea", "AXComboBox", "AXPopUpButton", "AXMenuButton",
+        "AXCheckBox", "AXRadioButton", "AXLink", "AXSlider", "AXDisclosureTriangle",
+    ]
+
+    private static func copyCaption(_ element: AXUIElement, role: String) -> String? {
         guard MacPerceptionCompiler.captionedRoles.contains(role) else { return nil }
         if let caption = copyElement(element, kAXTitleUIElementAttribute) {
             return MacPerceptionCompiler.captionText(

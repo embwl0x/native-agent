@@ -2,6 +2,7 @@ import Darwin
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import Desk
 
 @main
 struct TaskLedgerCLI {
@@ -56,13 +57,17 @@ struct TaskLedgerCLI {
             fputs("error: append received unexpected positional argument '\(parsed.positionals[0])'\n", stderr)
             return 64
         }
-        guard let actor = actor(parsed.options["actor"]) else {
-            fputs("error: append requires --actor claude|assistant|codex|user\n", stderr)
-            return 64
-        }
         let kindRaw = parsed.options["kind"] ?? "created"
         guard let kind = TaskLedgerKind(rawValue: kindRaw) else {
             fputs("error: unknown kind '\(kindRaw)' (expected one of \(kindList()))\n", stderr)
+            return 64
+        }
+        guard kind != .deleted else {
+            fputs("error: deleted requires task_ledger_post with expected_title\n", stderr)
+            return 64
+        }
+        guard let actor = actor(parsed.options["actor"]) else {
+            fputs("error: append requires --actor claude|assistant|codex|user\n", stderr)
             return 64
         }
         let taskId: String
@@ -191,7 +196,7 @@ struct TaskLedgerCLI {
     }
 
     static func kindList() -> String {
-        TaskLedgerKind.allCases.map(\.rawValue).joined(separator: "/")
+        TaskLedgerKind.allCases.filter { $0 != .deleted }.map(\.rawValue).joined(separator: "/")
     }
 
     static func emptyToNil(_ value: String?) -> String? {

@@ -287,7 +287,7 @@ struct NativeSecurityCenterPanel: View {
     }
 
     private static func liveStatus(limit: Int) async throws -> SecurityCenterStatus {
-        await SwiftNativeSecurityCenter().status(limit: limit)
+        try await SwiftNativeSecurityCenter().status(limit: limit)
     }
 }
 

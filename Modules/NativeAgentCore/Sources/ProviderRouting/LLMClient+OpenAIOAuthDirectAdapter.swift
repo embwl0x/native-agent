@@ -1,6 +1,8 @@
 import Foundation
+import os
 import NativeAgentCore
 import PersistenceCore
+import TurnTrace
 
 // MARK: - OpenAIOAuthDirectAdapter
 //
@@ -195,7 +197,7 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
     }
 
     private func responsesRequest(accessToken: String) throws -> URLRequest {
-        guard let accountID = currentAccountID() else {
+        guard let accountID = try currentAccountID(accessToken: accessToken) else {
             throw LLMError.notConfigured(provider: "openai_oauth_direct")
         }
 
@@ -234,7 +236,7 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
     ) async throws -> CodexOAuthAccessContext {
         let access = try await ensureFreshAccessToken(
             forceRefresh: forceRefresh, staleToken: staleToken)
-        guard let accountID = currentAccountID() else {
+        guard let accountID = try currentAccountID(accessToken: access) else {
             throw LLMError.notConfigured(provider: "openai_oauth_direct")
         }
         return CodexOAuthAccessContext(
@@ -261,6 +263,7 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
         // User, 2026-09-06: the token the last attempt actually sent, handed to
         // the forced refresh so a rotation another caller already performed is
         // taken instead of burning a second single-use refresh_token.
+        let requestAccount = OAuthRequestAccount()
         var lastSentAccessToken: String?
         for attempt in 0...1 {
             try Task.checkCancellation()
@@ -268,7 +271,7 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
             do {
                 access = try await ensureFreshAccessToken(
                     forceRefresh: forceTokenRefresh,
-                    staleToken: lastSentAccessToken
+                    staleToken: lastSentAccessToken, requestAccount: requestAccount
                 )
                 forceTokenRefresh = false
                 lastSentAccessToken = access
@@ -350,6 +353,8 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
         throw LLMError.notConfigured(provider: "openai_oauth_direct")
     }
 
+    public func messagesStreamKind(tools: [LLMToolSchema]?) -> LLMMessagesStreamKind { .incremental }
+
     public func streamMessages(
         messages: [LLMMessage],
         system: String?,
@@ -380,6 +385,7 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
         // User, 2026-09-06: the token the last attempt actually sent, handed to
         // the forced refresh so a rotation another caller already performed is
         // taken instead of burning a second single-use refresh_token.
+        let requestAccount = OAuthRequestAccount()
         var lastSentAccessToken: String?
                 for attempt in 0...1 {
                     var emittedProviderOutput = false
@@ -389,7 +395,7 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
                         do {
                             access = try await ensureFreshAccessToken(
                                 forceRefresh: forceTokenRefresh,
-                                staleToken: lastSentAccessToken
+                                staleToken: lastSentAccessToken, requestAccount: requestAccount
                             )
                             forceTokenRefresh = false
                             lastSentAccessToken = access
@@ -440,6 +446,14 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
                         }
                         var pendingByItemId: [String: PendingCall] = [:]
                         var pendingOrder: [String] = []
+                        var replyTextSettled = false
+                        var sawFunctionCall = false
+                        func resumeReply() {
+                            if replyTextSettled {
+                                replyTextSettled = false
+                                continuation.yield(.replyTextSettled(false))
+                            }
+                        }
                         // U1 step 1 — streaming telemetry: TTFT stamped at
                         // the FIRST meaningful output frame — text delta,
                         // function_call output_item.added, or first argument
@@ -468,6 +482,8 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
                         }
 
                         func yieldToolCall(id: String, name: String, args: String) {
+                            sawFunctionCall = true
+                            resumeReply()
                             let body = args.isEmpty ? "{}" : args
                             stampTTFT()
                             continuation.yield(.toolCall(LLMStreamToolCall(
@@ -477,6 +493,7 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
                             )))
                         }
 
+                        var lastRawDelta: ContinuousClock.Instant?
                         func processPayload(_ payloadStr: String) throws -> Bool {
                             if payloadStr == "[DONE]" { return true }
                             guard let pdata = payloadStr.data(using: .utf8),
@@ -495,6 +512,8 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
                             let etype = event["type"] as? String ?? ""
                             if etype == "response.output_text.delta" {
                                 if let delta = event["delta"] as? String, !delta.isEmpty {
+                                    lastRawDelta = ContinuousClock.now
+                                    resumeReply()
                                     stampTTFT()
                                     continuation.yield(.textDelta(delta))
                                     if runaway.feed(delta) {
@@ -506,6 +525,8 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
                                 if let item = event["item"] as? [String: Any],
                                    (item["type"] as? String) == "function_call",
                                    let id = item["id"] as? String {
+                                    sawFunctionCall = true
+                                    resumeReply()
                                     // First model-output frame for a
                                     // tool-call-first response — stamp TTFT
                                     // here, not at output_item.done.
@@ -517,6 +538,8 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
                                     pendingOrder.append(id)
                                 }
                             } else if etype == "response.function_call_arguments.delta" {
+                                sawFunctionCall = true
+                                resumeReply()
                                 if let id = event["item_id"] as? String,
                                    let delta = event["delta"] as? String {
                                     // Argument deltas are model output even
@@ -536,6 +559,12 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
                                 // (pre-existing gap, gpt-5.5 review 2026-06-15).
                                 continuation.yield(.keepAlive)
                             } else if etype == "response.output_item.done" {
+                                if let item = event["item"] as? [String: Any],
+                                   (item["type"] as? String) == "message",
+                                   lastRawDelta != nil, !sawFunctionCall, !replyTextSettled {
+                                    replyTextSettled = true
+                                    continuation.yield(.replyTextSettled(true))
+                                }
                                 if let item = event["item"] as? [String: Any],
                                    (item["type"] as? String) == "function_call",
                                    let id = item["id"] as? String {
@@ -878,6 +907,7 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
         // User, 2026-09-06: the token the last attempt actually sent, handed to
         // the forced refresh so a rotation another caller already performed is
         // taken instead of burning a second single-use refresh_token.
+        let requestAccount = OAuthRequestAccount()
         var lastSentAccessToken: String?
         for attempt in 0...1 {
             try Task.checkCancellation()
@@ -885,7 +915,7 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
             do {
                 access = try await ensureFreshAccessToken(
                     forceRefresh: forceTokenRefresh,
-                    staleToken: lastSentAccessToken
+                    staleToken: lastSentAccessToken, requestAccount: requestAccount
                 )
                 forceTokenRefresh = false
                 lastSentAccessToken = access
@@ -1254,12 +1284,14 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
     /// already rotated, instead of rotating again (User, 2026-09-06).
     func ensureFreshAccessToken(
         forceRefresh: Bool = false,
-        staleToken: String? = nil
+        staleToken: String? = nil,
+        requestAccount: OAuthRequestAccount = OAuthRequestAccount()
     ) async throws -> String {
         // Fast path OUTSIDE the lock — check disk; return if still fresh.
         guard let blob0 = loadAuthBlob() else {
             throw LLMError.notConfigured(provider: "openai_oauth_direct")
         }
+        try requestAccount.check(blob0, provider: "openai_oauth_direct", rejectedToken: staleToken)
         let tokens0 = (blob0["tokens"] as? [String: Any]) ?? [:]
         guard let access0 = tokens0["access_token"] as? String, !access0.isEmpty else {
             throw LLMError.notConfigured(provider: "openai_oauth_direct")
@@ -1295,6 +1327,7 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
             guard let blob = self.loadAuthBlob() else {
                 throw LLMError.notConfigured(provider: "openai_oauth_direct")
             }
+            try requestAccount.check(blob, provider: "openai_oauth_direct")
             let tokens = (blob["tokens"] as? [String: Any]) ?? [:]
             guard let access = tokens["access_token"] as? String, !access.isEmpty else {
                 throw LLMError.notConfigured(provider: "openai_oauth_direct")
@@ -1324,7 +1357,7 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
                     return access  // someone else already refreshed
                 }
             }
-            return try await self.refreshTokens()
+            return try await self.refreshTokens(requestAccount: requestAccount)
         }
     }
 
@@ -1332,7 +1365,7 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
     /// lock-protected refresh block at L511-L531 + `_refresh_with_refresh_
     /// token` at L533-L558.
     @discardableResult
-    func refreshTokens() async throws -> String {
+    func refreshTokens(requestAccount: OAuthRequestAccount = OAuthRequestAccount()) async throws -> String {
         // User, 2026-09-06: resolve the path ONCE, before the network call. It
         // used to be resolved again at write time, and candidate resolution
         // probes the filesystem — a sign-out that deleted the app-owned file
@@ -1347,10 +1380,14 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
         let baseline = try? Data(contentsOf: path)
         guard let baseline,
               let blob = try? JSONSerialization.jsonObject(with: baseline) as? [String: Any],
-              let tokens = blob["tokens"] as? [String: Any],
-              let refresh = tokens["refresh_token"] as? String, !refresh.isEmpty else {
+              let tokens = blob["tokens"] as? [String: Any] else {
             throw LLMError.notConfigured(provider: "openai_oauth_direct")
         }
+        try requestAccount.check(blob, provider: "openai_oauth_direct")
+        guard let refresh = tokens["refresh_token"] as? String, !refresh.isEmpty else {
+            throw LLMError.notConfigured(provider: "openai_oauth_direct")
+        }
+        try OAuthRefreshBinding.requireRefresh(blob, provider: "openai_oauth_direct")
         // Build the form body — NO scope, NO redirect_uri (matches Python's
         // exact body shape at L536-L540).
         var components = URLComponents()
@@ -1404,6 +1441,7 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
         guard let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw LLMError.underlying(message: "refresh: unparseable response")
         }
+        try OAuthRefreshBinding.requireSameAccount(payload, original: blob, provider: "openai_oauth_direct")
 
         // Merge new tokens into existing — preserving account_id and any
         // other fields the refresh response doesn't return. Same merge
@@ -1444,14 +1482,14 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
         // could resurrect a deleted credential or overwrite a newer one with
         // the older account's tokens. The bytes captured before the network
         // call are the generation: if they moved, this refresh is stale, its
-        // write is skipped, and the caller is served whatever credential now
-        // owns the file.
+        // write is skipped. The caller can use the replacement only when it
+        // remains bound to the request's original account.
         // User, 2026-09-06: the comparison and the write now sit in ONE
         // critical section on the credential path's shared lock — the app's
         // sign-in and sign-out take the same lock — because a compare followed
         // by an unguarded write still lost every sign-out that landed between
         // the two.
-        enum RefreshWrite { case wrote, superseded(String), supersededAndGone }
+        enum RefreshWrite { case wrote, superseded(Data), supersededAndGone }
         let outcome: RefreshWrite
         do {
             // Serialize the blob to bytes outside the closure so we don't
@@ -1462,7 +1500,7 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
             )
             outcome = try CredentialFileLock.withLock(path) { () -> RefreshWrite in
                 guard (try? Data(contentsOf: path)) == baseline else {
-                    guard let current = Self.storedAccessToken(at: path) else {
+                    guard let current = try? Data(contentsOf: path) else {
                         return .supersededAndGone
                     }
                     return .superseded(current)
@@ -1485,8 +1523,14 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
         }
         switch outcome {
         case .superseded(let current):
-            // Another writer owns the file now. Its credential is the live one.
-            return current
+            guard let object = try JSONSerialization.jsonObject(with: current) as? [String: Any] else {
+                throw LLMError.notConfigured(provider: "openai_oauth_direct")
+            }
+            try requestAccount.check(object, provider: "openai_oauth_direct")
+            guard let access = OAuthRefreshBinding.string(OAuthRefreshBinding.tokenSet(object, provider: "openai_oauth_direct")["access_token"]) else {
+                throw LLMError.notConfigured(provider: "openai_oauth_direct")
+            }
+            return access
         case .supersededAndGone:
             throw LLMError.notConfigured(provider: "openai_oauth_direct")
         case .wrote:

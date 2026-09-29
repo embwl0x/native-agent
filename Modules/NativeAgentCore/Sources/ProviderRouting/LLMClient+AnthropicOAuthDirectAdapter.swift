@@ -2,6 +2,7 @@ import Foundation
 import os
 import NativeAgentCore
 import PersistenceCore
+import TurnTrace
 
 /// Optional effect-time admission carried through an unattended adapter call.
 /// Ordinary chat leaves this nil. Throws propagate without transport remapping.
@@ -344,13 +345,14 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
         // the forced refresh so a rotation another caller already performed is
         // taken instead of burning a second single-use refresh_token — N
         // simultaneous 401s otherwise rotated N times and signed the user out.
+        let requestAccount = OAuthRequestAccount()
         var lastSentAccessToken: String?
         for attempt in 0...1 {
             try Task.checkCancellation()
             let accessToken: String
             do {
                 accessToken = try await ensureFreshAccessToken(
-                    forceRefresh: attempt == 1, staleToken: lastSentAccessToken)
+                    forceRefresh: attempt == 1, staleToken: lastSentAccessToken, requestAccount: requestAccount)
                 lastSentAccessToken = accessToken
             } catch is CancellationError { throw CancellationError() }
             catch let err as LLMError { throw err }
@@ -434,13 +436,14 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
         // the forced refresh so a rotation another caller already performed is
         // taken instead of burning a second single-use refresh_token — N
         // simultaneous 401s otherwise rotated N times and signed the user out.
+        let requestAccount = OAuthRequestAccount()
         var lastSentAccessToken: String?
         for attempt in 0...1 {
             try Task.checkCancellation()
             let accessToken: String
             do {
                 accessToken = try await ensureFreshAccessToken(
-                    forceRefresh: attempt == 1, staleToken: lastSentAccessToken)
+                    forceRefresh: attempt == 1, staleToken: lastSentAccessToken, requestAccount: requestAccount)
                 lastSentAccessToken = accessToken
             } catch is CancellationError {
                 throw CancellationError()
@@ -577,11 +580,12 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
         // the forced refresh so a rotation another caller already performed is
         // taken instead of burning a second single-use refresh_token — N
         // simultaneous 401s otherwise rotated N times and signed the user out.
+        let requestAccount = OAuthRequestAccount()
         var lastSentAccessToken: String?
         for attempt in 0...1 {
             try Task.checkCancellation()
             let accessToken = try await ensureFreshAccessToken(
-                forceRefresh: attempt == 1, staleToken: lastSentAccessToken)
+                forceRefresh: attempt == 1, staleToken: lastSentAccessToken, requestAccount: requestAccount)
             lastSentAccessToken = accessToken
 
             var req = URLRequest(url: endpoint)
@@ -727,6 +731,8 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
         }
     }
 
+    public func messagesStreamKind(tools: [LLMToolSchema]?) -> LLMMessagesStreamKind { .incremental }
+
     // MARK: - U1 item 9 — real SSE over messages-shaped bodies
     //
     // The LLMAdapter default `streamMessages` falls back to NON-streaming
@@ -783,11 +789,12 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
         // the forced refresh so a rotation another caller already performed is
         // taken instead of burning a second single-use refresh_token — N
         // simultaneous 401s otherwise rotated N times and signed the user out.
+        let requestAccount = OAuthRequestAccount()
         var lastSentAccessToken: String?
         for attempt in 0...1 {
             try Task.checkCancellation()
             let accessToken = try await ensureFreshAccessToken(
-                forceRefresh: attempt == 1, staleToken: lastSentAccessToken)
+                forceRefresh: attempt == 1, staleToken: lastSentAccessToken, requestAccount: requestAccount)
             lastSentAccessToken = accessToken
 
             var req = URLRequest(url: endpoint)
@@ -1006,11 +1013,17 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
     /// is set. Mirrors OpenAIOAuthDirectAdapter.ensureFreshAccessToken.
     func ensureFreshAccessToken(
         forceRefresh: Bool = false,
-        staleToken: String? = nil
+        staleToken: String? = nil,
+        requestAccount: OAuthRequestAccount = OAuthRequestAccount()
     ) async throws -> String {
         let path = resolveAuthPath()
+        let data = try Data(contentsOf: path)
+        guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw LLMError.notConfigured(provider: "anthropic_oauth_direct")
+        }
+        try requestAccount.check(object, provider: "anthropic_oauth_direct", rejectedToken: staleToken)
         // Fast path — no refresh needed.
-        if !forceRefresh, let (token, exp) = Self.loadAccessTokenAndExpiry(from: path) {
+        if !forceRefresh, let (token, exp) = Self.accessTokenAndExpiry(in: object) {
             if let exp = exp {
                 if exp.timeIntervalSinceNow > Self.tokenExpiryBufferSec {
                     return token
@@ -1026,6 +1039,11 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
         // Slow path — serialize.
         let actor = Self.sharedRefreshActor(for: path)
         return try await actor.run { [self] in
+            let data = try Data(contentsOf: path)
+            guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                throw LLMError.notConfigured(provider: "anthropic_oauth_direct")
+            }
+            try requestAccount.check(object, provider: "anthropic_oauth_direct")
             // Re-read inside the critical section in case another waiter
             // already refreshed.
             // User, 2026-09-06: the reread was skipped entirely on a forced
@@ -1035,24 +1053,18 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
             // the user out. A forced refresh whose on-disk token has already
             // moved past the one the failing request sent takes the new token.
             if forceRefresh, let staleToken, !staleToken.isEmpty,
-               let (token, _) = Self.loadAccessTokenAndExpiry(from: path),
+               let (token, _) = Self.accessTokenAndExpiry(in: object),
                token != staleToken {
                 return token
             }
-            if !forceRefresh, let (token, exp) = Self.loadAccessTokenAndExpiry(from: path) {
+            if !forceRefresh, let (token, exp) = Self.accessTokenAndExpiry(in: object) {
                 if let exp = exp, exp.timeIntervalSinceNow > Self.tokenExpiryBufferSec {
                     return token
                 }
                 if exp == nil { return token }
             }
-            return try await self.refreshTokens()
+            return try await self.refreshTokens(requestAccount: requestAccount)
         }
-    }
-
-    /// True when a signed-in Anthropic OAuth credential is on disk at this
-    /// adapter's own path (User, 2026-09-06 — see `OAuthCredentialPresence`).
-    var hasStoredOAuthCredential: Bool {
-        Self.loadAccessTokenAndExpiry(from: resolveAuthPath()) != nil
     }
 
     /// Read `(access_token, expires_at)` from the JSON. Returns nil if the
@@ -1062,13 +1074,42 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
         guard let data = try? Data(contentsOf: path),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         else { return nil }
-        let access: String? = (obj["access_token"] as? String)
-            ?? (obj["tokens"] as? [String: Any]).flatMap { $0["access_token"] as? String }
+        return accessTokenAndExpiry(in: obj)
+    }
+
+    private static func accessTokenAndExpiry(in obj: [String: Any]) -> (String, Date?)? {
+        let tokens = OAuthRefreshBinding.tokenSet(obj, provider: "anthropic_oauth_direct")
+        let access = tokens["access_token"] as? String
         guard let token = access, !token.isEmpty else { return nil }
         let expRaw: Any? = obj["expires_at"]
             ?? (obj["tokens"] as? [String: Any]).flatMap { $0["expires_at"] }
         let exp = expRaw.flatMap(parseExpiresAt)
         return (token, exp)
+    }
+
+    /// Can the credential in `auth` (this adapter's auth file, parsed) serve a
+    /// call? Answered by the rules `ensureFreshAccessToken` itself applies: a
+    /// token `loadAccessTokenAndExpiry` reads, used as-is when it carries no
+    /// expiry or has more than `tokenExpiryBufferSec` left, and otherwise a
+    /// `refresh_token` that `refreshTokens` can spend. Routing readiness and
+    /// the Providers page ask this, so neither reports signed in for a file
+    /// the adapter refuses — a bare `setup_token` key, for one (the app saves
+    /// a setup token as `access_token`).
+    public static func credentialStatus(_ auth: [String: Any]?) -> (usable: Bool, detail: String) {
+        guard let auth else { return (false, "anthropic_oauth_direct.json missing or malformed") }
+        let tokens = OAuthRefreshBinding.tokenSet(auth, provider: "anthropic_oauth_direct")
+        let canRefresh = OAuthRefreshBinding.string(tokens["refresh_token"]) != nil
+            && OAuthRefreshBinding.permitsRefresh(auth, provider: "anthropic_oauth_direct")
+        guard let (_, expiry) = accessTokenAndExpiry(in: auth) else {
+            return canRefresh
+                ? (true, "No access_token - refresh on next chat")
+                : (false, "no access_token - sign in required")
+        }
+        guard let expiry else { return (true, "Signed in") }
+        if expiry.timeIntervalSinceNow > tokenExpiryBufferSec { return (true, "Signed in (valid)") }
+        return canRefresh
+            ? (true, "Access expired - refresh on next chat")
+            : (false, "Access expired and no refresh_token - re-auth required")
     }
 
     /// Accept ISO basic ("2026-06-03T18:23:45Z"), full ISO with fractional
@@ -1113,19 +1154,21 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
     /// caller sees `.notConfigured` — the api-key adapter chain will then
     /// take over (and likely also throw, but with the right error shape).
     @discardableResult
-    func refreshTokens() async throws -> String {
+    func refreshTokens(requestAccount: OAuthRequestAccount = OAuthRequestAccount()) async throws -> String {
         let path = resolveAuthPath()
         guard let data = try? Data(contentsOf: path),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         else {
             throw LLMError.notConfigured(provider: "anthropic_oauth_direct")
         }
-        let refresh: String? = (obj["refresh_token"] as? String)
-            ?? (obj["tokens"] as? [String: Any]).flatMap { $0["refresh_token"] as? String }
+        try requestAccount.check(obj, provider: "anthropic_oauth_direct")
+        let tokenSet = OAuthRefreshBinding.tokenSet(obj, provider: "anthropic_oauth_direct")
+        let refresh = tokenSet["refresh_token"] as? String
         guard let refreshToken = refresh, !refreshToken.isEmpty else {
             throw LLMError.notConfigured(provider: "anthropic_oauth_direct")
         }
 
+        try OAuthRefreshBinding.requireRefresh(obj, provider: "anthropic_oauth_direct")
         let body: [String: Any] = [
             "grant_type":    "refresh_token",
             "refresh_token": refreshToken,
@@ -1178,6 +1221,7 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
         guard let payload = try? JSONSerialization.jsonObject(with: rdata) as? [String: Any] else {
             throw LLMError.underlying(message: "anthropic refresh: unparseable response")
         }
+        try OAuthRefreshBinding.requireSameAccount(payload, original: obj, provider: "anthropic_oauth_direct")
 
         // Merge: keep client_id / scope / token_type / user_info; replace
         // access_token, refresh_token (if rotated), recompute expires_at.
@@ -1204,8 +1248,7 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
         // just removed, or clobbered a newer one with the older account's
         // tokens. The bytes read before the network call are the generation:
         // if they moved, this refresh is stale and its write is skipped. The
-        // access token it minted is still valid, so the in-flight call is
-        // served from whatever credential now owns the file.
+        // replacement is handed back only if it retains the request's account.
         // User, 2026-09-06: the comparison and the write it guards now sit in
         // ONE critical section on the credential path's shared lock, which the
         // app's sign-in and sign-out take too — a compare followed by an
@@ -1218,12 +1261,12 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
         // reason the merge happens against what is on disk NOW, so a
         // concurrent settings save survives the refresh's write.
         let generation = CredentialFileLock.credentialGeneration(ofFileContents: data)
-        enum RefreshWrite { case wrote, superseded(String), supersededAndGone }
+        enum RefreshWrite { case wrote, superseded(Data), supersededAndGone }
         let outcome: RefreshWrite
         do {
             outcome = try CredentialFileLock.withLock(path) { () -> RefreshWrite in
                 guard CredentialFileLock.credentialGeneration(ofFileAt: path) == generation else {
-                    guard let (current, _) = Self.loadAccessTokenAndExpiry(from: path) else {
+                    guard let current = try? Data(contentsOf: path) else {
                         return .supersededAndGone
                     }
                     return .superseded(current)
@@ -1231,6 +1274,10 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
                 var blob = (try? Data(contentsOf: path))
                     .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
                     ?? obj
+                if blob["access_token"] == nil && blob["refresh_token"] == nil {
+                    for (key, value) in tokenSet { blob[key] = value }
+                    blob.removeValue(forKey: "tokens")
+                }
                 if let rotatedAccess { blob["access_token"] = rotatedAccess }
                 if let rotatedRefresh { blob["refresh_token"] = rotatedRefresh }
                 blob["expires_at"] = rotatedExpiresAt
@@ -1251,8 +1298,14 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
 
         switch outcome {
         case .superseded(let current):
-            // Another writer owns the file now. Its credential is the live one.
-            return current
+            guard let object = try JSONSerialization.jsonObject(with: current) as? [String: Any] else {
+                throw LLMError.notConfigured(provider: "anthropic_oauth_direct")
+            }
+            try requestAccount.check(object, provider: "anthropic_oauth_direct")
+            guard let access = OAuthRefreshBinding.string(OAuthRefreshBinding.tokenSet(object, provider: "anthropic_oauth_direct")["access_token"]) else {
+                throw LLMError.notConfigured(provider: "anthropic_oauth_direct")
+            }
+            return access
         case .supersededAndGone:
             throw LLMError.notConfigured(provider: "anthropic_oauth_direct")
         case .wrote:

@@ -1,14 +1,13 @@
 // SwiftNative port of POST /v1/multimodal/tts (Subsystem #28 — wave 35 W18).
 //
 // HISTORY / WHY THIS UNBLOCKS WAVE-34:
-//   Wave 33 W16 (CUTOVER_PLAN §6.96) and wave 34 W16 (§6.98) both classed this
+//   Wave 33 W16 and wave 34 W16 both classed this
 //   route KEPT_LIVE, BLOCKED on "the Swift secret-resolution layer" — at the
 //   time the OpenAI API key was only resolvable daemon-side (Runtime
 //   `_VisionClient._get_token`). That blocker is now LIFTED: the chat-path
-//   cutover landed `LLMCredentialResolver.resolveAPIKey(envVar:providerConfigFile:)`
+//   cutover landed `LLMCredentialResolver.resolveAPIKey(providerConfigFile:dataRoot:)`
 //   in the ProviderRouting module (LLMClient+Real.swift), which resolves the
-//   OpenAI platform key from the SAME first two sources the daemon's
-//   `_get_token` uses — (1) the OPENAI_API_KEY env var, (2)
+//   OpenAI platform key from the one place Settings saves it —
 //   data/providers/openai.json `api_key`. ProviderRouting is already a product
 //   dep of NativeAgentApp (Package.swift, wired for BackgroundLoops), so the
 //   module-graph blocker is also already closed.
@@ -36,12 +35,10 @@
 //     mirrored here.
 //   • headers Authorization/Content-Type/User-Agent.
 //   • 60s timeout.
-//   • token precedence env -> <dataRoot>/providers/openai.json -> (<dataRoot>/
-//     codex_home/auth.json OPENAI_API_KEY field), via LLMCredentialResolver's
-//     `dataRoot:` overload — the first two are the daemon's `_get_token`
-//     precedence exactly, resolved against the SAME data root the daemon's
-//     _VisionClient is constructed with (provider_config_dir=self.root/"providers",
-//     codex_home=self.root/"codex_home"), NOT the process CWD. This is the
+//   • token from <dataRoot>/providers/openai.json `api_key` only (no env var,
+//     no codex auth.json — 2026-09-26), via LLMCredentialResolver, resolved
+//     against the SAME data root the daemon's _VisionClient was constructed
+//     with (provider_config_dir=self.root/"providers"), NOT the process CWD. This is the
 //     REPO_PATH-parity fix (wave 36 W08 / §6.138): the wave-35 port used the
 //     CWD-relative overload, which silently returns notConfigured in an installed
 //     .app bundle (CWD `/`) even when the key is present in the stamped data root.
@@ -87,7 +84,7 @@ public enum MultimodalTTSError: Error, Equatable, Sendable, LocalizedError {
     /// Trust Center denies `multimodalPolicy.tts_openai` (default OFF). Mirrors
     /// the daemon's `_multimodal_policy_check("tts_openai")` "[trust_denied]" path.
     case trustDenied
-    /// No OpenAI platform key found (env / providers / codex). Mirrors the
+    /// No OpenAI platform key saved in providers/openai.json. Mirrors the
     /// daemon's "[tts_unavailable] No OpenAI API key found." path.
     case notConfigured
     /// HTTP 401 — token rejected. Mirrors "[tts_auth_error] HTTP 401".
@@ -100,7 +97,7 @@ public enum MultimodalTTSError: Error, Equatable, Sendable, LocalizedError {
     case emptyText
     /// The route this surface runs on declares no speech model, so there is no
     /// cloud voice to call. The client never picks another provider's
-    /// (2026-09-13 rulings); the caller reads with the on-device voice instead.
+    /// (2026-09-13 rulings); the caller says so and reads nothing.
     case routeHasNoSpeech(route: String)
 
     public var errorDescription: String? {
@@ -111,10 +108,10 @@ public enum MultimodalTTSError: Error, Equatable, Sendable, LocalizedError {
                 + "To enable: POST /v1/trust with multimodalPolicy.tts_openai=true"
         case .notConfigured:
             return "[tts_unavailable] No OpenAI API key found. "
-                + "Set OPENAI_API_KEY in your environment. See docs/multimodal_setup.md."
+                + "Add one in Settings → Providers → OpenAI."
         case .authRejected:
             return "[tts_auth_error] HTTP 401: API token rejected. "
-                + "Set OPENAI_API_KEY in your environment. See docs/multimodal_setup.md."
+                + "Check the key in Settings → Providers → OpenAI."
         case .apiError(let status):
             return "[tts_api_error] HTTP \(status)"
         case .transport(let message):
@@ -193,11 +190,11 @@ public final class SwiftOpenAITTSClient: MultimodalTTSSynthesizing {
     /// and safer for a sensitive-capability trust gate — fail-closed is the
     /// correct bias, and the Trust Center only ever writes a real bool, so no
     /// well-formed policy differs. (gpt-5.5 review NIT, wave 35 W18.)
-    private func ttsOpenAIAllowed() async -> Bool {
+    private func ttsOpenAIAllowed() async throws -> Bool {
         let path = dataRoot
             .appendingPathComponent("trust", isDirectory: true)
             .appendingPathComponent("policy.json")
-        let policy = await persistence.readJSON(path, defaultValue: .object([:]))
+        let policy = try await persistence.readJSON(path, ifMissing: .object([:]))
         guard case let .object(root) = policy,
               case let .object(mm)? = root["multimodalPolicy"],
               case let .bool(allowed)? = mm["tts_openai"] else {
@@ -209,15 +206,14 @@ public final class SwiftOpenAITTSClient: MultimodalTTSSynthesizing {
     public func synthesize(text: String, voice: String, format: String) async throws -> Data {
         // Daemon runs _multimodal_policy_check("tts_openai") FIRST
         // — before empty-text/key/network. Default OFF.
-        guard await ttsOpenAIAllowed() else { throw MultimodalTTSError.trustDenied }
+        guard try await ttsOpenAIAllowed() else { throw MultimodalTTSError.trustDenied }
 
         // Daemon: handler returns {"ok": false, "error": "text is required"} for
         // empty text BEFORE calling _vision_client.tts.
         if text.isEmpty { throw MultimodalTTSError.emptyText }
 
-        // Same key precedence as the daemon's _get_token: env OPENAI_API_KEY,
-        // then <dataRoot>/providers/openai.json `api_key`, then (OpenAI only)
-        // <dataRoot>/codex_home/auth.json. (apiKeyOverride is for tests.)
+        // The one key source: <dataRoot>/providers/openai.json `api_key`.
+        // (apiKeyOverride is for tests.)
         //
         // REPO_PATH parity (wave 36 W08 / §6.138): resolve against the SAME
         // `dataRoot` the trust gate above already uses
@@ -226,12 +222,10 @@ public final class SwiftOpenAITTSClient: MultimodalTTSSynthesizing {
         // CWD-relative resolver would look in `/data/providers/openai.json`
         // (nonexistent) and return notConfigured even though the key is sitting
         // in the stamped/AppSupport data root. The daemon's `_VisionClient` is
-        // constructed with `provider_config_dir=self.root / "providers"` and
-        // `codex_home=self.root / "codex_home"`, so
+        // constructed with `provider_config_dir=self.root / "providers"`, so
         // resolving against `dataRoot` is exact parity for installed builds.
         guard let key = apiKeyOverride
                 ?? LLMCredentialResolver.resolveAPIKey(
-                    envVar: "OPENAI_API_KEY",
                     providerConfigFile: "openai.json",
                     dataRoot: dataRoot),
               !key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {

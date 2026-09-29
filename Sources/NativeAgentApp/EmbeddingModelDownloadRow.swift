@@ -8,12 +8,17 @@ final class EmbeddingModelDownloadController {
     static let shared = EmbeddingModelDownloadController()
     var status = EmbeddingModelDownload.Status()
     var activating = false
+    private var lastDoctorInstallCompleted = false
+    private var installCommitted = false
     private let downloader = EmbeddingModelDownload(dataRoot: PersistenceCore.defaultDataRoot())
     private var task: Task<Void, Never>?
+    private var pauseTask: Task<Void, Never>?
     private var observation: Task<Void, Never>?
 
-    func start() {
-        guard task == nil else { return }
+    func start(createOnly: Bool = true, reconcile: Bool = false) {
+        guard task == nil, pauseTask == nil else { return }
+        lastDoctorInstallCompleted = false
+        installCommitted = false
         if observation == nil {
             observation = Task {
                 for await value in await downloader.updates() { status = value }
@@ -24,21 +29,47 @@ final class EmbeddingModelDownloadController {
             guard let runtime = await SwiftNativeMemoryV2.shared.embeddingRuntimeSnapshot(),
                   runtime.requestedBackend != ManagedEmbeddingProvider.mockBackend else { return }
             do {
-                if try await downloader.install() {
+                if createOnly, await downloader.isUserPaused() { return }
+                if !createOnly { try await downloader.resumeByUser() }
+                if try await downloader.install(createOnly: createOnly) {
+                    installCommitted = true
                     activating = true
                     // Once the verified directory has committed, a late Pause must
                     // not cancel corpus convergence and strand two vector spaces.
-                    await Task.detached(priority: .utility) {
+                    let converged = reconcile ? await Task.detached(priority: .utility) {
                         _ = await SwiftNativeMemoryV2.shared.releaseEmbeddingMemory(reason: "verified model installed")
-                        await reconcileMemoryEmbeddingEpochAtLaunch()
-                    }.value
+                        return await reconcileMemoryEmbeddingEpochAtLaunch()
+                    }.value : true
                     activating = false
+                    lastDoctorInstallCompleted = converged
                 }
             } catch { /* Core publishes the failure and retains resumable parts. */ }
         }
     }
 
-    func cancel() { task?.cancel() }
+    func cancel() {
+        guard let active = task, pauseTask == nil else { return }
+        active.cancel()
+        pauseTask = Task {
+            await active.value
+            if !installCommitted { try? await downloader.pauseByUser() }
+            pauseTask = nil
+        }
+    }
+
+    func doctorSnapshot() async -> EmbeddingModelDownload.Status {
+        await downloader.currentStatus()
+    }
+
+    func doctorUserPaused() async -> Bool { await downloader.isUserPaused() }
+
+    /// Doctor joins the same owner task used by the two visible rows.
+    func resumeForDoctor(reconcile: Bool) async -> Bool {
+        guard task == nil else { return false }
+        start(reconcile: reconcile)
+        await task?.value
+        return lastDoctorInstallCompleted
+    }
 }
 
 struct EmbeddingModelDownloadRow: View {
@@ -61,7 +92,7 @@ struct EmbeddingModelDownloadRow: View {
             if controller.status.running {
                 Button("Pause") { controller.cancel() }
             } else {
-                Button("Check / resume") { controller.start() }
+                Button("Check / resume") { controller.start(createOnly: false, reconcile: true) }
                     .disabled(controller.activating)
             }
         }

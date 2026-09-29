@@ -1,3 +1,4 @@
+import FeedPolicy
 import Foundation
 import NativeAgentCore
 import PersistenceCore
@@ -482,7 +483,7 @@ extension SwiftNativeBrowserClient: BrowserOperationCommanding {
 
     private func readCanonicalRuns() async throws -> [JSONValue] {
         guard FileManager.default.fileExists(atPath: runsPath.path) else { return [] }
-        let raw = await persistenceCore.readJSON(runsPath, defaultValue: .null)
+        let raw = try await persistenceCore.readJSON(runsPath, ifMissing: .null)
         guard case .array(let rows) = raw else {
             throw BrowserOperationStoreError.corruptRunsDocument
         }

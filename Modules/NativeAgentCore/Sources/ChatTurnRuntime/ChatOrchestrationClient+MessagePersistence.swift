@@ -1,0 +1,2353 @@
+import Foundation
+import Darwin
+import CryptoKit
+import NativeAgentCore
+import PersistenceCore
+import TurnTrace
+import Transcripts
+import PersonaEngine
+import MemoryV2
+import NativeAgentShared
+import MCPDispatcher
+import ProviderRouting
+import TrustCenter
+import KnowledgeGraph
+import XConnector
+import Dispatcher
+import MacControl
+import SwarmRuns
+import MacIntegration
+import CognitiveSubstrate
+
+/// Process-wide, stat-validated line count for chat transcript JSONL files.
+///
+/// The session index needs one number per persisted message: how many rows the
+/// transcript now holds. Deriving it by reading every byte of the file is
+/// correct but costs O(session bytes) per append and gets slower every day the
+/// session lives. Writers in THIS process know the delta exactly (+1 per
+/// appended row), so the count is carried forward instead of rediscovered.
+///
+/// The safety property is that a cached count is only ever served for a file
+/// that is byte-for-byte the one it was measured against: every entry carries
+/// the `(device, inode, size, mtime)` stamp observed at record time, and any
+/// mismatch — an external writer, a compaction rewrite, a truncation, a
+/// deletion, a restore — falls back to a full recount. A stale cache cannot be
+/// served; the worst case is that it is discarded and we pay what we used to.
+///
+/// Correctness of the count itself relies on callers doing their read/append/
+/// record under the transcript's cross-process `flock`, which they do.
+final class ChatTranscriptLineCountCache: @unchecked Sendable {
+    /// Identity + content stamp. Any field changing means "not the same bytes".
+    struct Stamp: Equatable, Sendable {
+        var device: Int32
+        var inode: UInt64
+        var size: Int64
+        var modifiedSeconds: Int
+        var modifiedNanoseconds: Int
+    }
+
+    private struct Entry {
+        var stamp: Stamp
+        var count: Int
+    }
+
+    static let shared = ChatTranscriptLineCountCache()
+
+    private let lock = NSLock()
+    private var entries: [String: Entry] = [:]
+    private var fullRecounts: [String: Int] = [:]
+
+    /// Current line count for `path`, recomputing only when the file on disk is
+    /// not the one this cache last measured.
+    func count(at path: URL, recount: (URL) -> Int) -> Int {
+        let key = path.path
+        let before = Self.stamp(of: path)
+        if let before {
+            lock.lock()
+            let cached = entries[key]
+            lock.unlock()
+            if let cached, cached.stamp == before {
+                return cached.count
+            }
+        }
+        let counted = recount(path)
+        lock.lock()
+        fullRecounts[key, default: 0] += 1
+        // Only cache when the file did not move under the read. If it did, the
+        // pairing of (count, stamp) would be a lie — drop it and let the next
+        // caller recount.
+        if let before, let after = Self.stamp(of: path), before == after {
+            entries[key] = Entry(stamp: after, count: counted)
+        } else {
+            entries[key] = nil
+        }
+        lock.unlock()
+        return counted
+    }
+
+    /// Record a count the caller established authoritatively (it just wrote the
+    /// file under the lock). Returns the same count for call-site chaining.
+    @discardableResult
+    func record(count: Int, at path: URL) -> Int {
+        let key = path.path
+        lock.lock()
+        if let stamp = Self.stamp(of: path) {
+            entries[key] = Entry(stamp: stamp, count: count)
+        } else {
+            entries[key] = nil
+        }
+        lock.unlock()
+        return count
+    }
+
+    func invalidate(at path: URL) {
+        lock.lock()
+        entries[path.path] = nil
+        lock.unlock()
+    }
+
+    /// Test/diagnostic probe: how many full byte scans this cache has paid for
+    /// `path`. A cache that is working keeps this at 1 for a hot session.
+    func fullRecountCount(at path: URL) -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return fullRecounts[path.path] ?? 0
+    }
+
+    func resetForTesting() {
+        lock.lock()
+        entries.removeAll()
+        fullRecounts.removeAll()
+        lock.unlock()
+    }
+
+    private static func stamp(of path: URL) -> Stamp? {
+        var info = stat()
+        guard stat(path.path, &info) == 0 else { return nil }
+        return Stamp(
+            device: info.st_dev,
+            inode: info.st_ino,
+            size: Int64(info.st_size),
+            modifiedSeconds: info.st_mtimespec.tv_sec,
+            modifiedNanoseconds: info.st_mtimespec.tv_nsec
+        )
+    }
+}
+
+public enum CodexCompletionTranscriptEvidence {
+    public enum RecoveryError: Error, Equatable {
+        case corruptBinding
+        case ambiguousBinding
+    }
+
+    public static func responseDigest(
+        sessionId: String,
+        runId: String,
+        content: String,
+        attachments: [MultimodalAttachment]
+    ) -> String {
+        let attachmentRows: [JSONValue] = attachments.map { attachment in
+            var row: [String: JSONValue] = [
+                "id": .string(attachment.id),
+                "type": .string(attachment.type),
+                "mime": .string(attachment.mime),
+                "name": .string(attachment.name ?? ""),
+                "byteSize": .int(Int64(attachment.byteSize)),
+            ]
+            if let path = attachment.path, !path.isEmpty { row["path"] = .string(path) }
+            return .object(row)
+        }
+        let payload: JSONValue = .object([
+            "attachments": .array(attachmentRows),
+            "content": .string(content),
+            "runId": .string(runId),
+            "sessionId": .string(sessionId),
+        ])
+        let bytes = (try? payload.serializedData(pretty: false)) ?? Data()
+        return SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
+    }
+
+    public static func recoverResponse(
+        from rows: [JSONValue],
+        deliveryId: String,
+        requestDigest: String,
+        sessionId: String
+    ) throws -> ChatResponse? {
+        var matches: [ChatResponse] = []
+        for row in rows {
+            guard case .object(let object) = row,
+                  case .string(let role)? = object["role"], role == "assistant",
+                  case .string(let rowSession)? = object["sessionId"], rowSession == sessionId,
+                  case .string(let content)? = object["content"],
+                  case .string(let runId)? = object["runId"],
+                  case .object(let metadata)? = object["metadata"],
+                  case .object(let binding)? = metadata["codexCompletion"],
+                  case .string(let rowDelivery)? = binding["deliveryId"],
+                  rowDelivery == deliveryId,
+                  case .string(let rowRequestDigest)? = binding["requestDigest"],
+                  rowRequestDigest == requestDigest,
+                  case .string(let model)? = binding["model"],
+                  case .string(let storedResponseDigest)? = binding["responseDigest"]
+            else { continue }
+            let attachments = try decodeAttachments(metadata["attachments"])
+            guard responseDigest(
+                sessionId: sessionId,
+                runId: runId,
+                content: content,
+                attachments: attachments
+            ) == storedResponseDigest else {
+                throw RecoveryError.corruptBinding
+            }
+            let effort: String?
+            if case .string(let value)? = binding["reasoningEffort"] { effort = value }
+            else { effort = nil }
+            matches.append(ChatResponse(
+                runId: runId,
+                model: model,
+                reasoningEffort: effort,
+                output: content,
+                sessionId: sessionId,
+                attachments: attachments.isEmpty ? nil : attachments
+            ))
+        }
+        guard matches.count <= 1 else { throw RecoveryError.ambiguousBinding }
+        return matches.first
+    }
+
+    private static func decodeAttachments(_ value: JSONValue?) throws -> [MultimodalAttachment] {
+        guard let value else { return [] }
+        guard case .array(let rows) = value else { throw RecoveryError.corruptBinding }
+        return try rows.map { row in
+            guard case .object(let object) = row,
+                  case .string(let id)? = object["id"],
+                  case .string(let type)? = object["type"],
+                  case .string(let mime)? = object["mime"],
+                  case .string(let name)? = object["name"],
+                  case .int(let byteSize)? = object["byteSize"],
+                  byteSize >= 0, byteSize <= Int64(Int.max)
+            else { throw RecoveryError.corruptBinding }
+            let path: String?
+            if case .string(let value)? = object["path"], !value.isEmpty { path = value }
+            else { path = nil }
+            return MultimodalAttachment(
+                id: id,
+                type: type,
+                base64: "",
+                mime: mime,
+                name: name.isEmpty ? nil : name,
+                byteSize: Int(byteSize),
+                path: path
+            )
+        }
+    }
+}
+
+extension SwiftNativeChatOrchestrationClient {
+    /// Tool results are live-turn data, not durable context. Persist only a
+    /// bounded, redacted receipt so tool_catalog/read_file/bash outputs cannot
+    /// inflate every future transcript read. The full value remains available
+    /// to the provider during the tool loop that produced it.
+    private static let persistedToolInputMaximumCharacters = 4_000
+    private static let persistedToolResultMaximumCharacters = 8_000
+
+    /// Fail-loud reporter for transcript-write failures (M1/M2, honesty sweep
+    /// 2026-07-09). A dropped transcript write is exactly the silent loss these
+    /// writes exist to prevent, so it must never be swallowed: it is always
+    /// NSLogged, and it is surfaced to the user through the turn-notice channel
+    /// — `onNotice` when the caller holds the live stream continuation, else the
+    /// `ToolNoticeBus` task-local the tool loop binds. When neither is available
+    /// (background loops, tests) the log is the receipt.
+    static func reportTranscriptWriteFailure(
+        label: String,
+        path: URL,
+        error: Error,
+        userText: String,
+        onNotice: (@Sendable (String, String) async -> Void)?
+    ) async {
+        NSLog("%@: transcript write FAILED for %@: %@",
+              label, path.lastPathComponent, String(describing: error))
+        let emit = onNotice ?? ToolNoticeBus.emit
+        await emit?("transcript_write_failed", userText)
+    }
+
+    /// Persist a partial assistant reply with a `cancelled: true` marker on the
+    /// record's metadata so downstream readers can distinguish completed turns
+    /// from truncated ones.
+    ///
+    /// M1 (2026-07-09): this write is the partial-reply RESCUE — a `try?` here
+    /// meant the one write whose entire purpose is to stop silent loss could
+    /// itself lose silently. Failure now logs and raises a turn notice.
+    func persistPartialIfNeeded(
+        sessionId: String,
+        runId: String,
+        text: String,
+        cancelled: Bool,
+        failure: Error? = nil,
+        source: String = "app",
+        outcomeContext: TurnContext? = nil,
+        outcomeInterventionAssignment: CausalInterventionAssignment? = nil,
+        onNotice: @escaping @Sendable (String, String) async -> Void
+    ) async {
+        guard !text.isEmpty else { return }
+        guard let safeSessionId = NativeAgentChatSessionID.normalizedPathComponent(sessionId) else { return }
+        let messageSource = Self.messageSource(for: source)
+        let path = dataRoot
+            .appendingPathComponent("chat", isDirectory: true)
+            .appendingPathComponent("messages", isDirectory: true)
+            .appendingPathComponent("\(safeSessionId).jsonl")
+        let persistedAt = clock()
+        let createdAt = Self.iso8601(persistedAt)
+        let messageId = UUID().uuidString
+        let outcomeObservation = ResponseOutcomeObservationV2.make(
+            turnID: TurnTraceContext.turnId ?? runId,
+            messageID: messageId,
+            sessionID: sessionId,
+            surface: messageSource,
+            observedAt: persistedAt,
+            responsePersistence: cancelled ? "cancelled" : "partial",
+            context: outcomeContext,
+            interventionAssignment: outcomeInterventionAssignment
+        )
+        var partialMetadata: [String: JSONValue] = [
+            "cancelled": .bool(cancelled),
+            "partial": .bool(true),
+        ]
+        let refused = !cancelled && failure.flatMap { ProviderFailure.report($0)?.cause } == .refused
+        let visibleText: String
+        if refused {
+            partialMetadata["provider_refusal"] = .bool(true)
+            let route = outcomeContext?.providerId ?? "unknown route"
+            let model = outcomeContext?.modelId ?? "unknown model"
+            visibleText = text + "\n\noutcome unknown — inspect before retry. The \(route) route rejected this request on \(model); some steps may have run."
+        } else {
+            visibleText = text
+        }
+        if let outcomeObservation {
+            partialMetadata["outcomeObservation"] = outcomeObservation.jsonValue
+            partialMetadata["turnTraceId"] = .string(outcomeObservation.turnID)
+        }
+        let record: JSONValue = .object([
+            "id": .string(messageId),
+            "sessionId": .string(sessionId),
+            "role": .string("assistant"),
+            "content": .string(visibleText),
+            "createdAt": .string(createdAt),
+            "source": .string(messageSource),
+            "runId": .string(runId),
+            "cancelled": .bool(cancelled),
+            "metadata": .object(partialMetadata),
+        ])
+        // Under the transcript's sidecar lock: compaction + the async distiller
+        // do locked read-modify-rewrite of this file; an unlocked append racing
+        // that rewrite would be silently dropped by the atomic rename.
+        do {
+            try await persistence.withFileLock(path) {
+                // FAST PATH, deliberately (sweep R4 item 4). This row is a
+                // STREAMING PARTIAL: superseded by the terminal assistant row
+                // the moment the turn finishes, and written often enough that a
+                // per-row F_FULLFSYNC would be felt on every turn. Losing the
+                // newest partial to a power cut costs a fragment of a reply
+                // that never committed; losing a user row or a tool receipt
+                // costs a turn that did. Those go durable — see appendMessage
+                // and appendToolMessage below.
+                try await persistence.appendJSONL(record, to: path)
+            }
+        } catch {
+            await Self.reportTranscriptWriteFailure(
+                label: "persistPartialIfNeeded",
+                path: path,
+                error: error,
+                userText: "Couldn't save this turn's partial reply - it may be missing when the conversation reloads.",
+                onNotice: onNotice
+            )
+            return
+        }
+    }
+
+    /// Persist a role="tool" message capturing one tool dispatch (name,
+    /// inputJSON, resultSummary, ok) in the daemon's per-line JSON shape so
+    /// getChatMessages can render it as a tool pill in the Mac UI.
+    func appendToolMessage(
+        sessionId: String,
+        runId: String?,
+        toolName: String,
+        inputJSON: String,
+        resultSummary: String,
+        ok: Bool,
+        cognitiveResult: ChatToolOutcome.CognitiveResult? = nil,
+        source: String = "app"
+    ) async throws {
+        guard let safeSessionId = NativeAgentChatSessionID.normalizedPathComponent(sessionId) else {
+            throw ChatOrchestrationError.underlying("invalid chat session id")
+        }
+        let messageSource = Self.messageSource(for: source)
+        // W2/W3-FIX-R2 2/3 — this row is PERSISTED to the transcript and read
+        // back by every surface (Mac, iOS, Telegram, bridge). For an injection
+        // tool `inputJSON` is the literal characters about to be typed and
+        // `resultSummary` can echo the value an `ax_act` wrote;
+        // `boundedRedactedToolReceipt` only catches secret-SHAPED strings, and
+        // a password is not shaped like anything. Redact by TOOL first.
+        // Approval detection already requires the original envelope. Share that
+        // one parse with the exact outcome tag before rendering a bounded body.
+        let originalResult = try? JSONValue.parse(Data(resultSummary.utf8))
+        let safeInputJSON = Self.boundedRedactedToolReceipt(
+            Self.injectionRedactedArgJSON(tool: toolName, json: inputJSON),
+            maximumCharacters: Self.persistedToolInputMaximumCharacters,
+            label: "tool input"
+        )
+        // W3.5-FIX 3 — and for `mac_view` the RESULT is a base64 screenshot of
+        // the whole window. The persisted transcript is read back by every
+        // surface and syncs; the pixels come out here and leave the digest.
+        let safeResultSummary = Self.redactedPersistedToolResult(
+            tool: toolName, json: resultSummary
+        )
+        let canonicalRiskInput: [String: JSONValue] = {
+            guard let parsed = try? JSONValue.parse(Data(inputJSON.utf8)),
+                  case .object(let object) = parsed
+            else { return [:] }
+            return object
+        }()
+        let canonicalToolRisk = SwiftNativeSecurityCenter.canonicalToolRisk(
+            tool: toolName,
+            input: canonicalRiskInput,
+            dataRoot: dataRoot
+        )
+        let path = dataRoot
+            .appendingPathComponent("chat", isDirectory: true)
+            .appendingPathComponent("messages", isDirectory: true)
+            .appendingPathComponent("\(safeSessionId).jsonl")
+        let messageId = UUID().uuidString
+        let persistedAt = clock()
+        let createdAt = Self.iso8601(persistedAt)
+        var record: [String: JSONValue] = [
+            "id": .string(messageId),
+            "sessionId": .string(sessionId),
+            "role": .string("tool"),
+            "content": .string(""),
+            "createdAt": .string(createdAt),
+            "source": .string(messageSource),
+        ]
+        if let runId { record["runId"] = .string(runId) }
+        let pendingApprovalID = originalResult.flatMap { ChatTranscriptToolMessageKind.pendingApprovalID(in: $0) }
+        // The approval card's own text lives on the row it is drawn from. Only
+        // an approval row gets one; every other tool receipt keeps its empty
+        // content exactly as before.
+        if pendingApprovalID != nil,
+           let asked = originalResult.flatMap({ ChatTranscriptToolMessageKind.pendingApprovalReason(in: $0) }) {
+            record["content"] = .string(asked)
+        }
+        // The card is persisted on the ordinary tool row, beside the approval
+        // detection that already lives here — one writer, one row identity.
+        // This is what makes the card survive a relaunch WITH ITS STATE: the
+        // transcript is the only thing that outlives the process, and the
+        // pending "Connect GitHub" has to still be there, still pending, when
+        // the app comes back.
+        //
+        // It is display state ONLY. The transcript never becomes the
+        // authority on whether GitHub is connected; the resolver asks
+        // Connectors that question every time.
+        let raisedInteraction = originalResult
+            .flatMap { InlineInteractionNeed.interaction(in: $0) }
+            .map { Self.scrubbedCardDisplay($0) }
+        var stampedInteraction: InlineInteraction?
+        var metadata: [String: JSONValue] = [
+            "kind": .string(
+                raisedInteraction != nil
+                    ? InlineInteractionWire.transcriptKind
+                    : pendingApprovalID == nil
+                        ? ChatTranscriptToolMessageKind.toolUse
+                        : ChatTranscriptToolMessageKind.approvalPending
+            ),
+            "toolName": .string(toolName),
+            "inputJSON": .string(safeInputJSON),
+            "resultSummary": .string(safeResultSummary),
+            "ok": .bool(ok),
+            // A tool receipt is the record of an EXTERNAL EFFECT, read back by
+            // every surface. It gets the same durable envelope the
+            // conversational rows get, so "which surface's turn caused this
+            // effect, and where did that turn's reply go" survives on the row
+            // rather than being re-derived later from the session's current
+            // surface — a thing that stops being well-defined the moment more
+            // than one surface writes a transcript.
+            //
+            // Streaming PARTIALS deliberately do not carry it: they are
+            // superseded by the terminal assistant row within the same turn,
+            // and they take the fast append precisely to stay off the hot path.
+            "envelope": TurnEnvelope.current(surface: messageSource).persistedMetadata(),
+        ]
+        if let raisedInteraction {
+            // The runtime owns identity and the continuation record, never the
+            // model: this is where the raised need learns which tool call it
+            // suspended, so the resolver can replay exactly that one call and
+            // nothing else. The replay ARGUMENTS are not stored here — the
+            // redacted `inputJSON` above must never be reconstructed into a
+            // live call — only the identifiers needed to find the request.
+            var stamped = raisedInteraction
+            if stamped.continuation == nil {
+                // The blocked call's arguments, kept EXACTLY or not at all.
+                //
+                // A resume that re-asks the model to make "the same call"
+                // gets whatever the model reconstructs, which is not
+                // necessarily what it wrote the first time — the path it read,
+                // the recipient it addressed, the range it asked for. So the
+                // runtime keeps the literal arguments and replays them itself.
+                //
+                // The one thing it will not do is replay a REDACTED argument
+                // set: if the transcript's redactor changed or truncated the
+                // receipt, the stored text is no longer the call that was
+                // attempted, and replaying it would perform a different
+                // action under the person's approval. In that case nothing is
+                // stored and the resume falls back to asking the model.
+                let exactArguments = safeInputJSON == inputJSON ? inputJSON : nil
+                let resumeRunId = "interaction-\(stamped.id)"
+                var continuation = InlineInteraction.Continuation(
+                    originRunId: runId,
+                    toolCallId: nil,
+                    toolName: toolName,
+                    toolArgumentsJSON: toolName == InlineInteractionWire.toolName
+                        ? nil
+                        : exactArguments,
+                    mode: toolName == InlineInteractionWire.toolName
+                        ? .continueTurn
+                        : .retryBlockedTool,
+                    state: .waiting,
+                    // Stable: a duplicate resolve from a second surface lands
+                    // on this same claim instead of starting a second turn.
+                    resumeRunId: resumeRunId
+                )
+                // A signed turn's card has to be able to replay AS a signed
+                // turn. The envelope cannot carry that (a persisted trust
+                // verdict is authority from history), so what is kept is a
+                // receipt re-verified against the live pairing material at
+                // replay. It is minted over the WHOLE row identity — this
+                // session, this interaction, this origin, this tool and these
+                // exact arguments — so it cannot be lifted onto another card
+                // or an edited one. Nil for every unsigned turn.
+                continuation.signatureReceipt = InlineInteractionSignatureWitness.receipt(
+                    for: .init(
+                        sessionID: sessionId,
+                        interactionID: stamped.id,
+                        continuation: continuation,
+                        // The same envelope this row persists above.
+                        originEnvelope: TurnEnvelope.current(surface: messageSource),
+                        interaction: stamped
+                    )
+                )
+                stamped.continuation = continuation
+            }
+            if let encoded = InlineInteractionNeed.encode(stamped) {
+                metadata[InlineInteractionWire.metadataKey] = encoded
+            }
+            metadata["interactionId"] = .string(stamped.id)
+            stampedInteraction = stamped
+        }
+        if let pendingApprovalID {
+            // The post-resolution writer locates and replaces this row by the
+            // same durable identifier, so the inline card never loses its
+            // transition to a settled tool receipt.
+            metadata["approvalId"] = .string(pendingApprovalID)
+        }
+        // Preserve only the existing classifier's exact outcome tag before
+        // receipt clipping/redaction can remove the envelope's status. `ok`
+        // remains transport success; no-status legacy results stay unchanged.
+        if let result = originalResult,
+           case .object(let object) = result,
+           case .string(let recordedStatus)? = object["status"] {
+            metadata["resultClass"] = .string(ChatToolOutcome.exactResultClass(result).rawValue)
+            // The class alone cannot tell "queued" from "accepted" from
+            // "running" — they all collapse to `.unknown`, which the renderer
+            // then reported as "completion unconfirmed" even when the envelope
+            // plainly said what state the work reached. Keep the exact word
+            // beside the class so the receipt can say what is actually known.
+            metadata["resultStatus"] = .string(recordedStatus)
+        }
+        record["metadata"] = .object(metadata)
+        // Locked: see appendPartial — protects against the compactor/distiller
+        // locked rewrite dropping a concurrent append. (Immutable binding: a
+        // @Sendable closure cannot capture the mutable `record`.)
+        let toolRow: JSONValue = .object(record)
+        // One live card per ask (Agent, 2026-09-13). A newer, identical need —
+        // same kind, same target, same access mode — replaces every older one
+        // still waiting in this conversation, AT THE RAISE, under the same file
+        // lock that appends it. Four "Connect Notion" cards stacked up because
+        // four tool calls each hit the same missing connector; the person is
+        // being asked one question, so one card is live and the rest go quiet.
+        let supersedeKey = stampedInteraction.map {
+            SupersedeKey(kind: $0.kind, target: $0.target, mode: $0.mode, id: $0.id)
+        }
+        // Immutable binding, same reason as `toolRow` above.
+        let stampedNeed = stampedInteraction
+        try await persistence.withFileLock(path) {
+            var rowToAppend = toolRow
+            if let supersedeKey {
+                // Not `try?`: the new pending row is appended only after the
+                // older copies are provably quiet. A swallowed failure here
+                // left two live cards asking the same question.
+                let running = try await Self.supersedeOlderPending(
+                    matching: supersedeKey, in: path, persistence: persistence
+                )
+                // A card whose action is ALREADY RUNNING is not a stale copy:
+                // the person tapped it and a control is open on it. Superseding
+                // it invalidates the continuation the running action is going to
+                // resume, and the tap is lost. So the older card keeps running
+                // and the DUPLICATE goes quiet instead — still exactly one live
+                // card, and it is the one the person is looking at.
+                if running, let stampedNeed {
+                    rowToAppend = Self.supersededRow(rowToAppend, as: stampedNeed)
+                }
+            }
+            // DURABLE (sweep R4 item 4). A tool receipt is the transcript's
+            // only record that an EXTERNAL EFFECT happened — a file written, a
+            // message sent, a command run. If a power cut drops it, the effect
+            // still happened in the world but the conversation no longer says
+            // so, and the next turn can redo it. That asymmetry is what buys
+            // the flush; partial rows (above) have no such counterpart.
+            try await persistence.appendJSONLDurable(rowToAppend, to: path)
+        }
+        if stampedInteraction != nil {
+            NotificationCenter.default.post(name: InlineInteractionWire.changedNotification, object: sessionId)
+        }
+        await observeCognitiveTool(
+            sessionId: sessionId,
+            runId: runId,
+            toolName: toolName,
+            resultSummary: safeResultSummary,
+            ok: ok,
+            cognitiveResult: cognitiveResult,
+            canonicalToolRisk: canonicalToolRisk,
+            source: messageSource,
+            createdAt: createdAt,
+            messageId: messageId
+        )
+    }
+
+    // MARK: helpers
+
+    /// What makes two asks the SAME ask: the kind of thing needed, the thing
+    /// it is needed for, and the axis asked for. Not the wording, and not the
+    /// tool that happened to hit it.
+    public struct SupersedeKey: Sendable {
+        public let kind: InlineInteraction.Kind
+        public let target: String
+        public let mode: InlineInteraction.AccessMode?
+        /// The new card's own id, so a re-persist can never supersede itself.
+        public let id: String
+
+        public init(
+            kind: InlineInteraction.Kind,
+            target: String,
+            mode: InlineInteraction.AccessMode?,
+            id: String
+        ) {
+            self.kind = kind
+            self.target = target
+            self.mode = mode
+            self.id = id
+        }
+    }
+
+    /// Mark every older still-PENDING copy of this ask superseded, in place.
+    /// Called under the transcript's own file lock, immediately before the new
+    /// row is appended, so there is no window in which two live cards exist.
+    ///
+    /// Returns true when an older copy was left alone because it is `.running`
+    /// — a control is open on it and its continuation is live. The caller's own
+    /// new row is the one that goes quiet in that case.
+    @discardableResult
+    public static func supersedeOlderPending(
+        matching key: SupersedeKey,
+        in path: URL,
+        persistence: any PersistenceCoreProtocol
+    ) async throws -> Bool {
+        // A `choose` has no canonical thing it is about: its `target` is empty
+        // and its `mode` nil BY CONSTRUCTION, so kind+target+mode makes every
+        // question in a conversation "the same ask" as every other one. Two
+        // unrelated questions superseded each other and the first went quiet
+        // unanswered. Only the kinds that name what they are for supersede.
+        guard key.kind != .choose else { return false }
+        // THROWING. A missing transcript already reads as no rows, so the
+        // only thing `try?` hid here was a read that actually failed — and a
+        // failed read looks exactly like "no older copy of this ask", which
+        // appended a second live card for the same question.
+        var rows = try await persistence.readJSONL(path)
+        var changed = false
+        var sawRunning = false
+        for index in rows.indices {
+            guard case .object(var object) = rows[index],
+                  case .object(var metadata)? = object["metadata"],
+                  case .string(InlineInteractionWire.transcriptKind)? = metadata["kind"],
+                  let raw = metadata[InlineInteractionWire.metadataKey],
+                  let existing = InlineInteractionNeed.decode(raw),
+                  existing.id != key.id,
+                  existing.state.isOpen,
+                  existing.kind == key.kind,
+                  existing.target == key.target,
+                  existing.mode == key.mode
+            else { continue }
+            // `.isOpen` is pending OR running, and the two are not the same
+            // thing to supersede: running means a tap already happened.
+            if case .running = existing.state {
+                sawRunning = true
+                continue
+            }
+            guard let encoded = InlineInteractionNeed.encode(existing.superseded())
+            else { continue }
+            metadata[InlineInteractionWire.metadataKey] = encoded
+            metadata["resultStatus"] = .string("superseded")
+            metadata["resultSummary"] = .string(Self.supersededSummary)
+            object["metadata"] = .object(metadata)
+            rows[index] = .object(object)
+            changed = true
+        }
+        if changed {
+            try await persistence.replaceJSONL(rows, to: path)
+        }
+        return sawRunning
+    }
+
+    /// The same row, carrying the interaction already superseded — used for a
+    /// duplicate raised while an identical card is running.
+    public static func supersededRow(
+        _ row: JSONValue, as interaction: InlineInteraction
+    ) -> JSONValue {
+        guard case .object(var object) = row,
+              case .object(var metadata)? = object["metadata"],
+              let encoded = InlineInteractionNeed.encode(interaction.superseded())
+        else { return row }
+        metadata[InlineInteractionWire.metadataKey] = encoded
+        metadata["resultStatus"] = .string("superseded")
+        metadata["resultSummary"] = .string(Self.supersededSummary)
+        object["metadata"] = .object(metadata)
+        return .object(object)
+    }
+
+    /// The receipt a superseded card carries, in the same shape the resolver
+    /// writes for a declined one: a cancelled envelope.
+    ///
+    /// Superseding rewrote the interaction and `resultStatus` but left
+    /// `resultSummary` reading `needs_input`, and every surface that counts
+    /// open cards parses THAT — so a fold said "7 tools · 1 needs you" with
+    /// every card on screen already answered (Agent, 2026-09-14). Written in
+    /// the same locked write as the state, so the two can never disagree.
+    static let supersededSummary: String = {
+        let envelope: JSONValue = .object([
+            "status": .string("cancelled"),
+            "detail": .string("A newer identical request replaced this one."),
+        ])
+        return (try? envelope.serialize(pretty: false)) ?? "{\"status\":\"cancelled\"}"
+    }()
+
+    nonisolated static func redactedProgressEvent(_ event: TurnStreamEvent) -> TurnStreamEvent {
+        switch event {
+        case .toolUse(let name, let input):
+            return .toolUse(name: name, input: ChatSecretRedactor.redactValue(input))
+        case .toolResult(let name, let output):
+            return .toolResult(name: name, output: ChatSecretRedactor.redactValue(output))
+        case .error(let message):
+            return .error(ChatSecretRedactor.redactText(message))
+        default:
+            return event
+        }
+    }
+
+    /// Ack-on-enqueue seam (wake-delivery-classification, 2026-07-25): durably
+    /// append the user row and return. The turn that consumes it runs later
+    /// with `suppressUserAppend: true`, producing the same on-disk state the
+    /// normal path has at context-build time (structured chat appends the user
+    /// row FIRST, then builds context from the transcript — so a pre-appended
+    /// row is indistinguishable to the engine).
+    ///
+    /// Failure semantics callers must respect: `appendMessage` performs
+    /// post-append bookkeeping (session index sync, cognitive observation)
+    /// that can throw AFTER the row is durably on disk. A thrown error from
+    /// this method therefore means "not proven enqueued", never "proven not
+    /// enqueued" — transports must settle ambiguity against the store itself.
+    public func enqueueUserMessage(
+        message: String,
+        sessionId: String?,
+        persona: String?,
+        surface: String,
+        attachments: [MultimodalAttachment] = [],
+        // Set by a caller that is enqueueing MACHINE text on the user row — the
+        // bridge's transport notices, a bot's composed brief. The user row is
+        // the one place a templated line can pass for something User said.
+        mechanicalRow: CognitiveMechanicalRowKind? = nil
+    ) async throws -> EnqueuedUserMessage {
+        let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            throw ChatOrchestrationError.emptyMessage
+        }
+        let resolvedSession = try Self.resolveSessionId(sessionId)
+        let runId = UUID().uuidString
+        try await appendMessage(
+            sessionId: resolvedSession,
+            role: "user",
+            content: message,
+            runId: runId,
+            attachments: attachments,
+            persona: persona,
+            source: surface,
+            mechanicalRow: mechanicalRow
+        )
+        return EnqueuedUserMessage(sessionId: resolvedSession, runId: runId)
+    }
+
+    /// Append one chat message in the daemon's per-line JSON shape so a
+    /// future reader (Python or SwiftNative SessionHistoryReader) round-trips
+    /// the record. Mirrors `append_chat_message` in the retired daemon.
+    /// `recalledMemoryIds` (mind-into-circulation, 2026-07-10): the MemoryV2
+    /// record ids this turn actually recalled. Stamped onto the assistant
+    /// turn's cognitive event as `memoryRecordIds` metadata — the convention
+    /// `attentionSignals(at:)` reads to feed felt-memory activation back into
+    /// Fluid Context selection. Without this stamp that channel is inert.
+    func appendMessage(
+        sessionId: String,
+        role: String,
+        content: String,
+        runId: String?,
+        attachments: [MultimodalAttachment],
+        persona: String? = nil,
+        source: String = "app",
+        recalledMemoryIds: [String] = [],
+        canonicalAssistantCompletion: Bool = false,
+        outcomeResult: TurnEngineResult? = nil,
+        outcomeContext: TurnContext? = nil,
+        outcomeTurnID: String? = nil,
+        responseOutcomeStatus: String? = nil,
+        providerRefusal: Bool = false,
+        providerRefusalDraft: Bool = false,
+        outcomeInterventionAssignment: CausalInterventionAssignment? = nil,
+        expectedLastMessageID: String? = nil,
+        // PROVENANCE, not prose: the templated writer that produced this row
+        // names ITSELF (`CognitiveMechanicalRowKind`). The felt organ keeps such
+        // a row out of lived state; it must never be inferred from the text of
+        // the row itself. Nil is the ordinary case — a turn somebody meant.
+        mechanicalRow: CognitiveMechanicalRowKind? = nil
+    ) async throws {
+        guard let safeSessionId = NativeAgentChatSessionID.normalizedPathComponent(sessionId) else {
+            throw ChatOrchestrationError.underlying("invalid chat session id")
+        }
+        let messageSource = Self.messageSource(for: source)
+        let sessionsPath = dataRoot
+            .appendingPathComponent("chat", isDirectory: true)
+            .appendingPathComponent("sessions.json")
+        // Reject a damaged shared index before creating an orphan transcript.
+        // The locked sync below remains authoritative; this preflight keeps the
+        // common stable-corruption case fully fail-closed across both files.
+        _ = try ChatSessionIndexFile.loadObjectRowsForMutation(at: sessionsPath)
+        let path = dataRoot
+            .appendingPathComponent("chat", isDirectory: true)
+            .appendingPathComponent("messages", isDirectory: true)
+            .appendingPathComponent("\(safeSessionId).jsonl")
+        let persistedAt = clock()
+        let createdAt = Self.iso8601(persistedAt)
+        let messageId = UUID().uuidString
+        // Precompute and encode the complete payload-free observation before
+        // entering the transcript lock. The lock performs no awaits and no
+        // future-state lookup; it only appends/replaces immutable bytes.
+        let responseStatus = responseOutcomeStatus
+            ?? (canonicalAssistantCompletion && role == "assistant" ? "persisted" : nil)
+        let outcomeObservation = responseStatus.flatMap {
+            ResponseOutcomeObservationV2.make(
+                turnID: outcomeTurnID ?? TurnTraceContext.turnId ?? runId,
+                messageID: messageId,
+                sessionID: sessionId,
+                surface: messageSource,
+                observedAt: persistedAt,
+                responsePersistence: $0,
+                result: outcomeResult,
+                context: outcomeContext,
+                interventionAssignment: outcomeInterventionAssignment
+            )
+        }
+        var record: [String: JSONValue] = [
+            "id": .string(messageId),
+            "sessionId": .string(sessionId),
+            "role": .string(role),
+            "content": .string(content),
+            "createdAt": .string(createdAt),
+            "source": .string(messageSource),
+        ]
+        if let runId { record["runId"] = .string(runId) }
+        var metadata: [String: JSONValue] = [:]
+        if !attachments.isEmpty {
+            // Stash attachment metadata (not bytes) so a future consolidation
+            // pass can correlate. Including base64 inline would explode the
+            // JSONL — daemon practice is to keep blobs out of this file.
+            var arr: [JSONValue] = []
+            for a in attachments {
+                var item: [String: JSONValue] = [
+                    "id": .string(a.id),
+                    "type": .string(a.type),
+                    "mime": .string(a.mime),
+                    "name": .string(a.name ?? ""),
+                    "byteSize": .int(Int64(a.byteSize)),
+                ]
+                if let path = a.path?.trimmingCharacters(in: .whitespacesAndNewlines),
+                   !path.isEmpty {
+                    item["path"] = .string(path)
+                }
+                arr.append(.object(item))
+            }
+            metadata["attachments"] = .array(arr)
+        }
+        if let persona, !persona.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            metadata["persona"] = .string(persona)
+        }
+        // THE ROW ANSWERS FOR ITSELF ON DISK. The cognitive event carries the
+        // resolved turn kind, but that lives in the substrate; a reader holding
+        // only the transcript — a replay, an export, the felt organ reading a
+        // node minted before this stamp existed — needs the provenance on the
+        // row. Written for BOTH roles: a templated user row (a bridge transport
+        // notice, a bot's composed brief) is no more something User said than
+        // card copy is something she said.
+        if let mechanicalRow {
+            metadata[CognitiveMechanicalRowKind.metadataKey] = .string(mechanicalRow.rawValue)
+        }
+        if providerRefusal { metadata["provider_refusal"] = .bool(true) }
+        if providerRefusalDraft { metadata["provider_refusal_draft"] = .bool(true) }
+        // Session provenance (658.14). Durable, out-of-band origin marking for
+        // messages that did NOT come from the human at this Mac. Only the user
+        // row carries it: an assistant row is hers by construction, and
+        // stamping origin there would imply the reply came from the bridge.
+        let originProvenance = role == "user"
+            ? ChatPersistenceContext.originProvenance
+            : nil
+        if let origin = originProvenance {
+            var originObject: [String: JSONValue] = [
+                "surface": .string(origin.surface),
+            ]
+            if let agent = origin.agent,
+               !agent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                originObject["agent"] = .string(agent)
+            }
+            if let replyTo = origin.replyTo { originObject["replyTo"] = .string(replyTo) }
+            metadata["origin"] = .object(originObject)
+        }
+        // `metadata.envelope` — the turn's surface identity and return route,
+        // durable on the row (one-thread-many-surfaces plan §2.3).
+        //
+        // WHY IT IS BROADER THAN `metadata.origin`, which stays exactly as it
+        // is above:
+        //
+        //   * origin is USER-ROW ONLY and deliberately so — an assistant row
+        //     is hers by construction, and stamping origin there would imply
+        //     the reply came from the bridge. The envelope has the opposite
+        //     job: it records WHERE THIS ROW'S TURN WAS SPOKEN AND WHERE ITS
+        //     REPLY WENT, which is a fact about the assistant row too.
+        //   * origin carries {surface, agent}. The envelope also carries the
+        //     verified identities and the delivery route, so a completion that
+        //     arrives after the originating loop has moved on can still find
+        //     its destination without re-deriving it from "the session's
+        //     surface" — which, with several surfaces writing one transcript,
+        //     is no longer a thing that exists.
+        //
+        // Both are written for one release (plan §6: rollback is only cheap
+        // while dual-write is on). The readers at MemoryV2+AdaptivePromoter
+        // and MacChatMessageProvenance keep reading `origin` untouched.
+        //
+        // NO TRUST VERDICT IS PERSISTED HERE, ever. See `TurnEnvelope`: a tool
+        // call's authority comes from the CURRENT turn's envelope, never from
+        // one in history. This row is a label a reader can trust to be honest
+        // about provenance, and it grants nothing.
+        let turnEnvelope: TurnEnvelope = {
+            let live = TurnEnvelope.current(surface: messageSource)
+            guard let origin = originProvenance else { return live }
+            // A bridged turn's honest surface is the bridge it arrived on, and
+            // its lane is the agent. `messageSource` is the TOOL-AUTHORIZATION
+            // surface (the bridges deliberately run as "chat"), so the two
+            // must not be conflated on a provenance row.
+            return TurnEnvelope(
+                surface: origin.surface,
+                agent: origin.agent,
+                verifiedChatId: live.verifiedChatId,
+                verifiedUserId: live.verifiedUserId,
+                commandSignatureVerified: live.commandSignatureVerified,
+                deliveryRoute: live.deliveryRoute,
+                declaredRemote: live.declaredRemote
+            )
+        }()
+        metadata["envelope"] = turnEnvelope.persistedMetadata()
+        if canonicalAssistantCompletion,
+           role == "assistant",
+           let binding = ChatPersistenceContext.codexCompletionBinding,
+           !binding.deliveryId.isEmpty,
+           !binding.requestDigest.isEmpty {
+            let executedModel = outcomeContext?.modelId
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let completionModel = executedModel?.isEmpty == false
+                ? executedModel!
+                : binding.model
+            let completionEffort = outcomeContext?.reasoningEffort
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            var completion: [String: JSONValue] = [
+                "deliveryId": .string(binding.deliveryId),
+                "requestDigest": .string(binding.requestDigest),
+                // The successful turn context is the execution truth. A shell
+                // may bind blank/stale request evidence before admission, but
+                // crash recovery must cache the tuple that actually produced
+                // this canonical assistant row.
+                "model": .string(completionModel),
+                "responseDigest": .string(CodexCompletionTranscriptEvidence.responseDigest(
+                    sessionId: sessionId,
+                    runId: runId ?? "",
+                    content: content,
+                    attachments: attachments
+                )),
+            ]
+            if let effort = completionEffort?.isEmpty == false
+                ? completionEffort
+                : binding.reasoningEffort {
+                completion["reasoningEffort"] = .string(effort)
+            }
+            metadata["codexCompletion"] = .object(completion)
+        }
+        // Payload-free outcome correlation: canonical assistant completions
+        // retain the opaque turn receipt identity that produced them. This is
+        // not prompt context and is never reconstructed from message prose.
+        // It lets an explicit regenerate replacement name the exact earlier
+        // turn rather than guessing that the preceding assistant row was it.
+        if let outcomeObservation, role == "assistant" {
+            metadata["turnTraceId"] = .string(outcomeObservation.turnID)
+            metadata["outcomeObservation"] = outcomeObservation.jsonValue
+        }
+        // Where this assistant row's working commentary ends and its answer
+        // begins. Content is untouched; the transcript uses this to fold the
+        // commentary into a detail once the turn has settled.
+        if role == "assistant",
+           let commentary = outcomeResult?.workingCommentaryCharacters,
+           commentary > 0, commentary < content.count {
+            metadata["workingCommentaryChars"] = .int(Int64(commentary))
+        }
+        if !metadata.isEmpty {
+            record["metadata"] = .object(metadata)
+        }
+        // Locked: see appendPartial — protects against the compactor/distiller
+        // locked rewrite dropping a concurrent append. (Immutable binding: a
+        // @Sendable closure cannot capture the mutable `record`.)
+        let messageRow: JSONValue = .object(record)
+        // Line-count bookkeeping happens INSIDE this lock, on purpose. Both
+        // branches below know exactly how many rows the transcript holds when
+        // they commit — the append branch adds one line to whatever was there,
+        // the replacement branch rewrites a known row set — so the session
+        // index sync below can validate that count with a stat instead of
+        // re-deriving it by reading every byte of the file. Doing it under the
+        // same lock that guards the write is what makes the recorded count
+        // trustworthy: no other lock-respecting writer, in this process or
+        // another, can slip a row in between the read and the record.
+        let replacedTurnTraceID: String? = try await persistence.withFileLock(path) {
+            if let expectedLastMessageID {
+                let bytes = try Data(contentsOf: path)
+                guard bytes.count <= 8 * 1024 * 1024,
+                      let text = String(data: bytes, encoding: .utf8),
+                      let tail = text.split(separator: "\n", omittingEmptySubsequences: true).last,
+                      let last = try? JSONValue.parse(Data(tail.utf8)),
+                      Self.messageID(in: last) == expectedLastMessageID else {
+                    throw ChatOrchestrationError.underlying("The conversation changed before the reply could be saved. Reopen it before replying.")
+                }
+            }
+            if canonicalAssistantCompletion,
+               role == "assistant",
+               let replacementID = ChatPersistenceContext.replacementAssistantMessageID?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+               !replacementID.isEmpty {
+                let rows = try await persistence.readJSONL(path)
+                let matching = rows.indices.filter { index in
+                    Self.messageID(in: rows[index]) == replacementID
+                }
+                guard matching.count == 1 else {
+                    throw ChatOrchestrationError.underlying(
+                        "regenerate replacement target must identify exactly one persisted message"
+                    )
+                }
+                let index = matching[0]
+                guard Self.messageRole(in: rows[index]) == "assistant" else {
+                    throw ChatOrchestrationError.underlying(
+                        "regenerate replacement target is not an assistant message"
+                    )
+                }
+                // Retry may already have persisted its own tool receipts. They
+                // are not a newer conversational turn, but must stay ahead of
+                // its final answer. No foreign or untyped trailing row qualifies.
+                let onlyOwnRetryReceipts = rows[(index + 1)...].allSatisfy { row in
+                    guard let runId, !runId.isEmpty,
+                          case .object(let object) = row,
+                          object["role"] == .string("tool"),
+                          object["runId"] == .string(runId),
+                          object["sessionId"] == .string(sessionId),
+                          case .string(let rowID)? = object["id"], !rowID.isEmpty,
+                          case .object(let metadata)? = object["metadata"],
+                          case .string(let toolName)? = metadata["toolName"], !toolName.isEmpty,
+                          case .string(let kind)? = metadata["kind"]
+                    else { return false }
+                    return kind == ChatTranscriptToolMessageKind.toolUse
+                        || kind == ChatTranscriptToolMessageKind.approvalPending
+                }
+                guard onlyOwnRetryReceipts else {
+                    throw ChatOrchestrationError.underlying(
+                        "regenerate replacement target is no longer the transcript tail"
+                    )
+                }
+                let priorTurnTraceID = Self.messageTurnTraceID(in: rows[index])
+                var replaced = rows
+                replaced.remove(at: index)
+                replaced.append(messageRow)
+                try Self.writeJSONLAtomically(replaced, to: path)
+                // A replacement is row-count neutral by construction: one row
+                // replaces exactly one match, after its receipts. `writeJSONLAtomically`
+                // emits one non-blank line per row, which is precisely what
+                // `countJSONLLines` counts.
+                ChatTranscriptLineCountCache.shared.record(count: replaced.count, at: path)
+                return priorTurnTraceID
+            } else {
+                let priorCount = ChatTranscriptLineCountCache.shared.count(
+                    at: path,
+                    recount: Self.countJSONLLines(at:)
+                )
+                // DURABLE (sweep R4 item 4). Every row that reaches this
+                // function is a COMMITTED turn boundary: `role` is "user" at
+                // three call sites and "assistant" at four, and the assistant
+                // ones are terminal completions or the terminal failure row —
+                // streaming partials never come here (persistPartialIfNeeded
+                // owns those and stays on the fast path). A user row lost to
+                // power loss is a question the user watched land and then
+                // vanish; a terminal assistant row lost is the answer to it.
+                // Cost is one F_FULLFSYNC per committed turn boundary (~2 per
+                // turn), which is the budget PersistenceCore's own note on
+                // appendJSONLDurable reserves for "feeds that ARE the state of
+                // record".
+                try await persistence.appendJSONLDurable(messageRow, to: path)
+                // `appendJSONLDurable` writes exactly one serialized line plus "\n".
+                ChatTranscriptLineCountCache.shared.record(count: priorCount + 1, at: path)
+                return nil
+            }
+        }
+        if role == "user" {
+            do {
+                _ = try await OutcomeFeedbackStore(
+                    dataRoot: dataRoot,
+                    persistence: persistence,
+                    clock: { persistedAt }
+                ).recordConversationContinuation(
+                    sessionID: safeSessionId,
+                    reactionMessageID: messageId
+                )
+            } catch {
+                // The user row is already durable state. Reaction learning is
+                // additive evidence and cannot roll the user's message back.
+                NSLog("OutcomeFeedbackStore: continuation receipt failed: \(error)")
+            }
+        }
+        // This receipt means exactly one thing: the locked canonical transcript
+        // replacement committed. It does not call the retry a correction, say
+        // that the old response was bad, or give the shadow any control.
+        if let targetTurnID = OutcomeTraceIdentity.normalized(replacedTurnTraceID),
+           let reactionTurnID = OutcomeTraceIdentity.normalized(TurnTraceContext.turnId),
+           targetTurnID != reactionTurnID {
+            TurnTraceBus.fire(TurnTraceEvent(
+                turnId: reactionTurnID,
+                kind: "turn.reaction",
+                sessionId: sessionId,
+                surface: source,
+                payload: .object([
+                    "schema": .string("metacognition.reaction.v1"),
+                    "controlAuthority": .bool(false),
+                    "reaction": .string("explicit_retry"),
+                    "targetTurnId": .string(targetTurnID),
+                    "observedBy": .string("transcript.regenerate_replacement"),
+                ])
+            ), on: turnTraceBus)
+        }
+        try await syncSessionIndex(
+            sessionId: sessionId,
+            role: role,
+            content: content,
+            timestamp: createdAt,
+            messagesPath: path,
+            source: messageSource
+        )
+        await observeCognitiveMessage(
+            sessionId: sessionId,
+            role: role,
+            content: content,
+            runId: runId,
+            source: messageSource,
+            createdAt: createdAt,
+            messageId: messageId,
+            origin: originProvenance,
+            recalledMemoryIds: recalledMemoryIds,
+            mechanicalRow: mechanicalRow
+        )
+    }
+
+    private static func messageID(in row: JSONValue) -> String? {
+        guard case .object(let object) = row else { return nil }
+        if case .string(let id)? = object["id"] { return id }
+        if case .string(let id)? = object["message_id"] { return id }
+        return nil
+    }
+
+    private static func messageRole(in row: JSONValue) -> String? {
+        guard case .object(let object) = row,
+              case .string(let role)? = object["role"] else { return nil }
+        return role
+    }
+
+    private static func messageTurnTraceID(in row: JSONValue) -> String? {
+        guard case .object(let object) = row,
+              case .object(let metadata)? = object["metadata"],
+              case .string(let raw)? = metadata["turnTraceId"]
+        else { return nil }
+        return OutcomeTraceIdentity.normalized(raw)
+    }
+
+    private static func writeJSONLAtomically(_ rows: [JSONValue], to path: URL) throws {
+        var payload = Data()
+        for row in rows {
+            payload.append(contentsOf: try row.serialize(pretty: false).utf8)
+            payload.append(0x0A)
+        }
+        try FileManager.default.createDirectory(
+            at: path.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        // Durable replacement, not bare .atomic: this writer's one production
+        // caller swaps a terminal assistant row in place (regenerate). Losing
+        // that rewrite to power loss while the session index already durably
+        // recorded it would roll the transcript back behind its own index
+        // (gpt-5.5 review 2026-08-06, blocking #2). Same temp-fsync + rename
+        // + parent-dir-fsync contract as every other state-of-record write.
+        try SwiftNativePersistenceCore.writeDataAtomicDurable(payload, to: path)
+        _ = chmod(path.path, 0o600)
+    }
+
+    func appendFailureMessageIfNeeded(
+        sessionId: String,
+        runId: String?,
+        errorMessage: String,
+        failure: Error? = nil,
+        persona: String?,
+        outcomeContext: TurnContext? = nil,
+        outcomeTurnID: String? = nil,
+        outcomeInterventionAssignment: CausalInterventionAssignment? = nil
+    ) async throws {
+        let report = failure.flatMap { ProviderFailure.report($0) }
+        let canDraft = report?.cause == .refused && report?.work == .nothingRan
+            && outcomeContext?.providerId?.isEmpty == false
+            && outcomeContext?.modelId.isEmpty == false
+        let content: String
+        if report?.cause == .refused {
+            let route = outcomeContext?.providerId ?? "unknown route"
+            let model = outcomeContext?.modelId ?? "unknown model"
+            content = "The \(route) route rejected this request on \(model). "
+                + (canDraft
+                    ? "Use Retry draft below, choose another configured model in the chat model picker, then send it."
+                    : "outcome unknown — inspect before retry. Some steps may have run.")
+        } else {
+            content = report?.personDescription ?? "The reply could not be completed."
+        }
+        guard let safeSessionId = NativeAgentChatSessionID.normalizedPathComponent(sessionId) else {
+            return
+        }
+        let path = dataRoot
+            .appendingPathComponent("chat", isDirectory: true)
+            .appendingPathComponent("messages", isDirectory: true)
+            .appendingPathComponent("\(safeSessionId).jsonl")
+        if await Self.sessionAlreadyHasAssistantMessage(path: path, runId: runId) {
+            return
+        }
+        try await appendMessage(
+            sessionId: sessionId,
+            role: "assistant",
+            content: content,
+            runId: runId,
+            attachments: [],
+            persona: persona,
+            outcomeContext: outcomeContext,
+            outcomeTurnID: outcomeTurnID,
+            responseOutcomeStatus: "failed",
+            providerRefusal: report?.cause == .refused,
+            providerRefusalDraft: canDraft,
+            outcomeInterventionAssignment: outcomeInterventionAssignment,
+            // This sentence is the machine reporting that it broke, filed on
+            // her row because a transcript has nowhere else to put it. She did
+            // not say it, and a provider failure is already felt through the
+            // somatic lane — reading the error TEXT back as a moment she lived
+            // scores the same failure a second time, in words she never chose.
+            mechanicalRow: .systemRow
+        )
+    }
+
+    /// Carry the compaction outcome so the window cursor does not rewrite the
+    /// same prefix again. Only cancellation aborts this preparation.
+    func prepareSessionHistoryForTurn(
+        sessionId: String,
+        model: String,
+        surface: String,
+        runId: String
+    ) async throws(CancellationError) -> Bool {
+        var compactionRanThisTurn = false
+        do {
+            compactionRanThisTurn = try await compactSessionBeforeContextIfNeeded(
+                sessionId: sessionId, model: model, surface: surface, runId: runId
+            ).compacted
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            let message = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
+            // 2026-09-05: compaction is a BACKSTOP, not a precondition. Killing
+            // the turn here spent the user's turn on a failure nothing about
+            // this turn depended on: the history window cursor already bounds
+            // the replayed prefix, so an oversized session still assembles a
+            // bounded prompt, and the aging lane retries the fold later. Trace
+            // it and carry on with compactionRanThisTurn = false.
+            TurnTraceBus.fireFromContext(
+                kind: "compaction.backstop_failed", surface: surface,
+                payload: .object(["message": .string(message)])
+            )
+        }
+        // The append may have crossed the aging boundary. Scheduling is not
+        // awaited and cannot fail the turn; cancellation above never schedules.
+        scheduleTranscriptAgingIfNeeded(
+            sessionId: sessionId, model: model, surface: surface, runId: runId
+        )
+        return compactionRanThisTurn
+    }
+
+    @discardableResult
+    func compactSessionBeforeContextIfNeeded(
+        sessionId: String,
+        model: String,
+        surface: String,
+        runId: String?
+    ) async throws -> ChatSessionCompactionOutcome {
+        // A pre-seeding provider call is never a prefix-shaped request: this
+        // runs BEFORE the turn's context is built and its messages are seeded,
+        // so there is no replayed prefix for a v2 wire layout to describe.
+        // Binding here covers every caller of this entry point — the
+        // text-compat lane and both structured-chat sites.
+        try await ConversationPrefixShape.$override.withValue(.v1Legacy) {
+            try await compactSession(
+                sessionId: sessionId,
+                model: model,
+                surface: surface,
+                runId: runId,
+                providerID: LLMCallContext.providerId,
+                trigger: "auto_threshold",
+                force: false
+            )
+        }
+    }
+
+    /// Explicit user-requested compaction through the same canonical owner as
+    /// automatic pre-turn compaction. `force` bypasses only the automatic
+    /// enable/threshold gates; validation, verified backup, keep-tail,
+    /// durable replacement, trace projection, and optional distillation remain
+    /// identical.
+    @discardableResult
+    public func compactSession(
+        sessionId: String,
+        model: String,
+        surface: String = "chat",
+        runId: String? = nil,
+        providerID: String? = nil,
+        force: Bool = true
+    ) async throws -> ChatSessionCompactionOutcome {
+        try await compactSession(
+            sessionId: sessionId,
+            model: model,
+            surface: surface,
+            runId: runId,
+            providerID: providerID,
+            trigger: force ? "manual_request" : "manual_threshold",
+            force: force
+        )
+    }
+
+    private func compactSession(
+        sessionId: String,
+        model: String,
+        surface: String,
+        runId: String?,
+        providerID: String?,
+        trigger: String,
+        force: Bool
+    ) async throws -> ChatSessionCompactionOutcome {
+        let compactor = ChatSessionAutocompactor(
+            dataRoot: dataRoot,
+            config: autocompactionConfig,
+            now: clock
+        )
+        let outcome = try await compactor.compactIfNeeded(
+            sessionId: sessionId,
+            model: model,
+            surface: surface,
+            runId: runId,
+            providerID: providerID,
+            trigger: trigger,
+            force: force
+        )
+        // 2026-09-06: compaction rewrites the transcript, so it is a transcript
+        // write like any other and has to advance the session's transcript
+        // version. Outside the compactor's own message-file lock — this takes
+        // the index lock, and the two are never nested.
+        if outcome.compacted {
+            await bumpSessionTranscriptGeneration(sessionId: outcome.sessionId)
+        }
+        // Fire-and-forget LLM distillation of the mechanical summary. Only when
+        // distill is enabled AND a backup was taken (both encoded in the outcome
+        // via a non-nil summaryRowId/backupPath). Never delays or fails the turn;
+        // any distiller failure leaves the mechanical summary standing.
+        if autocompactionConfig.distillEnabled,
+           outcome.compacted,
+           let rowId = outcome.summaryRowId,
+           let backupPath = outcome.backupPath {
+            let dataRoot = self.dataRoot   // let/Sendable — nonisolated capture
+            let llm = self.llm
+            let clock = self.clock
+            let messagesReplaced = outcome.messagesReplaced
+            Task.detached(priority: .background) {
+                let distiller = ChatCompactionDistiller(
+                    dataRoot: dataRoot,
+                    summaryModelResolver: { surface in
+                        try? await SwiftNativeProviderRouting(
+                            dataRoot: dataRoot,
+                            surfacesPathOverride: dataRoot
+                                .appendingPathComponent("providers", isDirectory: true)
+                                .appendingPathComponent("surfaces.json"),
+                            activeProviderPathOverride: dataRoot
+                                .appendingPathComponent("providers", isDirectory: true)
+                                .appendingPathComponent("active.json")
+                        ).modelForSurface(surface).model
+                    },
+                    llmComplete: { model, prompt in
+                        try await llm.complete(
+                            prompt: prompt,
+                            system: ChatCompactionDistiller.distillSystem,
+                            model: model,
+                            surface: ChatCompactionDistiller.distillSurface
+                        )
+                    },
+                    now: clock
+                )
+                // `Task.detached` inherits no task-locals, so the caller's
+                // binding cannot reach here — and the distiller's own LLM call
+                // is a plain prompt with no replayed prefix. Say v1 outright
+                // rather than depending on unbound-means-legacy, which holds
+                // only while the adapters read `override` and not `.effective`.
+                await ConversationPrefixShape.$override.withValue(.v1Legacy) {
+                    await distiller.distill(
+                        sessionId: sessionId,
+                        summaryRowId: rowId,
+                        backupPath: backupPath,
+                        messagesReplaced: messagesReplaced,
+                        turnModel: model,
+                        providerID: providerID,
+                        surface: surface,
+                        runId: runId
+                    )
+                }
+            }
+        }
+        return outcome
+    }
+
+    static func shouldPersistFailureMessage(surface: String) -> Bool {
+        // 2026-09-22: telegram removed — a failed phone turn left no row.
+        !["bot"].contains(surface.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
+    }
+
+    /// The one public boundary that admits an identity to durable chat state.
+    /// Mounted surfaces creating a new conversation must generate and retain an
+    /// ID before calling this; persistence itself never manufactures one.
+    public static func resolveSessionId(_ sessionId: String?) throws -> String {
+        // A transcript operation may never invent an identity. A caller that
+        // lost its session id must fail at this boundary instead of silently
+        // creating an orphan transcript and sessions.json row that no visible
+        // conversation owns. New-session creation belongs to the mounted
+        // surface before it calls into persistence, where it can retain and
+        // display the generated identity.
+        guard let raw = sessionId else {
+            throw ChatOrchestrationError.underlying("missing chat session id")
+        }
+        guard let safe = NativeAgentChatSessionID.normalizedPathComponent(raw) else {
+            throw ChatOrchestrationError.underlying("invalid chat session id")
+        }
+        return safe
+    }
+
+    static func sessionAlreadyHasAssistantMessage(path: URL, runId: String?) async -> Bool {
+        guard let runId, !runId.isEmpty else { return false }
+        guard let data = try? Data(contentsOf: path),
+              let text = String(data: data, encoding: .utf8) else {
+            return false
+        }
+        for rawLine in text.split(separator: "\n", omittingEmptySubsequences: true).reversed() {
+            guard let lineData = String(rawLine).data(using: .utf8),
+                  let parsed = try? JSONValue.parse(lineData),
+                  case .object(let obj) = parsed else {
+                continue
+            }
+            if case .string(let rowRunId)? = obj["runId"], rowRunId != runId {
+                continue
+            }
+            if case .string(let rowRunId)? = obj["runId"], rowRunId == runId,
+               case .string(let role)? = obj["role"], role == "assistant" {
+                // A persisted PARTIAL/cancelled row (mid-stream failure or cancel)
+                // is NOT a completed turn — it must not suppress the failure row
+                // that surfaces the error on non-Mac surfaces (audit #5 follow-up;
+                // mirrors NativeClient.isCompletedAssistant). gpt-5.5 review.
+                if case .bool(true)? = obj["cancelled"] { continue }
+                if case .object(let meta)? = obj["metadata"] {
+                    if case .bool(true)? = meta["partial"] { continue }
+                    if case .bool(true)? = meta["cancelled"] { continue }
+                }
+                // Nor is a BLANK row a completed assistant turn. A row that
+                // persisted with no text is the thing the failure sentence
+                // exists to explain, so letting it suppress that sentence
+                // left the run with receipts and nothing said at all.
+                if case .string(let rowContent)? = obj["content"],
+                   rowContent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    continue
+                }
+                return true
+            }
+        }
+        return false
+    }
+
+    private func observeCognitiveMessage(
+        sessionId: String,
+        role: String,
+        content: String,
+        runId: String?,
+        source: String,
+        createdAt: String,
+        messageId: String,
+        origin: ChatMessageOrigin? = nil,
+        recalledMemoryIds: [String] = [],
+        mechanicalRow: CognitiveMechanicalRowKind? = nil
+    ) async {
+        guard let cognitiveObserver else { return }
+        let normalizedRole = role.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let kind: CognitiveEventKind
+        let sourceClass: CognitiveSourceClass
+        let importance: Double
+        switch normalizedRole {
+        case "user":
+            kind = .userMessageReceived
+            // A bridge worker is not the human. Out-of-band origin, never its
+            // forgeable text prefix, decides this trust class.
+            sourceClass = origin == nil ? .userStated : .imported
+            importance = 0.65
+        case "assistant":
+            // The failure row is the only row stamped .systemRow, so the row
+            // kind says "this turn broke" exactly. This used to be read off a
+            // "chat error:" text prefix, which the plain failure sentence no
+            // longer carries — and which a reply could have written itself.
+            if mechanicalRow == .systemRow {
+                kind = .providerFailure
+                sourceClass = .observed
+                importance = 0.85
+            } else {
+                kind = .assistantTurnCompleted
+                sourceClass = .selfReported
+                importance = 0.55
+            }
+        default:
+            return
+        }
+        let redactedSummary = ChatSecretRedactor.redactText(content)
+        var metadata: [String: JSONValue] = [
+            "sessionId": .string(sessionId),
+            "messageId": .string(messageId),
+            "role": .string(normalizedRole),
+            "source": .string(source),
+        ]
+        if normalizedRole == "user", let origin {
+            // Keep the cognitive ledger correlated with the canonical
+            // transcript without copying attacker-sized TaskLocal strings.
+            // This is recorded route provenance, not a named-agent identity
+            // attestation (the bridge currently uses one shared bearer).
+            var cognitiveOrigin: [String: JSONValue] = [
+                "surface": .string(String(origin.surface.unicodeScalars.prefix(80))),
+            ]
+            if let agent = origin.agent {
+                let boundedAgent = String(agent.unicodeScalars.prefix(80))
+                if !boundedAgent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    cognitiveOrigin["agent"] = .string(boundedAgent)
+                }
+            }
+            // Item 8: forwarded ONLY when the lane stated it. Route provenance
+            // alone cannot say whether the agent spoke or merely carried the
+            // human's words, and the affect layer needs that distinction before
+            // it will let anyone other than the user move her.
+            if let authored = origin.authored {
+                cognitiveOrigin["authored"] = .string(authored.rawValue)
+            }
+            metadata["origin"] = .object(cognitiveOrigin)
+        }
+        if let runId { metadata["runId"] = .string(runId) }
+        if kind == .providerFailure, providerLifecycleObserverInstalled {
+            metadata[CognitiveSomaticSignalAdapter.somaticOwnerMetadataKey] = .string(
+                CognitiveSomaticSignalAdapter.providerLifecycleSomaticOwner
+            )
+        }
+        // Mind-into-circulation (2026-07-10): stamp the turn's recalled MemoryV2
+        // record ids so the node this event becomes carries them — the substrate's
+        // attentionSignals read maps them to felt-memory activation. Assistant
+        // turns only (that's the turn that USED the recalls), deduped, bounded.
+        if normalizedRole == "assistant", kind == .assistantTurnCompleted, !recalledMemoryIds.isEmpty {
+            let bounded = Array(Set(recalledMemoryIds)).sorted().prefix(32)
+            metadata["memoryRecordIds"] = .array(bounded.map { .string($0) })
+        }
+        if normalizedRole == "assistant", kind == .assistantTurnCompleted {
+            // The event summary is deliberately capped below, but delivery-
+            // envelope telemetry needs the length of the actual redacted
+            // reply. Carry only that bounded count; never duplicate content.
+            metadata[CognitiveSubstrate.replyCharacterCountMetadataKey] =
+                .int(Int64(redactedSummary.count))
+            // The summary keeps the head; a long reply's sign-off is where a
+            // form of address lives, so the Sound rut detector gets the tail.
+            if redactedSummary.count > 500 {
+                metadata[CognitiveSubstrate.replyTailMetadataKey] =
+                    .string(String(redactedSummary.suffix(300)))
+            }
+        }
+        // Carried onto the node so the READ side can recognise the row later
+        // without re-deriving anything — and so a stored node says which
+        // machinery wrote it, not merely that something did.
+        if let mechanicalRow {
+            metadata[CognitiveMechanicalRowKind.metadataKey] = .string(mechanicalRow.rawValue)
+        }
+        let turnKind = Self.cognitiveMessageTurnKind(
+            role: normalizedRole, source: source,
+            redactedContent: redactedSummary, origin: origin,
+            mechanicalRow: mechanicalRow
+        )
+        let subject: CognitiveSubjectReference
+        if normalizedRole == "assistant", kind == .assistantTurnCompleted {
+            subject = CognitiveSubjectReference(
+                type: "chat.assistant_turn",
+                id: "\(sessionId):\(messageId)",
+                // Her own turns get a topic too (2026-09-02): a felt moment
+                // that read `chat.assistant_turn` pointed at nothing.
+                label: CognitiveSubstrate.feltTopicLabel(from: redactedSummary)
+            )
+        } else if kind == .userMessageReceived || kind == .userCorrection {
+            // Audit C2 (2026-07-09): user turns get PER-TURN subjects, mirroring the
+            // assistant branch. The old per-session subject collapsed every user turn
+            // onto ONE field node whose asymmetric reconsolidation (up 0.5 / down 0.15)
+            // ratcheted positive — a criticism blended into a warm session node instead
+            // of stamping a fresh stung one, defeating the felt fingerprint's sting
+            // path in production while per-turn-shaped tests passed. Session-level
+            // continuity still reads through sessionId metadata (the semantic
+            // appraisal's same-session evidence), not through node identity.
+            subject = CognitiveSubjectReference(
+                type: "chat.user_turn",
+                id: "\(sessionId):\(messageId)",
+                // 2026-09-02 — the turn's TOPIC, so the felt line can say what
+                // it is about ("on edge — about deploy pipeline") instead of
+                // carrying a feeling with no sky. Up to three salient content
+                // words, from the REDACTED summary and through the same
+                // extractor Fluid Context uses for attention terms; nil when
+                // the turn has no salient term, and then the line simply has
+                // no object. Never the message itself: stopwords, pronouns,
+                // punctuation, grammar and digits do not survive it.
+                label: CognitiveSubstrate.feltTopicLabel(from: redactedSummary)
+            )
+        } else {
+            subject = CognitiveSubjectReference(type: "chat.session", id: sessionId)
+        }
+        await cognitiveObserver.observe(CognitiveEvent(
+            id: "chat:\(sessionId):\(messageId)",
+            kind: kind,
+            subject: subject,
+            sourceClass: sourceClass,
+            occurredAt: Self.dateFromISO8601(createdAt) ?? clock(),
+            summary: String(redactedSummary.prefix(500)),
+            importance: importance,
+            turnKind: turnKind,
+            metadata: metadata
+        ))
+    }
+
+    /// One workload-class boundary for accepted events and their capsules.
+    /// Capsule preparation must not reinterpret admitted live prose as debug.
+    nonisolated static func cognitiveMessageTurnKind(
+        role: String,
+        source: String,
+        redactedContent: String,
+        origin: ChatMessageOrigin?,
+        mechanicalRow: CognitiveMechanicalRowKind? = nil
+    ) -> CognitiveTurnKind {
+        // Chat workload class comes from surface provenance, never from topic
+        // words. An ordinary user asking about the scheduler/doctor/observatory
+        // is still a live turn. Verified out-of-band bridge origin makes
+        // bounded content markers eligible to classify diagnostic traffic as
+        // debug/verification; the runtime then carries that class through the
+        // correlated run to tools and reply.
+        let classificationSignals: [String]
+        if role == "user", let origin, Self.isTrustedBridgeOrigin(origin) {
+            // Content markers are eligible only behind a server-bound bridge
+            // lane. This is transport provenance, not a claim inferred from
+            // prose supplied by the human.
+            // The synthetic prefix keeps the existing Codex debug classifier
+            // behavior without trusting prose supplied by a Mac user.
+            classificationSignals = [
+                source,
+                origin.surface,
+                origin.agent.map { "[from: \($0), via bridge]" } ?? "",
+                redactedContent,
+            ]
+        } else if role == "user" {
+            classificationSignals = [source]
+        } else {
+            classificationSignals = [source, redactedContent]
+        }
+        // A TEMPLATED LINE IS NOT AN EXPERIENCE (Agent, item 5, 2026-09-14).
+        //
+        // ASKED FIRST, AND OF BOTH ROLES. The card lane was the first writer to
+        // claim this and the rule was written for assistant rows only, on the
+        // reasoning that "the same words typed by a person are a real thing they
+        // said to her". That reasoning holds for words a PERSON typed and for
+        // nothing else — and the rest of Agent's list is not that. A bridge
+        // transport notice and a bot's composed brief arrive on the USER row
+        // while being machine-written boilerplate no human ever said, so asking
+        // only about assistant rows left exactly those two feeding the organ.
+        // The writer names itself either way; a row nobody meant is a row nobody
+        // meant, whichever side of the conversation it was filed under.
+        if mechanicalRow != nil {
+            return .mechanical
+        }
+        // The card lane's own case is `.cardLane` above. Its history, kept
+        // because both halves were bought with a regression:
+        //
+        //   * The interaction lane writes consequence sentences in her voice
+        //     when a connector is missing or a permission is refused, and they
+        //     reached this seam as ordinary assistant prose with nothing to mark
+        //     them; the felt organ scored "I'll carry on with whatever else I
+        //     can reach." as her mood. The row is still recorded in full —
+        //     `.mechanical` only keeps it out of lived state, which is where
+        //     appraisal reads.
+        //   * That used to be decided by matching the lane's stock phrases
+        //     inside the row's text, so a genuine reply that happened to contain
+        //     one ("…; nothing else changes.") was dropped from felt appraisal
+        //     (2026-09-14). Provenance is the only honest signal, and the writer
+        //     is the only thing that has it.
+        let inferredTurnKind = CognitiveTurnKind.inferred(fromSignals: classificationSignals)
+        return switch inferredTurnKind {
+        case .debug, .verification: inferredTurnKind
+        case .live, .system, .mechanical: .live
+        }
+    }
+
+    private static func isTrustedBridgeOrigin(_ origin: ChatMessageOrigin) -> Bool {
+        let surface = origin.surface.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let agent = origin.agent?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        switch (surface, agent) {
+        case ("claude-bridge", "claude"),
+             ("codex-bridge", "codex"),
+             ("omp-bridge", "omp"):
+            return true
+        default:
+            return false
+        }
+    }
+
+    private func observeCognitiveTool(
+        sessionId: String,
+        runId: String?,
+        toolName: String,
+        resultSummary: String,
+        ok: Bool,
+        cognitiveResult: ChatToolOutcome.CognitiveResult?,
+        canonicalToolRisk: CanonicalToolRisk,
+        source: String,
+        createdAt: String,
+        messageId: String
+    ) async {
+        guard let cognitiveObserver else { return }
+        let exactCognitiveResult = cognitiveResult ?? (ok ? .succeeded : .failed)
+        guard exactCognitiveResult != .unknown else { return }
+        var metadata: [String: JSONValue] = [
+            "sessionId": .string(sessionId),
+            "messageId": .string(messageId),
+            "toolName": .string(toolName),
+            "ok": .bool(ok),
+            "source": .string(source),
+            "trustRisk": .string(canonicalToolRisk.rawValue),
+        ]
+        if let runId { metadata["runId"] = .string(runId) }
+        let succeeded = exactCognitiveResult == .succeeded
+        let status = succeeded ? "ok" : "failed"
+        let summary = resultSummary.isEmpty
+            ? "\(toolName) \(status)"
+            : "\(toolName) \(status): \(resultSummary)"
+        await cognitiveObserver.observe(CognitiveEvent(
+            id: "chat-tool:\(sessionId):\(messageId)",
+            kind: succeeded ? .toolSucceeded : .toolFailed,
+            subject: CognitiveSubjectReference(type: "tool", id: toolName, label: toolName),
+            sourceClass: .observed,
+            occurredAt: Self.dateFromISO8601(createdAt) ?? clock(),
+            summary: String(summary.prefix(500)),
+            importance: succeeded ? 0.55 : 0.8,
+            metadata: metadata
+        ))
+    }
+
+    func observeCognitiveProgressEvent(
+        sessionId: String,
+        runId: String?,
+        surface: String,
+        event: TurnStreamEvent,
+        toolResultAlreadyPersisted: Bool
+    ) async {
+        guard let cognitiveObserver else { return }
+        let occurredAt = clock()
+        switch event {
+        case .toolUse(let name, let input):
+            let safeName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !safeName.isEmpty else { return }
+            // Canonical motor owners emit their own exact action identity and
+            // lifecycle. A generic start here cannot be correlated with that
+            // terminal state and would leave false pending physiology.
+            guard !ChatToolOutcome.hasCanonicalMotorOwner(safeName) else { return }
+            // W2/W3-FIX-R2 2 — cognitive events are persisted physiology, so
+            // the same by-tool redaction applies before the preview is cut.
+            // (Injection tools take the canonical-motor-owner early return
+            // above today; this must not depend on that staying true.)
+            let inputPreview = Self.compactCognitiveJSON(
+                MacInjectionArgRedaction.redactedPayload(tool: safeName, payload: input),
+                maxCharacters: 240
+            )
+            var metadata: [String: JSONValue] = [
+                "sessionId": .string(sessionId),
+                "toolName": .string(safeName),
+                "surface": .string(surface),
+                "phase": .string("started"),
+                "inputPreview": .string(inputPreview),
+            ]
+            if let runId { metadata["runId"] = .string(runId) }
+            await cognitiveObserver.observe(CognitiveEvent(
+                id: "chat-tool-start:\(sessionId):\(runId ?? "no-run"):\(safeName):\(Self.cognitiveDigest(inputPreview))",
+                kind: .toolStarted,
+                subject: CognitiveSubjectReference(type: "tool", id: safeName, label: safeName),
+                sourceClass: .observed,
+                occurredAt: occurredAt,
+                summary: inputPreview.isEmpty
+                    ? "\(safeName) started"
+                    : "\(safeName) started: \(inputPreview)",
+                importance: 0.45,
+                metadata: metadata
+            ))
+
+        case .toolResult(let name, let output):
+            guard !toolResultAlreadyPersisted else { return }
+            let safeName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !safeName.isEmpty else { return }
+            let cognitiveResult = ChatToolOutcome.cognitiveResult(
+                tool: safeName,
+                output: output
+            )
+            guard cognitiveResult != .unknown else { return }
+            let ok = cognitiveResult == .succeeded
+            let outputPreview = Self.compactCognitiveJSON(
+                MacInjectionResultRedaction.redacted(
+                    tool: safeName,
+                    result: MacScreenViewResultRedaction.redacted(tool: safeName, result: output)
+                ),
+                maxCharacters: 300
+            )
+            var metadata: [String: JSONValue] = [
+                "sessionId": .string(sessionId),
+                "toolName": .string(safeName),
+                "surface": .string(surface),
+                "phase": .string("result"),
+                "ok": .bool(ok),
+                "outputPreview": .string(outputPreview),
+            ]
+            if let runId { metadata["runId"] = .string(runId) }
+            await cognitiveObserver.observe(CognitiveEvent(
+                id: "chat-tool-result:\(sessionId):\(runId ?? "no-run"):\(safeName):\(Self.cognitiveDigest(outputPreview))",
+                kind: ok ? .toolSucceeded : .toolFailed,
+                subject: CognitiveSubjectReference(type: "tool", id: safeName, label: safeName),
+                sourceClass: .observed,
+                occurredAt: occurredAt,
+                summary: outputPreview.isEmpty
+                    ? "\(safeName) \(ok ? "ok" : "failed")"
+                    : "\(safeName) \(ok ? "ok" : "failed"): \(outputPreview)",
+                importance: ok ? 0.55 : 0.8,
+                metadata: metadata
+            ))
+
+        case .error(let message):
+            // The provider lifecycle observer owns exact correlated provider
+            // physiology in production. Emitting this uncorrelated fallback as
+            // well would double-count one failure. Custom/test clients without
+            // that observer retain the legacy progress-only fallback.
+            guard !providerLifecycleObserverInstalled else { return }
+            let safe = ChatSecretRedactor.redactText(message)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !safe.isEmpty else { return }
+            var metadata: [String: JSONValue] = [
+                "sessionId": .string(sessionId),
+                "surface": .string(surface),
+                "phase": .string("progress_error"),
+            ]
+            if let runId { metadata["runId"] = .string(runId) }
+            await cognitiveObserver.observe(CognitiveEvent(
+                id: "chat-provider-progress-error:\(sessionId):\(runId ?? "no-run"):\(Self.cognitiveDigest(safe))",
+                kind: .providerFailure,
+                subject: CognitiveSubjectReference(type: "chat.surface", id: surface, label: surface),
+                sourceClass: .observed,
+                occurredAt: occurredAt,
+                summary: String(safe.prefix(500)),
+                importance: 0.85,
+                metadata: metadata
+            ))
+
+        case .delta, .final, .notice, .replyTextSettled:
+            return
+        }
+    }
+
+    nonisolated private static func dateFromISO8601(_ raw: String) -> Date? {
+        ISO8601DateFormatter().date(from: raw)
+    }
+
+    nonisolated static func injectionRedactedArgJSON(tool: String, json: String) -> String {
+        ChatToolJSONRedaction.injectionRedactedArgJSON(tool: tool, json: json)
+    }
+
+    nonisolated static func injectionRedactedResultJSON(tool: String, json: String) -> String {
+        ChatToolJSONRedaction.injectionRedactedResultJSON(tool: tool, json: json)
+    }
+
+    nonisolated static func screenViewRedactedResultJSON(tool: String, json: String) -> String {
+        ChatToolJSONRedaction.screenViewRedactedResultJSON(tool: tool, json: json)
+    }
+
+    /// The EXACT redaction and receipt bound every persisted tool result gets
+    /// — tool-specific injection/screenshot stripping first, then the secret
+    /// redactor and the transcript cap.
+    ///
+    /// Public because the transcript row is no longer the only place a tool
+    /// result is persisted: the inline-card resolver keeps a REPLAYED result
+    /// on the card's continuation, and a resumed `read_file` carries exactly
+    /// the credentials this pass exists to take out. One definition, so the
+    /// two can never drift.
+    public nonisolated static func redactedPersistedToolResult(
+        tool: String, json: String
+    ) -> String {
+        let safeResult = injectionRedactedResultJSON(
+            tool: tool,
+            json: screenViewRedactedResultJSON(tool: tool, json: json)
+        )
+        if let receipt = PersistedReadToolReceipt.project(
+            tool: tool, json: safeResult, maximumCharacters: persistedToolResultMaximumCharacters
+        ) { return receipt }
+        return boundedRedactedToolReceipt(
+            safeResult,
+            maximumCharacters: persistedToolResultMaximumCharacters,
+            label: "tool result"
+        )
+    }
+
+    /// The card's DISPLAY text, scrubbed and bounded before it is persisted.
+    ///
+    /// A raised need is lifted out of the tool's own result envelope, so every
+    /// sentence on it — the why, an option label, the decline consequence — is
+    /// tool output. `inputJSON`/`resultSummary` beside it are redacted; these
+    /// were not, so a credential quoted into a card's `why` landed verbatim in
+    /// the transcript and on the glass. Scrubbed HERE, before the signature
+    /// witness is minted, so the receipt is minted over the text that is
+    /// actually stored.
+    static func scrubbedCardDisplay(_ interaction: InlineInteraction) -> InlineInteraction {
+        var copy = interaction
+        copy.title = Self.scrubbedCardText(copy.title, maximumCharacters: 120)
+        copy.why = Self.scrubbedCardText(copy.why, maximumCharacters: 400)
+        copy.primaryActionLabel = Self.scrubbedCardText(
+            copy.primaryActionLabel, maximumCharacters: 80)
+        copy.secondaryActionLabel = copy.secondaryActionLabel.map {
+            Self.scrubbedCardText($0, maximumCharacters: 80)
+        }
+        copy.declineConsequence = Self.scrubbedCardText(
+            copy.declineConsequence, maximumCharacters: 400)
+        copy.persistenceNote = copy.persistenceNote.map {
+            Self.scrubbedCardText($0, maximumCharacters: 240)
+        }
+        copy.cardProse = copy.cardProse.map { Self.scrubbedCardText($0, maximumCharacters: 400) }
+        copy.options = copy.options.map { option in
+            var option = option
+            option.label = Self.scrubbedCardText(option.label, maximumCharacters: 120)
+            option.detail = option.detail.map {
+                Self.scrubbedCardText($0, maximumCharacters: 240)
+            }
+            return option
+        }
+        if case .settled(var outcome) = copy.state {
+            outcome.summary = Self.scrubbedCardText(outcome.summary, maximumCharacters: 240)
+            copy.state = .settled(outcome)
+        }
+        if case .failed(let reason) = copy.state {
+            copy.state = .failed(
+                reason: Self.scrubbedCardText(reason, maximumCharacters: 240))
+        }
+        return copy
+    }
+
+    private nonisolated static func scrubbedCardText(
+        _ value: String, maximumCharacters: Int
+    ) -> String {
+        // Redact a guard window past the cap, exactly as the receipt bound
+        // does, so a secret starting near the boundary cannot be cut into an
+        // unrecognized fragment and kept.
+        let window = String(value.prefix(maximumCharacters + 512))
+        // The DISPLAY redactor, not the tool-result one: these fields are
+        // sentences a person reads, and the general "Name: value" rule mangled
+        // ordinary card labels like "GitHub: Reconnect account". The label is
+        // kept; only a value that proves itself a secret is replaced.
+        return String(TurnSecretRedactor.redactDisplayText(window).prefix(maximumCharacters))
+    }
+
+    nonisolated private static func compactCognitiveJSON(_ value: JSONValue, maxCharacters: Int) -> String {
+        let serialized = (try? value.serialize(pretty: false)) ?? ""
+        return String(serialized.prefix(max(0, maxCharacters)))
+    }
+
+    nonisolated private static func cognitiveDigest(_ value: String) -> String {
+        let digest = SHA256.hash(data: Data(value.utf8))
+        return digest.map { String(format: "%02x", $0) }.joined().prefix(12).description
+    }
+
+    private func syncSessionIndex(
+        sessionId: String,
+        role: String,
+        content: String,
+        timestamp: String,
+        messagesPath: URL,
+        source: String
+    ) async throws {
+        let dataRoot = self.dataRoot
+        let sessionsPath = dataRoot
+            .appendingPathComponent("chat", isDirectory: true)
+            .appendingPathComponent("sessions.json")
+        let normalizedRole = role.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let preview = Self.previewText(content)
+        let envelope = ChatToolSessionContext.envelope
+        let contactName: String? = if envelope?.commandSignatureVerified == true,
+            let id = envelope?.verifiedUserId {
+            (try? AgentPeerStore(dataRoot: dataRoot).list())?.first(where: { $0.id == id })?.name
+        } else { nil }
+        let title = normalizedRole == "user"
+            ? (contactName ?? Self.peerBridgeTitle(content: content, source: source) ?? Self.titleText(content))
+            : nil
+        let sourceKey = Self.sessionSourceKey(for: sessionId, source: source)
+        // Same value, same moment, same definition as the old
+        // `countJSONLLines(at: messagesPath)` that stood here — this count is
+        // NOT advisory bookkeeping. `SessionDigestProvider.swift:243` renders
+        // it into the next session's prompt ("Previous session "X" (N
+        // messages) ended ..."), so it has to stay byte-exact. The cache only
+        // removes the full byte scan when a stat proves the transcript is
+        // still the one the count was measured against; anything else — an
+        // external writer, a compaction rewrite, a truncation — recounts and
+        // returns exactly what the scan would have.
+        let persistence = self.persistence
+        let retentionClock = self.clock
+        // 2026-09-06: `timestamp` is the MESSAGE's createdAt, captured before
+        // the transcript append. Stamping the index row's `updatedAt` with it
+        // left every synced row permanently behind its own transcript's mtime,
+        // and retention reads exactly that comparison as "this session has a
+        // pending index sync" — so `.activeCap` archiving could never fire for
+        // any ordinary session. The row's `updatedAt` says when the row was
+        // last brought level with its transcript, so it is read HERE, after the
+        // bytes are down. A new row's `createdAt` keeps the message stamp.
+        let syncedAt = Self.iso8601(retentionClock())
+        try await persistence.withFileLock(sessionsPath) {
+            // 2026-09-06: READ UNDER THE INDEX LOCK. Taken before the lock, two
+            // concurrent appenders could each measure the transcript, then
+            // commit in the opposite order — the later writer stamping the
+            // EARLIER count over the index. Measured here, the last writer to
+            // hold this lock always measures a transcript that already contains
+            // every row committed before it, so the index cannot go backwards.
+            let messageCount = ChatTranscriptLineCountCache.shared.count(
+                at: messagesPath,
+                recount: Self.countJSONLLines(at:)
+            )
+            let parent = sessionsPath.deletingLastPathComponent()
+            try? FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+            let rows = try ChatSessionIndexFile.loadObjectRowsForMutation(at: sessionsPath)
+
+            var updated: [String: JSONValue]? = nil
+            var remaining: [[String: JSONValue]] = []
+            for var row in rows {
+                guard case .string(let id)? = row["id"], id == sessionId else {
+                    remaining.append(row)
+                    continue
+                }
+                row["updatedAt"] = .string(syncedAt)
+                // 2026-09-06: a transcript write advances the session's
+                // transcript version. The phone reads it to order published
+                // transcripts; without a bump here, an empty snapshot built
+                // before this append still looks as new as the rebuilt
+                // transcript and would clear it on the phone.
+                ChatSessionIndexFile.bumpTranscriptGeneration(in: &row)
+                row["messageCount"] = .int(Int64(messageCount))
+                if !preview.isEmpty { row["lastMessagePreview"] = .string(preview) }
+                if let title,
+                   Self.shouldReplaceSessionTitle(row["title"]) {
+                    row["title"] = .string(title)
+                }
+                // §1.3, FIXED. This block used to read:
+                //
+                //     if source != "app" { row["source"] = .string(source) ... }
+                //
+                // i.e. the session index row's `source` was overwritten by
+                // WHICHEVER SURFACE APPENDED MOST RECENTLY. `source` is
+                // supposed to say what a conversation IS; last-writer-wins
+                // made it say who touched it last, and every downstream reader
+                // keyed on it (snapshot projection, iOS tab adoption, Doctor,
+                // retention diagnostics) flapped with it.
+                //
+                // A row's `source` is now written ONCE, at creation, and never
+                // restamped. What a later surface DOES contribute is the
+                // per-message `source` on its own transcript row, which is
+                // where per-turn provenance has always belonged and which the
+                // envelope now makes complete.
+                //
+                // `sourceKey` keeps its backfill-only behavior (set when
+                // absent, never overwritten) — it was already additive.
+                if row["source"] == nil {
+                    row["source"] = .string(source)
+                }
+                if row["sourceKey"] == nil, let sourceKey {
+                    row["sourceKey"] = .string(sourceKey)
+                }
+                // Additive classification so readers stop having to infer a
+                // conversation's nature from a field that describes traffic.
+                // Backfill-only: a kind assigned once is not re-decided by a
+                // later append, or we would have rebuilt the bug above.
+                if row["threadKind"] == nil {
+                    let existingSource: String = {
+                        if case .string(let value)? = row["source"] { return value }
+                        return source
+                    }()
+                    row["threadKind"] = .string(
+                        ChatThreadKind.inferred(fromSource: existingSource).rawValue
+                    )
+                }
+                updated = row
+            }
+
+            if updated == nil {
+                var row: [String: JSONValue] = [
+                    "id": .string(sessionId),
+                    "title": .string(title ?? "New Chat"),
+                    "source": .string(source),
+                    "threadKind": .string(ChatThreadKind.inferred(fromSource: source).rawValue),
+                    "createdAt": .string(timestamp),
+                    "updatedAt": .string(syncedAt),
+                    "archived": .bool(false),
+                    "messageCount": .int(Int64(messageCount)),
+                    "summary": .string(""),
+                    ChatSessionIndexFile.transcriptGenerationKey: .int(1),
+                ]
+                if let sourceKey { row["sourceKey"] = .string(sourceKey) }
+                if !preview.isEmpty { row["lastMessagePreview"] = .string(preview) }
+                updated = row
+            }
+
+            if var updated {
+                ChatSessionIndexFile.recordConversationChange(in: &updated, role: normalizedRole)
+                remaining.insert(updated, at: 0)
+            }
+            let out = try ChatSessionIndexFile.serializedData(for: remaining)
+            // Sweep R4 item 5: was `out.write(to:options:.atomic)`. Atomic
+            // replacement survives an app crash, but not power loss — the temp
+            // file's bytes and the rename both sit unflushed. The transcript
+            // rows this index describes are now durable (item 4), so the index
+            // must be too, or a power cut leaves messages on disk that the
+            // sidebar no longer lists. Same bytes, same lock, durable tail.
+            try await persistence.writeDataAtomicDurable(out, to: sessionsPath)
+            // Retention stays here, inside the lock and on every message, and
+            // the perf audit's proposal to move or debounce it is REJECTED.
+            // Two independent reasons:
+            //
+            // 1. Lock: it does its own read-modify-rewrite of this exact file,
+            //    and its documented contract (ChatSessionRetention.swift:47)
+            //    is that the caller holds the sessions lock. Outside it, it
+            //    races the write two lines above.
+            // 2. Prompt bytes: archiving REMOVES a row from `sessions.json`,
+            //    and `SessionDigestProvider.latestPriorSession` (:293) picks
+            //    the newest remaining row to render into the next session's
+            //    prompt. Delaying an archive delays a row's disappearance from
+            //    that candidate set, so a throttle is not byte-identical — it
+            //    is a (small, self-healing) change in what the model sees.
+            //
+            // The waste the audit measured is real but lives one level down:
+            // `pruneArchive` stats the whole archive tier on every pass, and
+            // that part IS invisible to the prompt. Throttling belongs there,
+            // in PersistenceCore, not at this call site.
+            ChatSessionRetention.enforceBestEffort(
+                dataRoot: dataRoot,
+                now: retentionClock(),
+                context: "ChatOrchestrationClient.syncSessionIndex"
+            )
+        }
+    }
+
+    /// 2026-09-06: advance a session's transcript version without touching any
+    /// other index field. Used by transcript writers that rewrite the messages
+    /// file without appending a message (compaction). Best effort: the version
+    /// is remote-display ordering, never grounds to fail a turn that already
+    /// wrote durable bytes.
+    private func bumpSessionTranscriptGeneration(sessionId: String) async {
+        guard let safeSessionId = NativeAgentChatSessionID.normalizedPathComponent(sessionId) else { return }
+        let sessionsPath = dataRoot
+            .appendingPathComponent("chat", isDirectory: true)
+            .appendingPathComponent("sessions.json")
+        let persistence = self.persistence
+        do {
+            try await persistence.withFileLock(sessionsPath) {
+                var rows = try ChatSessionIndexFile.loadObjectRowsForMutation(at: sessionsPath)
+                guard let index = rows.firstIndex(where: {
+                    $0["id"] == .string(safeSessionId)
+                }) else { return }
+                ChatSessionIndexFile.bumpTranscriptGeneration(in: &rows[index])
+                let out = try ChatSessionIndexFile.serializedData(for: rows)
+                try await persistence.writeDataAtomicDurable(out, to: sessionsPath)
+            }
+        } catch {
+            NSLog("ChatOrchestrationClient: transcript generation bump failed: \(error)")
+        }
+    }
+
+    nonisolated static func errorText(_ error: ChatOrchestrationError) -> String {
+        (error as LocalizedError).errorDescription ?? String(describing: error)
+    }
+
+    private nonisolated static func countJSONLLines(at path: URL) -> Int {
+        guard let handle = try? FileHandle(forReadingFrom: path) else { return 0 }
+        defer { try? handle.close() }
+        var count = 0
+        var lineHasContent = false
+        while true {
+            guard let chunk = try? handle.read(upToCount: 256 * 1024),
+                  !chunk.isEmpty else { break }
+            for byte in chunk {
+                if byte == 0x0A {
+                    if lineHasContent { count += 1 }
+                    lineHasContent = false
+                } else if byte != 0x0D && byte != 0x20 && byte != 0x09 {
+                    lineHasContent = true
+                }
+            }
+        }
+        if lineHasContent { count += 1 }
+        return count
+    }
+
+    private nonisolated static func boundedRedactedToolReceipt(
+        _ value: String,
+        maximumCharacters: Int,
+        label: String
+    ) -> String {
+        guard maximumCharacters > 0 else { return "" }
+        let sourceCount = value.count
+        guard sourceCount > maximumCharacters else {
+            return ChatSecretRedactor.redactText(value)
+        }
+        // Redact a small guard window beyond the persisted boundary so a
+        // secret beginning near the cutoff cannot be split into an unrecognized
+        // fragment. Work remains O(the receipt cap), not O(tool output size).
+        let redactionWindow = String(value.prefix(maximumCharacters + 512))
+        let redacted = ChatSecretRedactor.redactText(redactionWindow)
+        let omitted = sourceCount - maximumCharacters
+        return String(redacted.prefix(maximumCharacters))
+            + "\n[... \(label) truncated in transcript; \(omitted) characters omitted ...]"
+    }
+
+    private nonisolated static func previewText(_ raw: String) -> String {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "" }
+        let collapsed = trimmed
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\t", with: " ")
+        return String(collapsed.prefix(180))
+    }
+
+    /// A PEER'S SESSION IS NAMED BY THE PEER, not by the plumbing.
+    ///
+    /// A bridge turn's first user message is the transport's own header with
+    /// the peer's message after it, so the first-user-text rule below titled
+    /// the row with sixty characters of header — "[Agent bridge — this turn
+    /// came from proof-peer, another agen". The row names WHO instead.
+    /// Nil on every other surface, and on a bridge turn with no header (an
+    /// elevated peer, which runs on `chat` anyway), so nothing else changes.
+    private nonisolated static func peerBridgeTitle(content: String, source: String) -> String? {
+        guard PeerTurnEffectPolicy.isPeerBridge(surface: source),
+              let name = PeerTurnEffectPolicy.peerName(inTurnHeader: content)
+        else { return nil }
+        return "\(name) · bridge"
+    }
+
+    private nonisolated static func titleText(_ raw: String) -> String {
+        let preview = previewText(raw)
+        guard !preview.isEmpty else { return "New Chat" }
+        return String(preview.prefix(60))
+    }
+
+    private nonisolated static func shouldReplaceSessionTitle(_ value: JSONValue?) -> Bool {
+        guard case .string(let raw)? = value else { return true }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty || trimmed == "New Chat"
+    }
+
+    private nonisolated static func messageSource(for surface: String) -> String {
+        let normalized = surface
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        switch normalized {
+        case "telegram":
+            return "telegram"
+        case "ios", "mobile", "iphone", "icloud":
+            return "ios"
+        case "app", "chat", "mac", "default", "":
+            return "app"
+        default:
+            return normalized
+        }
+    }
+
+    /// PARSE SITE 4 of 5, DELETED (one-thread-many-surfaces plan §1.2).
+    ///
+    /// This used to derive a session's `sourceKey` by asking whether the
+    /// session id STRING started with `telegram:` or `ios:` — the same
+    /// storage-key-as-identity mistake as the four trust sites, one layer down
+    /// in persistence. It meant a `/new` Telegram session (a bare UUID) got no
+    /// sourceKey at all, while an `app`-sourced row whose id happened to read
+    /// `telegram:codex-probe` got one.
+    ///
+    /// The sourceKey now comes from the turn's own envelope — the routing
+    /// facts the transport actually bound — or is left absent. Absent is
+    /// honest; inferred was not. `app` remains the constant it always was,
+    /// because a local Mac turn has one routing identity by construction.
+    ///
+    /// `sessionId` stays in the signature to keep the deletion legible at the
+    /// call site rather than invisible.
+    private nonisolated static func sessionSourceKey(for sessionId: String, source: String) -> String? {
+        _ = sessionId
+        if let bound = ChatToolSessionContext.envelope?.deliveryRoute?.sourceKey?
+            .trimmingCharacters(in: .whitespacesAndNewlines), !bound.isEmpty {
+            return bound
+        }
+        if let route = ChatToolSessionContext.replyRoute?.sourceKey?
+            .trimmingCharacters(in: .whitespacesAndNewlines), !route.isEmpty {
+            return route
+        }
+        return source == "app" ? "app" : nil
+    }
+}

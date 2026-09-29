@@ -106,6 +106,35 @@ public struct ChatSession: Identifiable, Codable, Hashable, Sendable {
     /// whether an EMPTY one is newer than what it already shows. Never derived
     /// from the clock; `nil` on rows written before this existed.
     public var transcriptGeneration: Int? = nil
+
+    public init(
+        id: String, title: String, source: String? = nil, sourceKey: String? = nil,
+        createdAt: String, updatedAt: String? = nil, archived: Bool? = nil,
+        messageCount: Int? = nil, lastMessagePreview: String? = nil, summary: String? = nil,
+        parentSessionId: String? = nil, rootSessionId: String? = nil,
+        forkedAtMessageId: String? = nil, projectSpaceId: String? = nil,
+        worktreePath: String? = nil, providerId: String? = nil, modelId: String? = nil,
+        transcriptGeneration: Int? = nil
+    ) {
+        self.id = id
+        self.title = title
+        self.source = source
+        self.sourceKey = sourceKey
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+        self.archived = archived
+        self.messageCount = messageCount
+        self.lastMessagePreview = lastMessagePreview
+        self.summary = summary
+        self.parentSessionId = parentSessionId
+        self.rootSessionId = rootSessionId
+        self.forkedAtMessageId = forkedAtMessageId
+        self.projectSpaceId = projectSpaceId
+        self.worktreePath = worktreePath
+        self.providerId = providerId
+        self.modelId = modelId
+        self.transcriptGeneration = transcriptGeneration
+    }
 }
 
 public extension ChatSession {
@@ -137,6 +166,14 @@ public struct RuntimeHealth: Codable, Hashable, Sendable {
     public var version: String
     public var dataDir: String
     public var uptimeSeconds: Double
+
+    public init(ok: Bool, app: String, version: String, dataDir: String, uptimeSeconds: Double) {
+        self.ok = ok
+        self.app = app
+        self.version = version
+        self.dataDir = dataDir
+        self.uptimeSeconds = uptimeSeconds
+    }
 }
 
 public struct RunRecord: Identifiable, Codable, Hashable, Sendable {
@@ -167,6 +204,24 @@ public struct MemoryRecord: Identifiable, Codable, Hashable, Sendable {
     public var tags: [String]?
     public var createdAt: String
     public var updatedAt: String?
+
+    public init(
+        id: String, layer: String, text: String, sourceRunId: String? = nil,
+        importance: Double, confidence: Double, status: String? = nil, pinned: Bool? = nil,
+        tags: [String]? = nil, createdAt: String, updatedAt: String? = nil
+    ) {
+        self.id = id
+        self.layer = layer
+        self.text = text
+        self.sourceRunId = sourceRunId
+        self.importance = importance
+        self.confidence = confidence
+        self.status = status
+        self.pinned = pinned
+        self.tags = tags
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+    }
 }
 
 public struct PersonalityTraits: Codable, Hashable, Sendable {

@@ -86,7 +86,7 @@ struct EvolutionToolBridgeImpl: EvolutionToolBridge {
             "has_diff": .bool(proposal.diffText != nil),
             "note": .string(proposal.status == .needsDiff
                 ? "Filed without a diff (needs_diff). Attach a diff before it can build."
-                : "Filed as 'proposed' — eligible to build+test in an isolated worktree."),
+                : "Filed as 'proposed' — eligible to build in an isolated worktree."),
         ])
     }
 
@@ -196,7 +196,7 @@ struct EvolutionToolBridgeImpl: EvolutionToolBridge {
                 "status": .string("candidate_in_flight"),
                 "id": .string(id),
                 "proposal_status": .string(proposal.status.rawValue),
-                "reason": .string("a candidate build/test run is in flight\(runId)"),
+                "reason": .string("a candidate build run is in flight\(runId)"),
                 "fix": .string("Wait for the run to land on candidate_green or candidate_failed, then withdraw."),
             ])
         }
@@ -270,7 +270,7 @@ struct EvolutionToolBridgeImpl: EvolutionToolBridge {
                 "id": .string(id),
                 "proposal_status": .string(proposal.status.rawValue),
                 "reason": .string("not installable yet: status=\(proposal.status.rawValue)"),
-                "fix": .string("self_install requires status=candidate_green (the proposal must build+test GREEN in an isolated worktree first)."),
+                "fix": .string("self_install requires status=candidate_green (the proposal must build GREEN in an isolated worktree first)."),
             ])
         }
         // Idempotent + targeted: stage ONLY this proposal's card (gpt-5.5

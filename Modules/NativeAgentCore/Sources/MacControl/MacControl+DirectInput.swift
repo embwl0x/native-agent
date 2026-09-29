@@ -49,8 +49,9 @@ extension SwiftNativeMacControl {
         }
     }
 
-    /// Resolve only in the captured window. Inferred or duplicate labels cannot
-    /// establish element identity, so those marks require a fresh semantic target.
+    /// Resolve only in the captured window. Nearby-text guesses or duplicate
+    /// labels cannot establish element identity, so those marks require a fresh
+    /// semantic target. A row named by its own child text re-resolves by it.
     private func liveMarkedTarget(
         _ mark: MacScreenViewMark,
         snapshot: MacScreenViewSnapshot
@@ -59,7 +60,7 @@ extension SwiftNativeMacControl {
               identity.pid != getpid(),
               accessibilitySource.frontmostApp()?.processIdentifier == identity.pid,
               let label = mark.label, !label.isEmpty,
-              mark.labelSource == "title" || mark.labelSource == "value"
+              ["title", "value", "descendant_text"].contains(mark.labelSource)
         else { return nil }
         let windows = accessibilityActSource.windows(pid: identity.pid)
         guard case .matched(let window, _) = MacAXWindowIdentity.match(

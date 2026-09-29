@@ -266,22 +266,24 @@ public struct Provider: Sendable, Codable, Equatable {
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: AnyKey.self)
         func str(_ keys: String...) throws -> String? {
+            var result: String?
             for k in keys {
                 if let key = AnyKey(stringValue: k),
-                   let v = (try? c.decodeIfPresent(String.self, forKey: key)) ?? nil {
-                    return v
+                   let v = try c.decodeIfPresent(String.self, forKey: key) {
+                    if result == nil { result = v }
                 }
             }
-            return nil
+            return result
         }
         func bool(_ keys: String...) throws -> Bool? {
+            var result: Bool?
             for k in keys {
                 if let key = AnyKey(stringValue: k),
-                   let v = (try? c.decodeIfPresent(Bool.self, forKey: key)) ?? nil {
-                    return v
+                   let v = try c.decodeIfPresent(Bool.self, forKey: key) {
+                    if result == nil { result = v }
                 }
             }
-            return nil
+            return result
         }
         func jv(_ keys: String...) throws -> JSONValue? {
             for k in keys {
@@ -342,25 +344,21 @@ public struct Provider: Sendable, Codable, Equatable {
 public struct ModelPreferences: Sendable, Codable, Equatable {
     public var surfaceModels: JSONValue?
     public var defaultModel: String?
-    public var fallbackChain: [String]?
     public var extras: JSONValue?
 
     public init(
         surfaceModels: JSONValue? = nil,
         defaultModel: String? = nil,
-        fallbackChain: [String]? = nil,
         extras: JSONValue? = nil
     ) {
         self.surfaceModels = surfaceModels
         self.defaultModel = defaultModel
-        self.fallbackChain = fallbackChain
         self.extras = extras
     }
 
     enum CodingKeys: String, CodingKey {
         case surfaceModels = "surface_models"
         case defaultModel = "default_model"
-        case fallbackChain = "fallback_chain"
         case extras
     }
 }

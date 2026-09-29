@@ -254,9 +254,33 @@ public struct DeviceSyncSendOutcomeUnknown: Error, LocalizedError, Sendable {
     public var errorDescription: String? { message }
 }
 
+public struct DeviceSyncAccountFailure: Error, LocalizedError, Sendable, Codable, Equatable {
+    public let code: Int
+    public let detail: String
+
+    public static let macMessage = "iCloud sign-in needs attention on this Mac (System Settings → Apple Account); phone messages can't arrive until it's fixed"
+    public static let phoneMessage = "iCloud sign-in needs attention on this iPhone"
+
+    public var errorDescription: String? { detail }
+}
+
+/// An empty successful query is different from a failed or skipped query.
+public enum DeviceSyncDrainResult: Sendable {
+    case success(Int)
+    case failure(DeviceSyncError, dispatched: Int = 0)
+    case skipped(Int)
+
+    public var dispatchedCount: Int {
+        switch self {
+        case .success(let count), .skipped(let count), .failure(_, let count): return count
+        }
+    }
+}
+
 public enum DeviceSyncError: Error, LocalizedError, Sendable {
     case notConfigured
     case unauthorized
+    case account(DeviceSyncAccountFailure)
     case quotaExceeded
     case conflict
     case payloadTooLarge(actualBytes: Int, maximumBytes: Int)
@@ -267,6 +291,7 @@ public enum DeviceSyncError: Error, LocalizedError, Sendable {
         switch self {
         case .notConfigured: return "device sync not configured (missing container or entitlements)"
         case .unauthorized: return "iCloud account unavailable"
+        case .account(let failure): return failure.localizedDescription
         case .quotaExceeded: return "iCloud quota exceeded"
         case .conflict: return "device sync record conflict"
         case .payloadTooLarge(let actual, let maximum):
@@ -350,12 +375,12 @@ public protocol DeviceSyncTransport: Sendable {
     func accountStatus() async -> String
 
     /// Pull any pending inbound messages NOW and dispatch to the `observeIncoming`
-    /// handler; returns the count dispatched. The wakeup for a pull-based
+    /// handler; distinguishes success, failure and skipped work. The wakeup for a pull-based
     /// transport (CloudKit) — called after a late handler registration and on an
     /// APNs silent push (CK-3c). Push-driven transports (a future KVS impl) can
     /// no-op via the default. Idempotent per message id.
     @discardableResult
-    func drainIncoming() async -> Int
+    func drainIncoming() async -> DeviceSyncDrainResult
 
     /// Pull the peer's pairing singleton now; returns true if the handler fired.
     @discardableResult
@@ -410,7 +435,7 @@ public extension DeviceSyncTransport {
     // Default no-ops: a push-driven transport that delivers via observe* alone
     // (e.g. a future KVS/ubiquity impl) needs no explicit pull. The CloudKit
     // transport and the mock override these with real pulls.
-    @discardableResult func drainIncoming() async -> Int { 0 }
+    @discardableResult func drainIncoming() async -> DeviceSyncDrainResult { .skipped(0) }
     @discardableResult func drainPairing() async -> Bool { false }
     func peekPairingSecret() async -> Data? { nil }
     @discardableResult func drainStatus() async -> Int { 0 }

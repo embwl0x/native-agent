@@ -228,7 +228,7 @@ struct ActivityCapturePermissionsView: View {
     private var modelAccessControl: some View {
         let title = "Let me answer from activity history"
         let detail = "With Full Mac I can use your recorded activity in trusted chats. In other modes a switch here decides, and it starts off. When I answer from it, the answer goes to the chat's AI provider; the database and full history stay on this Mac. Recording itself is the switch at the top."
-        if appModel.trustPolicy.map(AppModel.fullMacGrantIsActive) ?? false {
+        if appModel.engine.trust.policy.map(AppModel.fullMacGrantIsActive) ?? false {
             HStack(alignment: .center, spacing: 12) {
                 VStack(alignment: .leading, spacing: 3) {
                     Text(title)

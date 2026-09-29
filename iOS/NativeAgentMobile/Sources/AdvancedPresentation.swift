@@ -26,7 +26,7 @@ enum MobileDesignSamples {
     #if DEBUG
     private static let fixtures: [String: String] = [
         "ProviderInfo": #"[{"provider_id":"design-provider","display_name":"Research and long-form writing provider","auth_modes":["api_key"],"auth_status":{"provider_id":"design-provider","state":"ready","detail":"Connected"},"models":[]}]"#,
-        "ApprovalRequest": #"[{"id":"design-approval","title":"Review the weekend project plan before sharing","action":"Share project summary","risk":"medium","reason":"The summary includes the updated milestones and a link to the working draft.","status":"pending","localOnly":false,"remoteResolvable":true}]"#,
+        "ApprovalRequest": ##"[{"id":"design-approval-hygiene","title":"Run memory hygiene after the test-heavy week","action":"self_improvement.apply","risk":"medium","reason":"[run_memory_hygiene] Run memory hygiene to consolidate duplicates and clear test-derived noise before it settles into long-term memory.","status":"pending","localOnly":true,"remoteResolvable":false},{"id":"design-approval-skill","title":"Keep this as a skill: workspace → workspace","action":"skill.proposal","risk":"low","reason":"This exact sequence ran 3 times across 2 days, verified successful every time. Approve to save the draft below as a skill body — she will find it through recall when a conversation enters its territory. It grants no permission, activates nothing, and runs nothing on its own. Deny and nothing is written.","payloadPreview":"# learned-workspace-then-workspace-8c211c66\n\nUse when a request calls for the same run of work this sequence keeps doing: `workspace` → `workspace`.\n\n## Steps\n1. `workspace` — arguments: path.\n2. `workspace` — arguments: path.\n","status":"pending","localOnly":true,"remoteResolvable":false},{"id":"design-approval","title":"Review the weekend project plan before sharing","action":"Share project summary","risk":"medium","reason":"The summary includes the updated milestones and a link to the working draft.","payloadPreview":"{\"tool\":\"mail_send\",\"input\":{\"to\":\"Sam\",\"subject\":\"Weekend project plan\",\"message\":\"Here is the updated plan with the new milestones. The working draft is linked at the bottom.\",\"attachDraft\":true,\"draftId\":\"doc_4821\"}}","status":"pending","localOnly":false,"remoteResolvable":true}]"##,
         "InboxItemRecord": #"[{"id":"design-inbox","created_at":"2026-09-07T18:00:00Z","source":"desk","severity":"info","title":"The research summary is ready to read","summary":"Three sources agree on the main result. One open question is included for the next conversation.","actions":[],"status":"unread"}]"#,
         "MobileDeskItem": #"[{"handle":"design-desk","alias":"D-14","kind":"task","status":"active","project":"Weekend research and planning","title":"Collect the final notes for the project review","summary":"Compare the remaining sources and prepare a short summary.","openedAt":"2026-09-07T18:00:00Z","updatedAt":"2026-09-07T18:00:00Z","pinned":false,"blockedOn":[],"origin":"user","requiresOwnerInput":false,"recentNotes":[]}]"#,
         "WorkshopTaskRecord": #"[{"id":"design-task","title":"Prepare the project reading list","objective":"Collect the most useful references and explain what each adds.","status":"running","phase":"Research","summary":"Reviewing the final two references.","createdAt":"2026-09-07T18:00:00Z"}]"#,
@@ -44,13 +44,15 @@ struct MobileReadingSurface<Content: View>: View {
     @ViewBuilder var content: () -> Content
 
     var body: some View {
+        // The alive card: a fill over the haze, never glass (AliveKit).
         content()
             .padding(NativeAgentMobileTheme.Spacing.lg)
-            .background(NativeAgentMobileTheme.Colors.contentSurface,
-                        in: RoundedRectangle(cornerRadius: NativeAgentMobileTheme.Radius.card))
+            .aliveCard(radius: 16)
             .overlay {
-                RoundedRectangle(cornerRadius: NativeAgentMobileTheme.Radius.card)
-                    .strokeBorder(contrast == .increased ? Color.primary.opacity(0.5) : NativeAgentMobileTheme.Colors.hairline, lineWidth: 1)
+                if contrast == .increased {
+                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                        .strokeBorder(Color.primary.opacity(0.5), lineWidth: 1)
+                }
             }
     }
 }
@@ -103,7 +105,7 @@ struct MobileReadingEmptyState: View {
                     Label(action.title, systemImage: action.systemImage)
                         .frame(minHeight: NativeAgentMobileTheme.Layout.controlHeight)
                 }
-                .tint(NativeAgentMobileTheme.Colors.accentText)
+                .hazeTinted()
             }
         }
         .multilineTextAlignment(.center)
@@ -128,29 +130,17 @@ struct MobileAdaptiveRow<Content: View>: View {
     }
 }
 
-/// Action titles keep their intrinsic width; when the group cannot fit it becomes a column.
-struct MobileActionRow<Content: View>: View {
-    @Environment(\.dynamicTypeSize) private var typeSize
-    @ViewBuilder var content: () -> Content
-
-    var body: some View {
-        ViewThatFits(in: .horizontal) {
-            if !typeSize.isAccessibilitySize {
-                HStack(spacing: 8) { content() }
-                    .fixedSize(horizontal: true, vertical: false)
-            }
-            VStack(alignment: .leading, spacing: 8) { content() }
-        }
-        .labelStyle(.titleOnly)
-        .controlSize(.large)
-    }
-}
-
 extension View {
     func mobileReadingScreen() -> some View {
         scrollContentBackground(.hidden)
             .background { MobileRoomBackground() }
-            .tint(NativeAgentMobileTheme.Colors.accentText)
+            // In a sheet the room is the sheet itself, edge to edge under its
+            // bar, so every sheet wears the haze like the screens do. Ignored
+            // outside a presentation.
+            .presentationBackground { MobileRoomBackground() }
+            // The haze control tint: sheet toolbar buttons (Done, Cancel,
+            // Add), links and pickers all take the chosen colour.
+            .hazeTinted()
             .environment(\.defaultMinListRowHeight, NativeAgentMobileTheme.Layout.controlHeight)
             .navigationBarTitleDisplayMode(.inline)
             .allowsHitTesting(MobileDesignSamples.screen == nil)
@@ -219,7 +209,7 @@ enum RunDetailPresentation {
             facts.append(.init(label: "Requested (substituted)", value: requested))
         }
         if let effort = nonEmpty(run.reasoningEffort) {
-            facts.append(.init(label: "Reasoning effort", value: effort.capitalized))
+            facts.append(.init(label: "Reasoning effort", value: effort == "xhigh" ? "XHigh" : effort.capitalized))
         }
         if let sandbox = nonEmpty(run.codexSandbox) {
             facts.append(.init(label: "Sandbox", value: sandbox))

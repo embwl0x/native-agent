@@ -19,7 +19,11 @@ import UIKit
 import UserNotifications
 
 struct ContentView: View {
+    @Environment(\.scenePhase) private var scenePhase
+    @ObservedObject private var phoneRequests = PhoneRequestCoordinator.shared
+    @EnvironmentObject private var chatStore: ChatStore
     @Environment(\.colorScheme) private var colorScheme
+    @AppStorage(HazeColor.key) private var hazeColorRaw = HazeColor.defaultValue.rawValue
     @EnvironmentObject private var pairingStore: PairingStore
     @ObservedObject private var sync = iCloudSyncEngine.shared
 
@@ -77,7 +81,29 @@ struct ContentView: View {
         }
     }
 
+    private func openSharedChatIfNeeded() {
+        do {
+            if try !SharedChatInbox.pendingFiles().isEmpty { selection = .chat }
+        } catch { chatStore.errorBanner = "Sharing is unavailable: \(error.localizedDescription)" }
+    }
+
     var body: some View {
+        tabContent
+            .sheet(item: Binding(get: { phoneRequests.active }, set: { _ in })) { request in
+                PhoneRequestSheet(request: request)
+            }
+            .task { await phoneRequests.resume() }
+            .onChange(of: scenePhase) { _, phase in
+                if phase == .active { Task { await phoneRequests.resume() } }
+            }
+            .alert("Phone request", isPresented: Binding(
+                get: { phoneRequests.errorMessage != nil },
+                set: { if !$0 { phoneRequests.errorMessage = nil } }
+            )) { Button("OK") { phoneRequests.errorMessage = nil } }
+            message: { Text(phoneRequests.errorMessage ?? "") }
+    }
+
+    private var tabContent: some View {
         TabView(selection: $selection) {
             ChatView()
                 .tabItem {
@@ -118,40 +144,42 @@ struct ContentView: View {
                 }
                 .tag(Tab.desk)
 
-            VStack(spacing: 0) {
-                    Label("More", systemImage: "ellipsis.circle")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.horizontal, 20)
-                        .padding(.vertical, 6)
-                        .background(NativeAgentMobileTheme.Colors.canvas)
-                        .accessibilityLabel("More section")
-                AdvancedView(deskTaskNavigationTarget: $deskTaskNavigationTarget)
-            }
+            // AdvancedView's own title names the page; no second label above it.
+            AdvancedView(deskTaskNavigationTarget: $deskTaskNavigationTarget)
                 .tabItem {
                     Label("More", systemImage: "ellipsis.circle")
                     .environment(\.symbolVariants, .none)
                 }
                 .tag(Tab.more)
         }
-        .tint(NativeAgentMobileTheme.Colors.selectedTab(for: colorScheme))
+        .tint(HazeColor(stored: hazeColorRaw).control(dark: colorScheme == .dark, labelled: false))
         // 2026-09-11 craft trial (User: Chrome's bar reads finer; Agent: less
         // ink, preserved character). Outlined glyphs at one weight for all five
         // tabs, the selected one included: the teal and the selection pill
         // already say which tab is on, the filled silhouette only added mass.
         .environment(\.symbolVariants, .none)
-        .safeAreaInset(edge: .bottom) {
-            // PATCH-2026-06-06: iOS SystemToast parity. safeAreaInset(.bottom)
-            // pushes the toast bar above the TabView/home indicator without
-            // hand-rolled offsets (the system handles iPhone home-indicator
-            // vs iPad geometry differences). iOSSystemToastCenter.shared is
-            // pushed from any view surfacing a transient banner (inline
-            // approval decisions, remote model-picker changes, and action results).
-            // gpt-5.5 review finding #4: replaced fixed 56pt overlay padding
-            // with a safe-area-aware inset, and dropped the redundant
-            // .allowsHitTesting wrapper (the bar's own gate already skips
-            // hit-testing when the queue is empty).
+        .onAppear {
+            openSharedChatIfNeeded()
+            if MobileQuickAskRoute.isPending { selection = .chat }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: MobileQuickAskRoute.notification)) { _ in
+            selection = .chat
+        }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active {
+                openSharedChatIfNeeded()
+                if MobileQuickAskRoute.isPending { selection = .chat }
+            }
+        }
+        .overlay(alignment: .top) {
+            // PATCH-2026-06-06: iOS SystemToast parity. iOSSystemToastCenter
+            // .shared is pushed from any view surfacing a transient banner
+            // (inline approval decisions, remote model-picker changes, and
+            // action results). 2026-09-25: the toasts drop in from the top,
+            // under the status bar, like a system banner. At the bottom they
+            // landed on the floating tab bar and the chat composer (glass on
+            // glass). An overlay takes no layout, so an empty queue moves
+            // nothing; the bar's own gate skips hit-testing when it is empty.
             iOSSystemToastBar(center: iOSSystemToastCenter.shared)
         }
         .onAppear {

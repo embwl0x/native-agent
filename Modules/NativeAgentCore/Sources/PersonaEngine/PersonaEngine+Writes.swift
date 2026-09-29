@@ -13,10 +13,9 @@ import PersistenceCore
 //
 // The READ side of this subsystem (listPersonaDocs / listPersonaDocSpecs /
 // PersonaCompiler.loadProfile) shipped in earlier waves and is FLAG_FLIPPED
-// behind `.personaEngine`. The write side was held HTTP-only with a named
-// retirement path (CUTOVER_PLAN.md §6.55 W17 `POST /v1/personality` and
-// `POST /v1/personality/docs` rows, and §6.34 line "no `save*` write methods
-// exist (grep: zero)"). This file closes that gap.
+// behind `.personaEngine`. The write side was held HTTP-only (`POST /v1/personality`,
+// `POST /v1/personality/docs`; no `save*` write methods existed). This file
+// closes that gap.
 //
 // PARITY CONTRACT (must match the daemon byte-for-byte on the wire):
 //
@@ -144,8 +143,7 @@ extension SwiftNativePersonaEngine {
     /// `persona_compile_cache.clear()` is intentionally omitted — that cache
     /// is daemon-process-only state. The daemon re-reads profile.json on the
     /// next persona compile, so the on-disk wire output is what matters and it
-    /// is byte-identical. (Same rationale as the wave-20 onboarding port,
-    /// CUTOVER_PLAN §6.21 "Side effects deliberately skipped".)
+    /// is byte-identical. (Same rationale as the wave-20 onboarding port.)
     ///
     /// - Parameter body: the partial profile fields to merge (the same dict
     ///   the HTTP route receives — keys NOT present are preserved from the
@@ -225,7 +223,7 @@ extension SwiftNativePersonaEngine {
     /// mirroring `_atomic_write_text`) and held under a cross-process flock on
     /// the target doc file.
     ///
-    /// SIDE-EFFECT PARITY (CUTOVER_PLAN §6.76 item B.1 — CLOSED wave 36 W06 §6.138):
+    /// SIDE-EFFECT PARITY (closed wave 36 W06):
     /// the daemon's `save_personality_doc` calls, inside its `with file_lock(path)`
     /// block, BOTH `persona_compile_cache.clear()` AND
     /// `record_activity("memory", "{doc}.md updated", "Personality document saved",
@@ -314,6 +312,14 @@ extension SwiftNativePersonaEngine {
         // daemon's single `record_activity`.
         let persistence = SwiftNativePersistenceCore()
         let result: PersonaDocSpec = try await persistence.withFileLock(path) { [self] in
+            // One pre-edit copy per doc (`SOUL.md.bak`), replaced each save, so
+            // the last version before any edit is always one file away.
+            if FileManager.default.fileExists(atPath: path.path) {
+                try SwiftNativePersistenceCore.writeDataAtomicDurable(
+                    Data(contentsOf: path),
+                    to: path.appendingPathExtension("bak")
+                )
+            }
             try Self.atomicWriteText(cappedContent, to: path)
 
             // §6.76 item B.1 / §6.138: emit the daemon's activity-feed row. The
@@ -680,52 +686,15 @@ extension SwiftNativePersonaEngine {
         return base + frac + "+00:00"
     }
 
-    /// Crash-safe atomic write mirroring Python `_atomic_write_text`
-    ///: temp file created 0600 via O_CREAT|O_EXCL,
-    /// full write with EINTR retry, close-failure escalated, rename(2),
-    /// chmod 0600. Identical to `Onboarding.atomicWriteText` (CUTOVER §6.21);
-    /// duplicated here so PersonaEngine does not take an Onboarding dep (which
-    /// would invert the module graph — Onboarding depends on PersonaEngine).
+    /// Crash-safe atomic write: the shared durable writer (0600 temp, fsync,
+    /// rename, parent-directory fsync). The old hand-rolled copy renamed
+    /// without an fsync, so a power loss could leave an identity doc empty.
     static func atomicWriteText(_ content: String, to path: URL) throws {
-        let dir = path.deletingLastPathComponent()
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let name = path.lastPathComponent
-        let pid = getpid()
-        let rand = UUID().uuidString.lowercased().replacingOccurrences(of: "-", with: "").prefix(8)
-        let tmpPath = dir.appendingPathComponent(".\(name).\(pid).\(rand).tmp")
-
-        let fd = open(tmpPath.path, O_WRONLY | O_CREAT | O_EXCL, 0o600)
-        if fd < 0 {
-            throw PersonaWriteError.ioFailure("open(tmp) failed: \(String(cString: strerror(errno)))")
+        do {
+            try SwiftNativePersistenceCore.writeDataAtomicDurable(Data(content.utf8), to: path)
+        } catch PersistenceCoreError.ioFailure(let detail) {
+            throw PersonaWriteError.ioFailure(detail)
         }
-        var fdClosed = false
-        var didRename = false
-        defer {
-            if !fdClosed { _ = close(fd) }
-            if !didRename { _ = unlink(tmpPath.path) }
-        }
-        let bytes = Array(content.utf8)
-        var written = 0
-        while written < bytes.count {
-            let n = bytes.withUnsafeBufferPointer { bp -> Int in
-                Darwin.write(fd, bp.baseAddress!.advanced(by: written), bp.count - written)
-            }
-            if n < 0 {
-                if errno == EINTR { continue }
-                throw PersonaWriteError.ioFailure("write(tmp) failed: \(String(cString: strerror(errno)))")
-            }
-            written += n
-        }
-        if close(fd) != 0 {
-            fdClosed = true
-            throw PersonaWriteError.ioFailure("close(tmp) failed: \(String(cString: strerror(errno)))")
-        }
-        fdClosed = true
-        if rename(tmpPath.path, path.path) != 0 {
-            throw PersonaWriteError.ioFailure("rename failed: \(String(cString: strerror(errno)))")
-        }
-        didRename = true
-        _ = chmod(path.path, 0o600)
     }
 }
 

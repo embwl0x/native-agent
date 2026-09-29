@@ -10,7 +10,7 @@ const {
   createProcessStartIdentityReader, safeFilePart: sharedSafeFilePart,
   postWakeCompletion, unicodePrefix, dirLockOwnerAlive, fsyncDirectorySync, writeSyncedAndClose,
   copyWakeProducerIdentity, copyWakeCompletionOrigin, readWakeJSON,
-  appendSyncedWakeLine, createWakeEventWaiter, readWakeJSONLines, sleep, readWakeBridgeToken,
+  appendSyncedWakeLine, createWakeEventWaiter, readWakeJSONLines, sleep, readWakeBridgeToken, createWakeLivePoster,
 } = require("./wake_worker_common.js");
 
 const {
@@ -130,13 +130,16 @@ function readBridgeDescriptor(file = BRIDGE_DESCRIPTOR_PATH) {
   return value;
 }
 
+// The endpoint the running bridge published, or an explicit port. Null when
+// neither exists: each install listens on its own port, so there is no
+// fixed one to guess.
 function codexReturnBridgeEndpoint(config = {}) {
   const explicitHost = config.bridgeHost || process.env.NATIVE_AGENT_CODEX_BRIDGE_HOST;
   const explicitPort = config.bridgePort || process.env.NATIVE_AGENT_CODEX_BRIDGE_PORT;
-  if (explicitHost || explicitPort) {
+  if (explicitPort) {
     return {
       host: String(explicitHost || "127.0.0.1"),
-      port: Number(explicitPort || 8771),
+      port: Number(explicitPort),
       source: "explicit",
     };
   }
@@ -158,7 +161,7 @@ function codexReturnBridgeEndpoint(config = {}) {
       }
     } catch {}
   }
-  return { host: "127.0.0.1", port: 8771, source: "fallback" };
+  return null;
 }
 
 function safeFilePart(value) {
@@ -1409,7 +1412,15 @@ async function deliverReplyJobUnlocked(jobPath, config) {
   let execution = job.completedExecution && job.completedExecution.turnResult
     ? job.completedExecution
     : null;
+  // The app's live stream for these messages: working, reply so far, finished.
+  const endpoint = codexReturnBridgeEndpoint(config);
+  const live = createWakeLivePoster({
+    url: endpoint ? `http://${endpoint.host}:${endpoint.port}/codex/live` : null,
+    tokenPath: stringSetting(config, "bridgeTokenPath", "NATIVE_AGENT_CODEX_BRIDGE_TOKEN_PATH", BRIDGE_TOKEN_PATH),
+    messageIds: entries.map((entry) => entry && entry.payload && entry.payload.messageId).filter(Boolean),
+  });
   if (!execution) {
+    live.started();
     execution = await waitForDurableTerminalExecution(job, config, async (observed) => {
       // Timeout is a bounded wait interval, not evidence that the Codex turn
       // ended. Persist the observation and resubscribe to exact app-server/file
@@ -1422,7 +1433,8 @@ async function deliverReplyJobUnlocked(jobPath, config) {
         turnId: observed.turnId,
       };
       writeJSONAtomic(jobPath, job);
-    });
+    }, { live });
+    live.finished(execution.turnResult.status);
   }
   if (!job.completedExecution && execution.turnResult.status === "failed_hung") {
     const hangRecovery = await recoverHungTurn(job, execution, config);
@@ -2116,6 +2128,25 @@ async function main() {
     fail("invalid_stdin_json", { error: String(error.message || error) });
   }
 
+  // agent_cancel: interrupt one exact running turn. Connect-only: with no
+  // app-server running there is no turn to stop, so none is started.
+  if (payload.interrupt === true) {
+    const target = canonicalCodexThreadId(payload.threadId);
+    const turnId = typeof payload.turnId === "string" ? payload.turnId : "";
+    if (!target || !turnId) fail("interrupt_target_missing");
+    let client;
+    try {
+      client = await connectRpcOnce(12000);
+      await client.request("turn/interrupt", { threadId: target, turnId });
+      jsonOut({ status: "interrupted", threadId: target, turnId });
+    } catch (error) {
+      jsonOut({ status: "failed", reason: "turn_interrupt_failed", error: String(error && error.message || error) });
+    } finally {
+      if (client) client.close();
+    }
+    return;
+  }
+
   const mode = wakeupMode(config, payload);
   const threadId = canonicalCodexThreadId(
     payload.threadId || process.env.NATIVE_AGENT_CODEX_THREAD_ID || (mode === PINNED_THREAD_MODE ? config.threadId : null)
@@ -2240,6 +2271,7 @@ const {
   finalizeReplyJobFile,
   isTerminalBridgeReply
 } = require("./wake_reply_delivery.js").createCodexReplyDelivery({
+  BRIDGE_DESCRIPTOR_PATH,
   BRIDGE_TOKEN_PATH,
   USER_NAME,
   codexReturnBridgeEndpoint,

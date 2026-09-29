@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import TurnTrace
 
 /// One `cache_control` marker observed on an outgoing request body.
 ///
@@ -555,10 +556,16 @@ public final class LLMCallTraceRecorder: @unchecked Sendable {
         private let persistence = SwiftNativePersistenceCore()
 
         func write(_ pending: SessionUsageReceiptWrite) async {
-            let existing = await persistence.readJSON(
-                pending.path,
-                defaultValue: .object([:])
-            )
+            let existing: JSONValue
+            do {
+                existing = try await persistence.readJSON(pending.path, ifMissing: .object([:]))
+            } catch {
+                // Never write over a receipt that did not read back.
+                FileHandle.standardError.write(
+                    Data("LLMCallTraceRecorder: session usage receipt read failed: \(error)\n".utf8)
+                )
+                return
+            }
             if case .object(let object) = existing,
                case .int(let existingOrder)? = object["recordedAtEpochMicros"],
                existingOrder > pending.recordedAtEpochMicros {
@@ -657,6 +664,11 @@ public final class LLMCallTraceRecorder: @unchecked Sendable {
             "turnId": .string(turnId),
         ]
         if let ttftMs { payload["ttftMs"] = .int(Int64(ttftMs)) }
+        // How the adapter's streamMessages delivered this call; absent on
+        // calls that did not come through streamMessages.
+        if let streamKind = LLMMessagesStreamKind.current {
+            payload["streamKind"] = .string(streamKind.rawValue)
+        }
         // Additive, chat-only: absent for every caller that does not bind the
         // per-turn prefix receipts, so those rows decode exactly as before.
         //

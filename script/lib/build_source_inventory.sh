@@ -18,7 +18,7 @@ nativeagent_inventory_files() {
         \( -path '*/.build' -o -path '*/.build/*' \) -prune -o \
         -type f -print
     done
-    for package_file in "$root/Package.swift" "$root/Package.resolved" "$root"/Modules/*/Package.swift "$root"/Modules/*/Package.resolved; do
+    for package_file in "$root/Package.swift" "$root/Package.resolved" "$root"/Modules/*/Package.swift; do
       [[ -f "$package_file" ]] && printf '%s\n' "$package_file"
     done
   } | LC_ALL=C sort -u

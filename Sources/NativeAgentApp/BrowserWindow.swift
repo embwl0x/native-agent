@@ -1,8 +1,10 @@
-// PATCH-2026-05-06: wkwebview-browser Real WKWebView browser window + NWListener IPC server preferring port 8766
+import EngineRuntime
+// PATCH-2026-05-06: wkwebview-browser Real WKWebView browser window + NWListener IPC server on this install's fixed port (8766)
 import SwiftUI
 import WebKit
 import Network
 import AppKit
+import PersistenceCore
 
 // MARK: - Models
 
@@ -12,10 +14,7 @@ struct NavResult: Codable, Sendable {
     let httpStatus: Int?
 }
 
-struct BrowserLink: Codable, Sendable, Hashable {
-    let url: String
-    let text: String
-}
+typealias BrowserLink = EngineRuntime.BrowserLink
 
 // MARK: - Nav delegate helper (nonisolated, bridges WKWebView callbacks to actor)
 
@@ -214,17 +213,18 @@ final class BrowserWindowController: NSObject, ObservableObject {
     private var activeNavigationID: String?
 
     // IPC server state
-    private let ipcListener = NativeLoopbackPortFallbackListener(
-        preferredPort: BrowserWindowController.preferredIPCPort,
+    private let ipcListener = NativeLoopbackListener(
+        port: InstallPaths.current.loopbackPorts().browserIPC,
         label: "BrowserIPC"
     )
+    /// Doctor's "Local bridges" row for the browser IPC listener.
+    nonisolated var ipcListenerHealth: NativeLoopbackListener.Health { ipcListener.health }
     private var connections: [ObjectIdentifier: NWConnection] = [:]
     private var connectionTimeouts: [ObjectIdentifier: Task<Void, Never>] = [:]
     private(set) var ipcToken: String = ""
     private(set) var ipcPort: UInt16 = 0
     private let dataRoot: URL
 
-    private static let preferredIPCPort: UInt16 = 8766
     /// Drop a connection that hasn't completed its request/response within this window
     /// so stalled/half-open peers can't accumulate in `connections` indefinitely.
     private static let ipcIdleTimeout: Duration = .seconds(15)

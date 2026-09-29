@@ -238,7 +238,7 @@ struct NativeAgentMobileApp: App {
     @UIApplicationDelegateAdaptor(NativeAgentMobilePushDelegate.self) private var pushDelegate
     @StateObject private var pairingStore = PairingStore()
     @StateObject private var bridgeClient = MacBridgeClient()
-    @StateObject private var chatStore = ChatStore()
+    @StateObject private var chatStore = ChatStore.shared
     // PERF-2026-08-05: `@Observable` controller — `@State`/`.environment` is the
     // Observation idiom (`@StateObject`/`.environmentObject` require ObservableObject).
     @State private var voiceInput = VoiceInputController()
@@ -253,6 +253,18 @@ struct NativeAgentMobileApp: App {
 
     init() {
         ChatRuntimeControls.primeDeviceSourceKey()
+        MobileNotificationRouting.register()
+        UNUserNotificationCenter.current().delegate = notificationDelegate
+        NativeAgentMobileShortcuts.updateAppShortcutParameters()
+        let pairing = PairingStore()
+        _pairingStore = StateObject(wrappedValue: pairing)
+        iCloudBridge.shared.pairingStore = pairing
+        iCloudSyncEngine.shared.pairingStore = pairing
+        // Location relaunches need their observer even without a visible scene.
+        if PhonePlaces.shared.places.contains(where: \.enabled) {
+            iCloudBridge.shared.setup()
+            PhonePlaces.shared.resume()
+        }
     }
 
     /// True when the user has either paired OR explicitly skipped the pairing screen.
@@ -270,7 +282,9 @@ struct NativeAgentMobileApp: App {
     @Environment(\.scenePhase) private var scenePhase
 
     private func refreshOnForeground() {
+        PhoneTurnActivity.shared.resume()
         guard pairingStore.usesICloudTransport else { return }
+        PhonePlaces.shared.resume()
         Task { @MainActor in
             await iCloudSyncEngine.shared.refreshSnapshots()
         }
@@ -290,7 +304,7 @@ struct NativeAgentMobileApp: App {
                             // E8: durable queued sends resume themselves when
                             // the phone's network path returns, instead of
                             // waiting for the user to notice and retry.
-                            bridgeClient.onNetworkPathRestored = { [weak chatStore] in
+                            bridgeClient.onNetworkPathRestored = { [weak chatStore = chatStore] in
                                 chatStore?.resumeQueuedSends()
                             }
                             configureNotifications()
@@ -414,6 +428,8 @@ struct NativeAgentMobileApp: App {
         // F4: bridgeClient needs pairingStore so it can pick the `.macUnreachable`
         // status when paired but the bridge has been offline for >30 s.
         bridgeClient.pairingStore = pairingStore
+        PhonePlaces.shared.resume()
+        PhoneTurnActivity.shared.resume()
         // Use iCloud when either the paired flag is set OR the HMAC secret is present
         // (the secret survives app reinstalls and Skip flows via Keychain).
         if pairingStore.usesICloudTransport {

@@ -9,6 +9,7 @@ import UniformTypeIdentifiers
 import NativeAgentShared
 import MemoryV2
 import PersistenceCore
+import TriggerScheduler
 #if canImport(CoreSpotlight)
 import CoreSpotlight
 #endif
@@ -71,7 +72,7 @@ struct SchedulerJobsRefreshCoalescer: Equatable {
 /// control now (item 36), so every outcome gets a line: a refused write must
 /// never read like an accepted one.
 enum SchedulerJobToggleOutcome: Equatable {
-    case verified(SchedulerJob)
+    case verified(ScheduledJob)
     case failed(String)
 }
 
@@ -141,10 +142,10 @@ struct SchedulerView: View {
                 .foregroundStyle(reflectionOutcome.succeeded ? Color.secondary : Color.red)
             }
 
-            if isLoadingJobs, appModel.jobs.isEmpty {
+            if isLoadingJobs, appModel.engine.desk.jobs.isEmpty {
                 ProgressView("Loading schedule")
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else if let detail = jobsLoadResult?.failureDetail, appModel.jobs.isEmpty {
+            } else if let detail = jobsLoadResult?.failureDetail, appModel.engine.desk.jobs.isEmpty {
                 NativeEmptyState(
                     title: "Schedule unavailable",
                     detail: detail,
@@ -172,7 +173,7 @@ struct SchedulerView: View {
                             .font(.caption)
                             .foregroundStyle(toggleMessage.isError ? Color.red : Color.secondary)
                     }
-                    List(appModel.jobs) { job in
+                    List(appModel.engine.desk.jobs) { job in
                         HStack(alignment: .firstTextBaseline) {
                             VStack(alignment: .leading) {
                                 Text(job.name)
@@ -201,8 +202,8 @@ struct SchedulerView: View {
         }
         .padding()
         .navigationTitle("Scheduler")
-        .task(id: appModel.client.schedulerJobsPath) {
-            let jobsPath = appModel.client.schedulerJobsPath
+        .task(id: appModel.engine.desk.jobsPath) {
+            let jobsPath = appModel.engine.desk.jobsPath
             await SchedulerJobsLiveRefresh.observe(path: jobsPath) {
                 await loadJobs()
             }
@@ -210,9 +211,9 @@ struct SchedulerView: View {
     }
 
     /// One pause/resume per job in flight. The row is repainted from
-    /// `appModel.jobs` after the write settles, so the switch always shows the
+    /// `engine.desk.jobs` after the write settles, so the switch always shows the
     /// store's truth rather than the click's.
-    private func setEnabled(_ job: SchedulerJob, _ enabled: Bool) {
+    private func setEnabled(_ job: ScheduledJob, _ enabled: Bool) {
         guard !togglingJobIDs.contains(job.id) else { return }
         togglingJobIDs.insert(job.id)
         toggleMessage = nil

@@ -18,7 +18,7 @@ struct AgentScreenView: View {
 
     var body: some View {
         let scope = appModel.activeChatSessionId
-        ShellFrame(classic: false) {
+        ShellFrame {
             EmptyView()
         } detail: {
             VStack(alignment: .leading, spacing: 10) {

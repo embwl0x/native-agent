@@ -1,3 +1,4 @@
+import AppToolRuntime
 import SwiftUI
 import UserNotifications
 // PATCH-2026-05-07: app-owned runtime SMAppService for login auto-start
@@ -15,12 +16,14 @@ import ChatOrchestration
 import MCPDispatcher
 import BackgroundLoops
 import MemoryV2
+import KnowledgeGraph
 import DreamREMCycle
 import PersistenceCore
 import PersonaEngine
 import OSLog
 #if canImport(BackgroundTasks)
 import BackgroundTasks
+import DeviceSync
 #endif
 
 final class WakeResetThrottle: @unchecked Sendable {
@@ -165,6 +168,7 @@ enum NativeAgentAppMain {
         // two databases. Claim the process first so a second launch can never
         // move storage beneath an already-running app, then prepare the root
         // before any state owner exists.
+        InlineInteractionResolver.platform = AppInlineInteractionPlatformPort()
         _ = NSApplication.shared
         guard AppDelegate.claimSingleAppInstance() else { return }
         if case .failed(let error) = NativeAgentPaths.preparePublicReleaseDataRootIfNeeded() {
@@ -179,6 +183,18 @@ enum NativeAgentAppMain {
             AppDelegate.presentBackupRestoreError(error.localizedDescription)
             return
         }
+        // Before any owner opens or creates state under a root that is not
+        // there. A public first run is blank by design.
+        if !NativeAgentPaths.isPublicReleaseBundle {
+            let missing = PersistenceCore.missingLaunchRoots(dataRoot: NativeAgentPaths.dataRoot)
+            if !missing.isEmpty, !AppDelegate.confirmLaunchWithMissingRoots(missing) {
+                return
+            }
+        }
+        // memory.sqlite has one owner: the graph reaches its kg_* tables
+        // through MemoryStorage's pool. Installed before any view or loop can
+        // read the graph.
+        KnowledgeGraphPoolCache.installOwner(SwiftNativeMemoryV2.knowledgeGraphPool(at:))
         NativeAgentApp.main()
     }
 }
@@ -192,12 +208,10 @@ struct NativeAgentApp: App {
     @State private var browserController = BrowserWindowController.shared
     @AppStorage("nativeagent.darkMode") private var preferDarkAppearance = true
     @State private var appearance = AppearanceController.shared
-    @AppStorage("showDeveloperSurfaces") private var showDeveloperSurfaces = false
+    /// Her haze colour is the app's tint, so every native control wears it.
+    @AppStorage(HazeColor.key) private var hazeRaw = HazeColor.defaultValue.rawValue
 
     init() {
-        // User, 2026-09-23: no way back to the classic sidebar; anyone left on
-        // it lands in the current shell.
-        UserDefaults.standard.removeObject(forKey: NativeAgentShellPreference.classicShellKey)
         // User, 2026-09-03: native text on this app looked heavy next to the
         // Claude desktop app's. That app is Chromium, which draws without
         // macOS font smoothing (stem darkening). Turn it off for this process
@@ -213,6 +227,7 @@ struct NativeAgentApp: App {
         // and surfaces as a normal error. App.init runs before any delegate
         // callback or subprocess spawn, so this is the earliest hook.
         signal(SIGPIPE, SIG_IGN)
+        AgentACPProcess.installHost(MacAgentACPProcess())
 
         // User, 2026-09-13: "if you've missed anything, it needs to be up there
         // on Providers." The three Providers groups and the routed surface list
@@ -292,15 +307,14 @@ struct NativeAgentApp: App {
                 ?? NativeAgentAppChatSurfaceProfile.mac
             let approvalFiler = NativeAgentChatApprovalFiler(dataRoot: dataRoot)
             let gated = makeGatedToolDispatchClient(
-                tools: makeNativeAgentAppToolDispatchClient(
+                tools: NativeAgentEngine.live.toolDispatchClient(
                     includeEvolutionBridge: profile.includesEvolutionBridge,
                     denyExternalMcp: profile.deniesExternalMCP,
                     // The gate below resolves autonomy once, as it does for an
                     // ordinary Mac turn; the inner dispatcher must not re-run
                     // that decision from a reconstructed origin.
                     enforceAppAutonomy: false,
-                    swarmApprovalFiler: approvalFiler,
-                    dataRoot: dataRoot
+                    swarmApprovalFiler: approvalFiler
                 ),
                 fileAccess: "auto",
                 approvalFiler: approvalFiler,
@@ -378,7 +392,7 @@ struct NativeAgentApp: App {
                 }
             },
             startPermissionSync: {
-                MacIntegrationICloudBridge.shared.startObserving()
+                NativeAgentEngine.liveDeviceSync.macIntegrationPermissions.startObserving()
             },
             wireGlobalHotkey: {
                 NativeAgentHotkeyBootstrap.shared.start(appModel: appModel)
@@ -412,6 +426,7 @@ struct NativeAgentApp: App {
                 // answers dark or light for both layers; "off" follows the
                 // system live. See AppearanceController.swift.
                 .preferredColorScheme(appearance.colorScheme)
+                .tint((HazeColor(rawValue: hazeRaw) ?? .defaultValue).base)
                 .onChange(of: preferDarkAppearance, initial: true) { _, dark in
                     appearance.setPreferDark(dark)
                 }
@@ -479,13 +494,9 @@ struct NativeAgentApp: App {
                         KeyboardShortcut(KeyEquivalent($0), modifiers: .command)
                     })
                 }
-                // B2.2 review fix (gpt-5.5 BLOCKING): Knowledge Graph is a
-                // developer-gated surface — its menu entry hides with the gate
-                // (explicit deep links still resolve). It carries no digit: the
-                // digits belong to the sidebar's primary order.
-                if NativeAgentShellPreference.developerSurfacesShown(showDeveloperSurfaces) {
-                    Button("Knowledge graph") { NativeAgentAppCoordinator.shared.request(.sidebar(.knowledge)) }
-                }
+                // Knowledge graph carries no digit: the digits belong to the
+                // sidebar's primary order.
+                Button("Knowledge graph") { NativeAgentAppCoordinator.shared.request(.sidebar(.knowledge)) }
                 Divider()
                 Button("Approvals") { NativeAgentAppCoordinator.shared.request(.activity(.approvals)) }
                     .keyboardShortcut("a", modifiers: [.command, .shift])
@@ -495,8 +506,7 @@ struct NativeAgentApp: App {
         }
 
         // One Settings page: Command-comma opens the same SetupView the
-        // sidebar's Settings opens. SlimSettingsView survives only as the
-        // classic sidebar's Settings (ContentView).
+        // sidebar's Settings opens.
         Settings {
             SetupView()
                 .environment(appModel)
@@ -504,6 +514,7 @@ struct NativeAgentApp: App {
                 // answers dark or light for both layers; "off" follows the
                 // system live. See AppearanceController.swift.
                 .preferredColorScheme(appearance.colorScheme)
+                .tint((HazeColor(rawValue: hazeRaw) ?? .defaultValue).base)
                 .onChange(of: preferDarkAppearance, initial: true) { _, dark in
                     appearance.setPreferDark(dark)
                 }
@@ -541,7 +552,7 @@ struct NativeAgentApp: App {
             // pair could contradict itself ("Ready" over "unavailable").
             Text(MenuBarStatusPresentation.line(
                 statusText: appModel.statusText,
-                health: appModel.health
+                health: appModel.engine.doctor.health
             ))
         }
 
@@ -603,31 +614,32 @@ private struct ActivityCaptureMenuBarContent: View {
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
-    /// A click on a banner OPENS what the banner was about. It never approves,
-    /// runs, or closes anything — a Desk reminder lands on its own item.
+    var approvalNotificationTask: Task<Void, Never>?
+
     nonisolated func userNotificationCenter(
         _ center: UNUserNotificationCenter,
-        didReceive response: UNNotificationResponse,
-        withCompletionHandler completionHandler: @escaping () -> Void
-    ) {
-        let userInfo = response.notification.request.content.userInfo
-        if let handle = NativeAgentNotificationRoute.deskHandle(in: userInfo) {
-            Task { @MainActor in
-                _ = NativeAgentAppCoordinator.shared.request(.sidebar(.desk))
-                // The handle WAITS on the model. Posting it here lost the click
-                // whenever the Desk page was not already mounted (no
-                // subscriber) or had not finished loading (nothing to scroll
-                // to); the page takes it when it can actually show the item.
-                QuietSelfAdmin.shared.appModel?.pendingDeskHandle = handle
-            }
-        }
-        completionHandler()
+        willPresent notification: UNNotification
+    ) async -> UNNotificationPresentationOptions {
+        let category = notification.request.content.categoryIdentifier
+        guard category == NativeAgentNotificationActions.approvalCategory
+                || category == NativeAgentNotificationActions.messageCategory else { return [] }
+        return [.banner, .list, .sound]
+    }
+
+    /// Only explicit action buttons execute. An ordinary banner click opens
+    /// its destination; dismissal does nothing.
+    nonisolated func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        didReceive response: UNNotificationResponse
+    ) async {
+        let action = NativeAgentNotificationActions.Response(response)
+        await NativeAgentNotificationActions.handle(action)
     }
 
     /// Paired iPhone chat is the same resident mind with its own closed remote
     /// surface profile. Reuse never crosses into Mac/bridge-only evolution or
     /// approval policy.
-    static let residentIOSChatClient = makeNativeAgentAppChatOrchestrationClient(
+    static let residentIOSChatClient = NativeAgentEngine.live.chatClient(
         profile: .ios
     )
 }

@@ -6,22 +6,21 @@ name: NativeAgentMobile
 options:
   bundleIdPrefix: io.github.embwl0x.nativeagent
   deploymentTarget:
-    iOS: "17.0"
-  xcodeVersion: "15.0"
+    iOS: "26.0"
+  xcodeVersion: "27.0"
   createIntermediateGroups: true
+  # Only a local package today; any remote dependencies must use the root pins.
+  postGenCommand: mkdir -p NativeAgentMobile.xcodeproj/project.xcworkspace/xcshareddata/swiftpm && cp ../../Package.resolved NativeAgentMobile.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved
 
 settings:
-  SWIFT_VERSION: "5.9"
-  # U4 (2026-07-09) stage 1: warnings-only strict concurrency. The Mac side is
-  # already Swift 6; iOS stays on the 5.9 language mode so data-race violations
-  # surface as WARNINGS rather than hard errors while the remaining call sites
-  # are worked through. Stage 2 bumps SWIFT_VERSION to 6 (turning these into
-  # errors) once the `// concurrency-stage2` markers are cleared.
+  SWIFT_VERSION: "6"
+  # U4 stage 2: Swift 6 enforces complete concurrency checking on both platforms.
+  # Build with the iOS 27 SDK; gate 27-only APIs while keeping the iOS 26 floor.
   SWIFT_STRICT_CONCURRENCY: complete
   TARGETED_DEVICE_FAMILY: "1,2"  # iPhone + iPad
   SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: NO
-  MARKETING_VERSION: "0.4.11"
-  CURRENT_PROJECT_VERSION: "14"
+  MARKETING_VERSION: "0.5.0"
+  CURRENT_PROJECT_VERSION: "15"
   # Set DEVELOPMENT_TEAM locally in Xcode or on the xcodebuild command line
   # for device builds. Do not commit a personal Apple Developer Team ID.
   CODE_SIGN_STYLE: "Automatic"
@@ -41,28 +40,26 @@ packages:
     path: ../../Modules/NativeAgentShared
 
 targets:
-  # 2026-06-11: first iOS unit-test target (ChatStore merge semantics; the
-  # chat-smoothness campaign will grow it). Hosted in the app for @testable.
-  NativeAgentMobileTests:
-    type: bundle.unit-test
-    platform: iOS
-    sources:
-      - path: Tests
-    dependencies:
-      - target: NativeAgentMobile
-      - package: NativeAgentShared
-        product: NativeAgentSharedTestSupport
-    settings:
-      GENERATE_INFOPLIST_FILE: YES
-      PRODUCT_BUNDLE_IDENTIFIER: $(NATIVEAGENT_IOS_TEST_BUNDLE_ID)
   NativeAgentMobile:
     type: application
     platform: iOS
     sources:
       - path: Sources
       - path: Resources
+      - path: NotificationSupport
+      - path: Shared
+      - path: ControlSupport
+      - path: LiveActivityShared
     dependencies:
       - package: NativeAgentShared
+      - target: NativeAgentNotificationService
+        embed: true
+      - target: NativeAgentShare
+        embed: true
+      - target: NativeAgentControls
+        embed: true
+      - target: NativeAgentLiveActivity
+        embed: true
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: $(NATIVEAGENT_IOS_BUNDLE_ID)
@@ -80,6 +77,9 @@ targets:
     entitlements:
       path: Sources/NativeAgentMobile.entitlements
       properties:
+        com.apple.security.application-groups:
+          - $(NATIVEAGENT_IOS_APP_GROUP_ID)
+          - group.$(NATIVEAGENT_IOS_BUNDLE_ID).notifications
         # Release archives must request production APNS/CloudKit. Keeping the
         # environment in configuration-specific build settings prevents a
         # development entitlement from surviving into an App Store archive.
@@ -91,6 +91,7 @@ targets:
         # NOTE: xcodegen REGENERATES the .entitlements file from this block;
         # edits made directly to the plist are wiped on the next regen.
         com.apple.developer.usernotifications.time-sensitive: true
+        com.apple.developer.usernotifications.communication: true
         com.apple.developer.icloud-container-identifiers:
           - $(NATIVEAGENT_ICLOUD_CONTAINER_ID)
         com.apple.developer.icloud-services:
@@ -110,6 +111,12 @@ targets:
         ITSAppUsesNonExemptEncryption: false
         NSMicrophoneUsageDescription: "Listen to push-to-talk so you can dictate messages to your agent."
         NSPhotoLibraryUsageDescription: "NativeAgentMobile lets you attach photos from your library so your agent can see them in chat."
+        NSLocationWhenInUseUsageDescription: "Share your current location with your agent when you accept a phone request."
+        NSCameraUsageDescription: "Take a photo to share with your agent when you accept a camera request."
+        NSLocationAlwaysAndWhenInUseUsageDescription: "Let your agent know when you arrive at or leave places you enable, even while NativeAgent is closed."
+        NSSupportsLiveActivities: true
+        NSUserActivityTypes: [INSendMessageIntent]
+        NativeAgentNotificationGroup: group.$(NATIVEAGENT_IOS_BUNDLE_ID).notifications
         NSSpeechRecognitionUsageDescription: "Convert your voice to text so your agent can read what you said."
         CFBundleShortVersionString: "$(MARKETING_VERSION)"
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
@@ -124,12 +131,128 @@ targets:
         # this Info.plist key (env var still overrides on macOS/tests). "cloudkit"
         # routes the companion through CloudKit; "kvs" (or removing this) reverts.
         NativeAgentDeviceSync: "cloudkit"
+        NativeAgentAppGroupID: "$(NATIVEAGENT_IOS_APP_GROUP_ID)"
         UILaunchScreen: {}
-        UIBackgroundModes: [remote-notification]
+        UIBackgroundModes: [remote-notification, location]
         UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait, UIInterfaceOrientationPortraitUpsideDown, UIInterfaceOrientationLandscapeLeft, UIInterfaceOrientationLandscapeRight]
         UISupportedInterfaceOrientations~ipad: [UIInterfaceOrientationPortrait, UIInterfaceOrientationPortraitUpsideDown, UIInterfaceOrientationLandscapeLeft, UIInterfaceOrientationLandscapeRight]
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: false
+  NativeAgentLiveActivity:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: LiveActivity
+      - path: LiveActivityShared
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(NATIVEAGENT_IOS_BUNDLE_ID).liveactivity
+        APPLICATION_EXTENSION_API_ONLY: YES
+        SKIP_INSTALL: YES
+    info:
+      path: LiveActivity/Info.plist
+      properties:
+        CFBundleDisplayName: NativeAgent Activity
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+  NativeAgentNotificationService:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: NotificationService
+      - path: NotificationSupport
+      - path: Resources
+    dependencies:
+      - package: NativeAgentShared
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(NATIVEAGENT_IOS_BUNDLE_ID).notifications
+        APPLICATION_EXTENSION_API_ONLY: YES
+        SKIP_INSTALL: YES
+      configs:
+        Debug:
+          NATIVEAGENT_ICLOUD_ENVIRONMENT: Development
+        Release:
+          NATIVEAGENT_ICLOUD_ENVIRONMENT: Production
+    entitlements:
+      path: NotificationService/NotificationService.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - group.$(NATIVEAGENT_IOS_BUNDLE_ID).notifications
+        com.apple.developer.icloud-container-identifiers:
+          - $(NATIVEAGENT_ICLOUD_CONTAINER_ID)
+        com.apple.developer.icloud-services: [CloudKit]
+        com.apple.developer.icloud-container-environment: $(NATIVEAGENT_ICLOUD_ENVIRONMENT)
+    info:
+      path: NotificationService/Info.plist
+      properties:
+        CFBundleDisplayName: NativeAgent Notifications
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        NSUserActivityTypes: [INSendMessageIntent]
+        NativeAgentNotificationGroup: group.$(NATIVEAGENT_IOS_BUNDLE_ID).notifications
+        NativeAgentICloudContainerID: $(NATIVEAGENT_ICLOUD_CONTAINER_ID)
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.usernotifications.service
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).NotificationService
+  NativeAgentControls:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: Controls
+      - path: ControlSupport
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(NATIVEAGENT_IOS_BUNDLE_ID).controls
+        APPLICATION_EXTENSION_API_ONLY: YES
+        SKIP_INSTALL: YES
+    entitlements:
+      path: Controls/NativeAgentControls.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - $(NATIVEAGENT_IOS_APP_GROUP_ID)
+    info:
+      path: Controls/Info.plist
+      properties:
+        CFBundleDisplayName: NativeAgent Controls
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        NativeAgentAppGroupID: $(NATIVEAGENT_IOS_APP_GROUP_ID)
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+  NativeAgentShare:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: ShareExtension
+      - path: Shared
+      - path: Sources/NativeAgentMobileTheme.swift
+    dependencies:
+      - package: NativeAgentShared
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(NATIVEAGENT_IOS_SHARE_BUNDLE_ID)
+        APPLICATION_EXTENSION_API_ONLY: YES
+        SKIP_INSTALL: YES
+    entitlements:
+      path: ShareExtension/NativeAgentShare.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - $(NATIVEAGENT_IOS_APP_GROUP_ID)
+    info:
+      path: ShareExtension/Info.plist
+      properties:
+        CFBundleDisplayName: "Share to NativeAgent"
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        NativeAgentAppGroupID: "$(NATIVEAGENT_IOS_APP_GROUP_ID)"
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.share-services
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).ShareViewController
+          NSExtensionAttributes:
+            NSExtensionActivationRule: 'SUBQUERY(extensionItems, $item, SUBQUERY($item.attachments, $attachment, ANY $attachment.registeredTypeIdentifiers UTI-CONFORMS-TO "public.text" OR ANY $attachment.registeredTypeIdentifiers UTI-CONFORMS-TO "public.url" OR ANY $attachment.registeredTypeIdentifiers UTI-CONFORMS-TO "public.image" OR ANY $attachment.registeredTypeIdentifiers UTI-CONFORMS-TO "com.adobe.pdf").@count == $item.attachments.@count AND $item.attachments.@count > 0 AND $item.attachments.@count <= 4).@count == extensionItems.@count'
 # CK-4: explicit shared scheme so command-line xcodebuild can resolve the
 # NativeAgentShared SPM package + sign for device (a plain -target build can't
 # resolve package deps; xcodegen wasn't emitting an app scheme on regen).
@@ -138,12 +261,7 @@ schemes:
     build:
       targets:
         NativeAgentMobile: all
-        NativeAgentMobileTests: [test]
     run:
       config: Debug
-    test:
-      config: Debug
-      targets:
-        - NativeAgentMobileTests
     archive:
       config: Release

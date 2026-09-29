@@ -537,6 +537,24 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
             generation: generation
         )
         precoveredSourceIDs.formUnion(userPrecoverage.precoveredSourceIDs)
+        // 2026-09-26: the other direction. When USER.md rides the stable
+        // prompt, a memory row whose text IS one of its lines is already there;
+        // 31% of inline memory rows were. Same join as precoverage.
+        if let user = mirror.documents.first(where: { $0.id.rawValue == "USER.md" }),
+           let userSourceID = user.sourceID, precoveredSourceIDs.contains(userSourceID),
+           let facts = Self.generatedUserFacts(in: user.text) {
+            let factsByCore = Dictionary(grouping: facts, by: \.core)
+            let memorySourceIDs = Set(selectedSources.lazy.filter {
+                $0.descriptor.owner == "nativeagent.memory-v2"
+            }.map(\.descriptor.id))
+            for atom in generation.atoms where atom.validToGeneration == nil
+                && memorySourceIDs.contains(atom.draft.sourceID) {
+                let body = MemoryDisplayText.projectionJoinKey(atom.draft.body)
+                if factsByCore[body.core]?.contains(where: { $0.isCovered(by: body) }) == true {
+                    precoveredSourceIDs.insert(atom.draft.sourceID)
+                }
+            }
+        }
 
         let protectedCorrectionAtomIDs = Set(generation.atoms.lazy.filter { atom in
             atom.validToGeneration == nil
@@ -785,13 +803,17 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
                     measureLatency: true
                 )
             }
+            let recordsFeedback = policy.recordsSideEffects
+                && !Self.isTestSession(request.sessionID)
             if policy.recordsSideEffects {
-                await recordFeedback(
-                    signal: .selection,
-                    atomIDs: packet.receipt.selectedAtomIDs,
-                    evidenceIDs: [packet.receipt.id],
-                    generationID: generation.generation.id
-                )
+                if recordsFeedback {
+                    await recordFeedback(
+                        signal: .selection,
+                        atomIDs: packet.receipt.selectedAtomIDs,
+                        evidenceIDs: [packet.receipt.id],
+                        generationID: generation.generation.id
+                    )
+                }
                 Task { [weak self] in
                     await self?.observePrewarmContinuity(
                         request: request,
@@ -837,7 +859,7 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
                 [ContextAtomID],
                 [String]
             ) async -> Void)?
-            if policy.recordsSideEffects {
+            if recordsFeedback {
                 feedbackHandler = { [weak self] signal, atomIDs, evidenceIDs in
                     await self?.recordFeedback(
                         signal: signal,
@@ -1252,6 +1274,17 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
             lastError = "context feedback restore failed: \(error)"
             diagnostics("[context-flow] \(lastError ?? "context feedback restore failed")")
         }
+    }
+
+    /// Test traffic must not train her ranker (User, 2026-09-26). Benchmarks,
+    /// walks and drives reach her over the bridge in sessions whose ids name
+    /// them (bench-…, walk26-…, cuwalk-…, a2awalk-…, desk-walk…,
+    /// claude-drive-…, telegram-drive-…, rut-test); her own Mac and Telegram
+    /// threads are UUIDs, which can never contain these words. 09-24: fifteen
+    /// bench-* context_expand calls raised one memory's score in real turns.
+    private static func isTestSession(_ sessionID: String?) -> Bool {
+        guard let id = sessionID?.lowercased() else { return false }
+        return ["bench", "walk", "drive", "test"].contains { id.contains($0) }
     }
 
     private static func feedbackTimeBucket(_ date: Date = Date()) -> Int64 {

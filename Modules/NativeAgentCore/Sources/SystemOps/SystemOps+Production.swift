@@ -160,7 +160,7 @@ public struct SwiftNativeProductionExportsClient: ProductionExportsClient {
         // default []. PersistenceCore.readJSON returns the defaultValue on
         // any read/parse failure, so `.array([])` is the byte-accurate
         // mirror of `read_json(..., [])`.
-        let value = await persistence.readJSON(registryPath, defaultValue: .array([]))
+        let value = try await persistence.readJSON(registryPath, ifMissing: .array([]))
         guard case .array(let rows) = value else {
             // Python: `if not isinstance(exports, list): return []`
             return []

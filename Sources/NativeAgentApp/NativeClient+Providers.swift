@@ -38,540 +38,11 @@ import Skills
 import Connectors
 import Browser
 
-
-// F.evalfix2/R2: real readiness validators for OAuth-direct providers.
-// "File non-empty" is not enough — a stale auth.json with no access_token,
-// or an expired access_token with no refresh_token, must report needs_oauth
-// so the chat brain bar surfaces the exact OAuth repair state.
-fileprivate func validateOpenAIOAuthDirect(
-    dataRoot: URL,
-    environment: [String: String] = ProcessInfo.processInfo.environment
-) -> (Bool, String) {
-    let paths = OpenAIOAuthDirectAdapter.authPathCandidates(
-        dataRoot: dataRoot,
-        environment: environment,
-        allowSharedFallbacks: dataRoot.standardizedFileURL
-            == PersistenceCore.defaultDataRoot().standardizedFileURL
-    )
-    var sawAuth = false
-    for path in paths {
-        guard let data = try? Data(contentsOf: path),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-        else { continue }
-        sawAuth = true
-        let tokens = (obj["tokens"] as? [String: Any]) ?? [:]
-        let access = (tokens["access_token"] as? String) ?? ""
-        if access.isEmpty { continue }
-        let refresh = (tokens["refresh_token"] as? String) ?? ""
-        if let expDate = parseExpiresAt(tokens["expires_at"])
-                        ?? parseExpiresAt(obj["expires_at"])
-                        ?? jwtExpiry(access) {
-            if expDate > Date() {
-                return (true, "Signed in (valid)")
-            }
-            if !refresh.isEmpty {
-                return (true, "Access expired - refresh on next chat")
-            }
-            continue
-        }
-        // No expiry persisted; access_token present. Treat as ready (some
-        // ChatGPT tokens are long-lived and don't include expires_at until
-        // first refresh).
-        return (true, "Signed in")
-    }
-    if sawAuth {
-        return (false, "tokens.access_token empty or expired without refresh_token - sign in required")
-    }
-    return (false, "auth.json missing or malformed")
-}
-
-fileprivate func validateAnthropicOAuthDirect(providersDir: URL) -> (Bool, String) {
-    let path = providersDir.appendingPathComponent("anthropic_oauth_direct.json")
-    guard let data = try? Data(contentsOf: path),
-          let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-    else { return (false, "anthropic_oauth_direct.json missing or malformed") }
-    // Accept either OAuth access_token (top-level or nested) or a setup_token.
-    let topAccess = (obj["access_token"] as? String) ?? ""
-    let nestedAccess = ((obj["tokens"] as? [String: Any])?["access_token"] as? String) ?? ""
-    let setupTok   = (obj["setup_token"] as? String) ?? ""
-    let access = !topAccess.isEmpty ? topAccess : (!nestedAccess.isEmpty ? nestedAccess : setupTok)
-    if access.isEmpty {
-        return (false, "no access_token or setup_token — sign in required")
-    }
-    let refresh = (obj["refresh_token"] as? String) ?? ""
-    if let expDate = parseExpiresAt(obj["expires_at"]) {
-        if expDate > Date() {
-            return (true, "Signed in (valid)")
-        }
-        if !refresh.isEmpty {
-            return (true, "Access expired — refresh on next chat")
-        }
-        return (false, "Access expired and no refresh_token — re-auth required")
-    }
-    // setup_token path has no expiry — long-lived.
-    return (true, "Signed in")
-}
-
-fileprivate func validateXAIOAuthDirect(providersDir: URL) -> (Bool, String) {
-    let path = providersDir.appendingPathComponent("xai_oauth_direct.json")
-    guard let data = try? Data(contentsOf: path),
-          let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-    else { return (false, "xai_oauth_direct.json missing or malformed") }
-    let topAccess = (obj["access_token"] as? String) ?? ""
-    let nestedAccess = ((obj["tokens"] as? [String: Any])?["access_token"] as? String) ?? ""
-    let access = !topAccess.isEmpty ? topAccess : nestedAccess
-    guard !access.isEmpty else {
-        return (false, "no access_token - sign in required")
-    }
-    let refresh = (obj["refresh_token"] as? String)
-        ?? ((obj["tokens"] as? [String: Any])?["refresh_token"] as? String)
-        ?? ""
-    if let expDate = parseExpiresAt(obj["expires_at"])
-        ?? parseExpiresAt((obj["tokens"] as? [String: Any])?["expires_at"])
-        ?? jwtExpiry(access) {
-        if expDate > Date() {
-            return (true, "Signed in (valid)")
-        }
-        if !refresh.isEmpty {
-            return (true, "Access expired - refresh on next chat")
-        }
-        return (false, "Access expired and no refresh_token - re-auth required")
-    }
-    return (true, "Signed in")
-}
-
-// FIX 2026-07-04 (false-ready guard): a provider file counts as holding a
-// usable credential only when it actually contains one — a non-empty api_key
-// (api-key providers) OR oauth token material (oauth providers). A file that
-// carries only bookkeeping fields (auth_mode / default_model) — which is what a
-// blank-key Save writes via configureProvider — is NOT usable and must not read
-// as "ready". Recognizing oauth token fields keeps the oauth-direct providers'
-// existing per-provider validators (validate*OAuthDirect) reachable, so this
-// only tightens the api-key path it was written to fix.
-fileprivate func providerFileHasCredential(_ url: URL) -> Bool {
-    guard let data = try? Data(contentsOf: url), !data.isEmpty,
-          let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-    else { return false }
-    let credentialKeys = ["api_key", "access_token", "setup_token", "refresh_token", "token", "id_token"]
-    for key in credentialKeys {
-        if let v = obj[key] as? String,
-           !v.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return true
-        }
-    }
-    // Nested oauth token bag (tokens.access_token), as written by some flows.
-    if let tokens = obj["tokens"] as? [String: Any],
-       let access = tokens["access_token"] as? String,
-       !access.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-        return true
-    }
-    return false
-}
-
-/// User, 2026-09-06: the UI bookkeeping `configureProvider` persists next to the
-/// credential — the "Model it falls back to" pick and the chosen auth mode. The
-/// synthesized provider record omitted both, so reopening the sheet always
-/// selected the first catalog model and the saved pick was invisible.
-fileprivate func providerFileBookkeeping(_ url: URL) -> (authMode: String?, defaultModel: String?) {
-    guard let data = try? Data(contentsOf: url), !data.isEmpty,
-          let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-    else { return (nil, nil) }
-    func string(_ keys: [String]) -> String? {
-        for key in keys {
-            if let v = obj[key] as? String,
-               !v.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                return v.trimmingCharacters(in: .whitespacesAndNewlines)
-            }
-        }
-        return nil
-    }
-    return (string(["auth_mode", "authMode"]), string(["default_model", "defaultModel"]))
-}
-
-fileprivate func jwtExpiry(_ token: String) -> Date? {
-    guard let obj = jwtPayload(token) else { return nil }
-    if let exp = obj["exp"] as? Int    { return Date(timeIntervalSince1970: TimeInterval(exp)) }
-    if let exp = obj["exp"] as? Double { return Date(timeIntervalSince1970: exp) }
-    return nil
-}
-
 // PATCH-2026-05-07: model-providers v1 — NativeClient provider API methods
 extension NativeClient {
-    // DAEMON-DEAD PORT (2026-06-02): registry decode of
-    // <dataRoot>/providers/registry.json. Returns [] when the file is missing
-    // or malformed — the daemon's empty-registry shape was an empty list.
-    func listProviders() async throws -> [ProviderInfo] {
-        try await listProviders(
-            dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot(),
-            authEnvironment: ProcessInfo.processInfo.environment
-        )
-    }
-
-    func listProviders(
-        dataRoot: URL,
-        codexCacheURL: URL? = nil,
-        authEnvironment: [String: String]
-    ) async throws -> [ProviderInfo] {
-        // DAEMON KILLED 2026-06-02. Three sources of truth for providers:
-        //   1. <dataRoot>/providers/registry.json (legacy daemon-era file)
-        //   2. <dataRoot>/providers/<id>.json (OAuth/setup-token files written
-        //      by NativeOAuthFlow + AnthropicSetupTokenInput)
-        //   3. <dataRoot>/codex_home/auth.json (OpenAI/ChatGPT OAuth lives
-        //      here per NativeOAuthFlow's openai_oauth_direct path)
-        let providersDir = dataRoot.appendingPathComponent("providers", isDirectory: true)
-        let chatGPTOAuthCacheURL = codexCacheURL ?? CodexSelectableModelCatalog
-            .chatGPTOAuthCacheCandidate(
-                dataRoot: dataRoot,
-                environment: authEnvironment
-            )
-        let openRouterModels = await OpenRouterModelCatalog.models(dataRoot: dataRoot)
-        let moonshotModels = await MoonshotModelCatalog.models(dataRoot: dataRoot)
-        let openRouterProviderModels = openRouterModels.map { model in
-            ProviderModelInfo(
-                id: model.id,
-                name: model.name,
-                context_length: model.contextLength,
-                supports_streaming: model.supportsStreaming,
-                supports_vision: model.supportsVision,
-                supports_tools: model.supportsTools,
-                supports_json_mode: model.supportsJSONMode,
-                cost_per_1k_in: model.costPer1KIn,
-                cost_per_1k_out: model.costPer1KOut
-            )
-        }
-        let openRouterModelDictionaries = openRouterModels.map { model -> [String: Any] in
-            var dict: [String: Any] = [
-                "id": model.id,
-                "name": model.name,
-                "context_length": model.contextLength,
-                "supports_streaming": model.supportsStreaming,
-                "supports_vision": model.supportsVision,
-                "supports_tools": model.supportsTools,
-                "supports_json_mode": model.supportsJSONMode,
-            ]
-            if let cost = model.costPer1KIn {
-                dict["cost_per_1k_in"] = cost
-            }
-            if let cost = model.costPer1KOut {
-                dict["cost_per_1k_out"] = cost
-            }
-            return dict
-        }
-        let moonshotModelDictionaries = moonshotModels.map { model -> [String: Any] in
-            [
-                "id": model.id,
-                "name": model.name,
-                "context_length": model.contextLength,
-                "supports_streaming": model.supportsStreaming,
-                "supports_vision": model.supportsVision,
-                "supports_tools": model.supportsTools,
-                "supports_json_mode": model.supportsJSONMode,
-                "default_reasoning_effort": MoonshotModelCatalog.defaultReasoningEffort(for: model.id),
-                "supported_reasoning_efforts": MoonshotModelCatalog.supportedReasoningEfforts(for: model.id),
-                "supports_fast": false,
-            ]
-        }
-
-        var byId: [String: ProviderInfo] = [:]
-
-        // Model lists per provider family — what each provider actually serves.
-        func modelsFor(_ providerId: String) -> [[String: Any]] {
-            func dictionary(_ model: FirstPartyModelDescriptor) -> [String: Any] {
-                [
-                    "id": model.id,
-                    "name": model.name,
-                    "context_length": model.contextLength,
-                    "supports_streaming": model.supportsStreaming,
-                    "supports_vision": model.supportsVision,
-                    "supports_tools": model.supportsTools,
-                    "supports_json_mode": model.supportsJSONMode,
-                    "default_reasoning_effort": model.defaultReasoningEffort,
-                    "supported_reasoning_efforts": model.supportedReasoningEfforts,
-                    "supports_fast": model.supportsFast,
-                ]
-            }
-            let openai = FirstPartyModelCatalog.publicOpenAIModels.map(dictionary)
-            let chatGPTOAuthModels = CodexSelectableModelCatalog.providerModelDictionaries(
-                providerID: "openai_oauth_direct",
-                cacheURL: chatGPTOAuthCacheURL,
-                useDefaultCacheWhenNil: false
-            )
-            let codexModels = CodexSelectableModelCatalog
-                .providerModelDictionaries(
-                    providerID: "codex",
-                    cacheURL: codexCacheURL,
-                    useDefaultCacheWhenNil: codexCacheURL == nil
-                )
-            let anthropic = FirstPartyModelCatalog.anthropicModels.map(dictionary)
-            let xai = FirstPartyModelCatalog.xAIModels.map(dictionary)
-            switch providerId {
-            case "openai": return openai
-            case "openai_oauth_direct": return chatGPTOAuthModels
-            case "codex": return codexModels
-            case "anthropic", "anthropic_oauth_direct", "anthropic_mcp": return anthropic
-            case "xai", "xai_oauth_direct", "xai-oauth", "grok-oauth", "x-ai-oauth", "xai-grok-oauth": return xai
-            case "openrouter": return openRouterModelDictionaries
-            case "moonshot": return moonshotModelDictionaries
-            case "kimi-code": return FirstPartyModelCatalog.kimiCodeModels.map(dictionary)
-            default: return openai + anthropic + xai
-            }
-        }
-
-        func synthesize(providerId: String, display: String, hasToken: Bool, modes: [String], readinessDetail: String? = nil) {
-            // F.evalfix2/R2: OAuth-direct readiness can't be inferred from
-            // "file non-empty" — a stale auth.json with no access_token or
-            // an expired access_token + no refresh_token is NOT ready, and
-            // the chat surface needs the truth to avoid hiding OAuth repair.
-            let (effectiveReady, effectiveDetail): (Bool, String) = {
-                if !hasToken {
-                    return (false, readinessDetail ?? "No token saved")
-                }
-                switch providerId {
-                case "openai_oauth_direct":
-                    return validateOpenAIOAuthDirect(
-                        dataRoot: dataRoot,
-                        environment: authEnvironment
-                    )
-                case "anthropic_oauth_direct":
-                    return validateAnthropicOAuthDirect(providersDir: providersDir)
-                case "xai_oauth_direct":
-                    return validateXAIOAuthDirect(providersDir: providersDir)
-                default:
-                    return (true, readinessDetail ?? "Token persisted")
-                }
-            }()
-            let state = effectiveReady ? "ready" : (modes == ["api_key"] ? "needs_key" : "needs_oauth")
-            let statusDict: [String: Any] = [
-                "provider_id": providerId,
-                "state": state,
-                "detail": effectiveDetail,
-                "metadata": [:] as [String: String],
-            ]
-            var providerDict: [String: Any] = [
-                "provider_id": providerId,
-                "display_name": display,
-                "auth_modes": modes,
-                "auth_status": statusDict,
-                "models": modelsFor(providerId),
-            ]
-            // User, 2026-09-06: carry the saved bookkeeping so the config sheet
-            // round-trips. Without it the sheet re-selected the first catalog
-            // model every time it opened and the saved "Model it falls back to"
-            // was silently dropped on the next Save.
-            let bookkeeping = providerFileBookkeeping(
-                providersDir.appendingPathComponent("\(providerId).json")
-            )
-            if let mode = bookkeeping.authMode { providerDict["auth_mode"] = mode }
-            if let model = bookkeeping.defaultModel { providerDict["default_model"] = model }
-            if let providerJSON = try? JSONSerialization.data(withJSONObject: providerDict),
-               let synthesized = try? JSONDecoder.nativeAgent.decode(ProviderInfo.self, from: providerJSON) {
-                byId[providerId] = synthesized
-            }
-        }
-
-        // Source 1: registry.json (legacy)
-        let registryPath = providersDir.appendingPathComponent("registry.json")
-        if let data = try? Data(contentsOf: registryPath),
-           let existing = try? JSONDecoder.nativeAgent.decode([ProviderInfo].self, from: data) {
-            for p in existing {
-                // User, 2026-09-06: a legacy registry row never goes through
-                // `synthesize`, and providers/<id>.json is where
-                // `configureProvider` saves the fallback model and the auth
-                // mode — so on a migrated install the sheet still lost the
-                // saved pick. OpenRouter felt it hardest: its own re-synthesize
-                // below is gated on there being no row at all.
-                var row = p
-                let bookkeeping = providerFileBookkeeping(
-                    providersDir.appendingPathComponent("\(p.provider_id).json")
-                )
-                if let mode = bookkeeping.authMode { row.auth_mode = mode }
-                if let model = bookkeeping.defaultModel { row.default_model = model }
-                byId[p.provider_id] = row
-            }
-        }
-
-        // Source 2: providers/<id>.json (Anthropic OAuth direct, OpenRouter, etc.)
-        let fm = FileManager.default
-        let skipNames: Set<String> = [
-            "registry.json",
-            "models.json",
-            "active.json",
-            "surfaces.json",
-            // Crash-recovery intent for the surface/provider tuple, not a
-            // credential-bearing provider record. If it is visible during an
-            // interrupted commit, the provider catalog must not synthesize a
-            // fake "Pending Surface Configuration" provider row from it.
-            "pending-surface-configuration.json",
-            "openrouter-models-cache.json",
-            "moonshot-models-cache.json",
-        ]
-        if let files = try? fm.contentsOfDirectory(at: providersDir, includingPropertiesForKeys: nil) {
-            for url in files where url.pathExtension == "json" && !skipNames.contains(url.lastPathComponent) && !url.lastPathComponent.hasSuffix(".lock") {
-                let providerId = url.deletingPathExtension().lastPathComponent
-                if byId[providerId] != nil { continue }
-                let display: String = {
-                    switch providerId {
-                    case "openai", "openai_oauth_direct": return "ChatGPT / OpenAI"
-                    case "anthropic": return "Anthropic (API key)"
-                    case "anthropic_oauth_direct": return "Anthropic (OAuth / Setup-Token)"
-                    case "xai_oauth_direct": return "xAI Grok (OAuth)"
-                    case "openrouter": return "OpenRouter"
-                    case "moonshot": return "Moonshot AI (Kimi)"
-                    case "kimi-code": return "Kimi Code"
-                    default: return providerId.replacingOccurrences(of: "_", with: " ").capitalized
-                    }
-                }()
-                let hasToken = providerFileHasCredential(url)
-                let modes: [String] = providerId.contains("oauth") ? ["oauth"] : ["api_key", "oauth"]
-                synthesize(providerId: providerId, display: display, hasToken: hasToken, modes: modes)
-            }
-        }
-
-        // First-party provider rows always come from the current canonical
-        // catalog. Legacy registry rows may carry stale model arrays and must
-        // not win merely because they decoded first.
-        synthesize(
-            providerId: "openai",
-            display: "OpenAI (API key)",
-            hasToken: providerFileHasCredential(providersDir.appendingPathComponent("openai.json")),
-            modes: ["api_key"]
-        )
-        synthesize(
-            providerId: "anthropic",
-            display: "Anthropic (API key)",
-            hasToken: providerFileHasCredential(providersDir.appendingPathComponent("anthropic.json")),
-            modes: ["api_key"]
-        )
-        let anthropicOAuthPath = providersDir.appendingPathComponent("anthropic_oauth_direct.json")
-        synthesize(
-            providerId: "anthropic_oauth_direct",
-            display: "Anthropic (OAuth / Setup-Token)",
-            hasToken: providerFileHasCredential(anthropicOAuthPath),
-            modes: ["oauth"]
-        )
-
-        // Source 3: codex_home/auth.json -> OpenAI OAuth direct. Use the
-        // same candidate paths as OpenAIOAuthDirectAdapter so the picker does
-        // not hide a working App Support token just because the data root is
-        // stamped to the repo.
-        let codexHasAuth = OpenAIOAuthDirectAdapter
-            .authPathCandidates(
-                dataRoot: dataRoot,
-                environment: authEnvironment,
-                allowSharedFallbacks: dataRoot.standardizedFileURL
-                    == PersistenceCore.defaultDataRoot().standardizedFileURL
-            )
-            .contains { path in
-                (try? Data(contentsOf: path)).map { !$0.isEmpty } ?? false
-            }
-        // This account-backed source is authoritative for the ChatGPT OAuth
-        // row. A providers/openai_oauth_direct.json file may legitimately
-        // contain only UI bookkeeping (auth_mode/default_model); letting that
-        // placeholder win would report needs_oauth and hide the signed model
-        // catalog even while codex_home/auth.json is healthy.
-        synthesize(
-            providerId: "openai_oauth_direct",
-            display: "ChatGPT (OAuth)",
-            hasToken: codexHasAuth,
-            modes: ["oauth"],
-            readinessDetail: codexHasAuth ? nil : "Sign in with ChatGPT OAuth"
-        )
-        // Codex CLI provider — always visible as its own explicit provider.
-        // Show it as ready iff codex auth.json exists.
-        synthesize(providerId: "codex", display: "Codex CLI", hasToken: codexHasAuth, modes: ["oauth"])
-        // OpenRouter — always shown so the Providers UI can configure a key.
-        // Token presence checked from providers/openrouter.json.
-        if byId["openrouter"] == nil {
-            let orPath = providersDir.appendingPathComponent("openrouter.json")
-            let hasKey = providerFileHasCredential(orPath)
-            synthesize(providerId: "openrouter", display: "OpenRouter", hasToken: hasKey, modes: ["api_key"])
-        }
-        if !openRouterProviderModels.isEmpty, var provider = byId["openrouter"] {
-            provider.models = openRouterProviderModels
-            byId["openrouter"] = provider
-        }
-        synthesize(
-            providerId: "moonshot",
-            display: "Moonshot AI (Kimi)",
-            hasToken: providerFileHasCredential(providersDir.appendingPathComponent("moonshot.json")),
-            modes: ["api_key"]
-        )
-        // Kimi Code SUBSCRIPTION provider (distinct from moonshot's token-billed
-        // developer API). Static catalog, api-key auth against kimi-code.json.
-        synthesize(
-            providerId: "kimi-code",
-            display: "Kimi Code",
-            hasToken: providerFileHasCredential(providersDir.appendingPathComponent("kimi-code.json")),
-            modes: ["api_key"]
-        )
-        let xaiPath = providersDir.appendingPathComponent("xai_oauth_direct.json")
-        let hasXAIToken = providerFileHasCredential(xaiPath)
-        synthesize(
-            providerId: "xai_oauth_direct",
-            display: "xAI Grok (OAuth)",
-            hasToken: hasXAIToken,
-            modes: ["oauth"],
-            readinessDetail: hasXAIToken ? nil : "Sign in with xAI OAuth"
-        )
-
-        func decodePreviewModels(_ dictionaries: [[String: Any]]) -> [ProviderModelInfo] {
-            dictionaries.compactMap { dictionary in
-                guard let data = try? JSONSerialization.data(withJSONObject: dictionary) else { return nil }
-                return try? JSONDecoder.nativeAgent.decode(ProviderModelInfo.self, from: data)
-            }
-        }
-        let codexPreviewModels = decodePreviewModels(
-            CodexSelectableModelCatalog.providerModelDictionaries(
-                providerID: "codex",
-                cacheURL: codexCacheURL,
-                useDefaultCacheWhenNil: codexCacheURL == nil
-            )
-        )
-        let oauthPreviewModels = decodePreviewModels(
-            CodexSelectableModelCatalog.providerModelDictionaries(
-                providerID: "openai_oauth_direct",
-                cacheURL: chatGPTOAuthCacheURL,
-                useDefaultCacheWhenNil: false
-            )
-        )
-        let previewIDs = Set((codexPreviewModels + oauthPreviewModels).map(\.id))
-        if !previewIDs.isEmpty {
-            for (providerID, previewModels) in [
-                ("openai_oauth_direct", oauthPreviewModels),
-                ("codex", codexPreviewModels),
-            ] where !previewModels.isEmpty {
-                guard var provider = byId[providerID] else { continue }
-                var seen = Set<String>()
-                provider.models = (previewModels + provider.models).filter { seen.insert($0.id).inserted }
-                byId[providerID] = provider
-            }
-        }
-
-        return Array(byId.values).sorted { $0.display_name < $1.display_name }
-    }
-
-    func getProvider(_ id: String) async throws -> ProviderInfo {
-        let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else {
-            throw NSError(domain: "NativeAgentProvider", code: 400, userInfo: [
-                NSLocalizedDescriptionKey: "provider id is required"
-            ])
-        }
-        let providers = try await listProviders()
-        if let exact = providers.first(where: { $0.provider_id == trimmed }) {
-            return exact
-        }
-        let lowered = trimmed.lowercased()
-        if let folded = providers.first(where: { $0.provider_id.lowercased() == lowered }) {
-            return folded
-        }
-        throw NSError(domain: "NativeAgentProvider", code: 404, userInfo: [
-            NSLocalizedDescriptionKey: "provider not found: \(trimmed)"
-        ])
-    }
-
     func configureProvider(_ id: String, apiKey: String?, authMode: String, defaultModel: String? = nil) async throws -> EmptyResponse {
-        let provider = try await getProvider(id)
+        let provider = try await ProvidersFacade(dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot())
+            .provider(id: id)
         let supportedModes = provider.auth_modes.map {
             $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         }
@@ -601,7 +72,7 @@ extension NativeClient {
     }
 
     // DAEMON-DEAD PORT (2026-06-02): native reachability probe. Resolves the
-    // API key via LLMCredentialResolver (env → providers/<id>.json), then for
+    // API key via LLMCredentialResolver (providers/<id>.json), then for
     // OpenAI hits GET /v1/models with a Bearer token and reports latency.
     // Anthropic (GET /v1/models, x-api-key) and OpenRouter (GET /api/v1/key)
     // are probed the same way; 401 (and Anthropic 403) reads "key rejected".
@@ -635,18 +106,12 @@ extension NativeClient {
             }
             return result
         }
-        let (envVar, configFile): (String?, String?) = {
-            switch id {
-            case "openai": return ("OPENAI_API_KEY", "openai.json")
-            case "anthropic": return ("ANTHROPIC_API_KEY", "anthropic.json")
-            case "moonshot": return ("MOONSHOT_API_KEY", "moonshot.json")
-            case "kimi-code": return ("KIMI_CODE_API_KEY", "kimi-code.json")
-            case "openrouter": return ("OPENROUTER_API_KEY", "openrouter.json")
-            default: return (nil, nil)
-            }
-        }()
+        let configFile: String? = switch id {
+        case "openai", "anthropic", "moonshot", "kimi-code", "openrouter": "\(id).json"
+        default: nil
+        }
 
-        guard let envVar, let configFile else {
+        guard let configFile else {
             return await recordProbeResult(ProviderTestResult(
                 provider_id: id, status: "unknown", tested: false,
                 response: nil, model_used: nil,
@@ -654,7 +119,7 @@ extension NativeClient {
             ))
         }
         guard let apiKey = draftKey ?? LLMCredentialResolver.resolveAPIKey(
-            envVar: envVar, providerConfigFile: configFile, dataRoot: dataRoot
+            providerConfigFile: configFile, dataRoot: dataRoot
         ), !apiKey.isEmpty else {
             return await recordProbeResult(ProviderTestResult(
                 provider_id: id, status: "error", tested: false,
@@ -764,7 +229,8 @@ extension NativeClient {
     // DAEMON-DEAD PORT (2026-06-02): write surface→provider into
     // <dataRoot>/providers/active.json under flock, merged with existing.
     func setActiveProvider(surface: String, providerId: String) async throws -> EmptyResponse {
-        try await Self.writeActiveProvider(surface: surface, providerID: providerId)
+        try await Self.writeActiveProvider(surface: surface, providerID: providerId,
+                                          dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot())
         return EmptyResponse()
     }
 
@@ -777,44 +243,46 @@ extension NativeClient {
         let dataRoot = dataRootOverride ?? PersistenceCore.defaultDataRoot()
         let path = dataRoot.appendingPathComponent("providers/registry.json")
         let persistence = SwiftNativePersistenceCore()
-        // Remove the credential first so a failed deletion leaves its registry
-        // entry discoverable. Only an already-missing file counts as removed.
+        guard !id.isEmpty, id != ".", id != "..",
+              id.allSatisfy({ "abcdefghijklmnopqrstuvwxyz0123456789_-".contains($0) }),
+              !["registry", "models", "active", "surfaces", "pending-surface-configuration",
+                "openrouter-models-cache", "moonshot-models-cache"].contains(id) else {
+            throw ProviderRoutingError.invalidRequest
+        }
         let credFile = dataRoot
             .appendingPathComponent("providers", isDirectory: true)
             .appendingPathComponent("\(id).json")
-        try await persistence.withFileLock(credFile) {
-            do {
-                try FileManager.default.removeItem(at: credFile)
-            } catch {
-                let failure = error as NSError
-                guard failure.domain == NSCocoaErrorDomain,
-                      failure.code == NSFileNoSuchFileError else { throw error }
+        let reference = try await persistence.withFileLock(path) {
+            _ = try SwiftNativeProviderRouting.loadProviderRegistryChecked(at: path)
+            return try await persistence.withFileLock(credFile) { () async throws -> String? in
+                // Validate the target row and credential before the first write.
+                // Unrelated rows survive; credential deletion still happens last.
+                let remaining = try ProviderStateValidation.registryRemovingProvider(at: path, providerID: id)
+                let credential = try ProviderStateValidation.credential(at: credFile)
+                let fields = try SwiftNativeProviderRouting.loadProviderStateObjectChecked(
+                    at: credFile, description: "provider \(id) configuration"
+                )
+                try SwiftNativeProviderRouting.validateProviderConfiguration(fields)
+                let reference = credential[ProviderAPIKeyStore.referenceField] as? String
+                if let remaining {
+                    try await persistence.writeJSON(.array(remaining), to: path)
+                }
+                do {
+                    try FileManager.default.removeItem(at: credFile)
+                } catch {
+                    let failure = error as NSError
+                    guard failure.domain == NSCocoaErrorDomain,
+                          failure.code == NSFileNoSuchFileError else { throw error }
+                }
+                return reference
             }
         }
-        try await persistence.withFileLock(path) {
-            let data: Data
+        if let reference {
             do {
-                data = try Data(contentsOf: path)
+                try ProviderAPIKeyStore.delete(reference)
             } catch {
-                let failure = error as NSError
-                if failure.domain == NSCocoaErrorDomain,
-                   failure.code == NSFileReadNoSuchFileError { return }
-                throw error
+                NSLog("provider_credentials: provider removed; unused Keychain item cleanup failed")
             }
-            let current = try JSONDecoder().decode(JSONValue.self, from: data)
-            guard case .array(let items) = current else {
-                throw NSError(domain: "NativeClient", code: -1, userInfo: [
-                    NSLocalizedDescriptionKey: "The saved provider registry is not an array."
-                ])
-            }
-            let filtered = items.filter { item in
-                if case .object(let obj) = item,
-                   case .string(let rid)? = obj["provider_id"], rid == id {
-                    return false
-                }
-                return true
-            }
-            try await persistence.writeJSON(.array(filtered), to: path)
         }
         return EmptyResponse()
     }
@@ -825,7 +293,7 @@ extension NativeClient {
     func getHealthCard() async throws -> HealthCard {
         // F6 (eval E06 fix-2): synthesize health from the real Swift
         // DoctorChecks runner (runDoctor) rather than a hardcoded all-ok
-        // row set. Each DoctorCheck maps 1:1 to a HealthCardSubsystem; the
+        // row set. Each CheckResult maps 1:1 to a HealthCardSubsystem; the
         // overall status is the worst-row rollup (fail > warn > ok) that
         // runDoctor already computes. A doctor failure falls back to a
         // single error row so the panel still renders.
@@ -854,11 +322,6 @@ extension NativeClient {
         )
     }
 
-    /// The Core doctor result type. Aliased because the app target has its own
-    /// `DoctorCheck` model struct, so an app-target test cannot `import
-    /// DoctorChecks` without making the name ambiguous.
-    typealias CoreCheckResult = CheckResult
-
     static func doctorCachePath() -> URL {
         PersistenceCore.defaultDataRoot().appendingPathComponent("doctor/latest.json")
     }
@@ -870,38 +333,10 @@ extension NativeClient {
     static func makeHealthCard(
         now: String,
         cachePath: URL,
-        liveChecks: [DoctorCheck],
+        liveChecks: [CheckResult],
         runCoreChecks: () async throws -> [CheckResult]
     ) async -> HealthCard {
-        if let cached = readCachedHealthCard(at: cachePath, now: now) {
-            return mergeHealthCard(cached: cached, liveChecks: liveChecks, now: now)
-        }
-        do {
-            let measuredAt = ISO8601DateFormatter().string(from: Date())
-            let core = try await runCoreChecks()
-            await persistDoctorSnapshot(core, to: cachePath, runAt: now, measuredAt: measuredAt)
-            let subs: [HealthCardSubsystem] = (core.map {
-                DoctorCheck(id: $0.id, title: $0.title, status: $0.status, detail: $0.detail, repair: $0.repair)
-            } + liveChecks).map { c in
-                HealthCardSubsystem(
-                    id: c.id,
-                    label: c.title,
-                    status: c.status,
-                    detail: c.detail,
-                    fixAction: c.repair
-                )
-            }
-            return HealthCard(overall: doctorRollup(subs.map(\.status)), subsystems: subs, createdAt: now)
-        } catch {
-            let err = HealthCardSubsystem(
-                id: "doctor",
-                label: "Doctor",
-                status: "error",
-                detail: "Doctor run failed: \(Self.safeDoctorDetail(error.localizedDescription))",
-                fixAction: nil
-            )
-            return HealthCard(overall: "error", subsystems: [err], createdAt: now)
-        }
+        await DoctorStatusProjection.makeHealthCard(now: now, cachePath: cachePath, liveChecks: liveChecks, safeDetail: Self.safeDoctorDetail, runCoreChecks: runCoreChecks)
     }
 
     /// Mirrors `DoctorAutoRunLoop.encodePayload` byte-for-byte: the same
@@ -919,61 +354,15 @@ extension NativeClient {
     static func persistDoctorSnapshot(
         _ results: [CheckResult], to path: URL, runAt: String, measuredAt: String
     ) async {
-        do {
-            let enc = JSONEncoder()
-            enc.outputFormatting = [.sortedKeys]
-            let checksValue = try JSONValue.parse(try enc.encode(results))
-            let payload = JSONValue.object([
-                "checks": checksValue, "runAt": .string(runAt), "measuredAt": .string(measuredAt),
-            ])
-            try FileManager.default.createDirectory(
-                at: path.deletingLastPathComponent(), withIntermediateDirectories: true
-            )
-            try await SwiftNativePersistenceCore().writeJSON(payload, to: path)
-        } catch {
-            NSLog("health_card: doctor snapshot cache write failed: \(error.localizedDescription)")
-        }
-    }
-
-    private struct CachedDoctorPayload: Decodable {
-        let checks: [DoctorCheck]
-        let runAt: String?
+        await DoctorStatusProjection.persistDoctorSnapshot(results, to: path, runAt: runAt, measuredAt: measuredAt)
     }
 
     static func readCachedHealthCard(at path: URL, now: String) -> HealthCard? {
-        guard let data = try? Data(contentsOf: path),
-              let payload = try? JSONDecoder().decode(CachedDoctorPayload.self, from: data),
-              let runAtString = payload.runAt,
-              let runAt = ISO8601DateFormatter().date(from: runAtString),
-              Date().timeIntervalSince(runAt) < 60
-        else { return nil }
-        let subs = payload.checks.map {
-            HealthCardSubsystem(
-                id: $0.id,
-                label: $0.title,
-                status: $0.status,
-                detail: $0.detail,
-                fixAction: $0.repair
-            )
-        }
-        let rollup = Self.doctorRollup(subs.map(\.status))
-        return HealthCard(overall: rollup, subsystems: subs, createdAt: now)
+        DoctorStatusProjection.readCachedHealthCard(at: path, now: now)
     }
 
-    static func mergeHealthCard(cached: HealthCard, liveChecks: [DoctorCheck], now: String) -> HealthCard {
-        let live = liveChecks.map { check in
-            HealthCardSubsystem(
-                id: check.id,
-                label: check.title,
-                status: check.status,
-                detail: check.detail,
-                fixAction: check.repair
-            )
-        }
-        let liveIDs = Set(live.map(\.id))
-        let subsystems = cached.subsystems.filter { !liveIDs.contains($0.id) } + live
-        let overall = doctorRollup(subsystems.map(\.status))
-        return HealthCard(overall: overall, subsystems: subsystems, createdAt: now)
+    static func mergeHealthCard(cached: HealthCard, liveChecks: [CheckResult], now: String) -> HealthCard {
+        DoctorStatusProjection.mergeHealthCard(cached: cached, liveChecks: liveChecks, now: now)
     }
 
     // Swift-native embedding status. The app no longer installs or probes
@@ -996,7 +385,8 @@ extension NativeClient {
     /// action. Release uses this rather than resolving a second alternate-root
     /// owner, which could make a fresh idle owner look like proof of release.
     private static func embeddingsStatus(from runtime: EmbeddingRuntimeSnapshot) -> EmbeddingsStatus {
-        let requestedCoreML = runtime.requestedBackend != ManagedEmbeddingProvider.mockBackend
+        let readiness = MemoryStatusProjection.embeddingReadiness(runtime)
+        let requestedCoreML = readiness.requestedCoreML
         // effectiveCoreML must be TRUE only when the runtime is ACTUALLY
         // serving CoreML vectors — not when it's mock and not when it's
         // fail-closed (CoreML failed + no NATIVE_AGENT_EMBEDDING_MOCK opt-in).
@@ -1004,11 +394,10 @@ extension NativeClient {
         // for "fail-closed" too, so the UI reported "local"/"Active" while
         // every embed() call was throwing. Match against the canonical CoreML
         // backend instead.
-        let effectiveCoreML = runtime.effectiveBackend == ManagedEmbeddingProvider.coreMLBackend
-        let isFailClosed = runtime.effectiveBackend == ManagedEmbeddingProvider.failClosedBackend
+        let isFailClosed = readiness.isFailClosed
         let modelName: String = {
             if isFailClosed {
-                return "Unavailable / \(runtime.dimensions)d (CoreML failed; install MiniLM or set NATIVE_AGENT_EMBEDDING_MOCK=1)"
+                return "Unavailable / \(runtime.dimensions)d (\(runtime.lastLoadError ?? "CoreML resources missing"))"
             }
             if requestedCoreML {
                 let loaded = runtime.coreMLLoaded ? "loaded" : "idle"
@@ -1046,7 +435,7 @@ extension NativeClient {
             modelLoadable: runtime.modelLoadable,
             configBackend: runtime.requestedBackend,
             envEnabled: true,
-            effectiveBackend: isFailClosed ? "unavailable" : (effectiveCoreML ? "local" : "hash"),
+            effectiveBackend: readiness.effectiveBackend,
             modelName: modelName,
             requestedEnabled: requestedCoreML,
             memoryMode: runtime.mode,
@@ -1099,7 +488,7 @@ extension NativeClient {
             return EmbeddingPlainCopy.headline(.testVectors)
         }
         if runtime.effectiveBackend == ManagedEmbeddingProvider.failClosedBackend {
-            return EmbeddingPlainCopy.headline(.modelMissing)
+            return EmbeddingPlainCopy.headline(runtime.lastLoadError == nil ? .modelMissing : .modelFailed)
         }
         return EmbeddingPlainCopy.modeLine(mode: runtime.mode)
     }
@@ -1184,7 +573,7 @@ extension NativeClient {
         let status = Self.embeddingsStatus(from: postRelease)
         let verification = EmbeddingsMemoryReleaseVerification.verify(
             releasedSnapshot: released,
-            reportedStatus: status
+            reportedModelLoaded: status.modelState?.loaded
         )
         return EmbeddingsToggleResult(
             ok: verification.ok,
@@ -1199,7 +588,7 @@ extension NativeClient {
     // (uninvoked) caller. The daemon GET /v1/embeddings/install/status route is
     // retired this wave; progress comes from getEmbeddingsStatus().installState.
     // The EmbeddingsInstallState type is KEPT — it still decodes the installState/
-    // reindexState fields embedded in EmbeddingsStatus. See CUTOVER_PLAN.md §6.55.
+    // reindexState fields embedded in EmbeddingsStatus.
 
 }
 
@@ -1257,9 +646,9 @@ enum EmbeddingPlainCopy {
         case .modelFailed:
             let trimmed = error?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             if trimmed.isEmpty {
-                return "Search model: Core ML MiniLM. Load failed."
+                return "Search model: Core ML. Load failed."
             }
-            return "Search model: Core ML MiniLM. Load failed: \(trimmed)"
+            return "Search model: Core ML. Load failed: \(trimmed)"
         }
     }
 

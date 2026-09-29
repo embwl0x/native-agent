@@ -1,5 +1,6 @@
 import Foundation
 import ChatOrchestration
+import Cognition
 
 // The aging lane's throttle (NORTHSTAR clause 4, sweep item 45).
 //
@@ -15,7 +16,7 @@ import ChatOrchestration
 enum ChatConsolidationGateInstall {
     static func install() {
         BackgroundConsolidationGate.shared.install { reason in
-            switch await NativeCognitionRuntime.shared.backgroundCognitionGate(reason: reason) {
+            switch await NativeAgentEngine.liveCognition.backgroundCognitionGate(reason: reason) {
             case .allowed:
                 return .allowed
             case .skipped(let why):

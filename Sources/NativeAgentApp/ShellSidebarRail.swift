@@ -1,3 +1,4 @@
+import AppToolRuntime
 import SwiftUI
 
 // ui-simplify 2026-09-02 (Lane A): the rail.
@@ -84,6 +85,8 @@ struct ShellRailItem: View {
         }
         .buttonStyle(.plain)
         .shellKeyboardTarget(.rail)
+        // Space presses a focused Button; Return does the same here.
+        .onKeyPress(.return) { onSelect(); return .handled }
         .onHover { hovering = $0 }
         .help(item.displayName)
         .accessibilityIdentifier("sidebar.item.\(item.rawValue)")
@@ -113,27 +116,25 @@ struct ShellSidebarRail: View {
     /// Every item except the last renders at the top; the last (Settings) is
     /// pushed to the bottom so the setup door is never mistaken for a place to
     /// work.
-    var items: [SidebarItem] = SidebarItem.shellPrimaryItems
+    var items: [SidebarItem] = SidebarItem.primaryItems
     /// The places that have something waiting on him. A dot, never a count —
     /// the caller does the counting and this rail only says whether.
     var needsYou: Set<SidebarItem> = []
     @AppStorage(BotsShelfPreference.key) private var botsPreviewEnabled = true
-    /// Explicit override is used by the headless renderer, never persisted.
-    var botsPreviewOverride: Bool? = nil
 
     /// The one id the travelling selection bar is known by.
     static let selectionBarID = "shell.rail.selection-bar"
     @Namespace private var selectionBar
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
-    /// Regular, like the composer: never mix clear and regular on one screen
-    /// (WWDC25 219). One token if the pixels say otherwise.
-    static let plateGlass: Glass = .regular
+    /// Clear with a dark tint (User 09-27): macOS 27 diffuses more, and plain
+    /// glass over the dark haze read milky. Never mix clear and regular on one screen.
+    static let plateGlass: Glass = .clear.tint(.black.opacity(0.28))
 
     var body: some View {
         VStack(spacing: 4) {
             ForEach(BotsShelfRailProposal.everyday(Array(items.dropLast()))) { item in proposalItem(item) }
-            if botsPreviewOverride ?? botsPreviewEnabled { proposalItem(.bots) }
+            if botsPreviewEnabled { proposalItem(.bots) }
             Rectangle()
                 .fill(NativeAgentShell.hairline)
                 .frame(height: 1)

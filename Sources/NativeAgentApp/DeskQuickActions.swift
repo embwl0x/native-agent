@@ -1,6 +1,7 @@
 import Foundation
 import Observation
 import PersistenceCore
+import Desk
 import ChatOrchestration
 import ApprovalInbox
 import ProviderRouting

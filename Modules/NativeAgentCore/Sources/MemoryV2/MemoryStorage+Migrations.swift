@@ -222,6 +222,18 @@ extension MemoryStorage {
         m.registerMigration("v9_drop_embedding_previous") { db in
             try db.execute(sql: "DROP TABLE IF EXISTS memory_embedding_previous")
         }
+        // v10 (2026-09-26): the consolidation swap's applied marker
+        // (MemoryConsolidationGate.appliedMarkerTable), created inline by the
+        // swap until now. IF NOT EXISTS adopts a store where a swap already
+        // made it; the shape is exactly what the swap created.
+        m.registerMigration("v10_consolidation_applied") { db in
+            try db.execute(sql: """
+                CREATE TABLE IF NOT EXISTS \(MemoryConsolidationGate.appliedMarkerTable) (
+                  run_id TEXT PRIMARY KEY,
+                  applied_at TEXT NOT NULL
+                )
+            """)
+        }
         return m
     }
 

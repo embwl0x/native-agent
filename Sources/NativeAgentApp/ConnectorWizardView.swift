@@ -1,9 +1,12 @@
+import Connectors
+import ProviderRouting
 // PATCH-2026-05-07: oauth-registration-2 Inline OAuth wizard — ConnectorWizardView
 import SwiftUI
 import AppKit
 import TrustCenter
 import ChatOrchestration
 import GitHubConnector
+import SlackBot
 
 /// The GitHub token form must describe the registered capability set, never a
 /// hand-maintained list that can call a write tool "read-only" after a catalog
@@ -28,69 +31,10 @@ enum GitHubPermissionPresentation {
 
 // MARK: - Models
 
-struct ConnectorRegistrationStatus: Codable {
-    var registered: Bool
-    var registeredAt: String?
-    var clientIdPresent: Bool
+typealias ConnectorRegistrationStatus = Connectors.ConnectorRegistrationStatus
+typealias ConnectorRegisterAppResponse = Connectors.ConnectorRegisterAppResponse
+typealias ConnectorWizardSetupRoute = Connectors.ConnectorWizardSetupRoute
 
-    enum CodingKeys: String, CodingKey {
-        case registered
-        case registeredAt = "registered_at"
-        case clientIdPresent = "client_id_present"
-    }
-}
-
-struct ConnectorRegisterAppResponse: Codable {
-    var provider: String?
-    var programmatic: Bool?
-    var approvalUrl: String?
-    var callbackPath: String?
-    var portalUrl: String?
-    var note: String?
-    var reason: String?
-    var nextSteps: [String]?
-
-    enum CodingKeys: String, CodingKey {
-        case provider, note, reason
-        case programmatic
-        case approvalUrl = "approval_url"
-        case callbackPath = "callback_path"
-        case portalUrl = "portal_url"
-        case nextSteps = "next_steps"
-    }
-}
-
-enum ConnectorWizardSetupRoute: Equatable {
-    case manualToken
-    case notionToken
-    case nativeOAuth(connectorId: String)
-    case unavailable
-
-    /// One table, in `InlineInteractionRegistry`. The wizard and the inline
-    /// card must never disagree about how an account is connected: a card that
-    /// offers "Sign in with GitHub" while the wizard wants a pasted token is a
-    /// lie the person only discovers after tapping. The registry answers which
-    /// route applies; the two token routes stay distinct here because Notion's
-    /// paste screen is its own.
-    static func resolve(provider: String) -> Self {
-        let canonical = InlineInteractionRegistry.canonicalConnectorID(provider)
-        switch InlineInteractionRegistry.connectorSetup(for: canonical) {
-        case .manualToken:
-            // Telegram has no wizard page; only the three token pastes below.
-            switch canonical {
-            case "notion": return .notionToken
-            case "slack", "github": return .manualToken
-            default: return .unavailable
-            }
-        case .oauth:
-            // The OAuth store spells Google Calendar `calendar`, while the
-            // connector registry spells it `gcal`.
-            return .nativeOAuth(connectorId: canonical == "gcal" ? "calendar" : canonical)
-        case .unavailable:
-            return .unavailable
-        }
-    }
-}
 
 /// The Slack setup page is an external browser handoff, not a completed
 /// connector setup. Keep the request outcome visible so a missing browser
@@ -564,7 +508,7 @@ struct ConnectorWizardView: View {
                             Text(code.userCode)
                                 .font(.system(size: 30, weight: .semibold, design: .monospaced))
                                 .textSelection(.enabled)
-                                .accessibilityLabel("Code \(code.userCode)")
+                                // macOS 27: selectable text + a custom accessibility label loops SwiftUI AX and crashes the app.
                             Spacer()
                             Button(didCopyGitHubCode ? "Copied" : "Copy",
                                    systemImage: didCopyGitHubCode ? "checkmark" : "doc.on.doc") {
@@ -637,7 +581,7 @@ struct ConnectorWizardView: View {
             githubCode = code
             copyGitHubCode(code.userCode)
             NSWorkspace.shared.open(code.verificationURI)
-            let outcome = await NativeOAuthFlow.completeGitHubDeviceFlow(code)
+            let outcome = await NativeOAuthFlow.completeGitHubDeviceFlow(code, credentialStore: AppGitHubOAuthCredentials())
             guard !Task.isCancelled else { return }
             githubCode = nil
             if outcome.result.ok {
@@ -953,6 +897,7 @@ struct ConnectorWizardView: View {
         switch ConnectorWizardSetupRoute.resolve(provider: provider) {
         case .nativeOAuth(let connectorId):
             let result = await NativeOAuthFlow.startConnectorOAuthFlow(
+                platform: NativeOAuthPlatform.self,
                 connectorId: connectorId)
             guard !Task.isCancelled else { return }
             if result.ok {
@@ -1053,7 +998,7 @@ struct ConnectorWizardView: View {
         isSavingGitHubToken = true
         defer { isSavingGitHubToken = false }
 
-        let result = await NativeOAuthFlow.saveGitHubToken(githubToken)
+        let result = await NativeOAuthFlow.saveGitHubToken(githubToken, credentialStore: AppGitHubOAuthCredentials())
         guard !Task.isCancelled else { return }
         if result.ok {
             githubToken = ""

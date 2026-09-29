@@ -1,0 +1,405 @@
+name: NativeAgent
+# S13 (2026-09-26): Xcode project for the Mac app so app extensions (widgets,
+# share, intents) have a host. The SwiftPM package stays the source of the
+# code: these targets compile the same Sources/ directories against the same
+# package products. Generate from the repo root: xcodegen --spec project.yml
+# Sources/ are synced folders, so adding or deleting a file needs no regenerate.
+# script/build_and_run.sh (and install_app.sh through it) builds this scheme,
+# passes the local identity overrides and NATIVEAGENT_STAMP_REPO_PATH=YES, then
+# signs the result. A plain xcodebuild/Xcode build carries no REPO_PATH.
+
+options:
+  deploymentTarget:
+    macOS: "26.0"
+  createIntermediateGroups: true
+  # Xcode consumes the same reviewed pins as SwiftPM, including after a clean clone.
+  postGenCommand: mkdir -p NativeAgent.xcodeproj/project.xcworkspace/xcshareddata/swiftpm && cp Package.resolved NativeAgent.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved
+
+settings:
+  SWIFT_VERSION: "6.0"
+  ENABLE_USER_SCRIPT_SANDBOXING: NO
+
+configFiles:
+  Debug: Config/NativeAgent.xcconfig
+  Release: Config/NativeAgent.xcconfig
+
+packages:
+  NativeAgentCore:
+    path: Modules/NativeAgentCore
+  NativeAgentShared:
+    path: Modules/NativeAgentShared
+  # Same requirements as Package.swift; pins come from Package.resolved.
+  grpc-swift-2:
+    url: https://github.com/grpc/grpc-swift-2.git
+    exactVersion: 2.4.3
+  grpc-swift-nio-transport:
+    url: https://github.com/grpc/grpc-swift-nio-transport.git
+    exactVersion: 2.10.0
+  grpc-swift-protobuf:
+    url: https://github.com/grpc/grpc-swift-protobuf.git
+    exactVersion: 2.4.1
+  Sparkle:
+    url: https://github.com/sparkle-project/Sparkle.git
+    from: 2.9.2
+
+targets:
+  NativeAgentWidget:
+    type: app-extension
+    platform: macOS
+    deploymentTarget: "27.0"
+    sources:
+      - path: Extensions/NativeAgentWidget
+      - path: Sources/NativeAgentApp/NativeAgentWidgetSnapshot.swift
+      - path: Sources/NativeAgentApp/NativeAgentDesignTokens.swift
+    settings:
+      PRODUCT_BUNDLE_IDENTIFIER: $(NATIVEAGENT_MAC_WIDGET_BUNDLE_ID)
+      CODE_SIGN_ENTITLEMENTS: Config/NativeAgentWidget.entitlements
+      PROVISIONING_PROFILE_SPECIFIER: $(NATIVEAGENT_WIDGET_PROFILE_SPECIFIER)
+      APPLICATION_EXTENSION_API_ONLY: YES
+      ENABLE_HARDENED_RUNTIME: YES
+      ENABLE_DEBUG_DYLIB: NO
+      SKIP_INSTALL: YES
+      LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/../Frameworks @executable_path/../../../../Frameworks"
+    info:
+      path: Config/NativeAgentWidget-Info.plist
+      properties:
+        CFBundleDisplayName: NativeAgent
+        CFBundleShortVersionString: "0.0.0"
+        CFBundleVersion: "0.0.0"
+        NativeAgentMacAppGroupID: $(NATIVEAGENT_MAC_APP_GROUP_ID)
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+    postBuildScripts:
+      - name: Stamp widget version
+        basedOnDependencyAnalysis: false
+        inputFiles:
+          - $(TARGET_BUILD_DIR)/$(INFOPLIST_PATH)
+        script: |
+          set -euo pipefail
+          plist="$TARGET_BUILD_DIR/$INFOPLIST_PATH"
+          version="$(tr -d '[:space:]' < "$SRCROOT/VERSION")"
+          sha="$(git -C "$SRCROOT" rev-parse --short=8 HEAD)"
+          suffix=""
+          if [[ -n "$(git -C "$SRCROOT" status --porcelain --untracked-files=normal)" ]]; then
+            suffix=".dirty"
+          fi
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $version" \
+            -c "Set :CFBundleShortVersionString ${NATIVEAGENT_BUILD_SHORT_VERSION:-$version-dev.$sha$suffix}" "$plist"
+
+  NativeAgentChromeRelay:
+    type: tool
+    platform: macOS
+    sources:
+      - path: Sources/NativeAgentChromeRelay
+        type: syncedFolder
+    dependencies:
+      - package: NativeAgentCore
+        products:
+          - NativeAgentChromeRelayCore
+          - PersistenceCore
+    settings:
+      ENABLE_HARDENED_RUNTIME: YES
+
+  nativeagent-link:
+    type: tool
+    platform: macOS
+    sources:
+      - path: Sources/NativeAgentLink
+        type: syncedFolder
+    dependencies:
+      - package: NativeAgentCore
+        products: [PersistenceCore, GrokLink]
+    settings:
+      PRODUCT_MODULE_NAME: NativeAgentLink
+      ENABLE_HARDENED_RUNTIME: YES
+      OTHER_SWIFT_FLAGS: -parse-as-library
+
+  # SwiftPM's resource bundle for the NativeAgentApp target, same name, same
+  # files (AgentBridgeRuntime looks the wake helpers up by this bundle name).
+  NativeAgent_NativeAgentApp:
+    type: bundle
+    platform: macOS
+    sources:
+      - path: docs/data-bounds.md
+        buildPhase: resources
+      - path: script/codex_thread_wakeup.js
+        buildPhase: resources
+      - path: script/codex_wake_daemon_probe.js
+        buildPhase: resources
+      - path: script/codex_wake_execution_policy.js
+        buildPhase: resources
+      - path: script/codex_wake_prompt.js
+        buildPhase: resources
+      - path: script/codex_wake_request_params.js
+        buildPhase: resources
+      - path: script/codex_wake_rpc.js
+        buildPhase: resources
+      - path: script/codex_wake_thread_state.js
+        buildPhase: resources
+      - path: script/codex_wake_inbox_projection.js
+        buildPhase: resources
+      - path: script/codex_wake_lane_identity.js
+        buildPhase: resources
+      - path: script/codex_wake_heartbeat.js
+        buildPhase: resources
+      - path: script/wake_worker_common.js
+        buildPhase: resources
+      - path: script/wake_queue_admission.js
+        buildPhase: resources
+      - path: script/wake_turn_observation.js
+        buildPhase: resources
+      - path: script/wake_reply_delivery.js
+        buildPhase: resources
+      - path: script/wake_recovery.js
+        buildPhase: resources
+      - path: script/codex_turn_result.js
+        buildPhase: resources
+      - path: script/claude_thread_wakeup.js
+        buildPhase: resources
+      - path: script/omp_thread_wakeup.js
+        buildPhase: resources
+    settings:
+      GENERATE_INFOPLIST_FILE: YES
+      PRODUCT_BUNDLE_IDENTIFIER: nativeagent.NativeAgentApp.resources
+      CODE_SIGNING_ALLOWED: NO
+
+  NativeAgent:
+    type: application
+    platform: macOS
+    sources:
+      - path: Sources/NativeAgentApp
+        type: syncedFolder
+      - path: Resources/AppIcon.icns
+        buildPhase: resources
+      - path: docs/licenses/A2A-gRPC-NOTICES.txt
+        buildPhase: resources
+      - path: Extensions/NativeAgentChrome/manifest.json
+        buildPhase:
+          copyFiles:
+            destination: resources
+            subpath: NativeAgentChrome
+      - path: Extensions/NativeAgentChrome/src
+        type: folder
+        buildPhase:
+          copyFiles:
+            destination: resources
+            subpath: NativeAgentChrome
+    dependencies:
+      - target: NativeAgentWidget
+        embed: true
+      - target: NativeAgentChromeRelay
+        embed: true
+        copy:
+          destination: executables
+      - target: nativeagent-link
+        embed: true
+        copy:
+          destination: executables
+      - target: NativeAgent_NativeAgentApp
+        embed: true
+        copy:
+          destination: resources
+      - package: grpc-swift-2
+        product: GRPCCore
+      - package: grpc-swift-nio-transport
+        product: GRPCNIOTransportHTTP2TransportServices
+      - package: grpc-swift-protobuf
+        product: GRPCProtobuf
+      - package: Sparkle
+        product: Sparkle
+      - package: NativeAgentShared
+        product: NativeAgentShared
+      - package: NativeAgentCore
+        products:
+          - NativeAgentCore
+          - ApprovalInbox
+          - MCPDispatcher
+          - MemoryV2
+          - Context
+          - ToolRegistry
+          - ToolExecution
+          - PersonaEngine
+          - TrustCenter
+          - TrustPersistence
+          - PersistenceCore
+          - FeedPolicy
+          - Privacy
+          - GrokLink
+          - Desk
+          - Studio
+          - TurnTrace
+          - Transcripts
+          - Procedures
+          - BackgroundLoops
+          - BackgroundWork
+          - DoctorChecks
+          - ProviderRouting
+          - DreamREMCycle
+          - TriggerScheduler
+          - SchedulerExecution
+          - StandingBots
+          - WorkshopExecution
+          - NotificationInbox
+          - Research
+          - CommandPalette
+          - SystemOps
+          - Dispatcher
+          - MacControl
+          - ScreenVision
+          - Onboarding
+          - MacAssistantStatus
+          - SelfImprovement
+          - ChatOrchestration
+          - CognitiveSubstrate
+          - XConnector
+          - GitHubConnector
+          - SlackConnector
+          - WorkflowOrchestration
+          - KnowledgeGraph
+          - Connectors
+          - TelegramBot
+          - SlackBot
+          - ChromeControl
+          - Agents
+          - ContextFlow
+          - Cognition
+          - DeviceSync
+          - AttentionRouting
+          - EngineRuntime
+          - AppToolRuntime
+          - ApprovalTransactions
+          - Skills
+          - Browser
+          - MultimodalTTS
+          - MacIntegration
+          - ActivityWatch
+    settings:
+      base:
+        PRODUCT_NAME: NativeAgent
+        # Same executable and module name as the SwiftPM product, so process
+        # lookups (pgrep -x NativeAgentApp) and runtime type names are unchanged.
+        EXECUTABLE_NAME: NativeAgentApp
+        PRODUCT_MODULE_NAME: NativeAgentApp
+        PRODUCT_BUNDLE_IDENTIFIER: $(NATIVEAGENT_MAC_BUNDLE_ID)
+        INFOPLIST_FILE: Config/NativeAgent-Info.plist
+        ENABLE_HARDENED_RUNTIME: YES
+        # One Mach-O like the SwiftPM build (no Previews debug-dylib split).
+        ENABLE_DEBUG_DYLIB: NO
+        LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/../Frameworks"
+    info:
+      path: Config/NativeAgent-Info.plist
+      properties:
+        CFBundleExecutable: $(EXECUTABLE_NAME)
+        CFBundleIdentifier: $(PRODUCT_BUNDLE_IDENTIFIER)
+        CFBundleName: NativeAgent
+        # Placeholders; the stamp phase below writes VERSION and the git identity.
+        CFBundleVersion: "0.0.0-dev"
+        CFBundleShortVersionString: "0.0.0-dev"
+        NativeAgentSourceRevision: unknown
+        NativeAgentSourceDirty: false
+        NativeAgentMacBundleID: $(NATIVEAGENT_MAC_BUNDLE_ID)
+        NativeAgentMacAppGroupID: $(NATIVEAGENT_MAC_APP_GROUP_ID)
+        NativeAgentICloudContainerID: $(NATIVEAGENT_ICLOUD_CONTAINER_ID)
+        NativeAgentMobileSourceKey: $(NATIVEAGENT_MOBILE_SOURCE_KEY)
+        NativeAgentBackgroundTaskIDPrefix: $(NATIVEAGENT_BACKGROUND_TASK_PREFIX)
+        NativeAgentDeviceSync: $(NATIVEAGENT_DEVICE_SYNC)
+        NativeAgentReleasePageURL: $(NATIVEAGENT_RELEASE_PAGE_URL)
+        CFBundleIconFile: AppIcon
+        CFBundleIconName: AppIcon
+        CFBundlePackageType: APPL
+        UTExportedTypeDeclarations:
+          - UTTypeConformsTo: [public.data]
+            UTTypeDescription: NativeAgent Chat Session
+            UTTypeIdentifier: com.nativeagent.chat-session
+        CFBundleURLTypes:
+          - CFBundleURLName: $(NATIVEAGENT_MAC_BUNDLE_ID).oauth
+            CFBundleURLSchemes: [nativeagent]
+        LSMinimumSystemVersion: "26.0"
+        NSHighResolutionCapable: true
+        NSPrincipalClass: NSApplication
+        NSAppleEventsUsageDescription: NativeAgent uses Apple Events to coordinate with system applications.
+        NSCalendarsUsageDescription: NativeAgent uses calendar access for assistant briefings and user-approved watch jobs.
+        NSCalendarsFullAccessUsageDescription: NativeAgent uses full calendar access to read upcoming events for assistant briefings and user-approved watch jobs.
+        NSCalendarsWriteOnlyAccessUsageDescription: NativeAgent uses write-only calendar access to create events only when the user enables Calendar write access.
+        NSRemindersUsageDescription: NativeAgent uses reminders access for assistant briefings and user-approved watch jobs.
+        NSRemindersFullAccessUsageDescription: NativeAgent uses reminders access to read due reminders for assistant briefings and user-approved watch jobs.
+        NSContactsUsageDescription: NativeAgent uses Contacts so the assistant can look up people you ask about and (with the Contacts write toggle on) create or update contacts on your behalf.
+        NSMicrophoneUsageDescription: NativeAgent uses your microphone for voice input.
+        NSSpeechRecognitionUsageDescription: NativeAgent uses speech recognition to transcribe your voice.
+        NSLocalNetworkUsageDescription: NativeAgent uses the local network to connect the Mac app and trusted companion devices.
+        NSDesktopFolderUsageDescription: NativeAgent may read files from your Desktop when you request it.
+        NSDocumentsFolderUsageDescription: NativeAgent may read files from your Documents folder when you request it.
+        NSDownloadsFolderUsageDescription: NativeAgent may read files from your Downloads folder when you request it.
+        BGTaskSchedulerPermittedIdentifiers:
+          - $(NATIVEAGENT_BACKGROUND_TASK_PREFIX).dream_cycle
+          - $(NATIVEAGENT_BACKGROUND_TASK_PREFIX).rem_cycle
+          - $(NATIVEAGENT_BACKGROUND_TASK_PREFIX).memory_consolidation
+          - $(NATIVEAGENT_BACKGROUND_TASK_PREFIX).self_improvement_sweep
+    postBuildScripts:
+      # Runs before Xcode's CodeSign step, so everything here is sealed.
+      - name: Stamp version, source identity, REPO_PATH, embedding model
+        basedOnDependencyAnalysis: false
+        inputFiles:
+          - $(TARGET_BUILD_DIR)/$(INFOPLIST_PATH)
+        script: |
+          set -euo pipefail
+          plist="$TARGET_BUILD_DIR/$INFOPLIST_PATH"
+          res="$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH"
+          version="$(tr -d '[:space:]' < "$SRCROOT/VERSION" 2>/dev/null || true)"
+          version="${version:-0.0.0-dev}"
+          revision="$(git -C "$SRCROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
+          sha="$(git -C "$SRCROOT" rev-parse --short=8 HEAD 2>/dev/null || true)"
+          [[ "$sha" =~ ^[0-9a-f]{8}$ ]] || sha="nogit"
+          dirty=false; suffix=""
+          if [[ -n "$(git -C "$SRCROOT" status --porcelain --untracked-files=normal 2>/dev/null || true)" ]]; then
+            dirty=true; suffix=".dirty"
+          fi
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $version" \
+            -c "Set :CFBundleShortVersionString ${NATIVEAGENT_BUILD_SHORT_VERSION:-$version-dev.$sha$suffix}" \
+            -c "Set :NativeAgentSourceRevision $revision" \
+            -c "Set :NativeAgentSourceDirty $dirty" "$plist"
+          cp "$SRCROOT/VERSION" "$res/VERSION"
+          printf '%s\n' "$revision" > "$res/VERSION_SHA"
+          # release.sh supplies the lane's updater claims as build settings.
+          # Remove optional keys first so an incremental build cannot retain a feed.
+          for key in SUPublicEDKey SUFeedURL NativeAgentUpdateFeedPublished SUEnableAutomaticChecks; do
+            /usr/libexec/PlistBuddy -c "Delete :$key" "$plist" >/dev/null 2>&1 || true
+          done
+          if [[ "${NATIVEAGENT_RELEASE_BUILD:-NO}" == YES ]]; then
+            /usr/libexec/PlistBuddy \
+              -c "Add :SUPublicEDKey string ${NATIVEAGENT_SPARKLE_PUBLIC_KEY:-}" \
+              -c "Add :NativeAgentUpdateFeedPublished bool $NATIVEAGENT_UPDATE_FEED_PUBLISHED" \
+              -c "Add :SUEnableAutomaticChecks bool $NATIVEAGENT_UPDATE_FEED_PUBLISHED" "$plist"
+            if [[ -n "${NATIVEAGENT_SPARKLE_FEED_URL:-}" ]]; then
+              /usr/libexec/PlistBuddy -c "Add :SUFeedURL string $NATIVEAGENT_SPARKLE_FEED_URL" "$plist"
+            fi
+            rm -rf "$res/docs"
+            mkdir -p "$res/docs/release-notes"
+            cp "$SRCROOT/docs/data-bounds.md" "$res/docs/data-bounds.md"
+            find "$SRCROOT/docs/release-notes" -maxdepth 1 -type f -name '*.md' \
+              -exec cp {} "$res/docs/release-notes/" \;
+          fi
+          # Dev builds only: the repo-owned data/ root. A release has none.
+          if [[ "${NATIVEAGENT_STAMP_REPO_PATH:-NO}" == YES ]]; then
+            printf '%s\n' "$SRCROOT" > "$res/REPO_PATH"
+          else
+            rm -f "$res/REPO_PATH"
+          fi
+          model="${NATIVEAGENT_EMBEDDING_MODEL_DIR:-$SRCROOT/extras/embedding}"
+          rm -rf "$res/embedding"
+          # Fetching the model stays with script/fetch_embedding_model.sh.
+          if [[ -f "$model/embedding.json" ]]; then
+            cp -R "$model" "$res/embedding"
+          else
+            echo "[embedding] no model at $model; bundle carries MiniLM only"
+          fi
+
+schemes:
+  NativeAgent:
+    build:
+      targets:
+        NativeAgent: all
+    run:
+      config: Debug
+    archive:
+      config: Release

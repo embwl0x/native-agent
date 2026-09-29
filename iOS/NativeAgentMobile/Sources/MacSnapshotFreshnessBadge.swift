@@ -5,14 +5,16 @@
 // contract and the copy, but only AdvancedView and WorkshopView consumed it, so
 // Desk / Memory / Approvals / Inbox / Knowledge Graph / Autonomy rendered an
 // overnight-stale snapshot exactly like a measured-empty one. This lifts the
-// existing presentation into a shared modifier — no new staleness rules.
+// existing presentation into one shared note — no new staleness rules. Pages
+// mount it under their header with `AlivePage(freshnessGroup:)` or
+// `AliveFreshnessNote(group:)` (AliveKit.swift).
 import SwiftUI
 
 /// Sweep 2026-09-01 item 2: a snapshot age is not the only way a screen lies.
 /// The Mac publishes the groups it could NOT rebuild, and a screen whose group
 /// is named there is showing old rows no matter how recently the phone synced.
 enum MacSnapshotGroupStaleness {
-    static let title = "STALE — the Mac could not rebuild this"
+    static let title = "This may be out of date \u{2014} your Mac couldn\u{2019}t refresh it"
 
     /// The Mac's reason for this screen's group, or nil when the group built.
     static func reason(in markers: [String: String], group: String?) -> String? {
@@ -22,7 +24,35 @@ enum MacSnapshotGroupStaleness {
     }
 }
 
-/// Renders nothing while the snapshot is fresh; a compact honest banner
+/// The page note's words and patience: iCloud delivery is not instant, so a
+/// page only calls itself old after a few minutes, and says so plainly.
+enum MacSnapshotPageFreshness {
+    static let staleAfter: TimeInterval = 5 * 60
+
+    static func state(lastSyncedAt: Date?, now: Date = Date()) -> StatusConnectionPresentation.SyncState {
+        StatusConnectionPresentation.syncState(lastSyncedAt: lastSyncedAt, now: now, staleAfter: staleAfter)
+    }
+
+    /// "12 minutes", "2 hours", "3 days".
+    static func spokenAge(_ interval: TimeInterval) -> String {
+        let seconds = max(0, Int(interval))
+        if seconds < 60 { return AliveWords.count(seconds, "second") }
+        if seconds < 3_600 { return AliveWords.count(seconds / 60, "minute") }
+        if seconds < 86_400 { return AliveWords.count(seconds / 3_600, "hour") }
+        return AliveWords.count(seconds / 86_400, "day")
+    }
+
+    static func line(for state: StatusConnectionPresentation.SyncState) -> String {
+        switch state {
+        case .current(let age): return "Last updated \(spokenAge(age)) ago"
+        case .stale(let age, _): return "Hasn\u{2019}t updated in \(spokenAge(age))"
+        case .neverSynced: return "Nothing has arrived from your Mac yet"
+        case .clockMismatch: return "Your Mac\u{2019}s clock and this iPhone\u{2019}s disagree"
+        }
+    }
+}
+
+/// Renders nothing while the snapshot is fresh; a quiet honest note
 /// otherwise. Time-based text is re-evaluated on a slow timeline so "4m old"
 /// does not itself go stale on screen.
 struct MacSnapshotFreshnessBadge: View {
@@ -32,70 +62,20 @@ struct MacSnapshotFreshnessBadge: View {
 
     var body: some View {
         TimelineView(.periodic(from: .now, by: 15)) { context in
-            let state = StatusConnectionPresentation.syncState(
-                lastSyncedAt: lastSyncedAt,
-                now: context.date
-            )
+            let state = MacSnapshotPageFreshness.state(lastSyncedAt: lastSyncedAt, now: context.date)
             // A named group failure outranks age: a Mac that published five
             // seconds ago can still have failed to rebuild THIS group.
             let title = staleGroupReason == nil
-                ? StatusConnectionPresentation.cardValue(for: state)
+                ? MacSnapshotPageFreshness.line(for: state)
                 : MacSnapshotGroupStaleness.title
-            let detail = staleGroupReason ?? StatusConnectionPresentation.detail(for: state)
+            let detail = staleGroupReason
             if staleGroupReason != nil || StatusConnectionPresentation.needsAttention(state) {
-                HStack(alignment: .top, spacing: 8) {
-                    Image(systemName: "clock.badge.exclamationmark")
-                        .foregroundStyle(.secondary)
-                        .accessibilityHidden(true)
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(title)
-                            .font(.caption.weight(.semibold))
-                        if let detail {
-                            Text(detail)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-                    }
-                    Spacer(minLength: 0)
-                }
-                .padding(.horizontal, 16)
-                .padding(.vertical, 8)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(NativeAgentMobileTheme.Colors.contentSurface)
-                .accessibilityElement(children: .combine)
-                .accessibilityLabel("Mac snapshot freshness: " + title)
+                // Said once under the page's header in secondary text: a
+                // note, not a band.
+                AliveStatusNote(text: [title, detail].compactMap { $0 }.joined(separator: ". "))
+                    .accessibilityElement(children: .combine)
+                    .accessibilityLabel("Mac snapshot freshness: " + title)
             }
         }
-    }
-}
-
-private struct MacSnapshotFreshnessModifier: ViewModifier {
-    @ObservedObject private var sync = iCloudSyncEngine.shared
-    /// The Mac snapshot group this screen renders, when it has exactly one.
-    let group: String?
-
-    func body(content: Content) -> some View {
-        content.safeAreaInset(edge: .top, spacing: 0) {
-            MacSnapshotFreshnessBadge(
-                // THIS screen's group's last delivery — not the last local
-                // cache read, and not the newest delivery of any group: a Desk
-                // delivery is not evidence that Approvals arrived.
-                lastSyncedAt: sync.transportDeliveryAt(screenGroup: group),
-                staleGroupReason: MacSnapshotGroupStaleness.reason(
-                    in: sync.staleSnapshotGroups,
-                    group: group
-                )
-            )
-        }
-    }
-}
-
-extension View {
-    /// Pin this screen's contents to the age of the Mac snapshot that produced
-    /// them, and — when `group` names the snapshot group this screen renders —
-    /// to whether the Mac could rebuild that group at all.
-    func macSnapshotFreshnessBadge(group: String? = nil) -> some View {
-        modifier(MacSnapshotFreshnessModifier(group: group))
     }
 }

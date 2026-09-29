@@ -1,358 +1,39 @@
+import Privacy
 import Foundation
-import NativeAgentShared
 import PersistenceCore
 import DoctorChecks
+import ProviderRouting
 import SystemOps
 import MacControl
-
+import Research
 
 extension NativeClient {
-    func runDoctor(repair: Bool) async throws -> DoctorReport {
-        // DAEMON-DEAD PORT P4: route through Modules/.../DoctorChecks.
-        // Core owns offline integrity checks. The app adds bounded live-owner
-        // coverage for the systems named by Doctor's UI; these are local state
-        // reads only and never call a provider, Telegram, search, or a tool.
-        let impl = makeDoctorChecks()
-        let initialResults = try await impl.runAll(repair: false, checkLLM: true)
-        let initialChecks = initialResults.map {
-            DoctorCheck(id: $0.id, title: $0.title, status: $0.status, detail: $0.detail, repair: $0.repair)
-        }
-        var repairReceipts: [DoctorCheck] = []
-        if repair {
-            // Never call `runAll(repair: true)`: that invokes every repairable
-            // check, including maintenance with no reported issue. This path
-            // executes only rows that offered an explicit app-owned safe repair
-            // in the fresh preflight report.
-            for id in DoctorSafeRepairIssuesPresentation.plan(for: initialChecks).checkIDs {
-                if let receipt = try await impl.runCheck(id: id, repair: true) {
-                    repairReceipts.append(DoctorCheck(
-                        id: receipt.id,
-                        title: receipt.title,
-                        status: receipt.status,
-                        detail: receipt.detail,
-                        repair: receipt.repair
-                    ))
-                }
-            }
-        }
-        let results: [CheckResult]
-        if repair {
-            results = try await impl.runAll(repair: false, checkLLM: true)
-        } else {
-            results = initialResults
-        }
-        let coreChecks = results.map {
-            DoctorCheck(id: $0.id, title: $0.title, status: $0.status, detail: $0.detail, repair: $0.repair)
-        }
-        let checks = coreChecks + (await liveDoctorCoverageChecks())
-        let rollup = Self.doctorRollup(checks.map(\.status))
-        let repaired = repair && DoctorSafeRepairIssuesPresentation.appliedRepairCount(in: repairReceipts) > 0
-        return DoctorReport(status: rollup, repaired: repaired, checks: checks)
+    private var doctorActions: DoctorActionRuntime<NativeClient> {
+        DoctorActionRuntime(port: self)
     }
 
-    func liveDoctorCoverageChecks() async -> [DoctorCheck] {
-        async let providers = providerDoctorCoverageCheck()
-        async let telegram = telegramDoctorCoverageCheck()
-        async let search = searchDoctorCoverageCheck()
-        async let tools = toolsDoctorCoverageCheck()
-        async let autonomy = autonomyDoctorCoverageCheck()
-        // FIX-4 (2026-09-01): DoctorLoopHealth's verdicts had no route into
-        // `doctorReport.checks`, so the toolbar pill could not see them. This
-        // is the same read-only evaluation the Doctor loops section renders,
-        // rolled into one row — and it rides the live-coverage lane, so
-        // `refreshLiveDoctorCoverage()` keeps it current too.
-        async let loops = backgroundLoopsDoctorCoverageCheck()
-        return await [providers, telegram, search, tools, autonomy, loops]
+    func runDoctor(repair: Bool = false, repairScope: DoctorRepairScope = .automatic) async throws -> DoctorReport {
+        let result = try await doctorActions.runDoctor(repair: repair, repairScope: repairScope, checks: makeDoctorChecks())
+        return DoctorReport(status: result.status, repaired: result.repaired, checks: result.checks)
     }
 
-    private func backgroundLoopsDoctorCoverageCheck() async -> DoctorCheck {
-        await DoctorLoopHealth.doctorCheck(
-            dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()
-        )
-    }
-
-    private func providerDoctorCoverageCheck() async -> DoctorCheck {
-        do {
-            let dataRoot = dataRootOverride ?? PersistenceCore.defaultDataRoot()
-            let providers = try await listProviders(
-                dataRoot: dataRoot,
-                authEnvironment: ProcessInfo.processInfo.environment
-            )
-            let registryCheck = Self.providerDoctorCoverageCheck(providers)
-            switch ProviderRuntimeHealthFeed.read(dataRoot: dataRoot) {
-            case .healthy:
-                guard registryCheck.status == "ok" else { return registryCheck }
-                return DoctorCheck(
-                    id: registryCheck.id,
-                    title: registryCheck.title,
-                    status: "ok",
-                    detail: "\(registryCheck.detail) Recent provider calls are healthy.",
-                    repair: nil
-                )
-            case .unhealthy(_, let detail):
-                return DoctorCheck(
-                    id: "live.providers",
-                    title: "Providers and OAuth",
-                    status: "warn",
-                    detail: "\(registryCheck.detail) \(Self.safeDoctorDetail(detail))",
-                    repair: "Open Providers and inspect the active path before running another agent turn."
-                )
-            case .unavailable:
-                break
-            }
-            switch LLMProviderStatusFeed.read(dataRoot: dataRoot) {
-            case .current:
-                return registryCheck
-            case .stale(let record):
-                return DoctorCheck(
-                    id: "live.providers",
-                    title: "Providers and OAuth",
-                    status: "warn",
-                    detail: "\(registryCheck.detail) Last native provider check for \(record.providerID ?? "an unknown provider") is stale.",
-                    repair: "Open Providers and run Test Connection."
-                )
-            case .unavailable(let detail):
-                return DoctorCheck(
-                    id: "live.providers",
-                    title: "Providers and OAuth",
-                    status: "warn",
-                    detail: "\(registryCheck.detail) Reachability is unmeasured: \(Self.safeDoctorDetail(detail))",
-                    repair: "Open Providers and run Test Connection when a native probe is available."
-                )
-            case .failed(let detail):
-                return DoctorCheck(
-                    id: "live.providers",
-                    title: "Providers and OAuth",
-                    status: "fail",
-                    detail: "The last native provider check failed: \(Self.safeDoctorDetail(detail))",
-                    repair: "Open Providers, repair authentication or connectivity, then run Test Connection."
-                )
-            }
-        } catch {
-            return DoctorCheck(
-                id: "live.providers", title: "Providers and OAuth", status: "fail",
-                detail: "Provider registry could not be read: \(Self.safeDoctorDetail(error.localizedDescription))", repair: nil
-            )
-        }
-    }
-
-    private func telegramDoctorCoverageCheck() async -> DoctorCheck {
-        do {
-            let status = try await getTelegramStatus()
-            return Self.telegramDoctorCoverageCheck(status)
-        } catch {
-            return DoctorCheck(
-                id: "live.telegram", title: "Telegram", status: "fail",
-                detail: "Telegram status could not be read: \(Self.safeDoctorDetail(error.localizedDescription))", repair: nil
-            )
-        }
-    }
-
-    private func searchDoctorCoverageCheck() async -> DoctorCheck {
-        do {
-            let raw = (try await getConfig()).searxngBaseURL?
-                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            return Self.searchDoctorCoverageCheck(raw)
-        } catch {
-            return DoctorCheck(
-                id: "live.search", title: "Search", status: "fail",
-                detail: "Search configuration could not be read: \(Self.safeDoctorDetail(error.localizedDescription))", repair: nil
-            )
-        }
-    }
-
-    private func toolsDoctorCoverageCheck() async -> DoctorCheck {
-        do {
-            let tools = try await getTools()
-            return Self.toolsDoctorCoverageCheck(tools)
-        } catch {
-            return DoctorCheck(
-                id: "live.tools", title: "Tool Registry", status: "fail",
-                detail: "Tool registry could not be read: \(Self.safeDoctorDetail(error.localizedDescription))", repair: nil
-            )
-        }
-    }
-
-    private func autonomyDoctorCoverageCheck() async -> DoctorCheck {
-        do {
-            let autonomy = try await getAutonomyKernel()
-            return Self.autonomyDoctorCoverageCheck(autonomy)
-        } catch {
-            return DoctorCheck(
-                id: "live.autonomy", title: "Autonomy", status: "fail",
-                detail: "Autonomy state could not be read: \(Self.safeDoctorDetail(error.localizedDescription))", repair: nil
-            )
-        }
-    }
-
-    private static func boundedDoctorDetail(_ value: String, limit: Int = 240) -> String {
-        guard value.count > limit else { return value }
-        return String(value.prefix(limit - 1)) + "…"
+    func liveDoctorCoverageChecks() async -> [CheckResult] {
+        await doctorActions.liveDoctorCoverageChecks()
     }
 
     static func safeDoctorDetail(_ value: String) -> String {
-        boundedDoctorDetail(NativeAppSecretRedactor.redactText(value))
+        DoctorActionRuntime<NativeClient>.safeDetail(value, redact: NativeAppSecretRedactor.redactText)
     }
 
     static func doctorRollup(_ statuses: [String]) -> String {
-        if statuses.contains(where: { ["fail", "error"].contains($0.lowercased()) }) { return "fail" }
-        if statuses.contains(where: { $0.lowercased() == "warn" }) { return "warn" }
-        return "ok"
+        DoctorStatusProjection.doctorRollup(statuses)
     }
 
-    static func providerDoctorCoverageCheck(_ providers: [ProviderInfo]) -> DoctorCheck {
-        let ready = providers.filter { $0.auth_status.state.lowercased() == "ready" }
-        if ready.isEmpty {
-            return DoctorCheck(
-                id: "live.providers", title: "Providers and OAuth", status: "warn",
-                detail: "Provider registry is readable, but no provider currently reports ready authentication.",
-                repair: "Open the Providers tab in the sidebar and authenticate one provider."
-            )
-        }
-        return DoctorCheck(
-            id: "live.providers", title: "Providers and OAuth", status: "ok",
-            detail: "\(ready.count) of \(providers.count) provider paths report ready authentication.", repair: nil
+    static func mergeDoctorReport(_ current: DoctorReport, liveChecks: [CheckResult]) -> DoctorReport {
+        let result = DoctorActionRuntime<NativeClient>.mergeReport(
+            currentChecks: current.checks, liveChecks: liveChecks
         )
-    }
-
-    static func telegramDoctorCoverageCheck(_ status: TelegramStatus) -> DoctorCheck {
-        guard status.enabled else {
-            return DoctorCheck(
-                id: "live.telegram", title: "Telegram", status: "ok",
-                detail: "Telegram is disabled by configuration.", repair: nil
-            )
-        }
-        guard status.tokenConfigured else {
-            return DoctorCheck(
-                id: "live.telegram", title: "Telegram", status: "fail",
-                detail: "Telegram is enabled but no bot token is configured.",
-                repair: "Open Settings → Telegram and configure the bot token."
-            )
-        }
-        if status.isTransientPollInterruption {
-            return DoctorCheck(
-                id: "live.telegram", title: "Telegram", status: "ok",
-                detail: "Telegram's poller is active and retrying after a transient poll interruption.",
-                repair: nil
-            )
-        }
-        if let lastError = status.actionableError {
-            return DoctorCheck(
-                id: "live.telegram", title: "Telegram", status: "warn",
-                detail: "Telegram's last recorded error is: \(safeDoctorDetail(lastError))", repair: nil
-            )
-        }
-        guard status.pollerEnabled else {
-            return DoctorCheck(
-                id: "live.telegram", title: "Telegram", status: "warn",
-                detail: "Telegram is configured, but its poller is not active.", repair: nil
-            )
-        }
-        return DoctorCheck(
-            id: "live.telegram", title: "Telegram", status: "ok",
-            detail: "Telegram is configured and its poller is active.", repair: nil
-        )
-    }
-
-    static func mergeDoctorReport(_ current: DoctorReport, liveChecks: [DoctorCheck]) -> DoctorReport {
-        let liveIDs = Set(liveChecks.map(\.id))
-        let checks = current.checks.filter { !liveIDs.contains($0.id) } + liveChecks
-        return DoctorReport(
-            status: doctorRollup(checks.map(\.status)),
-            repaired: current.repaired,
-            checks: checks
-        )
-    }
-
-    static func searchDoctorCoverageCheck(_ raw: String) -> DoctorCheck {
-        guard !raw.isEmpty else {
-            return DoctorCheck(
-                id: "live.search", title: "Search", status: "ok",
-                detail: "External SearXNG search is not configured.", repair: nil
-            )
-        }
-        guard let url = URL(string: raw),
-              ["http", "https"].contains(url.scheme?.lowercased() ?? ""),
-              url.host?.isEmpty == false else {
-            return DoctorCheck(
-                id: "live.search", title: "Search", status: "fail",
-                detail: "The configured SearXNG URL is invalid.",
-                repair: "Open Settings and enter a valid HTTP(S) SearXNG URL."
-            )
-        }
-        // FIX-5c (2026-09-01): this row is a URL-SYNTAX check wearing the name
-        // "Search". Doctor makes no request here (runDoctor's live coverage is
-        // local reads only), so a configured endpoint that is down, wrong, or
-        // unreachable renders exactly like a working one. Green is reserved
-        // for what was actually verified; an unprobed endpoint reads as
-        // unverified, not healthy.
-        return DoctorCheck(
-            id: "live.search", title: "Search", status: "warn",
-            detail: "SearXNG is configured and its URL is a valid HTTP(S) shape — syntax only, no request made."
-                + " Doctor cannot tell you whether the endpoint answers.",
-            repair: "Run a search from chat to prove the endpoint, or clear the SearXNG URL if it is no longer used."
-        )
-    }
-
-    /// FIX-5c (2026-09-01): every non-throwing path returned "ok", so a
-    /// registry holding QUARANTINED tools reported the same green as a clean
-    /// one. Two changes, both honesty: the detail now states the row's actual
-    /// scope on every path (the registry file was read; no tool was invoked),
-    /// and a quarantined tool is a finding. `proposed` is deliberately NOT a
-    /// finding — an unapproved proposal is the self-building lane working.
-    static func toolsDoctorCoverageCheck(_ tools: [ToolRecord]) -> DoctorCheck {
-        let quarantined = tools.filter { ($0.status ?? "active").lowercased() == "quarantined" }
-        let active = tools.filter { ($0.status ?? "active").lowercased() == "active" }.count
-        let scope = " Registry read only: Doctor invoked no tool, so this says nothing about whether one runs."
-        // Taste pass 2026-07-24: this registry holds SELF-BUILT (promoted)
-        // tools only — built-in chat tools never appear here, so an empty
-        // registry is the normal state and "0 active, 0 total" read like the
-        // agent had no tools at all.
-        if tools.isEmpty {
-            return DoctorCheck(
-                id: "live.tools", title: "Tool Registry", status: "ok",
-                detail: "Self-built tool registry is readable; no promoted tools yet."
-                    + " Built-in tools don't live here." + scope,
-                repair: nil
-            )
-        }
-        let census = "Self-built tool registry is readable (\(active) active, \(tools.count) total)."
-        if !quarantined.isEmpty {
-            let named = quarantined.prefix(3).map(\.name).joined(separator: ", ")
-            let more = quarantined.count > 3 ? ", …" : ""
-            return DoctorCheck(
-                id: "live.tools", title: "Tool Registry", status: "warn",
-                detail: census + " \(quarantined.count) quarantined: \(named)\(more)." + scope,
-                repair: "Open Tools and restore or remove the quarantined tools."
-            )
-        }
-        return DoctorCheck(
-            id: "live.tools", title: "Tool Registry", status: "ok",
-            detail: census + scope,
-            repair: nil
-        )
-    }
-
-    static func autonomyDoctorCoverageCheck(_ autonomy: AutonomyKernelSummary) -> DoctorCheck {
-        if autonomy.enabled == nil {
-            return DoctorCheck(
-                id: "live.autonomy", title: "Autonomy", status: "warn",
-                detail: "Autonomy state is readable, but its enabled posture is unknown.", repair: nil
-            )
-        }
-        guard autonomy.enabled == true else {
-            return DoctorCheck(
-                id: "live.autonomy", title: "Autonomy", status: "ok",
-                detail: autonomy.disabledReason ?? "Autonomy is disabled by policy.", repair: nil
-            )
-        }
-        let state = autonomy.status.lowercased()
-        return DoctorCheck(
-            id: "live.autonomy", title: "Autonomy",
-            status: ["fail", "error", "degraded"].contains(state) ? "warn" : "ok",
-            detail: "Autonomy is enabled in \(autonomy.mode ?? "supervised") mode; \(autonomy.runningImprovements ?? 0) improvements are active.",
-            repair: nil
-        )
+        return DoctorReport(status: result.status, repaired: current.repaired, checks: result.checks)
     }
 
     func systemRebuild() async throws -> SystemRebuildResult {
@@ -363,28 +44,10 @@ extension NativeClient {
     }
 
     func gitPush() async throws -> GitPushResult {
-        let repoRoot = PersistenceCore.defaultDataRoot().deletingLastPathComponent()
-        let branchResult = try await Self.runGit(["rev-parse", "--abbrev-ref", "HEAD"], repoRoot: repoRoot, timeout: 10)
-        let branch = branchResult.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
-        let remoteResult = try await Self.runGit(["remote"], repoRoot: repoRoot, timeout: 10)
-        let remotes = remoteResult.stdout
-            .split(whereSeparator: \.isNewline)
-            .map(String.init)
-            .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-        guard !remotes.isEmpty else {
-            return GitPushResult(ok: false, branch: branch.isEmpty ? nil : branch, output: nil, error: "No GitHub remote configured")
+        let result = try await SystemGitActions.gitPush { arguments, repoRoot, timeout in
+            try await Self.runGit(arguments, repoRoot: repoRoot, timeout: timeout)
         }
-        let pushResult = try await Self.runGit(["push"], repoRoot: repoRoot, timeout: 120)
-        let output = [pushResult.stdout, pushResult.stderr]
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-            .joined(separator: "\n")
-        return GitPushResult(
-            ok: pushResult.status == 0,
-            branch: branch.isEmpty ? nil : branch,
-            output: output.isEmpty ? nil : output,
-            error: pushResult.status == 0 ? nil : (output.isEmpty ? "git push failed" : output)
-        )
+        return GitPushResult(ok: result.ok, branch: result.branch, output: result.output, error: result.error)
     }
 
     static func runGit(
@@ -424,19 +87,7 @@ extension NativeClient {
     }
 
     static func processDetail(_ result: (status: Int32, stdout: String, stderr: String)) -> String {
-        let output = [result.stdout, result.stderr]
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-            .joined(separator: "\n")
-        guard !output.isEmpty else {
-            return "exit \(result.status)"
-        }
-        let tail = output
-            .split(whereSeparator: \.isNewline)
-            .suffix(6)
-            .joined(separator: " ")
-        let clipped = String(tail.prefix(500))
-        return "exit \(result.status): \(clipped)"
+        SystemGitActions.processDetail(result)
     }
 
     func gitStashRecover(label: String) async throws -> GitStashRecoverResult {
@@ -444,5 +95,250 @@ extension NativeClient {
         let impl = makeGitStashRecoverClient()
         let r = try await impl.gitStashRecover(label: label)
         return GitStashRecoverResult(ok: r.ok, stashRef: r.stashRef, output: r.output, error: r.error)
+    }
+}
+
+extension NativeClient: DoctorActionPort {
+    func doctorEmbeddingDownloadCheck() async -> CheckResult {
+        await DoctorEmbeddingDownloadCheck.read(dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot())
+    }
+
+    func doctorProviderAuthStates() async throws -> [String] {
+        try await ProvidersFacade(dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot())
+            .list().map { $0.auth_status.state }
+    }
+
+    func doctorProviderRuntimeReading() async -> DoctorProviderRuntimeReading {
+        await DoctorProviderPathReading.read(dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot())
+    }
+
+    func doctorProviderProbeReading() -> DoctorProviderProbeReading {
+        switch LLMProviderStatusFeed.read(dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()) {
+        case .current: return .current
+        case .stale(let record): return .stale(record.providerID)
+        case .unavailable(let detail): return .unavailable(detail)
+        case .failed(let detail): return .failed(detail)
+        }
+    }
+
+    func doctorTelegramSnapshot() async throws -> DoctorTelegramSnapshot {
+        let manager = backgroundLoopsManager.coreManager
+        let status = try await TelegramFacade(
+            dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        ).load(manager: manager)
+        let now = Date()
+        let uptime = await manager.uptimeSeconds(now: now)
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let pollDate = status.lastPollAt.flatMap {
+            formatter.date(from: $0) ?? ISO8601DateFormatter().date(from: $0)
+        }
+        // A normal poll holds up to 25 seconds, then waits for the next tick.
+        // Require both current-manager-lifecycle evidence and a bounded age.
+        let fresh = pollDate.map {
+            let age = now.timeIntervalSince($0)
+            return age >= 0 && age <= 35 && age < uptime
+        } ?? false
+        let starting = status.pollerEnabled && uptime > 0 && uptime <= 35 && !fresh
+        return (status.enabled, status.tokenConfigured, status.isTransientPollInterruption, status.actionableError, status.pollerEnabled, fresh, starting)
+    }
+
+    func doctorSearchURL() async throws -> String? {
+        try await getConfig().searxngBaseURL
+    }
+
+    func doctorProbeSearch(base: String) async -> Bool {
+        await SwiftNativeResearchClient(dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot())
+            .checkSearXNG(base: base)
+    }
+
+    private func doctorSearchContainerName() async throws -> String? {
+        // Discovery/configuration records only an endpoint, not ownership.
+        // No app provisioning path currently records a container name; keep
+        // the human action unless ownership was explicitly configured.
+        let path = (dataRootOverride ?? PersistenceCore.defaultDataRoot())
+            .appendingPathComponent("research/config.json")
+        let config = try await SwiftNativePersistenceCore().readJSON(path, ifMissing: .object([:]))
+        guard case .object(let fields) = config,
+              case .string(let name) = fields["searxng_container_name"],
+              !name.isEmpty else { return nil }
+        return name
+    }
+
+    func doctorRecordRepair(checkID: String, receipt: String, status: String) async throws {
+        let path = (dataRootOverride ?? PersistenceCore.defaultDataRoot())
+            .appendingPathComponent("doctor/repair_receipts.jsonl")
+        try await SwiftNativePersistenceCore().appendJSONL(.object([
+            "at": .string(ISO8601DateFormatter().string(from: Date())),
+            "check_id": .string(checkID), "receipt": .string(receipt), "status": .string(status),
+        ]), to: path)
+    }
+
+    func doctorLiveRepair(for check: CheckResult, scope: DoctorRepairScope) async -> DoctorExecutableRepair? {
+        let requestedRoot = dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        guard requestedRoot.resolvingSymlinksInPath().standardizedFileURL
+            == PersistenceCore.defaultDataRoot().resolvingSymlinksInPath().standardizedFileURL else { return nil }
+        switch check.id {
+        case "live.providers":
+            guard scope == .button else { return nil }
+            let pendingPath = requestedRoot.appendingPathComponent("providers/pending-surface-configuration.json")
+            let pendingSelection = FileManager.default.fileExists(atPath: pendingPath.path)
+            let needsProbe: Bool
+            switch doctorProviderProbeReading() {
+            case .current: needsProbe = false
+            case .unavailable: needsProbe = false
+            case .stale, .failed: needsProbe = true
+            }
+            guard pendingSelection || needsProbe else { return nil }
+            if !pendingSelection {
+                guard let snapshot = try? await SwiftNativeProviderRouting(dataRoot: requestedRoot)
+                    .checkedRoutingSnapshotReadOnly(),
+                    ProviderRoutingSurfaceLookup.value(snapshot.activeProviders, "chat") != nil else { return nil }
+            }
+            return DoctorExecutableRepair(checkID: check.id) {
+                do {
+                    let routing = SwiftNativeProviderRouting(dataRoot: requestedRoot)
+                    let snapshot = try await (FileManager.default.fileExists(atPath: pendingPath.path)
+                        ? routing.checkedRoutingSnapshot()
+                        : routing.checkedRoutingSnapshotReadOnly())
+                    guard let providerID = ProviderRoutingSurfaceLookup.value(snapshot.activeProviders, "chat") else {
+                        let row = await doctorActions.providerDoctorCoverageCheck()
+                        return .unverified("Repair could not test the active provider: \(row.detail)")
+                    }
+                    let test = try await testProvider(providerID)
+                    // Same verdict the Providers page uses for Test Connection.
+                    guard test.tested && test.status == "ok" else {
+                        return .unverified("Repair attempted: the \(providerID) connection test did not pass: \(Self.safeDoctorDetail(test.detail ?? test.error ?? test.status))")
+                    }
+                    let row = await doctorActions.providerDoctorCoverageCheck()
+                    return row.status == "ok"
+                        ? .completed("Completed: recovered provider selection if needed and checked the active provider connection.")
+                        : .unverified("Repair attempted: \(row.detail)")
+                } catch {
+                    let row = await doctorActions.providerDoctorCoverageCheck()
+                    return .unverified("Repair could not finish: \(Self.safeDoctorDetail(error.localizedDescription)) \(row.detail)")
+                }
+            }
+        case "live.inspector_feed":
+            return await doctorInspectorRepair(for: check)
+        case DoctorEmbeddingDownloadCheck.id:
+            return await DoctorEmbeddingDownloadCheck.repair(dataRoot: requestedRoot, scope: scope)
+        case "live.search":
+            guard let base = try? await doctorSearchURL(),
+                  let name = try? await doctorSearchContainerName(),
+                  let container = await SystemDockerPSExecutor().stoppedLocalSearXNG(base: base, containerName: name) else { return nil }
+            return DoctorExecutableRepair(checkID: check.id) {
+                guard try await doctorSearchURL() == base,
+                      try await doctorSearchContainerName() == name else {
+                    return .unverified("Repair skipped: the configured SearXNG URL or container name changed.")
+                }
+                try await SystemDockerPSExecutor().restartLocalSearXNG(base: base, containerName: name, containerID: container)
+                try await Task.sleep(for: .seconds(2))
+                return .completed("Completed: restarted the identified local SearXNG container \(container.prefix(12)); checking the configured endpoint again.")
+            }
+        case "live.background_loops":
+            return nil
+        case "live.telegram":
+            guard let state = try? await doctorTelegramSnapshot(), state.enabled,
+                  state.tokenConfigured, !state.pollerEnabled else { return nil }
+            return DoctorExecutableRepair(checkID: check.id) {
+                let facade = TelegramFacade(dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot())
+                let manager = backgroundLoopsManager.coreManager
+                let before = try await facade.load(manager: manager)
+                guard before.enabled, before.tokenConfigured else {
+                    return .unverified("Repair skipped: Telegram configuration changed.")
+                }
+                if !(await manager.registered().contains("telegram_poll")) {
+                    let outcome = await backgroundLoopsManager.restartLoop(id: "telegram_poll")
+                    guard outcome.didRestart else {
+                        return .unverified("Repair failed: \(outcome.surfaceMessage ?? "Telegram poller could not restart.")")
+                    }
+                }
+                _ = await manager.start()
+                // Observe the owner's ordinary bounded long poll, never send
+                // a second getUpdates request or force a duplicate tick.
+                let deadline = ContinuousClock.now.advanced(by: .seconds(35))
+                repeat {
+                    let after = try await facade.load(manager: manager)
+                    if after.lastPollAt != nil, after.lastPollAt != before.lastPollAt,
+                       after.pollerEnabled, after.actionableError == nil {
+                        return .completed("Completed: restarted Telegram's poller and confirmed a successful poll.")
+                    }
+                    try await Task.sleep(for: .seconds(1))
+                } while ContinuousClock.now < deadline
+                return .unverified("Repair attempted: Telegram's poller was started, but no successful poll was confirmed within 35 seconds.")
+            }
+        case "live.bridges":
+            let names = await doctorBridgeSnapshots().filter {
+                $0.expected && $0.health.boundPort == nil && !$0.health.isActive
+            }.map(\.name)
+            guard !names.isEmpty else { return nil }
+            return DoctorExecutableRepair(checkID: check.id) {
+                // Start methods retain their own gates, callbacks and tokens.
+                for name in names {
+                    switch name {
+                    case "ClaudeBridge": await ClaudeBridge.shared.startServer()
+                    case "MacControlBridge": MacControlBridge.shared.start()
+                    case "BrowserIPC": await BrowserWindowController.shared.startIPCServer()
+                    default: break
+                    }
+                }
+                let deadline = ContinuousClock.now.advanced(by: .seconds(3))
+                repeat {
+                    let rows = await doctorBridgeSnapshots().filter { names.contains($0.name) }
+                    if rows.allSatisfy({ $0.health.boundPort != nil }) {
+                        return .completed("Completed: rebound \(names.joined(separator: ", ")) and verified the listening ports.")
+                    }
+                    try await Task.sleep(for: .milliseconds(100))
+                } while ContinuousClock.now < deadline
+                return .unverified("Repair attempted: \(names.joined(separator: ", ")) did not confirm a bound port within 3 seconds.")
+            }
+        case DoctorLoopHealth.doctorCheckID:
+            return await DoctorLoopHealth.safeRepair(manager: backgroundLoopsManager.coreManager)
+        case let id where id.hasPrefix(DoctorLoopRecovery.checkPrefix):
+            return await DoctorLoopRecovery.repair(
+                checkID: check.id,
+                manager: backgroundLoopsManager,
+                dataRoot: requestedRoot
+            )
+        default: return await doctorCognitionRepair(for: check)
+        }
+    }
+
+    func doctorToolSnapshots() async throws -> [DoctorToolSnapshot] {
+        try await ToolsFacade(dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot())
+            .listAuthored().map { ($0.status, $0.name) }
+    }
+
+    func doctorAutonomySnapshot() async throws -> DoctorAutonomySnapshot {
+        let status = try await getAutonomyKernel()
+        return (status.enabled, status.disabledReason, status.status, status.mode, status.runningImprovements)
+    }
+
+    func doctorBridgeSnapshots() async -> [DoctorBridgeSnapshot] {
+        let browserIPC = await BrowserWindowController.shared.ipcListenerHealth
+        let bridges: [(name: String, health: NativeLoopbackListener.Health, expected: Bool)] = [
+            ("ClaudeBridge", ClaudeBridge.shared.listenerHealth, true),
+            ("MacControlBridge", MacControlBridge.shared.listenerHealth, MacControlBridge.startGateAllows()),
+            ("BrowserIPC", browserIPC, true),
+        ]
+        return bridges.map { ($0.name, ($0.health.failure, $0.health.boundPort, $0.health.isActive, $0.health.port), $0.expected) }
+    }
+
+    func doctorBackgroundLoopsCheck() async -> CheckResult {
+        await DoctorLoopHealth.doctorCheck(
+            dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        )
+    }
+
+    func doctorBackgroundLoopChecks() async -> [CheckResult] {
+        await DoctorLoopRecovery.checks(
+            manager: backgroundLoopsManager,
+            dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        )
+    }
+
+    func redactDoctorDetail(_ value: String) -> String {
+        NativeAppSecretRedactor.redactText(value)
     }
 }

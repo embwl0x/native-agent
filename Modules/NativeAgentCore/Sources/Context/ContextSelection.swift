@@ -169,15 +169,22 @@ public struct ContextSelector: Sendable {
             && need.queryEmbeddingModelFingerprint != nil
         let flooredMemoryIDs: Set<ContextAtomID> = floor > 0 && queryIsComparable
             ? Set(boundedCandidates.lazy.filter { atom in
-                guard atom.draft.kind == .memory,
+                guard atom.draft.kind == .memory || atom.draft.kind == .correction,
                       let embedding = atom.draft.embedding,
                       embedding.modelFingerprint == need.queryEmbeddingModelFingerprint,
                       let features = baseScores[atom.draft.id],
                       features.semanticCosine < floor else { return false }
+                // 2026-09-26: corrections too — three ambient ones rode 96-100%
+                // of turns. A correction's `activation` carries its record
+                // importance (0.7-0.95 on every live one), so for corrections
+                // only the working set counts as attention.
+                let attended = atom.draft.kind == .correction
+                    ? need.workingAtomIDs.contains(atom.draft.id)
+                    : features.activation >= 0.5
                 return features.lexicalExact < 1
                     && features.sharedIdentifiers <= 0
                     && features.messageCoverage < 0.5
-                    && features.activation < 0.5
+                    && !attended
             }.map(\.draft.id))
             : []
 

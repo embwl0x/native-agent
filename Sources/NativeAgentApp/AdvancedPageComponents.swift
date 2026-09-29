@@ -10,30 +10,6 @@ import SwiftUI
 // else is words on the sheet. Type comes from `ShellType`, colour from
 // `NativeAgentShell`, and nothing here paints a material.
 
-/// The one card the Advanced pages draw: a group of controls, or a list row.
-/// Today's fill and stroke at Today's radius, 16 of padding — the same card
-/// Setup's Advanced list uses for a route row.
-struct AdvancedCard<Content: View>: View {
-    var spacing: CGFloat = 12
-    @ViewBuilder var content: Content
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: spacing) {
-            content
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(16)
-        .background(
-            RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
-                .fill(TodayPalette.cardFill)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
-                .strokeBorder(TodayPalette.cardStroke, lineWidth: 1)
-        )
-    }
-}
-
 /// A section head, spelled exactly like the Advanced list's: 13 semibold,
 /// uppercase, 0.6 of tracking, on the sheet rather than on a plate.
 struct AdvancedEyebrow: View {
@@ -51,8 +27,7 @@ struct AdvancedSection<Content: View>: View {
     @ViewBuilder var content: Content
 
     /// Alive glass (2026-09-23): the kit's eyebrow over ONE group card, each
-    /// child a row with a hairline between. Only Capabilities uses it; the
-    /// plain `AdvancedCard` stays as it was for the classic knowledge graph.
+    /// child a row with a hairline between. Only Capabilities uses it.
     var body: some View {
         VStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
             AliveEyebrow(title)

@@ -1,7 +1,6 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-import MCPDispatcher
 import ToolRegistry
 
 // MARK: - Wave 13: dynamic source ports for capability_records() aggregator
@@ -152,11 +151,11 @@ public func promptSafeCapabilityText(_ raw: String?, limit: Int = 500) -> String
 public func listSkills(
     dataRoot: URL,
     persistence: any PersistenceCoreProtocol = SwiftNativePersistenceCore()
-) async -> [[String: JSONValue]] {
+) async throws -> [[String: JSONValue]] {
     let path = dataRoot
         .appendingPathComponent("skills", isDirectory: true)
         .appendingPathComponent("registry.json")
-    let raw = await persistence.readJSON(path, defaultValue: .array([]))
+    let raw = try await persistence.readJSON(path, ifMissing: .array([]))
     guard case .array(let items) = raw else { return [] }
     let dicts: [[String: JSONValue]] = items.compactMap {
         if case .object(let o) = $0 { return o }
@@ -317,11 +316,11 @@ private func pythonTitleCase(_ s: String) -> String {
 public func listTools(
     dataRoot: URL,
     persistence: any PersistenceCoreProtocol = SwiftNativePersistenceCore()
-) async -> [[String: JSONValue]] {
+) async throws -> [[String: JSONValue]] {
     let path = dataRoot
         .appendingPathComponent("tools", isDirectory: true)
         .appendingPathComponent("registry.json")
-    let raw = await persistence.readJSON(path, defaultValue: .array([]))
+    let raw = try await persistence.readJSON(path, ifMissing: .array([]))
     guard case .array(let items) = raw else { return [] }
     let dicts: [[String: JSONValue]] = items.compactMap {
         if case .object(let o) = $0 { return o }
@@ -352,7 +351,7 @@ public func listTools(
 public func manifestRegisteredSkills(
     dataRoot: URL,
     persistence: any PersistenceCoreProtocol = SwiftNativePersistenceCore()
-) async -> [String: JSONValue] {
+) async throws -> [String: JSONValue] {
     var merged: [String: JSONValue] = [
         "schemaVersion": .int(1),
         "skills": .object([:]),
@@ -376,9 +375,9 @@ public func manifestRegisteredSkills(
     pathsToScan.append(modernPath)
 
     for path in pathsToScan {
-        let raw = await persistence.readJSON(
+        let raw = try await persistence.readJSON(
             path,
-            defaultValue: .object(["schemaVersion": .int(1), "skills": .object([:])])
+            ifMissing: .object(["schemaVersion": .int(1), "skills": .object([:])])
         )
         guard case .object(let topObj) = raw,
               case .object(let skills) = topObj["skills"] ?? .null else {
@@ -409,7 +408,7 @@ public func manifestRegisteredSkills(
 public func manifestRegisteredSkillsOrdered(
     dataRoot: URL,
     persistence: any PersistenceCoreProtocol = SwiftNativePersistenceCore()
-) async -> (schemaVersion: Int, skills: [(String, JSONValue)]) {
+) async throws -> (schemaVersion: Int, skills: [(String, JSONValue)]) {
     var ordered: [(String, JSONValue)] = []
     var indexByKey: [String: Int] = [:]
 
@@ -429,9 +428,9 @@ public func manifestRegisteredSkillsOrdered(
     pathsToScan.append(modernPath)
 
     for path in pathsToScan {
-        let raw = await persistence.readJSON(
+        let raw = try await persistence.readJSON(
             path,
-            defaultValue: .object(["schemaVersion": .int(1), "skills": .object([:])])
+            ifMissing: .object(["schemaVersion": .int(1), "skills": .object([:])])
         )
         guard case .object(let topObj) = raw,
               case .object(let skills) = topObj["skills"] ?? .null else {
@@ -475,11 +474,11 @@ public func listWorkflows(
     dataRoot: URL,
     nowISO: String,
     persistence: any PersistenceCoreProtocol = SwiftNativePersistenceCore()
-) async -> [[String: JSONValue]] {
+) async throws -> [[String: JSONValue]] {
     let path = dataRoot
         .appendingPathComponent("workflows", isDirectory: true)
         .appendingPathComponent("registry.json")
-    let raw = await persistence.readJSON(path, defaultValue: .array([]))
+    let raw = try await persistence.readJSON(path, ifMissing: .array([]))
     let savedDicts: [[String: JSONValue]]
     if case .array(let items) = raw {
         savedDicts = items.compactMap {
@@ -594,33 +593,8 @@ public func workflowDefaults(nowISO: String) -> [[String: JSONValue]] {
 
 // MARK: - Source #6: list_mcp_servers
 //
-// Port of the retired daemon — defers to SwiftNativeMCPDispatcher
-// which already implements the byte-identical merge logic at
-// MCPDispatcher.swift:518. We re-shape its [MCPServer] output into the
-// dict-bag form the aggregator consumes.
-//
-// Read uses the cache; the dispatcher's actor TTL keeps subsequent reads
-// from re-hitting disk if multiple aggregator calls land in a 60-second
-// window.
-public func listMCPServersAsDicts(
-    dataRoot: URL,
-    dispatcher: SwiftNativeMCPDispatcher? = nil,
-    persistence: any PersistenceCoreProtocol = SwiftNativePersistenceCore()
-) async -> [[String: JSONValue]] {
-    let disp = dispatcher ?? SwiftNativeMCPDispatcher(
-        root: dataRoot, persistence: persistence
-    )
-    let servers: [MCPServer]
-    do {
-        servers = try await disp.listServers()
-    } catch {
-        return []
-    }
-    return servers.compactMap {
-        if case .object(let dict) = $0.toJSON() { return dict }
-        return nil
-    }
-}
+// The MCP owner lists its servers (MCPDispatcher's `listMCPServersAsDicts`);
+// the caller hands that listing in, so TrustCenter imports no executor.
 
 // MARK: - Source #7: list_capability_catalog
 //
@@ -631,11 +605,11 @@ public func listCapabilityCatalog(
     dataRoot: URL,
     nowISO: String,
     persistence: any PersistenceCoreProtocol = SwiftNativePersistenceCore()
-) async -> [[String: JSONValue]] {
+) async throws -> [[String: JSONValue]] {
     let path = dataRoot
         .appendingPathComponent("catalog", isDirectory: true)
         .appendingPathComponent("registry.json")
-    let raw = await persistence.readJSON(path, defaultValue: .array([]))
+    let raw = try await persistence.readJSON(path, ifMissing: .array([]))
     let savedDicts: [[String: JSONValue]]
     if case .array(let items) = raw {
         savedDicts = items.compactMap {
@@ -752,8 +726,8 @@ public func capabilityRecordsFull(
     personaRoot: URL? = nil,
     nowISO: String,
     persistence: any PersistenceCoreProtocol = SwiftNativePersistenceCore(),
-    mcpDispatcher: SwiftNativeMCPDispatcher? = nil
-) async -> [[String: JSONValue]] {
+    mcpServers: @Sendable () async -> [[String: JSONValue]]
+) async throws -> [[String: JSONValue]] {
 
     var records: [[String: JSONValue]] = []
 
@@ -782,7 +756,7 @@ public func capabilityRecordsFull(
     }
 
     // 2. list_skills + persona_skill_manifest_records → kind: skill
-    let skills = await listSkills(dataRoot: dataRoot, persistence: persistence)
+    let skills = try await listSkills(dataRoot: dataRoot, persistence: persistence)
     let personaSkills = personaSkillManifestRecords(
         personaRoot: personaRoot ?? PersistenceCore.defaultPersonaRoot(dataRoot: dataRoot)
     )
@@ -812,7 +786,7 @@ public func capabilityRecordsFull(
     }
 
     // 3. list_tools → kind: tool
-    let tools = await listTools(dataRoot: dataRoot, persistence: persistence)
+    let tools = try await listTools(dataRoot: dataRoot, persistence: persistence)
     for tool in tools.prefix(150) {
         var rec: [String: JSONValue] = [:]
         let tid = jsonString(tool, "id")
@@ -846,7 +820,7 @@ public func capabilityRecordsFull(
     // `list(manifest_skills.items())[:150]` (insertion order: legacy first,
     // then any modern-only keys). The dict-returning variant above loses
     // order via Swift's unordered dictionary.
-    let manifestOrdered = await manifestRegisteredSkillsOrdered(
+    let manifestOrdered = try await manifestRegisteredSkillsOrdered(
         dataRoot: dataRoot, persistence: persistence
     )
     for (manifestName, entry) in manifestOrdered.skills.prefix(150) {
@@ -888,7 +862,7 @@ public func capabilityRecordsFull(
     }
 
     // 5. list_workflows → kind: workflow
-    let workflows = await listWorkflows(
+    let workflows = try await listWorkflows(
         dataRoot: dataRoot, nowISO: nowISO, persistence: persistence
     )
     for workflow in workflows.prefix(100) {
@@ -957,9 +931,7 @@ public func capabilityRecordsFull(
     }
 
     // 7. list_mcp_servers → kind: mcp
-    let servers = await listMCPServersAsDicts(
-        dataRoot: dataRoot, dispatcher: mcpDispatcher, persistence: persistence
-    )
+    let servers = await mcpServers()
     for server in servers.prefix(50) {
         var rec: [String: JSONValue] = [:]
         let sid = jsonString(server, "id")
@@ -994,7 +966,7 @@ public func capabilityRecordsFull(
     }
 
     // 8. list_capability_catalog → kind: catalog
-    let catalog = await listCapabilityCatalog(
+    let catalog = try await listCapabilityCatalog(
         dataRoot: dataRoot, nowISO: nowISO, persistence: persistence
     )
     for item in catalog {

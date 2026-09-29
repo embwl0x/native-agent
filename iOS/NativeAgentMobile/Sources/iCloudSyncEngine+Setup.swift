@@ -189,13 +189,18 @@ extension iCloudSyncEngine {
     }
 
     func tearDown() {
+        providerSignIns = [:]
         lifecycleGeneration &+= 1
+        schedulerSnapshot = nil
+        schedulerJobReceiptTimes = [:]
+        schedulerError = nil
         snapshotRefreshGeneration &+= 1
         targetedRefreshGeneration &+= 1
         chatTranscriptsRefreshGeneration &+= 1
         chatSessionListRefreshGeneration &+= 1
         NotificationCenter.default.removeObserver(self)
         snapshotDir = nil
+        helpersSnapshot = nil
         inboxDir = nil
         responsesDir = nil
         transactionDir = nil
@@ -336,9 +341,7 @@ extension iCloudSyncEngine {
             } else {
                 // Legacy timestamp-only publishers did not identify the
                 // changed group, so compatibility requires one complete read.
-                if await self.refreshSnapshots() {
-                    self.noteTransportDelivery(groups: Set(NAMobileSnapshotGroup.allCases))
-                }
+                await self.refreshSnapshots(recordTransportDelivery: true)
             }
         }
     }
@@ -359,12 +362,16 @@ extension iCloudSyncEngine {
             return await refreshChatTranscriptsSnapshot()
         case .desk:
             return await refreshDeskSnapshot()
+        case .scheduler:
+            return await refreshSchedulerSnapshot()
         case .activity:
             return await refreshActivitySnapshot()
         case .advanced:
-            // Both files belong to this group: a half-read group is not fresh.
+            // Summaries and runs must both land. Older Macs do not publish helpers;
+            // its views report their own refresh failures.
             let summaries = await refreshTurnSummariesSnapshot()
             let runs = await refreshRunsSnapshot() == .refreshed
+            await refreshHelpersSnapshot()
             return summaries && runs
         }
     }

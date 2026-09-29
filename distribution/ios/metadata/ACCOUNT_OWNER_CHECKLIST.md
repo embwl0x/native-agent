@@ -3,7 +3,39 @@
 These steps require the NativeAgent Apple Developer/App Store Connect account
 and cannot be completed or truthfully verified from source alone.
 
+## 0.5.0 build 15 — 2026-09-25
+
+- [x] Claude's redesign and notification/approval fixes landed on private
+  `main` at `dcda587ec`; this candidate bumps iOS to `0.5.0 (15)`.
+- [x] Signed archive and local IPA export passed the release script from clean
+  commit `c032c937c`; fresh production CloudKit schema, App Store signing,
+  APNS, entitlements, privacy metadata, and icon checks passed. The archive
+  completed with no compiler warnings.
+- [x] Uploaded `0.5.0 (15)` through Xcode on 2026-09-25 at 17:24 CDT; Xcode
+  reports **Uploaded to Apple**. This confirms transfer, not processing or
+  TestFlight availability.
+- [x] Apple processing completed; App Store Connect reports build 15
+  **Validated**, with production APNS/CloudKit entitlements, iOS minimum 17.0,
+  and no non-exempt encryption. The User Internal group (one tester) is attached,
+  and build-specific What to Test guidance is saved.
+- [x] Created the public `0.5.0` version draft in App Store Connect and saved
+  its updated What's New text, promotional text, and App Review notes. Build 15
+  is selected and saved; the version is **Ready for Review** in a draft
+  submission. The final Submit for Review action has not been taken.
+- [ ] Install the processed build on the physical phone and check chat,
+  background and tapped notifications, and approval cards with the current Mac.
+- [ ] Submit the ready `0.5.0` App Store draft for review after the physical
+  check. Existing App Store screenshots still show the older UI; refresh them
+  from the installed release when feasible.
+- The Mac's proposal-approval action needs the next Mac DMG. Older Mac builds
+  show “Answer on your Mac” on those cards; do not claim remote proposal
+  decisions are available before that Mac release.
+
 ## 0.4.11 upload — 2026-09-12
+
+App Store Connect showed `0.4.11` as **Ready for Distribution** on 2026-09-25;
+the earlier unchecked processing and submission items below are historical
+checklist entries, not the current live status.
 
 - [x] Prepared `0.4.11 (14)` from approved private source `a1d4494df` plus
   version/build and release-note changes in

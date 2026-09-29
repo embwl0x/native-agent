@@ -21,7 +21,7 @@
 // WRITE paths (forget_entity, merge_two_entities, add_edge, extract_*) and the
 // batched flush/timer persistence machinery are deliberately NOT ported here —
 // they require the cross-process file lock and stay
-// HTTP-backed. See CUTOVER_PLAN.md §6.34.
+// HTTP-backed.
 //
 // The `/v1/graph/*` family is a SEPARATE subsystem (Runtime.build_graph_index
 // over executions + memories + embeddings) and is NOT in scope for this module.

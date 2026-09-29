@@ -217,6 +217,10 @@ final class InboxStore: ObservableObject {
             "source": item.source,
             "screen": "activity"
         ]
+        if let approvalID = item.related_approval_id, !approvalID.isEmpty {
+            userInfo.removeValue(forKey: "itemId")
+            userInfo["approvalId"] = approvalID
+        }
         let eventID = NativeAgentDeviceEventIdentity.notification(userInfo: userInfo)
         userInfo["eventId"] = eventID
 
@@ -249,12 +253,12 @@ final class InboxStore: ObservableObject {
             content.sound = .default
             content.badge = NSNumber(value: badgeCount)
             content.userInfo = ["screen": "activity", "source": "inbox_batch"]
-            let request = UNNotificationRequest(
-                identifier: "nativeagent.inbox.batch.\(UUID().uuidString)",
-                content: content,
-                trigger: UNTimeIntervalNotificationTrigger(timeInterval: 1, repeats: false)
-            )
             do {
+                let request = UNNotificationRequest(
+                    identifier: "nativeagent.inbox.batch.\(UUID().uuidString)",
+                    content: try await CommunicationNotification.decorate(content),
+                    trigger: UNTimeIntervalNotificationTrigger(timeInterval: 1, repeats: false)
+                )
                 try await UNUserNotificationCenter.current().add(request)
                 NSLog("[InboxStore] scheduled batch notification for %d cards", newUnreadCount)
             } catch {
@@ -300,12 +304,16 @@ struct InboxView: View {
         visibleItems.filter { !$0.isUnread && $0.status != "dismissed" && $0.status != "archived" }
     }
 
-    private var agentDisplayName: String {
-        sync.agentDisplayName
-    }
-
     private var earlierSection: InboxListPresentation.EarlierSection {
         InboxListPresentation.earlierSection(items: read, showsAll: showsAllEarlier)
+    }
+
+    private var headerLine: String {
+        switch active.count {
+        case 0: return "Nothing new from me."
+        case 1: return "One new thing from me."
+        default: return "\(AliveWords.spelled(active.count)) new things from me."
+        }
     }
 
     var body: some View {
@@ -320,30 +328,19 @@ struct InboxView: View {
 
     @ViewBuilder
     private var inboxContent: some View {
-        VStack(spacing: 0) {
-            if let err = store.bannerError {
-                VStack(spacing: 0) {
-                    InboxBannerView(message: err)
-                        .transition(.move(edge: .top).combined(with: .opacity))
-                }
-                .animation(AppMotion.snappy, value: store.bannerError)
+        // E6: freshness of the Mac snapshot behind this list.
+        AlivePage(title: "Inbox", line: headerLine, freshnessGroup: "inbox") {
+            if store.isLoading { ProgressView().controlSize(.small) }
+        } content: {
+            // "Pair to view" is already said by the header and its Pair with Mac.
+            if let err = store.bannerError, err != "Pair to view" {
+                InboxBannerView(message: err)
+                    .transition(.move(edge: .top).combined(with: .opacity))
             }
             listContent
         }
-        .mobileReadingScreen()
-        .navigationTitle("Inbox")
+        .animation(AppMotion.snappy, value: store.bannerError)
         .macSyncErrorBanner()
-        .safeAreaInset(edge: .top, spacing: 0) { MacStatusChip().frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 16) }
-        // E6: freshness of the Mac snapshot behind this list.
-        .macSnapshotFreshnessBadge(group: "inbox")
-        .toolbar {
-
-            ToolbarItem(placement: .navigationBarTrailing) {
-                if store.isLoading {
-                    ProgressView().scaleEffect(0.8)
-                }
-            }
-        }
         .refreshable {
             await store.refresh(client: bridgeClient, pairingStore: pairingStore)
         }
@@ -373,111 +370,110 @@ struct InboxView: View {
         }
     }
 
+    private func card(_ item: InboxItemRecord) -> some View {
+        InboxCardRow(item: item, onAction: { action in
+            Task {
+                await store.performAction(
+                    id: item.id,
+                    actionID: action,
+                    client: bridgeClient,
+                    pairingStore: pairingStore
+                )
+            }
+        }, onView: {
+            selectedDetailItem = item
+        })
+        .swipeActions(edge: .trailing) {
+            Button("Dismiss") {
+                Task {
+                    await store.performAction(id: item.id, actionID: "dismiss",
+                                              client: bridgeClient, pairingStore: pairingStore)
+                }
+            }
+            .tint(.gray)
+        }
+    }
+
     @ViewBuilder
     private var listContent: some View {
         if store.isLoading && MobileDesignSamples.rows(store.items).isEmpty {
-            ProgressView("Loading inbox…")
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            ProgressView("Checking with your Mac…")
+                .tint(AlivePalette.secondary)
+                .foregroundStyle(AlivePalette.secondary)
+                .frame(maxWidth: .infinity)
+                .padding(.top, 48)
         } else if MobileDesignSamples.rows(store.items).isEmpty {
-            MobileReadingEmptyState(
-                title: "Inbox empty",
-                systemImage: "tray",
-                kind: .empty,
-                description: "\(agentDisplayName) will surface things here when something is worth flagging.",
-                tint: NativeAgentPalette.agentAccent
-            )
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Nothing here yet.")
+                    .font(.system(.title3, design: .serif))
+                    .foregroundStyle(AlivePalette.text)
+                Text("When I notice something worth your attention, I'll leave it here.")
+                    .font(.subheadline)
+                    .foregroundStyle(AlivePalette.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Button("Check again") {
+                    Task { await store.refresh(client: bridgeClient, pairingStore: pairingStore) }
+                }
+                .aliveSecondaryButton()
+                .font(.subheadline.weight(.semibold))
+                .padding(.top, 4)
+            }
+            .padding(20)
+            .aliveCard()
         } else {
-            List {
-                if let groupFilter {
-                    Section {
-                        MobileAdaptiveRow(spacing: 12) {
-                            Image(systemName: "line.3.horizontal.decrease.circle")
-                                .foregroundStyle(.secondary)
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text(groupFilter.title)
-                                    .font(.headline)
-                                Text("\(active.count) unread, \(read.count) earlier")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-                            Spacer()
-                            Button("Clear") {
-                                withAnimation(AppMotion.snappy) {
-                                    self.groupFilter = nil
-                                    showsAllEarlier = false
-                                }
-                            }
-                            .font(.callout)
+            // One native row per card, in New and Earlier sections (User 09-27:
+            // all native); swipe to dismiss.
+            if let groupFilter {
+                Section {
+                    HStack(spacing: 12) {
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(groupFilter.title)
+                                .font(.body.weight(.medium))
+                                .foregroundStyle(AlivePalette.text)
+                            Text("\(active.count) new, \(read.count) earlier")
+                                .font(.footnote)
+                                .foregroundStyle(AlivePalette.secondary)
                         }
-                    }
-                    .listRowBackground(Color.clear)
-                    .listRowSeparator(.hidden)
-                    .listRowInsets(EdgeInsets(top: 6, leading: 16, bottom: 6, trailing: 16))
-                }
-
-                if !active.isEmpty {
-                    Section("Unread (\(active.count))") {
-                        ForEach(active) { item in
-                            InboxCardRow(item: item, onAction: { action in
-                                Task {
-                                    await store.performAction(
-                                        id: item.id,
-                                        actionID: action,
-                                        client: bridgeClient,
-                                        pairingStore: pairingStore
-                                    )
-                                }
-                            }, onView: {
-                                selectedDetailItem = item
-                            })
-                            .listRowBackground(Color.clear)
-                            .listRowSeparator(.hidden)
-                            .listRowInsets(EdgeInsets(top: 6, leading: 16, bottom: 6, trailing: 16))
+                        Spacer()
+                        Button("Show all") {
+                            withAnimation(AppMotion.snappy) {
+                                self.groupFilter = nil
+                                showsAllEarlier = false
+                            }
                         }
+                        .aliveSecondaryButton()
+                        .font(.subheadline.weight(.semibold))
                     }
                 }
+            }
 
-                let earlier = earlierSection
-                if !earlier.visibleItems.isEmpty {
-                    Section("Earlier (\(earlier.totalCount))") {
-                        ForEach(earlier.visibleItems) { item in
-                            InboxCardRow(item: item, onAction: { action in
-                                Task {
-                                    await store.performAction(
-                                        id: item.id,
-                                        actionID: action,
-                                        client: bridgeClient,
-                                        pairingStore: pairingStore
-                                    )
-                                }
-                            }, onView: {
-                                selectedDetailItem = item
-                            })
-                            .listRowBackground(Color.clear)
-                            .listRowSeparator(.hidden)
-                            .listRowInsets(EdgeInsets(top: 6, leading: 16, bottom: 6, trailing: 16))
+            if !active.isEmpty {
+                Section("New") {
+                    ForEach(active) { item in card(item) }
+                }
+            }
+
+            let earlier = earlierSection
+            if !earlier.visibleItems.isEmpty {
+                Section("Earlier") {
+                    ForEach(earlier.visibleItems) { item in card(item) }
+
+                    if earlier.hiddenCount > 0 {
+                        Button("Show \(earlier.hiddenCount) more") {
+                            withAnimation(AppMotion.snappy) {
+                                showsAllEarlier = true
+                            }
                         }
-
-                        if earlier.hiddenCount > 0 {
-                            Button("Show \(earlier.hiddenCount) more earlier") {
-                                withAnimation(AppMotion.snappy) {
-                                    showsAllEarlier = true
-                                }
+                    } else if showsAllEarlier,
+                              earlier.totalCount > InboxListPresentation.earlierPreviewLimit {
+                        Button("Show fewer") {
+                            withAnimation(AppMotion.snappy) {
+                                showsAllEarlier = false
                             }
-                            .font(.callout)
-                        } else if showsAllEarlier,
-                                  earlier.totalCount > InboxListPresentation.earlierPreviewLimit {
-                            Button("Show fewer earlier") {
-                                withAnimation(AppMotion.snappy) {
-                                    showsAllEarlier = false
-                                }
-                            }
-                            .font(.callout)
                         }
                     }
                 }
             }
-            .listStyle(.plain)
         }
     }
 }
@@ -509,6 +505,25 @@ enum InboxListPresentation {
 
 // MARK: - Card row
 
+extension InboxItemRecord {
+    /// Where a card came from, in plain words (the badge label is plumbing).
+    var sourceWords: String {
+        if hasLinkedApproval { return "Asking first" }
+        if source.hasPrefix("proactive_autonomy") { return "An idea" }
+        if source.hasPrefix("harness_learning") { return "Something I learned" }
+        if source == "dream_cycle" { return "A dream" }
+        if source == "rem_cycle" { return "From my rest" }
+        if source.hasPrefix("trigger:file_watch") { return "A file changed" }
+        if source.hasPrefix("trigger:morning_brief") { return "Your morning brief" }
+        if source.hasPrefix("trigger:stuck_pattern") { return "A pattern I noticed" }
+        if source == "idle_checkin" { return "Checking in" }
+        if source.hasPrefix("execution_complete") || source.hasPrefix("mission_complete") { return "Work finished" }
+        if source == "self_test" { return "A self-check" }
+        if source == "desk" { return "From the Desk" }
+        return "A note from me"
+    }
+}
+
 struct InboxCardRow: View {
     let item: InboxItemRecord
     let onAction: (String) -> Void
@@ -532,134 +547,101 @@ struct InboxCardRow: View {
         actionIDs.contains("approve")
     }
 
+    private var showsView: Bool {
+        actionIDs.contains("view") || item.detail?.isEmpty == false
+    }
+
     private var rejectActionID: String? {
         if actionIDs.contains("reject") { return "reject" }
         if actionIDs.contains("deny") { return "deny" }
         return nil
     }
 
+    private var kindLine: String {
+        item.relativeCreatedAt.isEmpty ? item.sourceWords : "\(item.sourceWords) · \(item.relativeCreatedAt)"
+    }
+
     var body: some View {
-        MobileReadingSurface {
-            VStack(alignment: .leading, spacing: 12) {
-
-                // Header
-                MobileAdaptiveRow(alignment: .top, spacing: 12) {
-                    ZStack(alignment: .topTrailing) {
-                        Image(systemName: item.sourceIcon)
-                            .font(.body)
-                            .foregroundStyle(.secondary)
-                            .frame(width: 22)
-                            .padding(.top, 2)
-                        if item.isUnread {
-                            Image(systemName: "circle.fill").font(.caption2).foregroundStyle(.secondary)
-                                .offset(x: 6, y: -2)
-                        }
-                    }
-
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(item.title)
-                            .font(.headline)
-                            .foregroundStyle(.primary)
-                            .fixedSize(horizontal: false, vertical: true)
-
-                        // Source badge
-                        Text(item.sourceBadgeLabel)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .padding(.horizontal, 7)
-                            .padding(.vertical, 2)
-                            .background(NativeAgentMobileTheme.Colors.quietFill, in: Capsule())
-                    }
-
-                    Spacer()
-
-                    // Created-at
-                    if !item.relativeCreatedAt.isEmpty {
-                        Text(item.relativeCreatedAt)
-                            .font(.caption)
-                            .foregroundStyle(.tertiary)
-                    }
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                if item.isUnread {
+                    AliveWaitingDot()
+                        .alignmentGuide(.firstTextBaseline) { $0[VerticalAlignment.center] + 4 }
                 }
+                Text(kindLine)
+                    .font(.caption)
+                    .foregroundStyle(AlivePalette.secondary)
+            }
 
-                // Body (no truncation)
+            Text(item.title)
+                .font(.body.weight(.medium))
+                .foregroundStyle(AlivePalette.text)
+                .fixedSize(horizontal: false, vertical: true)
+
+            // Body (no truncation)
+            if !item.summary.isEmpty {
                 Text(item.summary)
-                    .font(.body)
-                    .foregroundStyle(.secondary)
+                    .font(.subheadline)
+                    .foregroundStyle(AlivePalette.secondary)
                     .fixedSize(horizontal: false, vertical: true)
+            }
 
-                // Action buttons
-                ScrollView(.horizontal, showsIndicators: false) {
-                    MobileAdaptiveRow(spacing: 12) {
-                    if actionIDs.contains("view") || item.detail?.isEmpty == false {
-                        Button("View") {
-                            onView()
-                            if item.isUnread { onAction("read") }
-                        }
-                        .buttonStyle(.borderedProminent)
-                    .foregroundStyle(NativeAgentMobileTheme.Colors.onAccent)
-                        .font(.callout)
-                    }
-
+            // Actions: one primary (Approve, else Read), the rest quiet.
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
                     if hasApproveAction {
-                        Button {
-                            onAction("approve")
-                        } label: {
-                            Label("Approve", systemImage: "checkmark")
-                                .font(.headline)
-                                .foregroundStyle(NativeAgentMobileTheme.Colors.onAccent)
-                                .frame(minHeight: 44)
-                                .padding(.horizontal, 16)
-                                .padding(.vertical, 8)
-                                .background { Capsule().fill(NativeAgentMobileTheme.Colors.accentText) }
-                        }
-                        .buttonStyle(.plain)
+                        Button("Approve") { onAction("approve") }
+                            .alivePrimaryButton()
                     }
 
                     if let rejectActionID {
-                        Button {
-                            onAction(rejectActionID)
-                        } label: {
-                            Label("Deny", systemImage: "xmark")
-                                .font(.headline)
+                        Button("Deny") { onAction(rejectActionID) }
+                            .aliveSecondaryButton()
+                    }
+
+                    if showsView {
+                        if hasApproveAction {
+                            Button("Read") {
+                                onView()
+                                if item.isUnread { onAction("read") }
+                            }
+                            .aliveSecondaryButton()
+                        } else {
+                            Button("Read") {
+                                onView()
+                                if item.isUnread { onAction("read") }
+                            }
+                            .alivePrimaryButton()
                         }
-                        .buttonStyle(.bordered)
-                .tint(.secondary)
                     }
 
                     if actionIDs.contains("act") {
-                        Button(item.source.hasPrefix("trigger:file_watch") ? "Open File" : "Act") {
+                        Button(item.source.hasPrefix("trigger:file_watch") ? "Open file" : "Go ahead") {
                             onAction("act")
                         }
-                            .buttonStyle(.bordered)
-                .tint(.secondary)
-                            .font(.callout)
+                        .aliveSecondaryButton()
                     }
 
                     if showsArchive {
                         Button("Archive") { onAction("archive") }
-                            .buttonStyle(.bordered)
-                .tint(.secondary)
-                            .font(.callout)
+                            .aliveSecondaryButton()
                     }
 
-                    // Dismiss button
                     Button("Dismiss") { onAction("dismiss") }
-                        .buttonStyle(.bordered)
-                .tint(.secondary)
-                        .font(.callout)
+                        .aliveSecondaryButton()
 
                     // Card-specific extra actions (filter out standard ones we already show)
                     ForEach(extraActions, id: \.id) { action in
                         Button(action.label) { onAction(action.id) }
-                            .buttonStyle(.bordered)
-                .tint(.secondary)
-                            .font(.callout)
+                            .aliveSecondaryButton()
                     }
-
                 }
-                }
+                .font(.subheadline.weight(.semibold))
+                .padding(.top, 2)
             }
         }
+        .aliveRow()
+        .aliveCard()
     }
 }
 
@@ -676,64 +658,69 @@ struct InboxDetailSheet: View {
     var body: some View {
         NavigationStack {
             ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
-                    MobileReadingSurface {
-                        VStack(alignment: .leading, spacing: 8) {
-                            Text(item.title)
-                                .font(.headline)
-                            Text(item.sourceBadgeLabel)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: 20) {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(item.relativeCreatedAt.isEmpty ? item.sourceWords : "\(item.sourceWords) · \(item.relativeCreatedAt)")
+                            .font(.caption)
+                            .foregroundStyle(AlivePalette.secondary)
+                        Text(item.title)
+                            .font(.system(.title2, design: .serif))
+                            .foregroundStyle(AlivePalette.text)
+                            .fixedSize(horizontal: false, vertical: true)
+                        if !item.summary.isEmpty {
+                            Text(item.summary)
+                                .font(.body)
+                                .foregroundStyle(AlivePalette.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
                         }
                     }
-                    Text(item.summary)
-                        .font(.body)
-                        .foregroundStyle(.secondary)
+                    .padding(.horizontal, 4)
+
                     if let detail = item.detail, !detail.isEmpty {
                         Text(detail)
-                            .font(.system(.caption, design: .monospaced))
+                            .font(.system(.footnote, design: .monospaced))
+                            .foregroundStyle(AlivePalette.text)
                             .textSelection(.enabled)
                             .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(AliveMetrics.rowInsetH)
+                            .aliveCard()
                     }
+
                     if !relatedGroups.isEmpty {
-                        VStack(alignment: .leading, spacing: 12) {
-                            Text("Review Groups")
-                                .font(.headline)
-                            ForEach(relatedGroups) { group in
-                                Button {
-                                    onOpenGroup(group)
-                                } label: {
-                                    MobileAdaptiveRow(spacing: 12) {
-                                        Image(systemName: "tray.full")
-                                            .foregroundStyle(.secondary)
-                                        VStack(alignment: .leading, spacing: 4) {
-                                            Text(group.title)
-                                                .font(.callout)
-                                                .foregroundStyle(.primary)
-                                                .multilineTextAlignment(.leading)
-                                            Text("\(group.displayCount) item\(group.displayCount == 1 ? "" : "s")")
-                                                .font(.caption)
-                                                .foregroundStyle(.secondary)
+                        VStack(alignment: .leading, spacing: 10) {
+                            AliveEyebrow("Related")
+                            AliveCard {
+                                ForEach(Array(relatedGroups.enumerated()), id: \.element.id) { index, group in
+                                    if index > 0 { AliveDivider() }
+                                    Button {
+                                        onOpenGroup(group)
+                                    } label: {
+                                        HStack(spacing: 12) {
+                                            VStack(alignment: .leading, spacing: 3) {
+                                                Text(group.title)
+                                                    .font(.body)
+                                                    .foregroundStyle(AlivePalette.text)
+                                                    .multilineTextAlignment(.leading)
+                                                Text(AliveWords.count(group.displayCount, "item"))
+                                                    .font(.footnote)
+                                                    .foregroundStyle(AlivePalette.secondary)
+                                            }
+                                            Spacer()
+                                            AliveChevron()
                                         }
-                                        Spacer()
-                                        Image(systemName: "chevron.right")
-                                            .font(.caption)
-                                            .foregroundStyle(.tertiary)
+                                        .aliveRow()
+                                        .contentShape(Rectangle())
                                     }
-                                    .padding(.horizontal, 12)
-                                    .padding(.vertical, 10)
-                                    .background(NativeAgentMobileTheme.Colors.quietFill, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                                    .buttonStyle(.plain)
                                 }
-                                .buttonStyle(.plain)
                             }
                         }
                     }
                 }
-                .padding(16)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 8)
             }
-            .mobileReadingScreen()
-            .navigationTitle("Inbox Item")
-            .navigationBarTitleDisplayMode(.inline)
+            .alivePageChrome(title: "Inbox Item", root: false)
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Done") { onDone() }
@@ -767,15 +754,6 @@ private struct InboxBannerView: View {
     let message: String
 
     var body: some View {
-        MobileAdaptiveRow(spacing: 8) {
-            Image(systemName: "wifi.slash").font(.caption.weight(.semibold))
-            Text(message).font(.callout).fixedSize(horizontal: false, vertical: true)
-            Spacer()
-        }
-        .foregroundStyle(.primary)
-        .padding(.horizontal, 16)
-        .padding(.vertical, 10)
-        .background(NativeAgentMobileTheme.Colors.contentSurface)
-        .ignoresSafeArea(edges: .horizontal)
+        AliveStatusNote(systemImage: "wifi.slash", text: message)
     }
 }

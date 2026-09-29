@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import TrustCenter
 #if canImport(CryptoKit)
 import CryptoKit
 #endif
@@ -528,7 +529,7 @@ public struct CGEventSink: MacEventSink {
 
     public func post(key event: MacKeyEvent) {
         guard let cg = keyEvent(event) else { return }
-        NativeAgentMotorEpoch.noteAgentMotorEvent()
+        NativeAgentMotorEpoch.notePostedHIDEvent()
         cg.post(tap: .cghidEventTap)
     }
 
@@ -588,7 +589,7 @@ public struct CGEventSink: MacEventSink {
         // every consumer that watches that clock. It is tagged like any other
         // motor output; consumers separate it from human input by comparing the
         // two ages, not by leaving our own events unrecorded.
-        NativeAgentMotorEpoch.noteAgentMotorEvent()
+        NativeAgentMotorEpoch.notePostedHIDEvent()
         cg.post(tap: .cghidEventTap)
     }
 
@@ -607,7 +608,7 @@ public struct CGEventSink: MacEventSink {
             value: NativeAgentMacEventIdentity.sourceUserData
         )
         cg.flags.formUnion(flags(event.modifiers))
-        NativeAgentMotorEpoch.noteAgentMotorEvent()
+        NativeAgentMotorEpoch.notePostedHIDEvent()
         cg.post(tap: .cghidEventTap)
     }
 }
@@ -623,41 +624,7 @@ public struct UnavailableMacEventSink: MacEventSink {
     public func post(scroll: MacScrollEvent) {}
 }
 
-/// Reports available (so reachability/gating logic behaves as in production —
-/// a test that asserts "keystroke dispatches" must still see `status: typed`)
-/// but swallows every event. Used ONLY under a test harness so `swift test`
-/// cannot post real CGEvents into the host's frontmost app. Distinct from
-/// `UnavailableMacEventSink`, which reports UNavailable and would flip the
-/// dispatch decision.
-public struct InertAvailableMacEventSink: MacEventSink {
-    public init() {}
-    public var isAvailable: Bool { true }
-    public func post(key: MacKeyEvent) {}
-    public func post(mouse: MacMouseEvent) {}
-    public func post(scroll: MacScrollEvent) {}
-}
-
-/// True when the process is a test run. DELIBERATELY class-linkage-only:
-/// `XCTestCase` is linked into every `swift test` runner process (XCTest and
-/// swift-testing alike) and into NO shipped app build — while environment
-/// probes (XCTestConfigurationFilePath / SWIFT_TESTING) can be injected into a
-/// production launch via launchctl setenv or a wrapper, which would silently
-/// make her Mac control inert-but-"successful" (gpt-5.5 review 2026-08-13
-/// NEEDS-FIX #2/#3). A class-linkage probe cannot be spoofed by environment.
-private func isRunningUnderTestHarness() -> Bool {
-    NSClassFromString("XCTestCase") != nil
-}
-
 public func defaultMacEventSink() -> any MacEventSink {
-    // Load-bearing safety gate: a bare `swift test` holds the host's
-    // Accessibility grant, so the real CGEvent sink would type and click into
-    // whatever app is frontmost. Route tests to an inert-but-available sink so
-    // reachability assertions still pass while NO real input reaches the host.
-    // Production (no test env) is byte-identical to before. (2026-08-13, from a
-    // worker FLAG that observed `status: typed` during a test run.)
-    if isRunningUnderTestHarness() {
-        return InertAvailableMacEventSink()
-    }
     #if canImport(CoreGraphics) && os(macOS)
     return CGEventSink()
     #else
@@ -772,6 +739,17 @@ public struct MacAXWindowRef: Sendable, Equatable {
     }
 }
 
+/// The live editor's insertion range uses UTF-16 offsets, as AX does.
+public struct MacAXTextInput: Sendable, Equatable {
+    public let target: MacAXActTarget
+    public let value: String
+    public let selection: NSRange
+
+    public func inserting(_ text: String) -> String {
+        (value as NSString).replacingCharacters(in: selection, with: text)
+    }
+}
+
 /// Semantic action on a live element. Separate protocol from
 /// `MacAXElementSource` on purpose: the read seam has no member that can
 /// mutate anything, and this one is the only place that can.
@@ -825,9 +803,19 @@ public protocol MacAXActSource: Sendable {
     /// (`AXSelectedText`), which an AppKit text view takes while its app is in
     /// the back. Default `.unsupported`.
     func setSelectedText(_ target: MacAXActTarget, text: String) -> MacAXActOutcome
-    /// Is THIS element the app's `AXFocusedUIElement` right now? The gate in
-    /// front of every keystroke addressed to a background pid. Default false.
+    /// Position this editor's selection using AX UTF-16 offsets, without changing its value.
+    func setSelectedTextRange(_ target: MacAXActTarget, range: NSRange) -> MacAXActOutcome
+    /// Is THIS element, or something inside it, the app's `AXFocusedUIElement`
+    /// right now? The gate in front of every keystroke into a named field.
+    /// Default false.
     func isFocusedElement(_ target: MacAXActTarget, pid: Int32) -> Bool
+    func focusedElement(pid: Int32) -> MacAXActTarget?
+    /// Match the focused editor to the target itself, its ancestor, or its descendant.
+    func matchesTextInputTarget(_ focused: MacAXActTarget, target: MacAXActTarget) -> Bool
+    /// Resolve the element under a screen point inside the named app before clicking.
+    func elementAtPosition(x: Double, y: Double, pid: Int32) -> MacAXActTarget?
+    /// A value and valid insertion range on the actual focused editor.
+    func textInput(_ target: MacAXActTarget) -> MacAXTextInput?
     /// A menu item's key equivalent, as (glyphs "⇧⌘S", chord "cmd+shift+s"),
     /// or nil when it publishes none. Default nil.
     func menuShortcut(_ target: MacAXActTarget) -> (glyphs: String, chord: String)?
@@ -889,7 +877,12 @@ public extension MacAXActSource {
 
     func setFocused(_ target: MacAXActTarget) -> MacAXActOutcome { .unsupported }
     func setSelectedText(_ target: MacAXActTarget, text: String) -> MacAXActOutcome { .unsupported }
+    func setSelectedTextRange(_ target: MacAXActTarget, range: NSRange) -> MacAXActOutcome { .unsupported }
     func isFocusedElement(_ target: MacAXActTarget, pid: Int32) -> Bool { false }
+    func focusedElement(pid: Int32) -> MacAXActTarget? { nil }
+    func matchesTextInputTarget(_ focused: MacAXActTarget, target: MacAXActTarget) -> Bool { false }
+    func elementAtPosition(x: Double, y: Double, pid: Int32) -> MacAXActTarget? { nil }
+    func textInput(_ target: MacAXActTarget) -> MacAXTextInput? { nil }
     func menuShortcut(_ target: MacAXActTarget) -> (glyphs: String, chord: String)? { nil }
 
     /// fable51 item 29. Default `.appGone`: a source with no menu bar has
@@ -1313,7 +1306,30 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
             guard window.identity.pid != getpid(),
                   NSRunningApplication(processIdentifier: window.identity.pid) != nil,
                   let root = element(window.handle),
-                  labelSource == "title" || labelSource == "value" else { return nil }
+                  ["title", "value", "descendant_text"].contains(labelSource) else { return nil }
+            // A source-list row names itself only through a child
+            // (AXRow > AXCell > AXStaticText "Wi‑Fi"): the same two levels /
+            // three descendants the view builder read to name the mark.
+            func descendantText(_ node: AXUIElement) -> String? {
+                var budget = 3
+                func walk(_ node: AXUIElement, depth: Int) -> String? {
+                    guard depth < 2 else { return nil }
+                    for child in MacAXAttributeRead.copyElementArray(node, kAXChildrenAttribute) {
+                        guard budget > 0 else { return nil }
+                        budget -= 1
+                        let childRole = MacAXAttributeRead.copyString(child, kAXRoleAttribute) ?? ""
+                        if let text = MacAXAttributeRead.copyLabel(child, role: childRole)
+                            ?? MacAXAttributeRead.copyRaw(child, kAXValueAttribute)
+                                .flatMap(SystemMacAXElementSource.stringifiedValue) {
+                            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                            if !trimmed.isEmpty { return trimmed }
+                        }
+                        if let deeper = walk(child, depth: depth + 1) { return deeper }
+                    }
+                    return nil
+                }
+                return walk(node, depth: 0)
+            }
             enum SearchResult {
                 case complete(AXUIElement?)
                 case limited(AXUIElement?)
@@ -1334,6 +1350,12 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
                         let currentLabel: String?
                         if labelSource == "title" {
                             currentLabel = MacAXAttributeRead.copyLabel(current, role: currentRole)
+                        } else if labelSource == "descendant_text" {
+                            // Only an element with no name of its own is named
+                            // by its child, as the view builder did.
+                            let own = MacAXAttributeRead.copyLabel(current, role: currentRole)?
+                                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                            currentLabel = own.isEmpty ? descendantText(current) : nil
                         } else {
                             currentLabel = MacAXAttributeRead.copyRaw(current, kAXValueAttribute)
                                 .flatMap(SystemMacAXElementSource.stringifiedValue)?
@@ -1468,7 +1490,98 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
                 kAXFocusedUIElementAttribute as CFString,
                 &focused
             ) == .success, let focused, CFGetTypeID(focused) == AXUIElementGetTypeID() else { return false }
-            return CFEqual(focused, element)
+            // A field's focus can sit on a child (a web combo's inner input):
+            // a few parents up is still the field.
+            var node = focused as! AXUIElement
+            for _ in 0..<5 {
+                if CFEqual(node, element) { return true }
+                var parent: CFTypeRef?
+                guard AXUIElementCopyAttributeValue(node, kAXParentAttribute as CFString, &parent) == .success,
+                      let parent, CFGetTypeID(parent) == AXUIElementGetTypeID() else { return false }
+                node = parent as! AXUIElement
+            }
+            return false
+        }
+    }
+
+    public func matchesTextInputTarget(_ focused: MacAXActTarget, target: MacAXActTarget) -> Bool {
+        MacAXExecutionLane.sync {
+            guard let focusedElement = element(focused.handle),
+                  let targetElement = element(target.handle) else { return false }
+            func isDescendant(_ child: AXUIElement, of ancestor: AXUIElement) -> Bool {
+                var node = child
+                // Match isFocusedElement's five-node bound, including the starting node.
+                for _ in 1..<5 {
+                    guard let parent = MacAXAttributeRead.copyElement(node, kAXParentAttribute) else { return false }
+                    if CFEqual(parent, ancestor) { return true }
+                    node = parent
+                }
+                return false
+            }
+            return CFEqual(focusedElement, targetElement)
+                || isDescendant(focusedElement, of: targetElement)
+                || isDescendant(targetElement, of: focusedElement)
+        }
+    }
+
+    public func elementAtPosition(x: Double, y: Double, pid: Int32) -> MacAXActTarget? {
+        MacAXExecutionLane.sync {
+            guard pid > 0, pid != getpid(), x.isFinite, y.isFinite else { return nil }
+            var target: AXUIElement?
+            guard AXUIElementCopyElementAtPosition(
+                AXUIElementCreateApplication(pid), Float(x), Float(y), &target
+            ) == .success, let target else { return nil }
+            return describe(target)
+        }
+    }
+
+    public func focusedElement(pid: Int32) -> MacAXActTarget? {
+        MacAXExecutionLane.sync {
+            guard pid != getpid(),
+                  let focused = MacAXAttributeRead.copyElement(
+                    AXUIElementCreateApplication(pid), kAXFocusedUIElementAttribute
+                  ) else { return nil }
+            return describe(focused)
+        }
+    }
+
+    public func textInput(_ target: MacAXActTarget) -> MacAXTextInput? {
+        MacAXExecutionLane.sync {
+            guard let element = element(target.handle), let current = describe(element, reusing: target.handle),
+                  current.enabled,
+                  let rawValue = MacAXAttributeRead.copyRaw(element, kAXValueAttribute),
+                  CFGetTypeID(rawValue) == CFStringGetTypeID(),
+                  let raw = MacAXAttributeRead.copyRaw(element, kAXSelectedTextRangeAttribute),
+                  CFGetTypeID(raw) == AXValueGetTypeID() else { return nil }
+            // The display projection drops empty strings; an empty editor is
+            // still ready and must keep its exact value for insertion readback.
+            let value = rawValue as! CFString as String
+            let axRange = raw as! AXValue
+            var range = CFRange()
+            guard AXValueGetType(axRange) == .cfRange,
+                  AXValueGetValue(axRange, .cfRange, &range),
+                  range.location >= 0, range.length >= 0,
+                  range.location <= value.utf16.count,
+                  range.length <= value.utf16.count - range.location else { return nil }
+            return MacAXTextInput(target: current, value: value, selection: NSRange(location: range.location, length: range.length))
+        }
+    }
+
+    public func setSelectedTextRange(_ target: MacAXActTarget, range: NSRange) -> MacAXActOutcome {
+        MacAXExecutionLane.sync {
+            guard let element = element(target.handle) else { return .invalidTarget }
+            var settable: DarwinBoolean = false
+            let probe = AXUIElementIsAttributeSettable(element, kAXSelectedTextRangeAttribute as CFString, &settable)
+            guard probe == .success, settable.boolValue else { return .unsupported }
+            var selection = CFRange(location: range.location, length: range.length)
+            guard let value = AXValueCreate(.cfRange, &selection) else { return .failed }
+            NativeAgentMotorEpoch.noteAgentMotorEvent()
+            let status = AXUIElementSetAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, value)
+            switch status {
+            case .success: return .performed
+            case .attributeUnsupported, .actionUnsupported: return .unsupported
+            default: return .failed
+            }
         }
     }
 
@@ -1561,21 +1674,7 @@ public struct UnavailableMacAXActSource: MacAXActSource {
     public func reread(_ target: MacAXActTarget) -> MacAXActTarget? { nil }
 }
 
-/// Test-only default source: available/trusted enough for reachability checks,
-/// but incapable of resolving or mutating a real host AX element.
-struct InertAvailableMacAXActSource: MacAXActSource {
-    func isTrusted() -> Bool { true }
-    func resolve(path: [Int]) -> MacAXActTarget? { nil }
-    func resolve(path: [Int], inAppPid pid: Int32) -> MacAXPidResolution { .pathNotFound }
-    func perform(_ target: MacAXActTarget, action: String) -> MacAXActOutcome { .invalidTarget }
-    func setValue(_ target: MacAXActTarget, value: String) -> MacAXActOutcome { .invalidTarget }
-    func reread(_ target: MacAXActTarget) -> MacAXActTarget? { nil }
-}
-
 public func defaultMacAXActSource() -> any MacAXActSource {
-    if isRunningUnderTestHarness() {
-        return InertAvailableMacAXActSource()
-    }
     #if canImport(ApplicationServices) && os(macOS)
     return SystemMacAXActSource()
     #else
@@ -1872,71 +1971,6 @@ public enum MacAccessibilityActuator {
             postState: source.reread(target),
             error: nil
         ))
-    }
-}
-
-// MARK: - Injection TOOL vocabulary (the model-facing names)
-
-/// `macControlAccessibilityInjectionActions` names the MacControl ACTIONS.
-/// This names the model-facing TOOLS that map onto them, in every spelling the
-/// catalog has ever used. Single source of truth for the autonomy floor, the
-/// YOLO exclusion, and the redaction sinks — three places that were previously
-/// keeping their own copies of the same four strings, which is how one of them
-/// (the autonomy override path) ended up out of step.
-public enum MacInjectionToolNames {
-    public static let canonical: [String: String] = [
-        "mac_keystroke": "keystroke",
-        "mac_click": "click",
-        "mac_scroll": "scroll",
-        "mac_ax_act": "ax_act",
-        // native-look item 3 — the closed-loop verb. In this vocabulary
-        // because it IS injection: one entry here gives it the redaction sinks
-        // and the body-bound capability path, with no
-        // act-shaped special case anywhere in the gate.
-        "mac_act": "act",
-        // W6 — mac_wake posts a HID nudge, so it belongs to the SAME
-        // vocabulary: one entry here gives it replay verification, redaction,
-        // and the body-bound capability path, with no wake-shaped special case
-        // anywhere in the gate.
-        "mac_wake": "wake",
-        "mac.keystroke": "keystroke",
-        "mac.click": "click",
-        "mac.scroll": "scroll",
-        "mac.ax_act": "ax_act",
-        "mac.act": "act",
-        "mac.wake": "wake",
-    ]
-
-    public static var all: Set<String> { Set(canonical.keys) }
-
-    public static func isInjectionTool(_ toolName: String) -> Bool {
-        canonical[toolName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()] != nil
-    }
-
-    /// The MacControl action a tool name maps to, or nil if it is not an
-    /// injection tool.
-    public static func action(forTool toolName: String) -> String? {
-        canonical[toolName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()]
-    }
-
-    /// Legacy floor value; the compatibility clamp below is disabled.
-    public static let minimumAutonomyLevel = "send_approval"
-
-    /// Legacy unattended-level vocabulary retained for existing consumers.
-    public static let unattendedAutonomyLevels: Set<String> = [
-        "auto", "app_data_autonomous", "workspace_autonomous",
-    ]
-
-    /// Compatibility entry point: returns the resolved autonomy unchanged.
-    ///
-    /// USER 2026-08-12 — YOLO: "Nothing should be approval gated for her.
-    /// Nothing." The floor is DISABLED at his explicit direction. His machine,
-    /// his agent: the Full-Mac grant + accessibility category + the macOS TCC
-    /// grant are the gates, and per-call approval made every motor tool dead on
-    /// non-interactive surfaces (the bridge, while he is away) — precisely when
-    /// he needs her to act.
-    public static func clampedAutonomyLevel(toolName: String, resolved: String) -> String {
-        return resolved
     }
 }
 

@@ -112,7 +112,7 @@ For a separately running installed app, supply the bridge URL and contact bearer
 
 ```sh
 A2A_BASE_URL='http://127.0.0.1:BRIDGE_PORT' A2A_BEARER_TOKEN='CONTACT_BEARER' \
-  uv run --no-project tests/a2a_sdk/call_live_server.py
+  uv run --no-project script/a2a_live_check.py
 ```
 
 The script discovers gRPC from the card and exercises all eleven operations.

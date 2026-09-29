@@ -1,3 +1,4 @@
+import GrokLink
 import Foundation
 import Darwin
 import PersistenceCore
@@ -110,11 +111,16 @@ private enum BridgeHTTP {
     }
 
     /// One POST only. A lost acknowledgement must be recovered by IDs, never resent.
-    static func post(_ payload: [String: Any], descriptor: BridgeDescriptor) async throws -> [String: Any]? {
+    /// An SSE answer (agent_message waiting for its reply) hands each
+    /// notification to `forward` as it arrives and returns the final response.
+    static func post(_ payload: [String: Any], descriptor: BridgeDescriptor,
+                     forward: (@Sendable ([String: Any]) -> Void)? = nil) async throws -> [String: Any]? {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.connectionProxyDictionary = [:]
-        configuration.timeoutIntervalForRequest = 30
-        configuration.timeoutIntervalForResource = 30
+        // agent_message may hold the call open for its reply for up to the
+        // app's maximum wait (300 s) without sending a byte.
+        configuration.timeoutIntervalForRequest = 330
+        configuration.timeoutIntervalForResource = 330
         configuration.httpShouldSetCookies = false
         configuration.urlCache = nil
         let session = URLSession(configuration: configuration, delegate: NoRedirect(), delegateQueue: nil)
@@ -126,6 +132,8 @@ private enum BridgeHTTP {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("application/json, text/event-stream", forHTTPHeaderField: "Accept")
         request.setValue("2025-11-25", forHTTPHeaderField: "MCP-Protocol-Version")
+        // This relay reads SSE answers; older relays only claim to in Accept.
+        request.setValue("1", forHTTPHeaderField: "X-NativeAgent-Relay-SSE")
         let bytes: URLSession.AsyncBytes
         let response: URLResponse
         do { (bytes, response) = try await session.bytes(for: request) }
@@ -133,6 +141,32 @@ private enum BridgeHTTP {
         guard let http = response as? HTTPURLResponse else { throw LinkFailure.response }
         guard (200...299).contains(http.statusCode) else { throw LinkFailure.http(http.statusCode) }
         if http.statusCode == 202 { return nil }
+        func clean(_ object: [String: Any]) -> [String: Any]? {
+            // Defensive removal even if a compromised local server echoes a secret
+            // back. This connection's own key is scrubbed alongside the bearer.
+            var scrubbed = scrub(object, token: descriptor.token)
+            if let secret = descriptor.peerSecret { scrubbed = scrub(scrubbed, token: secret) }
+            return scrubbed as? [String: Any]
+        }
+        if http.mimeType == "text/event-stream" {
+            // One JSON-RPC message per `data:` line: notifications first, then the response.
+            var line = Data()
+            do {
+                for try await byte in bytes {
+                    guard byte == 10 else {
+                        guard line.count < 1_048_576 else { throw LinkFailure.response }
+                        line.append(byte); continue
+                    }
+                    defer { line.removeAll(keepingCapacity: true) }
+                    guard line.starts(with: Data("data:".utf8)),
+                          let object = try? JSONSerialization.jsonObject(with: line.dropFirst(5)) as? [String: Any],
+                          let message = clean(object) else { continue }
+                    if message["method"] != nil { forward?(message) } else { return message }
+                }
+            } catch let failure as LinkFailure { throw failure }
+            catch { throw LinkFailure.transport }
+            throw LinkFailure.response
+        }
         guard http.mimeType == "application/json", http.expectedContentLength <= 1_048_576 else {
             throw LinkFailure.response
         }
@@ -147,11 +181,7 @@ private enum BridgeHTTP {
         guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw LinkFailure.response
         }
-        // Defensive removal even if a compromised local server echoes a secret
-        // back. This connection's own key is scrubbed alongside the bearer.
-        var scrubbed = scrub(object, token: descriptor.token)
-        if let secret = descriptor.peerSecret { scrubbed = scrub(scrubbed, token: secret) }
-        return scrubbed as? [String: Any]
+        return clean(object)
     }
 
     private static func scrub(_ value: Any, token: String) -> Any {
@@ -178,17 +208,20 @@ private struct NativeAgentLink {
     nativeagent-link reply --contact id < reply.json
     nativeagent-link mcp
 
-    Connects to the running NativeAgent on this Mac. Message returns enqueue
-    acknowledgement, not a final answer. Keep both IDs and use reply to recover.
+    Connects to the running NativeAgent on this Mac. Message waits up to 25 s
+    for the reply; if it is still in progress it returns the enqueue
+    acknowledgement (status enqueued). Keep both IDs and use reply to recover.
     Never automatically resend an uncertain message. The mcp command relays
     newline-delimited MCP JSON-RPC over stdio; configure it as an MCP server command.
     """
 
+    private static let outputLock = NSLock()
+
+    /// One whole line per write, so concurrent relay requests never interleave.
     static func output(_ object: [String: Any]) {
-        if let data = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]) {
-            FileHandle.standardOutput.write(data)
-            FileHandle.standardOutput.write(Data([10]))
-        }
+        guard var data = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]) else { return }
+        data.append(10)
+        outputLock.withLock { FileHandle.standardOutput.write(data) }
     }
 
     static func main() async {
@@ -298,44 +331,55 @@ private struct NativeAgentLink {
     }
 
     /// The app owns all MCP semantics. This adapter only changes framing and auth.
-    /// Sequential requests, bounded input, no background process and no transcript.
+    /// Each request runs concurrently (agent_message may wait minutes for its
+    /// reply while the host pings or calls again); bounded input, no background
+    /// process and no transcript. Input ending still waits for every answer.
     static func relay() async {
-        var line = Data()
-        while true {
-            var byte: UInt8 = 0
-            let count = Darwin.read(STDIN_FILENO, &byte, 1)
-            if count == 0 { return }
-            if count < 0 { if errno == EINTR { continue }; return }
-            if byte != 10 {
-                guard line.count < 1_048_576 else {
-                    output(["jsonrpc": "2.0", "id": NSNull(), "error": ["code": -32700, "message": "MCP input exceeds limit"]])
-                    return
+        await withDiscardingTaskGroup { group in
+            var line = Data()
+            while true {
+                var byte: UInt8 = 0
+                let count = Darwin.read(STDIN_FILENO, &byte, 1)
+                if count == 0 { return }
+                if count < 0 { if errno == EINTR { continue }; return }
+                if byte != 10 {
+                    guard line.count < 1_048_576 else {
+                        output(["jsonrpc": "2.0", "id": NSNull(), "error": ["code": -32700, "message": "MCP input exceeds limit"]])
+                        return
+                    }
+                    line.append(byte)
+                    continue
                 }
-                line.append(byte)
-                continue
+                defer { line.removeAll(keepingCapacity: true) }
+                if line.isEmpty { continue }
+                guard (try? JSONSerialization.jsonObject(with: line)) is [String: Any] else {
+                    output(["jsonrpc": "2.0", "id": NSNull(), "error": ["code": -32700, "message": "Invalid JSON object"]])
+                    continue
+                }
+                let request = line
+                group.addTask { await relayOne(request) }
             }
-            defer { line.removeAll(keepingCapacity: true) }
-            if line.isEmpty { continue }
-            guard let payload = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else {
-                output(["jsonrpc": "2.0", "id": NSNull(), "error": ["code": -32700, "message": "Invalid JSON object"]])
-                continue
+        }
+    }
+
+    private static func relayOne(_ request: Data) async {
+        guard let payload = try? JSONSerialization.jsonObject(with: request) as? [String: Any] else { return }
+        let id = payload["id"]
+        do {
+            let descriptor = try BridgeDescriptor.load()
+            // Progress notifications for this call go straight to the host.
+            let response = try await BridgeHTTP.post(payload, descriptor: descriptor, forward: { output($0) })
+            if let id {
+                guard let response, response["jsonrpc"] as? String == "2.0",
+                      let responseID = response["id"] as? NSObject,
+                      responseID.isEqual(id) else { throw LinkFailure.response }
+                output(response)
             }
-            let id = payload["id"]
-            do {
-                let descriptor = try BridgeDescriptor.load()
-                let response = try await BridgeHTTP.post(payload, descriptor: descriptor)
-                if let id {
-                    guard let response, response["jsonrpc"] as? String == "2.0",
-                          let responseID = response["id"] as? NSObject,
-                          responseID.isEqual(id) else { throw LinkFailure.response }
-                    output(response)
-                }
-                // Notifications (HTTP 202) never produce a JSON-RPC response.
-            } catch {
-                if let id {
-                    output(["jsonrpc": "2.0", "id": id,
-                            "error": ["code": -32000, "message": (error as? LinkFailure)?.label ?? "request_failed"]])
-                }
+            // Notifications (HTTP 202) never produce a JSON-RPC response.
+        } catch {
+            if let id {
+                output(["jsonrpc": "2.0", "id": id,
+                        "error": ["code": -32000, "message": (error as? LinkFailure)?.label ?? "request_failed"]])
             }
         }
     }

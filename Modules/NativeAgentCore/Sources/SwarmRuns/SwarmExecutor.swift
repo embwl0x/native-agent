@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import TurnTrace
 
 public enum AgentSwarmError: Error, LocalizedError, Equatable {
     case invalidRequest(String)

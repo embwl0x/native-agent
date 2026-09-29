@@ -1,3 +1,4 @@
+import FeedPolicy
 import Foundation
 import NativeAgentCore
 import PersistenceCore
@@ -1294,13 +1295,20 @@ public actor SwiftNativeLoopScheduler {
         "rem_cycle",
     ]
 
-    /// A missing/corrupt file simply yields no persisted history, which
+    /// A missing file yields no persisted history. A corrupt one is reported
+    /// (readJSON keeps its bytes beside it) and also yields none, which
     /// degrades to the pre-LOOPS-4 behavior rather than blocking startup.
     private static func readLoopState(
         _ path: URL?
     ) async -> (runs: [String: Date], completions: [String: Date], firstSeen: [String: Date]) {
         guard let path else { return ([:], [:], [:]) }
-        let value = await SwiftNativePersistenceCore().readJSON(path, defaultValue: .object([:]))
+        let value: JSONValue
+        do {
+            value = try await SwiftNativePersistenceCore().readJSON(path, ifMissing: .object([:]))
+        } catch {
+            NSLog("BackgroundLoops: loop state unreadable, starting with no run history: %@", "\(error)")
+            return ([:], [:], [:])
+        }
         guard case .object(let root) = value else { return ([:], [:], [:]) }
         let iso = ISO8601DateFormatter()
         func stamps(_ key: String) -> [String: Date] {
@@ -1884,8 +1892,7 @@ public actor SwiftNativeLoopScheduler {
 
 import DoctorChecks
 
-/// First real Swift loop: periodically calls DoctorChecksProtocol.runAll
-/// (with repair=false, checkLLM=false — heavy probes stay opt-in) and
+/// Periodically calls the app's bounded Doctor run and
 /// serializes the result to `<dataRoot>/doctor/latest.json` atomically via
 /// SwiftNativePersistenceCore.writeJSON.
 ///
@@ -1895,7 +1902,7 @@ import DoctorChecks
 public struct DoctorAutoRunLoop: LoopRunner {
     public let loopId: String = "doctor_auto_run"
     public let interval: TimeInterval
-    private let doctorChecks: any DoctorChecksProtocol
+    private let runChecks: @Sendable () async throws -> [CheckResult]
     private let storage: @Sendable () async throws -> URL
 
     /// `storage` returns the directory that will hold `latest.json`. Default
@@ -1904,11 +1911,11 @@ public struct DoctorAutoRunLoop: LoopRunner {
     /// without forcing the work onto every callsite.
     public init(
         interval: TimeInterval = 600,
-        doctorChecks: any DoctorChecksProtocol,
+        runChecks: @escaping @Sendable () async throws -> [CheckResult],
         storage: @escaping @Sendable () async throws -> URL = { defaultDoctorStorageDir() }
     ) {
         self.interval = interval
-        self.doctorChecks = doctorChecks
+        self.runChecks = runChecks
         self.storage = storage
     }
 
@@ -1920,7 +1927,7 @@ public struct DoctorAutoRunLoop: LoopRunner {
             // before a single check runs, and let `runAt` go on meaning exactly
             // what it always meant — when this file was written.
             let measuredAt = Date()
-            let results = try await doctorChecks.runAll(repair: false, checkLLM: false)
+            let results = try await runChecks()
             // No checks ran ⇒ nothing was inspected. Persisting `{"checks":[]}`
             // would be worse than useless: every reader derives "healthy" from
             // "no check has status fail", so an empty snapshot reads as a clean

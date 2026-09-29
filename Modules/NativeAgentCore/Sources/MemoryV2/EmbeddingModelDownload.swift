@@ -88,6 +88,19 @@ public actor EmbeddingModelDownload {
         return (attrs[.size] as? NSNumber)?.int64Value ?? 0
     }
 
+    private static func removeStagingArtifacts(in work: URL) throws {
+        for item in try FileManager.default.contentsOfDirectory(at: work, includingPropertiesForKeys: nil) {
+            let name = item.lastPathComponent
+            let archive = name == "model.zip"
+                || (name.hasPrefix("model-") && name.hasSuffix(".zip")
+                    && UUID(uuidString: String(name.dropFirst(6).dropLast(4))) != nil)
+            let unpacked = name == "unpacked"
+                || (name.hasPrefix("unpacked-")
+                    && UUID(uuidString: String(name.dropFirst(9))) != nil)
+            if archive || unpacked { try FileManager.default.removeItem(at: item) }
+        }
+    }
+
     /// An absent installation may download; existing directories require positive
     /// downloader ownership before any replacement, including incomplete models.
     static func preservesCustomInstallation(at target: URL) -> Bool {
@@ -119,6 +132,36 @@ public actor EmbeddingModelDownload {
         }
     }
 
+    public func currentStatus() -> Status { status }
+
+    private func pauseMarker() -> URL? {
+        guard let descriptorURL,
+              let data = try? Data(contentsOf: descriptorURL),
+              let descriptor = try? Descriptor.parse(data),
+              descriptor.distribution == "separate-download" else { return nil }
+        return root.appendingPathComponent("extras/.coreml-download/user-paused-\(descriptor.sha256)")
+    }
+
+    public func isUserPaused() -> Bool {
+        guard let marker = pauseMarker() else { return false }
+        return FileManager.default.fileExists(atPath: marker.path)
+    }
+
+    public func pauseByUser() throws {
+        guard let marker = pauseMarker() else { return }
+        try FileManager.default.createDirectory(at: marker.deletingLastPathComponent(), withIntermediateDirectories: true)
+        if !FileManager.default.fileExists(atPath: marker.path) {
+            guard FileManager.default.createFile(atPath: marker.path, contents: Data()) else {
+                throw Failure.invalidRelease
+            }
+        }
+    }
+
+    public func resumeByUser() throws {
+        guard let marker = pauseMarker(), FileManager.default.fileExists(atPath: marker.path) else { return }
+        try FileManager.default.removeItem(at: marker)
+    }
+
     private func removeObserver(_ id: UUID) { observers.removeValue(forKey: id) }
     private func publish(_ phase: String? = nil, bytes: Int64 = 0) {
         if let phase { status.phase = phase }
@@ -128,7 +171,7 @@ public actor EmbeddingModelDownload {
 
     /// A release digest names the resume directory, so changed assets cannot reuse old bytes.
     /// Completed 1 MiB subranges survive cancellation, failures, and process restarts.
-    public func install() async throws -> Bool {
+    public func install(createOnly: Bool = false) async throws -> Bool {
         guard !status.running else { return false }
         guard let descriptorURL else {
             NSLog("[embedding-download] No bundled descriptor; download not required")
@@ -156,23 +199,34 @@ public actor EmbeddingModelDownload {
             let extras = root.appendingPathComponent("extras", isDirectory: true)
             let target = extras.appendingPathComponent("coreml", isDirectory: true)
             let marker = target.appendingPathComponent("release.sha256")
+            if createOnly, FileManager.default.fileExists(atPath: target.path) {
+                publish("Installed memory model left unchanged")
+                return false
+            }
             if Self.preservesCustomInstallation(at: target) {
                 publish("Custom memory model in use")
                 return false
             }
             if (try? String(contentsOf: marker, encoding: .utf8)) == sha,
-               CoreMLEmbeddingProvider.extrasModel(inDirectory: target) != nil {
+               (try? CoreMLEmbeddingProvider.extrasModel(inDirectory: target)) != nil {
                 publish("Memory model up to date")
                 return false
             }
             let work = extras.appendingPathComponent(".coreml-download/\(sha)", isDirectory: true)
             try FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
+            try Self.removeStagingArtifacts(in: work)
+            defer { try? Self.removeStagingArtifacts(in: work) }
+            let invalidParts = work.appendingPathComponent("invalid-parts")
+            if FileManager.default.fileExists(atPath: invalidParts.path) { throw Failure.digestMismatch }
             let ranges = Self.ranges(size: size)
             let parts = ranges.indices.map { work.appendingPathComponent("part-\($0)") }
             status.total = size
             for (part, range) in zip(parts, ranges) {
                 let have = (try? Self.fileSize(part)) ?? 0
-                if have > range.count { try FileManager.default.removeItem(at: part) }
+                if have > range.count {
+                    if createOnly { throw Failure.invalidRange }
+                    try FileManager.default.removeItem(at: part)
+                }
                 else { status.completed += have }
             }
             publish("Downloading memory model…")
@@ -215,14 +269,13 @@ public actor EmbeddingModelDownload {
             do {
                 try Self.assemble(parts: parts, ranges: ranges, destination: archive, sha256: sha)
             } catch Failure.digestMismatch {
-                // A corrupt completed part must not poison every future resume.
-                try FileManager.default.removeItem(at: work)
+                // Preserve suspect bytes for a deliberate recovery decision.
+                FileManager.default.createFile(atPath: invalidParts.path, contents: Data())
                 throw Failure.digestMismatch
             }
             try Task.checkCancellation()
             publish("Installing memory model…")
             let unpacked = work.appendingPathComponent("unpacked", isDirectory: true)
-            if FileManager.default.fileExists(atPath: unpacked.path) { try FileManager.default.removeItem(at: unpacked) }
             try FileManager.default.createDirectory(at: unpacked, withIntermediateDirectories: true)
             #if os(macOS)
             let process = Process()
@@ -235,10 +288,14 @@ public actor EmbeddingModelDownload {
             throw Failure.extractionFailed
             #endif
             let candidate = unpacked.appendingPathComponent("embedding", isDirectory: true)
-            guard CoreMLEmbeddingProvider.extrasModel(inDirectory: candidate) != nil else { throw Failure.invalidModel }
+            guard (try? CoreMLEmbeddingProvider.extrasModel(inDirectory: candidate)) != nil else { throw Failure.invalidModel }
             try sha.write(to: candidate.appendingPathComponent("release.sha256"), atomically: true, encoding: .utf8)
             try Task.checkCancellation()
             // A manual installation may have arrived while the transfer awaited.
+            if createOnly, FileManager.default.fileExists(atPath: target.path) {
+                publish("Installed memory model left unchanged")
+                return false
+            }
             if Self.preservesCustomInstallation(at: target) {
                 publish("Custom memory model in use")
                 return false
@@ -248,9 +305,12 @@ public actor EmbeddingModelDownload {
             } else {
                 try FileManager.default.moveItem(at: candidate, to: target)
             }
-            try? FileManager.default.removeItem(at: work)
+            try FileManager.default.removeItem(at: work)
             publish("Memory model installed")
             return true
+        } catch Failure.digestMismatch {
+            publish("Download failed: archive digest mismatch")
+            throw Failure.digestMismatch
         } catch {
             publish(Task.isCancelled ? "Download paused" : "Download failed: \(error.localizedDescription)")
             throw error

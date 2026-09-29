@@ -338,6 +338,7 @@ public actor CognitiveSubstrate {
     var soundRutSignature: String?
     var soundRutLastSurfacedAt: Date?
     var soundRutTurnsSinceSurfaced = 0
+    var soundRutEarlyRepeatSpent = false
     /// Bounded like every other counted family: once it is past any gate it
     /// could satisfy, a larger number carries no more meaning.
     static let soundRutTurnCounterCap = 10_000
@@ -409,6 +410,7 @@ public actor CognitiveSubstrate {
             soundRutSignature: soundRutSignature,
             soundRutLastSurfacedAt: soundRutLastSurfacedAt,
             soundRutTurnsSinceSurfaced: soundRutTurnsSinceSurfaced,
+            soundRutEarlyRepeatSpent: soundRutEarlyRepeatSpent,
             innerLineRuns: innerLineRuns,
             feltObjectCount: feltObjectCount,
             ambivalenceCount: ambivalenceCount,
@@ -561,6 +563,12 @@ public actor CognitiveSubstrate {
         return field.associationEdges(at: dependencies.now(), configuration: configuration)
     }
 
+    public func doctorAssociationSnapshot(at date: Date) -> [CognitiveAssociationEdge] {
+        guard configuration.enabled, configuration.workspaceEnabled else { return [] }
+        var copy = field
+        return copy.associationEdges(at: date, configuration: configuration)
+    }
+
     public func clearTransientState() async {
         await waitForMaintenanceTransition()
         // A maintenance transaction may be suspended in the store actor. Its
@@ -602,6 +610,7 @@ public actor CognitiveSubstrate {
         soundRutSignature = nil
         soundRutLastSurfacedAt = nil
         soundRutTurnsSinceSurfaced = 0
+        soundRutEarlyRepeatSpent = false
         // The reminded-of ledgers describe memories she was reminded OF while
         // this field existed; they clear with it.
         remindedOfLastSurfacedAt = nil

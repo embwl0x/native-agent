@@ -10,11 +10,11 @@ extension NativeClient {
         githubCredentialStore: GitHubCredentialStore = .shared,
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) async throws {
+        let impl = makeConnectorAuthClient(root: dataRoot)
+        _ = try await impl.revokeConnector(provider: provider)
         if provider.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "github" {
             try await githubCredentialStore.deleteCredential(dataRoot: dataRoot)
         }
-        let impl = makeConnectorAuthClient(root: dataRoot)
-        _ = try await impl.revokeConnector(provider: provider)
         return
     }
 

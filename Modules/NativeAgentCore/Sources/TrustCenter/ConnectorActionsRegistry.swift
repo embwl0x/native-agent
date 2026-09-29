@@ -880,27 +880,6 @@ public func connectorActionDescriptors() -> [ConnectorActionDescriptor] {
             ], required: ["script"])
         ),
         ConnectorActionDescriptor(
-            id: "mac.focus_app", connectorId: "mac", connector: "mac",
-            name: "Mac Focus App",
-            description: "Bring an app to front by bundle ID. Standard modes prompt; admitted Full Mac YOLO runs directly.",
-            risk: "medium", dryRunAvailable: false, requiresApproval: true,
-            category: "accessibility",
-            inputSchema: schema([
-                ("bundle_id", prop("string")),
-            ], required: ["bundle_id"])
-        ),
-        ConnectorActionDescriptor(
-            id: "mac.quit_app", connectorId: "mac", connector: "mac",
-            name: "Mac Quit App",
-            description: "Quit an app by bundle ID. Standard modes prompt; admitted Full Mac YOLO runs directly.",
-            risk: "high", dryRunAvailable: false, requiresApproval: true,
-            category: "accessibility",
-            inputSchema: schema([
-                ("bundle_id", prop("string")),
-                ("force", prop("boolean")),
-            ], required: ["bundle_id"])
-        ),
-        ConnectorActionDescriptor(
             id: "mac.running_apps", connectorId: "mac", connector: "mac",
             name: "Mac Running Apps",
             description: "List running apps on Mac.",
@@ -946,62 +925,6 @@ public func connectorActionDescriptors() -> [ConnectorActionDescriptor] {
                 ("cwd", prop("string")),
             ], required: ["command"])
         ),
-        // PATCH-2026-05-08: review-fix-A.5 — re-register direct mc.* routes
-        ConnectorActionDescriptor(
-            id: "mac.keystroke", connectorId: "mac", connector: "mac",
-            name: "Mac Keystroke",
-            description: "Type text and/or press key combinations on this Mac, as if from the physical keyboard. The keystrokes go to whatever app is frontmost. Standard modes prompt; admitted Full Mac YOLO runs directly.",
-            risk: "high", dryRunAvailable: false, requiresApproval: true,
-            category: "accessibility",
-            inputSchema: schema([
-                ("text", prop("string")),
-                ("keys", prop("string")),
-                ("attention_session", prop("string")),
-                ("attention_user_sequence", prop("integer")),
-            ])
-        ),
-        ConnectorActionDescriptor(
-            id: "mac.click", connectorId: "mac", connector: "mac",
-            name: "Mac Click",
-            description: "Click, double-click, right-click or drag at screen coordinates, as if from the physical mouse. Standard modes prompt; admitted Full Mac YOLO runs directly.",
-            risk: "high", dryRunAvailable: false, requiresApproval: true,
-            category: "accessibility",
-            inputSchema: schema([
-                ("x", prop("integer")),
-                ("y", prop("integer")),
-                ("button", prop("string")),
-                ("count", prop("integer")),
-                ("double", prop("boolean")),
-                ("from", prop("object")),
-                ("to", prop("object")),
-                ("duration_ms", prop("integer")),
-                ("mark", prop("integer")),
-                ("view", prop("string")),
-                ("attention_session", prop("string")),
-                ("attention_user_sequence", prop("integer")),
-            ])
-        ),
-        // W2/W3 injection surface (2026-08-12). Same `accessibility` category,
-        // same high risk and approval tier as the two above — these synthesize
-        // real input. `mac.ax_act` is the semantic one: it targets an element by
-        // the path mac.ax_tree/mac.ax_find returned, so the app runs its own
-        // handler instead of a coordinate being guessed at.
-        ConnectorActionDescriptor(
-            id: "mac.scroll", connectorId: "mac", connector: "mac",
-            name: "Mac Scroll",
-            description: "Scroll the view under the pointer, as if from the physical mouse wheel or trackpad. Standard modes prompt; admitted Full Mac YOLO runs directly.",
-            risk: "high", dryRunAvailable: false, requiresApproval: true,
-            category: "accessibility",
-            inputSchema: schema([
-                ("dx", prop("integer")),
-                ("dy", prop("integer")),
-                ("x", prop("integer")),
-                ("y", prop("integer")),
-                ("units", prop("string")),
-                ("attention_session", prop("string")),
-                ("attention_user_sequence", prop("integer")),
-            ])
-        ),
         // W6 (2026-08-12). Same category, same approval tier: it posts a real
         // mouse event. It refuses outright when the screen is password-locked.
         ConnectorActionDescriptor(
@@ -1023,74 +946,14 @@ public func connectorActionDescriptors() -> [ConnectorActionDescriptor] {
         // presses and types through the same actuator. The percept it returns
         // afterwards is evidence of the effect, never a reason for a lower
         // tier.
-        ConnectorActionDescriptor(
-            id: "mac.act", connectorId: "mac", connector: "mac",
-            name: "Mac Act",
-            description: "Act on one control from the latest Mac Look — press it, open it, type into it, select it, toggle it, dismiss the sheet it belongs to, or scroll it into view — and get back what changed: the accessibility notifications the app fired, the control before and after, which affordances appeared, disappeared or changed, focus and modal and window-title moves, plus a fresh look frame. Refuses when the handle no longer names the same control, when the app it was captured from is gone, or when the effect cannot be observed. Gated by Trust Center Full Mac with the Accessibility category on, plus the macOS Accessibility grant; no per-call approval.",
-            risk: "high", dryRunAvailable: false, requiresApproval: true,
-            category: "accessibility",
-            inputSchema: schema([
-                ("handle", prop("string")),
-                ("frame_id", prop("string")),
-                ("verb", prop("string")),
-                ("text", prop("string")),
-                ("direction", prop("string")),
-                ("wait_ms", prop("integer")),
-                ("attention_session", prop("string")),
-                ("attention_user_sequence", prop("integer")),
-            ])
-        ),
-        ConnectorActionDescriptor(
-            id: "mac.ax_act", connectorId: "mac", connector: "mac",
-            name: "Mac Accessibility Act",
-            description: "Act on one UI element of the frontmost window, addressed by the path from mac.ax_tree or mac.ax_find: press it, or set its value. Runs the app's own accessibility handler; falls back to a synthesized click at the element's centre when the element exposes no usable action. Gated by Trust Center Full Mac with the Accessibility category on, plus the macOS Accessibility grant; no per-call approval.",
-            risk: "high", dryRunAvailable: false, requiresApproval: true,
-            category: "accessibility",
-            inputSchema: schema([
-                ("path", prop("array")),
-                ("action", prop("string")),
-                ("value", prop("string")),
-                ("mark", prop("integer")),
-                ("view", prop("string")),
-                ("attention_session", prop("string")),
-                ("attention_user_sequence", prop("integer")),
-            ])
-        ),
         // W1 accessibility perception organ — READ-ONLY. These read the
         // AXUIElement tree (structured UI data) instead of screenshotting
         // pixels. No input injection: risk low, no approval, same read tier as
         // mac.spotlight_search, under the existing `accessibility` gate.
-        ConnectorActionDescriptor(
-            id: "mac.ax_status", connectorId: "mac", connector: "mac",
-            name: "Mac Accessibility Status",
-            description: "Check whether NativeAgent has macOS Accessibility permission. Read-only. Returns trusted:true/false plus how to grant it.",
-            risk: "low", dryRunAvailable: true, requiresApproval: false,
-            category: "accessibility",
-            inputSchema: emptySchema()
-        ),
         // W7 — the NUDGE. Low risk and no approval, alongside the reads rather
         // than the injection actions: it posts one bare mouse move, which
         // clicks nothing, types nothing and unlocks nothing. Same
         // `accessibility` gate category as everything else in this organ.
-        ConnectorActionDescriptor(
-            id: "mac.nudge", connectorId: "mac", connector: "mac",
-            name: "Mac Nudge",
-            description: "Post a single bare mouse move (one point) to wake a sleeping display or dismiss a screensaver — the software equivalent of bumping the mouse. It cannot click, type, scroll, drag or unlock; on a locked Mac it only brings up the login field. Takes no arguments.",
-            risk: "low", dryRunAvailable: true, requiresApproval: false,
-            category: "accessibility",
-            inputSchema: emptySchema()
-        ),
-        ConnectorActionDescriptor(
-            id: "mac.ax_tree", connectorId: "mac", connector: "mac",
-            name: "Mac Accessibility Tree",
-            description: "Read the frontmost app's frontmost window as a structured accessibility tree (role, title, value, enabled, frame, available actions, path). Read-only; bounded to 400 nodes / depth 12 and reports honestly when truncated.",
-            risk: "low", dryRunAvailable: true, requiresApproval: false,
-            category: "accessibility",
-            inputSchema: schema([
-                ("max_nodes", prop("integer")),
-                ("max_depth", prop("integer")),
-            ])
-        ),
         // W3.5 — the FUSED view: the screenshot and the AX structure in one
         // object, with every actionable element numbered on the image so she
         // acts by name instead of guessing a coordinate. Read tier like the
@@ -1114,7 +977,7 @@ public func connectorActionDescriptors() -> [ConnectorActionDescriptor] {
         // native-look item 2 (2026-08-22) — the compiled LOOK: the AX tree
         // distilled by the app into a glance line / a structured percept with
         // stable handles / the raw tree, so she pays tokens for the answer,
-        // not the parsing. Read tier like mac.ax_tree; no picture, so no
+        // not the parsing. Read tier with no picture, so no
         // Screen Recording dependency.
         ConnectorActionDescriptor(
             id: "mac.screen", connectorId: "mac", connector: "mac",
@@ -1131,7 +994,7 @@ public func connectorActionDescriptors() -> [ConnectorActionDescriptor] {
         ConnectorActionDescriptor(
             id: "mac.clipboard_read", connectorId: "mac", connector: "mac",
             name: "Clipboard Read",
-            description: "Read the Mac clipboard as text. Read-only. Lines that are themselves a secret (password, API key, one-time code, card number, recovery phrase) come back redacted with the reason; non-text contents are named by type and size, never returned as bytes.",
+            description: "Read Mac clipboard text. Redacts secret lines (password/API key/one-time code/card number/recovery phrase), stating why. Non-text returns type/size, never bytes. Read-only.",
             risk: "low", dryRunAvailable: true, requiresApproval: false,
             category: "accessibility",
             inputSchema: schema([("max_chars", prop("integer"))])
@@ -1139,7 +1002,7 @@ public func connectorActionDescriptors() -> [ConnectorActionDescriptor] {
         ConnectorActionDescriptor(
             id: "mac.clipboard_write", connectorId: "mac", connector: "mac",
             name: "Clipboard Write",
-            description: "Replace the Mac clipboard's text. The next paste in any app produces this text and the previous clipboard contents are gone. Posts no keystroke and clicks nothing; the result reports the character count and a read-back check, never the text.",
+            description: "Replace Mac clipboard text: next paste uses it and previous contents are lost. No keystrokes/clicks. Returns character count and read-back check, never text.",
             risk: "medium", dryRunAvailable: false, requiresApproval: false,
             category: "accessibility",
             inputSchema: schema([("text", prop("string"))])
@@ -1152,7 +1015,7 @@ public func connectorActionDescriptors() -> [ConnectorActionDescriptor] {
         ConnectorActionDescriptor(
             id: "mac.read", connectorId: "mac", connector: "mac",
             name: "Read",
-            description: "Read a document end to end: a PDF or text file the front window is showing (extracted through PDFKit, not scraped), or the front window's own text accumulated across scrolls and merged on the overlap. Scrolls only to see more, and scrolls back afterwards. Secret-shaped lines are redacted with the reason; a password-protected or text-less document refuses in words.",
+            description: "Read a front-window PDF/text file end to end via PDFKit extraction, not scraping; or merge the window's text across overlapping scrolls. Scrolls only for more content, then back. Redacts secret-shaped lines with reasons; password-protected/text-less documents refuse in words.",
             risk: "low", dryRunAvailable: true, requiresApproval: false,
             category: "accessibility",
             inputSchema: schema([("path", prop("string"))])
@@ -1171,7 +1034,7 @@ public func connectorActionDescriptors() -> [ConnectorActionDescriptor] {
         ConnectorActionDescriptor(
             id: "mac.menu_press", connectorId: "mac", connector: "mac",
             name: "Menu Press",
-            description: "Press one named menu path (File › Export › PDF…), running the app's own menu handler through the same actuator mac.act uses. Unknown, ambiguous and disabled paths refuse in words and press nothing.",
+            description: "Press one named menu path (File › Export › PDF…) through the shared Mac actuator. Unknown, ambiguous and disabled paths refuse in words and press nothing.",
             risk: "medium", dryRunAvailable: false, requiresApproval: false,
             category: "accessibility",
             inputSchema: schema([("path", prop("string")), ("app", prop("string"))])
@@ -1179,7 +1042,7 @@ public func connectorActionDescriptors() -> [ConnectorActionDescriptor] {
         ConnectorActionDescriptor(
             id: "mac.act_by_name", connectorId: "mac", connector: "mac",
             name: "Act",
-            description: "Do one thing to something on the live screen by NAME (click/open/type/select/toggle/scroll/dismiss). Resolves against a fresh look at act time; ambiguity is returned as a question and nothing is touched. Drives the same gated closed loop as mac.act.",
+            description: "Do one thing to something on the live screen by NAME (click/open/type/select/toggle/scroll/dismiss). Resolves against a fresh look at act time; ambiguity is returned as a question and nothing is touched. Drives the gated closed loop.",
             risk: "medium", dryRunAvailable: false, requiresApproval: false,
             category: "accessibility",
             inputSchema: schema([
@@ -1210,7 +1073,7 @@ public func connectorActionDescriptors() -> [ConnectorActionDescriptor] {
         ConnectorActionDescriptor(
             id: "mac.look", connectorId: "mac", connector: "mac",
             name: "Mac Look",
-            description: "Look at the frontmost window at one of three grades: glance (one distilled line), look (the structured percept: focus, modal, landmarks, every labeled control with a stable handle and its element path), or stare (the raw accessibility tree, same as mac.ax_tree). Read-only; unlabeled controls are counted by role, never hidden.",
+            description: "Look at the frontmost window at one of three grades: glance (one distilled line), look (the structured percept: focus, modal, landmarks, every labeled control with a stable handle and its element path), or stare (the raw accessibility tree). Read-only; unlabeled controls are counted by role, never hidden.",
             risk: "low", dryRunAvailable: true, requiresApproval: false,
             category: "accessibility",
             inputSchema: schema([
@@ -1233,19 +1096,6 @@ public func connectorActionDescriptors() -> [ConnectorActionDescriptor] {
                 ("wait_ms", prop("integer")),
                 ("duration_seconds", prop("integer")),
                 ("full_screen", prop("boolean")),
-            ])
-        ),
-        ConnectorActionDescriptor(
-            id: "mac.ax_find", connectorId: "mac", connector: "mac",
-            name: "Mac Accessibility Find",
-            description: "Find UI elements in the frontmost window by role, title substring (case-insensitive), and/or value. Read-only; returns up to 20 matches ranked by match quality with their frame and path.",
-            risk: "low", dryRunAvailable: true, requiresApproval: false,
-            category: "accessibility",
-            inputSchema: schema([
-                ("role", prop("string")),
-                ("title", prop("string")),
-                ("value", prop("string")),
-                ("limit", prop("integer")),
             ])
         ),
         // W7 (2026-08-14) — the ambient activity watcher's ONLY read path.

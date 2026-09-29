@@ -57,7 +57,7 @@ enum MacChatTranscriptSearch {
     /// never renders — the transcript folds a bridge receipt into
     /// `ShellEnvelopeRow`, and even "Show" reveals only the extracted reply.
     /// The index now carries the substantive text, which is a subset of what
-    /// both the new shell and the classic bubble display, so a match is always
+    /// the bubble displays, so a match is always
     /// reachable. The bridge-routed fences match the renderer's exactly (see
     /// `ChatShellConversationRow.isBridgeRouted`).
     static func visibleText(of message: ChatMessage) -> String {
@@ -66,8 +66,12 @@ enum MacChatTranscriptSearch {
             return content
         }
         let role = message.role.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        if role == "user", ChatShellEnvelope.isEnvelope(content) {
+        if role == "user", ChatShellEnvelope.isEnvelope(content, envelope: message.metadata?.envelope) {
             return ChatShellEnvelope.reply(content)
+        }
+        if role == "user", message.metadata?.origin?.surface?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "agent-bridge" {
+            return SimpleViewStore.bridgedText(content)
         }
         guard ChatShellConversationRow.hasBridgePrefix(content) else { return content }
         return ChatShellConversationRow.stripBridgePrefix(content)
@@ -389,25 +393,19 @@ struct MacChatTranscriptSearchBar: View {
     @Bindable var controller: MacChatTranscriptSearchController
     let focusRequest: UInt
     let onDismiss: () -> Void
-    @FocusState private var searchFocused: Bool
 
     var body: some View {
         HStack(spacing: NativeAgentSpacing.sm) {
-            Image(systemName: "magnifyingglass")
-                .foregroundStyle(.secondary)
-                .accessibilityHidden(true)
-
-            TextField(
-                "Search conversation",
-                text: Binding(
-                    get: { controller.query },
-                    set: { controller.setQuery($0) }
-                )
+            // The Mac's own search field (User 09-27: all controls native).
+            NativeSearchField(
+                text: Binding(get: { controller.query }, set: { controller.setQuery($0) }),
+                prompt: "Search conversation",
+                identifier: "chat.transcript.search",
+                accessibilityLabel: "Search conversation",
+                onSubmit: { _ = controller.selectNext() },
+                onEscape: onDismiss,
+                focusRequest: focusRequest
             )
-            .textFieldStyle(.plain)
-            .focused($searchFocused)
-            .onSubmit { _ = controller.selectNext() }
-            .accessibilityLabel("Search conversation")
 
             Text(controller.statusText)
                 .font(NativeAgentFont.tag)
@@ -443,8 +441,6 @@ struct MacChatTranscriptSearchBar: View {
         .padding(.vertical, NativeAgentSpacing.sm)
         .background(.bar)
         .overlay(alignment: .bottom) { Divider() }
-        .onAppear { searchFocused = true }
-        .onChange(of: focusRequest) { _, _ in searchFocused = true }
         .onExitCommand(perform: onDismiss)
     }
 }

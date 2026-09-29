@@ -1,5 +1,6 @@
 import SwiftUI
 import PersistenceCore
+import Desk
 
 // MARK: - DeskNagsPanel — User's nag switch, in the UI (C6)
 //

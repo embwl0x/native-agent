@@ -8,7 +8,7 @@ import WorkshopExecution
 /// A5.2 (2026-07-24): formerly the file-backed mirror of the retired
 /// daemon::Inbox.surface (`<root>/inbox/` items.jsonl + index.json). That
 /// silo is retired — nothing user-facing ever read it, and every fired card
-/// already lands in `notifications/inbox.jsonl` via the app-side mirror seam.
+/// already lands in `notifications/inbox.jsonl` via `TriggerNotificationInbox`.
 /// What remains here is the 7-day active-duplicate identity check against
 /// the live inbox; the fire path uses it to suppress duplicate pushes.
 public actor ProactiveInboxStore {
@@ -19,7 +19,7 @@ public actor ProactiveInboxStore {
     }
 
     /// The LIVE inbox — the one store the Mac UI, getInboxItems, and the iOS
-    /// snapshot read, and the one the app-side mirror seam writes.
+    /// snapshot read, and the one `TriggerNotificationInbox` writes.
     public nonisolated var notificationsInboxPath: URL {
         root
             .appendingPathComponent("notifications", isDirectory: true)
@@ -28,8 +28,8 @@ public actor ProactiveInboxStore {
 
     /// A5.2 (2026-07-24): the legacy `<root>/inbox/` silo (items.jsonl +
     /// index.json) is retired — nothing user-facing ever read it, and every
-    /// fired card already lands in the live inbox via the app-side seam
-    /// (`TriggerNotifierBinding.pairedDevicePush` for notify:true fires,
+    /// fired card already lands in the live inbox via `TriggerNotificationInbox`
+    /// (`TriggerNotificationDelivery.notify` for notify:true fires,
     /// `mirrorNonNotifiedFire` for everything else). This store's remaining
     /// job is the 7-day active-duplicate check, now anchored to the live
     /// inbox: a repeat fire hands back the EXISTING card id, and the fire
@@ -55,7 +55,7 @@ public actor ProactiveInboxStore {
     /// Suppress repeated proactive/routine inbox cards while an equivalent
     /// active card is still visible. This is deliberately scoped to proactive
     /// sources so event-like inbox writers can still emit separate events.
-    /// Public so the app-side mirror seam (TriggerNotifierBinding) can run the
+    /// Shared so `TriggerNotificationInbox` can run the
     /// SAME matcher atomically under the live-inbox file lock right before it
     /// appends — surface()'s call is advisory (suppresses the push early); the
     /// mirror's locked call is the backstop that closes the check-then-append

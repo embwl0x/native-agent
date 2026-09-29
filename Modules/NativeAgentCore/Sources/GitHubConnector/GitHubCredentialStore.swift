@@ -13,35 +13,30 @@ public protocol GitHubCredentialVault: Sendable {
 
 public enum GitHubCredentialVaultError: Error, Sendable, LocalizedError {
     case keychain(OSStatus)
-    case testHarnessAccessRefused
     case invalidStoredValue
     case verificationFailed
     case malformedMetadata
+    case accountChanged
 
     public var errorDescription: String? {
         switch self {
         case .keychain(let status):
             let detail = SecCopyErrorMessageString(status, nil) as String? ?? "OSStatus \(status)"
             return "GitHub credential Keychain access failed: \(detail)."
-        case .testHarnessAccessRefused:
-            return "GitHub credential Keychain access is disabled under the test harness."
         case .invalidStoredValue:
             return "The GitHub credential in Keychain is invalid."
         case .verificationFailed:
             return "GitHub credential Keychain verification failed."
         case .malformedMetadata:
             return "GitHub credential metadata is malformed."
+        case .accountChanged:
+            return "GitHub account changed — retry the request."
         }
     }
 }
 
 public struct SystemGitHubCredentialVault: GitHubCredentialVault {
     public init() {}
-
-    static var isRunningUnderTestHarness: Bool {
-        NSClassFromString("XCTestCase") != nil
-            || ProcessInfo.processInfo.processName == "swiftpm-testing-helper"
-    }
 
     static func nonInteractiveIdentityQuery(service: String, account: String) -> [String: Any] {
         let context = LAContext()
@@ -50,7 +45,7 @@ public struct SystemGitHubCredentialVault: GitHubCredentialVault {
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
-            // A background agent and a test runner must never summon a login
+            // A background agent must never summon a login
             // password dialog. If an item's ACL requires interaction, surface
             // errSecInteractionNotAllowed and let the caller report degraded
             // readiness instead of blocking the production chain.
@@ -59,9 +54,6 @@ public struct SystemGitHubCredentialVault: GitHubCredentialVault {
     }
 
     public func read(service: String, account: String) throws -> String? {
-        guard !Self.isRunningUnderTestHarness else {
-            throw GitHubCredentialVaultError.testHarnessAccessRefused
-        }
         var query = Self.nonInteractiveIdentityQuery(service: service, account: account)
         query[kSecMatchLimit as String] = kSecMatchLimitOne
         query[kSecReturnData as String] = true
@@ -80,9 +72,6 @@ public struct SystemGitHubCredentialVault: GitHubCredentialVault {
     }
 
     public func write(_ token: String, service: String, account: String) throws {
-        guard !Self.isRunningUnderTestHarness else {
-            throw GitHubCredentialVaultError.testHarnessAccessRefused
-        }
         let identity: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -108,9 +97,6 @@ public struct SystemGitHubCredentialVault: GitHubCredentialVault {
     }
 
     public func delete(service: String, account: String) throws {
-        guard !Self.isRunningUnderTestHarness else {
-            throw GitHubCredentialVaultError.testHarnessAccessRefused
-        }
         let query = Self.nonInteractiveIdentityQuery(service: service, account: account)
         let status = SecItemDelete(query as CFDictionary)
         guard status == errSecSuccess || status == errSecItemNotFound else {
@@ -159,6 +145,9 @@ public actor GitHubCredentialStore {
     /// One refresh at a time per data root: GitHub rotates the refresh token,
     /// so a second concurrent refresh would spend a dead one.
     private var refreshInFlight: [String: Task<GitHubOAuthDeviceFlow.Token?, any Error>] = [:]
+    private var lastRefresh: [String: (original: String, token: GitHubOAuthDeviceFlow.Token)] = [:]
+    /// A Doctor waiter protects the shared exchange even if a runtime caller started it.
+    private var nonDestructiveRefreshes: Set<String> = []
     /// Bumped by every save and delete, per data root. A refresh that
     /// finishes after one of those must not write or clear anything.
     private var generation: [String: Int] = [:]
@@ -198,6 +187,7 @@ public actor GitHubCredentialStore {
         guard !token.isEmpty else { throw GitHubCredentialVaultError.invalidStoredValue }
         let account = Self.credentialAccount(dataRoot: dataRoot)
         generation[account, default: 0] += 1
+        lastRefresh[account] = nil
         try writeAndVerify(token, account: account)
         // A token pasted now is the person's choice; a stored sign-in would
         // otherwise keep winning over it.
@@ -213,7 +203,11 @@ public actor GitHubCredentialStore {
         dataRoot: URL
     ) async throws {
         let account = Self.credentialAccount(dataRoot: dataRoot)
+        var token = token
+        token.accountID = metadata.userID
+        token.refreshTokenAccountID = token.refreshToken == nil ? nil : metadata.userID
         generation[account, default: 0] += 1
+        lastRefresh[account] = nil
         try writeOAuth(token, account: account)
         try await rewriteMetadata(dataRoot: dataRoot, metadata: metadata, createMissing: true,
                                   authMode: "oauth_device")
@@ -223,10 +217,49 @@ public actor GitHubCredentialStore {
     /// return the new access token, or nil when there is no sign-in to refresh.
     public func refreshAfterRejection(_ rejected: String, dataRoot: URL) async throws -> String? {
         let account = Self.credentialAccount(dataRoot: dataRoot)
-        guard let stored = try readOAuth(account: account), stored.refreshToken != nil else { return nil }
-        // Another caller already refreshed past the rejected token.
-        if stored.accessToken != rejected { return stored.accessToken }
-        return try await refreshedOAuth(stored, account: account)?.accessToken
+        guard let stored = try readOAuth(account: account) else { return nil }
+        // Only this owner's completed exchange proves that a changed token
+        // continues the rejected request's account, rather than a new sign-in.
+        if stored.accessToken != rejected {
+            guard let previous = lastRefresh[account],
+                  previous.original == rejected,
+                  let accountID = previous.token.accountID,
+                  accountID == stored.accountID,
+                  previous.token.accessToken == stored.accessToken,
+                  previous.token.refreshToken == stored.refreshToken else {
+                throw GitHubCredentialVaultError.accountChanged
+            }
+            return stored.accessToken
+        }
+        guard stored.refreshToken != nil else { return nil }
+        return try await refreshedOAuth(stored, account: account, dataRoot: dataRoot)?.accessToken
+    }
+
+    /// Doctor reads the Keychain owner's metadata, never the non-secret mirror's expiry.
+    public func credentialStatus(dataRoot: URL, requiringOAuth: Bool = false) throws -> (configured: Bool, expiresAt: Date?, canRefresh: Bool) {
+        let account = Self.credentialAccount(dataRoot: dataRoot)
+        if let token = try readOAuth(account: account) {
+            let hasRefresh = token.refreshToken?.isEmpty == false
+            var canRefresh = hasRefresh && token.hasRefreshBinding
+            if hasRefresh && token.refreshTokenAccountID == nil {
+                canRefresh = try expectedAccountID(for: token, dataRoot: dataRoot) != nil
+            }
+            return (true, token.expiresAt, canRefresh)
+        }
+        if requiringOAuth { return (false, nil, false) }
+        let pat = try vault.read(service: Self.keychainService, account: account)
+        return (pat?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false, nil, false)
+    }
+
+    public func refreshCredential(dataRoot: URL) async throws {
+        let account = Self.credentialAccount(dataRoot: dataRoot)
+        guard let stored = try readOAuth(account: account), stored.refreshToken?.isEmpty == false else {
+            throw GitHubCredentialVaultError.invalidStoredValue
+        }
+        // Doctor must neither migrate/fall back to a PAT nor clear a rejected sign-in.
+        guard try await refreshedOAuth(stored, account: account, dataRoot: dataRoot, preserveOnRejection: true) != nil else {
+            throw GitHubCredentialVaultError.invalidStoredValue
+        }
     }
 
     private func readOAuth(account: String) throws -> GitHubOAuthDeviceFlow.Token? {
@@ -251,31 +284,74 @@ public actor GitHubCredentialStore {
         }
     }
 
-    /// Refreshes, coalesced. A refresh token GitHub rejects clears the dead
-    /// sign-in and returns nil, so resolution falls back to a PAT or to
-    /// "not configured" — which offers Connect again.
-    private func refreshedOAuth(
-        _ stored: GitHubOAuthDeviceFlow.Token, account: String
-    ) async throws -> GitHubOAuthDeviceFlow.Token? {
-        if let inFlight = refreshInFlight[account] {
-            return try await inFlight.value
+    private func expectedAccountID(for token: GitHubOAuthDeviceFlow.Token, dataRoot: URL) throws -> Int64? {
+        if let accountID = token.accountID { return accountID }
+        var expected: Int64?
+        for path in Self.metadataPaths(dataRoot: dataRoot) {
+            let object = try Self.readObject(at: path)
+            guard let value = object["user_id"] else { continue }
+            guard case .int(let userID) = value, userID > 0 else { return nil }
+            if let expected, expected != userID { return nil }
+            expected = userID
         }
+        return expected
+    }
+
+    /// Refreshes, coalesced. A rejected bound grant clears the sign-in and
+    /// returns nil. Doctor and legacy grants preserve the credential on rejection.
+    /// The request cannot fall through to a PAT from another account.
+    private func refreshedOAuth(
+        _ stored: GitHubOAuthDeviceFlow.Token, account: String, dataRoot: URL,
+        preserveOnRejection: Bool = false
+    ) async throws -> GitHubOAuthDeviceFlow.Token? {
         guard let refreshToken = stored.refreshToken else { return stored }
+        let expectedAccountID = try expectedAccountID(for: stored, dataRoot: dataRoot)
+        let legacy = stored.refreshTokenAccountID == nil && expectedAccountID != nil
+        // Only an absent binding can migrate; a mismatched binding must not rotate.
+        guard stored.hasRefreshBinding || legacy else {
+            throw GitHubOAuthDeviceFlow.FlowError.refreshRejected("account_mismatch")
+        }
+        if preserveOnRejection || legacy { nonDestructiveRefreshes.insert(account) }
+        if let inFlight = refreshInFlight[account] {
+            let fresh = try await inFlight.value
+            guard fresh?.accountID == expectedAccountID,
+                  try readOAuth(account: account)?.accountID == expectedAccountID else {
+                throw GitHubCredentialVaultError.accountChanged
+            }
+            return fresh
+        }
         let started = generation[account, default: 0]
         // Runs on this actor; it writes before any waiter resumes.
         let task = Task { () throws -> GitHubOAuthDeviceFlow.Token? in
-            defer { self.refreshInFlight[account] = nil }
+            defer {
+                self.refreshInFlight[account] = nil
+                self.nonDestructiveRefreshes.remove(account)
+            }
             do {
-                let fresh = try await GitHubOAuthDeviceFlow.refresh(refreshToken)
+                var fresh = try await GitHubOAuthDeviceFlow.refresh(refreshToken)
+                if legacy {
+                    let user = try? await GitHubConnectorActions.validateToken(fresh.accessToken)
+                    let accountID = (user?["id"] as? NSNumber)?.int64Value
+                    guard accountID == expectedAccountID,
+                          fresh.refreshToken?.isEmpty == false else {
+                        throw GitHubOAuthDeviceFlow.FlowError.refreshRejected("account_mismatch")
+                    }
+                }
+                fresh.accountID = expectedAccountID
+                fresh.refreshTokenAccountID = fresh.refreshToken == nil ? nil : expectedAccountID
                 // Saved or disconnected meanwhile: that choice stands.
                 guard self.generation[account, default: 0] == started else {
-                    return try self.readOAuth(account: account)
+                    throw GitHubCredentialVaultError.accountChanged
                 }
                 try self.writeOAuth(fresh, account: account)
+                self.lastRefresh[account] = (stored.accessToken, fresh)
                 return fresh
             } catch GitHubOAuthDeviceFlow.FlowError.refreshRejected(let code) {
+                if self.nonDestructiveRefreshes.contains(account) {
+                    throw GitHubOAuthDeviceFlow.FlowError.refreshRejected(code)
+                }
                 guard self.generation[account, default: 0] == started else {
-                    return try self.readOAuth(account: account)
+                    throw GitHubCredentialVaultError.accountChanged
                 }
                 NSLog("[github] OAuth refresh rejected (%@); clearing the sign-in", code)
                 try self.vault.delete(service: Self.oauthKeychainService, account: account)
@@ -302,14 +378,17 @@ public actor GitHubCredentialStore {
         if let oauth = try readOAuth(account: account) {
             if !oauth.needsRefresh() { return oauth.accessToken }
             do {
-                if let fresh = try await refreshedOAuth(oauth, account: account) {
+                if let fresh = try await refreshedOAuth(oauth, account: account, dataRoot: dataRoot) {
                     return fresh.accessToken
                 }
+            } catch GitHubCredentialVaultError.accountChanged {
+                throw GitHubCredentialVaultError.accountChanged
             } catch {
                 // Transient (offline, 5xx): the old token may still have minutes left.
                 if let expiresAt = oauth.expiresAt, expiresAt > Date() { return oauth.accessToken }
                 throw error
             }
+            return nil
         }
         if let stored = try vault.read(service: Self.keychainService, account: account) {
             let token = stored.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -338,6 +417,7 @@ public actor GitHubCredentialStore {
     public func deleteCredential(dataRoot: URL) async throws {
         let account = Self.credentialAccount(dataRoot: dataRoot)
         generation[account, default: 0] += 1
+        lastRefresh[account] = nil
         try vault.delete(service: Self.keychainService, account: account)
         try vault.delete(service: Self.oauthKeychainService, account: account)
         var firstError: (any Error)?

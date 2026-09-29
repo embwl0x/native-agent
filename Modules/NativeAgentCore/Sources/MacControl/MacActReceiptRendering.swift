@@ -1,5 +1,6 @@
 import Foundation
 import PersistenceCore
+import TrustCenter
 
 /// Pure rendering of the observed act effect; execution and verification stay
 /// with SwiftNativeMacControl and MacActClosedLoop.

@@ -38,52 +38,40 @@ struct ShellWindowChrome: NSViewRepresentable {
     }
 }
 
-/// The classic shell keeps NavigationSplitView; the new shell lays the rail
-/// and the content side by side itself, so no system pane draws corners.
+/// The shell lays the rail and the content side by side itself, so no system
+/// pane draws corners.
 struct ShellFrame<Sidebar: View, Detail: View>: View {
     @State private var keyboardOrder = ShellKeyboardOrder()
     /// The haze is drawn only without Reduce Transparency, and where it is
     /// drawn it replaces the warm lamp: the two mixed to olive-khaki.
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
-    var classic: Bool
     @ViewBuilder var sidebar: () -> Sidebar
     @ViewBuilder var detail: () -> Detail
 
     var body: some View {
-        Group {
-            if classic {
-                NavigationSplitView {
-                    sidebar().focusSection()
-                } detail: {
-                    detail().focusSection()
-                }
-                    .background { Color.clear.contentShape(Rectangle()).gesture(WindowDragGesture()) }
-            } else {
-                HStack(spacing: 0) {
-                    sidebar().focusSection()
-                    detail().focusSection()
-                }
-                // User, 2026-09-03: one sheet of glass. Agent, same day: drawn ONCE,
-                // here, under all three columns — per-column copies of the same
-                // material still read as three plates. The columns are transparent
-                // over it; the lamp is drawn once over all of them. User,
-                // 2026-09-23: the one exception is the rail, which floats on
-                // this sheet as a rounded glass plate (ShellSidebarRail).
-                .background {
-                    ShellSheet().contentShape(Rectangle()).gesture(WindowDragGesture())
-                        // Alive glass, 2026-09-23: the one drifting haze, over
-                        // the sheet and under every column. See WindowHaze.swift.
-                        .overlay { WindowHaze() }
-                        .overlay { if reduceTransparency && shellLampUnderContent { ShellLamp() } }
-                }
-                .overlay { if reduceTransparency && !shellLampUnderContent { ShellLamp() } }
-                // Mood in the tint, 2026-09-14: one masked colour-blend pass
-                // over the whole sheet, so the rail, the room ground and the
-                // composer warm together and the transcript's prose does not.
-                // See MoodTint.swift — the whole feature is that file.
-                .moodTintWindow()
-            }
+        HStack(spacing: 0) {
+            sidebar().focusSection()
+            detail().focusSection()
         }
+        // User, 2026-09-03: one sheet of glass. Agent, same day: drawn ONCE,
+        // here, under all three columns — per-column copies of the same
+        // material still read as three plates. The columns are transparent
+        // over it; the lamp is drawn once over all of them. User,
+        // 2026-09-23: the one exception is the rail, which floats on
+        // this sheet as a rounded glass plate (ShellSidebarRail).
+        .background {
+            ShellSheet().contentShape(Rectangle()).gesture(WindowDragGesture())
+                // Alive glass, 2026-09-23: the one drifting haze, over
+                // the sheet and under every column. See WindowHaze.swift.
+                .overlay { WindowHaze() }
+                .overlay { if reduceTransparency && shellLampUnderContent { ShellLamp() } }
+        }
+        .overlay { if reduceTransparency && !shellLampUnderContent { ShellLamp() } }
+        // Mood in the tint, 2026-09-14: one masked colour-blend pass
+        // over the whole sheet, so the rail, the room ground and the
+        // composer warm together and the transcript's prose does not.
+        // See MoodTint.swift — the whole feature is that file.
+        .moodTintWindow()
         .environment(\.shellKeyboardOrder, keyboardOrder)
     }
 }
@@ -113,7 +101,11 @@ final class ShellKeyboardOrder {
     func move(from id: UUID, backwards: Bool) -> Bool {
         let order = ordered
         // Other pages retain their native traversal through all page controls.
-        guard order.contains(where: { $0.region == .composer }),
+        // Without Keyboard navigation (System Settings > Keyboard) macOS keeps
+        // buttons out of focus, so a hop to the rail or Send would land nowhere
+        // and eat the Tab; the native loop keeps it.
+        guard NSApp.isFullKeyboardAccessEnabled,
+              order.contains(where: { $0.region == .composer }),
               let index = order.firstIndex(where: { $0.id == id }) else { return false }
         let current = order[index]
         if backwards || current.region == .rail || current.region == .send {
@@ -167,6 +159,7 @@ private struct ShellKeyboardTarget: ViewModifier {
     @State private var y: CGFloat = 0
     @State private var visible = false
     let region: ShellKeyboardOrder.Region
+    var sortsLast = false
     var composerFocused: Bool = false
     var focusComposer: (() -> Void)?
     /// Offered the draft's Tab before the window-wide order is. The composer's
@@ -191,7 +184,7 @@ private struct ShellKeyboardTarget: ViewModifier {
                     // light instead of the square system one.
                     .focusEffectDisabled(region == .rail)
                     .overlay { if region == .rail, focused { ShellRailFocusRing() } }
-                    .onKeyPress(keys: [.tab]) { press in
+                    .onKeyPress(keys: [.tab, .backTab]) { press in
                         guard !press.modifiers.contains(.option) else { return .ignored }
                         return order?.move(from: id, backwards: press.modifiers.contains(.shift)) == true
                             ? .handled : .ignored
@@ -199,7 +192,7 @@ private struct ShellKeyboardTarget: ViewModifier {
             }
         }
         .onGeometryChange(for: CGFloat.self) { $0.frame(in: .global).midY } action: {
-            y = $0
+            y = sortsLast ? .greatestFiniteMagnitude : $0
             register()
         }
         .onScrollVisibilityChange(threshold: 0.01) {
@@ -222,9 +215,27 @@ private struct ShellKeyboardTarget: ViewModifier {
     }
 }
 
+extension KeyEquivalent {
+    /// Shift-Tab arrives as U+0019, not as `.tab` with Shift held, so a
+    /// `keys: [.tab]` handler never saw it and Shift-Tab fell to the native
+    /// loop: the rail's first word went to Send instead of back to the draft.
+    static let backTab = KeyEquivalent("\u{19}")
+}
+
 extension View {
-    func shellKeyboardTarget(_ region: ShellKeyboardOrder.Region) -> some View {
-        modifier(ShellKeyboardTarget(region: region))
+    /// A button or switch is a focus stop by itself while Keyboard navigation
+    /// is on, and `.focusable()` over it adds a second, invisible stop: Tab
+    /// off the last word, or through a pane, did nothing once. So it is added
+    /// only when the system leaves buttons out; one stop either way.
+    @MainActor @ViewBuilder
+    func buttonFocusable() -> some View {
+        if NSApp.isFullKeyboardAccessEnabled { self } else { focusable() }
+    }
+
+    /// `sortsLast`: a control pinned below a scrolling list (Simple's
+    /// Settings) comes after every row, wherever the list is scrolled.
+    func shellKeyboardTarget(_ region: ShellKeyboardOrder.Region, sortsLast: Bool = false) -> some View {
+        modifier(ShellKeyboardTarget(region: region, sortsLast: sortsLast))
     }
 
     func shellComposerKeyboardTarget(

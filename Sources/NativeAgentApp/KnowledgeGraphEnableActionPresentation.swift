@@ -62,7 +62,7 @@ enum KnowledgeGraphEnableAction {
     @MainActor
     static func perform(using appModel: AppModel, enabled: Bool = true) async -> KnowledgeGraphEnableActionPresentation {
         guard await appModel.patchMemoryPolicy(knowledgeGraphEnabled: enabled),
-              appModel.trustPolicy?.memoryPolicy?.knowledge_graph_enabled == enabled else {
+              appModel.engine.trust.policy?.memoryPolicy?.knowledge_graph_enabled == enabled else {
             return .failure(statusText: appModel.statusText, enabling: enabled)
         }
         return enabled ? .enabled : .disabled

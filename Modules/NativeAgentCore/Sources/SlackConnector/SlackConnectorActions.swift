@@ -450,7 +450,7 @@ public enum SlackConnectorActions {
             let fix: String? = switch error {
             case "not_authed", "invalid_auth", "token_revoked", "account_inactive": "The Slack token no longer works; reconnect Slack in Connectors."
             case "missing_scope": "The Slack app lacks the scope \((response["needed"] as? String) ?? "this needs"); add it in the Slack app settings and reconnect."
-            case "not_allowed_token_type": "This needs a user token (search does); a bot token cannot do it."
+            case "not_allowed_token_type": "Slack search is unavailable with the connected bot token."
             case "channel_not_found": "No channel by that name or id; slack_list_channels shows them."
             case "not_in_channel": "The bot isn't in that channel; invite it there with /invite first."
             case "ratelimited": "Slack is rate limiting; wait a minute before trying again."

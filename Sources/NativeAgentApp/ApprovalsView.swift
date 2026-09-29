@@ -1,4 +1,5 @@
 import SwiftUI
+import ApprovalInbox
 import Observation
 import AppKit
 import CoreGraphics
@@ -58,14 +59,13 @@ enum ApprovalPayloadPreviewPresentation {
         case unavailable
     }
 
-    static func state(for approval: ApprovalRequest) -> State {
-        guard let rawPreview = approval.payloadPreview else { return .unavailable }
-        let preview = rawPreview.trimmingCharacters(in: .whitespacesAndNewlines)
+    static func state(for approval: ApprovalRecord) -> State {
+        let preview = approval.payloadPreview.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !preview.isEmpty else { return .unavailable }
         return .available(preview)
     }
 
-    static func canResolve(_ approval: ApprovalRequest) -> Bool {
+    static func canResolve(_ approval: ApprovalRecord) -> Bool {
         if case .available = state(for: approval) { return true }
         return false
     }
@@ -84,7 +84,7 @@ enum ApprovalDecisionToastPresentation {
     }
 
     static func toast(
-        for resolvedApproval: ApprovalRequest,
+        for resolvedApproval: ApprovalRecord,
         requestedID: String
     ) -> Toast {
         guard !requestedID.isEmpty, resolvedApproval.id == requestedID else {
@@ -142,7 +142,7 @@ enum ApprovalHistoryRowPresentation {
         let tone: Tone
     }
 
-    static func icon(for approval: ApprovalRequest) -> Icon {
+    static func icon(for approval: ApprovalRecord) -> Icon {
         let decision = normalized(approval.decision)
         switch decision {
         case .some("approved"):
@@ -197,10 +197,10 @@ enum ApprovalHistoryRowPresentation {
 enum ApprovalRequestsLiveRefresh {
     @MainActor
     static func observe(
-        client: NativeClient,
+        approvals: ApprovalsFacade,
         refresh: @escaping @MainActor @Sendable () async -> Void
     ) async {
-        let approvalPath = await client.approvalRequestsPath()
+        let approvalPath = await approvals.requestsPath()
         await ViewFileRefreshTask.run(paths: [approvalPath], refresh: refresh)
     }
 }
@@ -230,7 +230,7 @@ enum ApprovalLoadFailurePresentation {
 /// clears the adverse state before publishing replacement rows.
 @MainActor @Observable
 final class ApprovalLoadState {
-    private(set) var approvals: [ApprovalRequest]
+    private(set) var approvals: [ApprovalRecord]
     private(set) var refreshErrorText: String?
     private(set) var actionErrorText: String?
     private(set) var hasLoadedSnapshot = false
@@ -239,7 +239,7 @@ final class ApprovalLoadState {
 
     var errorText: String? { actionErrorText ?? refreshErrorText }
 
-    init(approvals: [ApprovalRequest] = []) {
+    init(approvals: [ApprovalRecord] = []) {
         self.approvals = approvals
         hasLoadedSnapshot = !approvals.isEmpty
     }
@@ -265,7 +265,7 @@ final class ApprovalLoadState {
 
     @discardableResult
     func reload(
-        read: @escaping @MainActor () async throws -> [ApprovalRequest]
+        read: @escaping @MainActor () async throws -> [ApprovalRecord]
     ) async -> Bool {
         refreshGeneration &+= 1
         let generation = refreshGeneration
@@ -318,11 +318,11 @@ struct ApprovalsView: View {
         return pending.isEmpty ? "checkmark.shield.fill" : "exclamationmark.shield.fill"
     }
 
-    private var pending: [ApprovalRequest] {
+    private var pending: [ApprovalRecord] {
         approvalLoadState.approvals.filter { $0.status.lowercased() == "pending" }
     }
 
-    private var recent: [ApprovalRequest] {
+    private var recent: [ApprovalRecord] {
         approvalLoadState.approvals.filter { $0.status.lowercased() != "pending" }
     }
 
@@ -421,7 +421,7 @@ struct ApprovalsView: View {
         .navigationTitle("Approvals")
         .task(id: scenePhase) {
             guard scenePhase == .active else { return }
-            await ApprovalRequestsLiveRefresh.observe(client: appModel.client) {
+            await ApprovalRequestsLiveRefresh.observe(approvals: appModel.engine.approvals) {
                 await refreshApprovals()
             }
         }
@@ -429,8 +429,8 @@ struct ApprovalsView: View {
 
     @MainActor
     private func refreshApprovals() async {
-        if await approvalLoadState.reload(read: { try await appModel.getApprovals() }) {
-            appModel.approvals = approvalLoadState.approvals
+        if await approvalLoadState.reload(read: { try await appModel.engine.approvals.list() }) {
+            appModel.engine.approvals.records = approvalLoadState.approvals
         }
     }
 
@@ -511,7 +511,7 @@ struct ApprovalPayloadPreviewView: View {
 }
 
 private struct ApprovalRequestPanel: View {
-    var approval: ApprovalRequest
+    var approval: ApprovalRecord
     var isDeciding: Bool
     var onResolve: (String) -> Void
 
@@ -538,8 +538,8 @@ private struct ApprovalRequestPanel: View {
                     Spacer()
                     StatusBadge(text: riskBadge.label, status: riskBadge.status)
                 }
-                if let reason = approval.reason, !reason.isEmpty {
-                    Text(reason)
+                if !approval.reason.isEmpty {
+                    Text(approval.reason)
                         .font(NativeAgentFont.body)
                         .foregroundStyle(.secondary)
                         .lineLimit(5)
@@ -585,7 +585,7 @@ private struct ApprovalRequestPanel: View {
 }
 
 private struct ApprovalHistoryRow: View {
-    var approval: ApprovalRequest
+    var approval: ApprovalRecord
 
     var body: some View {
         let icon = ApprovalHistoryRowPresentation.icon(for: approval)
@@ -596,7 +596,7 @@ private struct ApprovalHistoryRow: View {
                 Text(approval.title.isEmpty ? approval.action : approval.title)
                     .font(NativeAgentFont.label)
                     .lineLimit(1)
-                Text("\(approval.decision ?? approval.status) · \(UserDisplayFormatters.humanizeISOTimestamp(approval.resolvedAt ?? approval.createdAt ?? ""))")
+                Text("\(approval.decision ?? approval.status) · \(UserDisplayFormatters.humanizeISOTimestamp(approval.resolvedAt ?? approval.createdAt))")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
