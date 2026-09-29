@@ -1106,8 +1106,9 @@ struct MessageBubble: View {
     }
 
     private var isPeerBridgeMessage: Bool {
-        isUser && message.metadata?.origin?.surface?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "agent-bridge"
+        // Peers and helpers both speak in the person's seat only by transport.
+        isUser && ["agent-bridge", "bot"].contains(message.metadata?.origin?.surface?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "")
     }
 
     private var bridgeTag: String? {
