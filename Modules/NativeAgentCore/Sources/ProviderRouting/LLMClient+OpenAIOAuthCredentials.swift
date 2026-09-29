@@ -72,6 +72,26 @@ extension OpenAIOAuthDirectAdapter {
 
     /// Preferred auth path for chat execution. Uses the first candidate with
     /// usable tokens; when none exist, returns the first writable candidate.
+    /// Read path for a runtime bound to `dataRoot` (helpers and their
+    /// workers): this root's own sign-in, or the Codex CLI session this root
+    /// consented to adopt — the rule chat already applies. Never a write
+    /// target for sign-in; `preferredAuthPath(allowSharedFallbacks: false)`
+    /// stays strictly app-owned. 2026-09-29: fresh "Use it" installs chatted
+    /// fine but every helper failed "Connect your model".
+    public static func boundRootReadAuthPath(
+        dataRoot: URL,
+        userCodexHome: URL = defaultUserCodexHome()
+    ) -> URL {
+        let owned = preferredAuthPath(dataRoot: dataRoot, allowSharedFallbacks: false, defaultRoot: dataRoot)
+        let shared = userCodexHome.appendingPathComponent("auth.json")
+        if !hasUsableTokens(at: owned),
+           cliAdoptionConsent(dataRoot: dataRoot) == .allowed,
+           hasUsableTokens(at: shared) {
+            return shared
+        }
+        return owned
+    }
+
     public static func preferredAuthPath(
         dataRoot: URL? = nil,
         environment: [String: String] = ProcessInfo.processInfo.environment,
@@ -82,19 +102,9 @@ extension OpenAIOAuthDirectAdapter {
         defaultRoot: URL = PersistenceCore.defaultDataRoot()
     ) -> URL {
         if !allowSharedFallbacks, let dataRoot {
-            let owned = dataRoot.standardizedFileURL
+            return dataRoot.standardizedFileURL
                 .appendingPathComponent("codex_home", isDirectory: true)
                 .appendingPathComponent("auth.json")
-            // A CLI session this root consented to adopt is this root's own
-            // sign-in, not a shared fallback; without it a fresh install on
-            // "Use it" chatted fine but every helper failed "Connect your model".
-            let shared = userCodexHome.appendingPathComponent("auth.json")
-            if !hasUsableTokens(at: owned),
-               cliAdoptionConsent(dataRoot: dataRoot) == .allowed,
-               hasUsableTokens(at: shared) {
-                return shared
-            }
-            return owned
         }
         if let codexHome = environment["CODEX_HOME"], !codexHome.isEmpty {
             return URL(fileURLWithPath: (codexHome as NSString).expandingTildeInPath)

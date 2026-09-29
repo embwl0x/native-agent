@@ -426,7 +426,7 @@ private func makeDefaultChatOrchestrationClient(
             ),
             openAIOAuthDirect: OpenAIOAuthDirectAdapter(
                 authPathOverride: credentialRoot.map {
-                    OpenAIOAuthDirectAdapter.preferredAuthPath(dataRoot: $0, allowSharedFallbacks: false, defaultRoot: $0)
+                    OpenAIOAuthDirectAdapter.boundRootReadAuthPath(dataRoot: $0)
                 },
                 telemetryDataRootOverride: telemetryRoot
             ),

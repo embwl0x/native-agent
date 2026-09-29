@@ -37,9 +37,7 @@ public struct SwarmProviderAssembly: Sendable {
         ]) { _, bound in bound }
         self.anthropicDataRoot = dataRoot
         self.openAIDataRoot = dataRoot
-        self.openAIOAuthPath = OpenAIOAuthDirectAdapter.preferredAuthPath(
-            dataRoot: dataRoot, allowSharedFallbacks: false, defaultRoot: dataRoot
-        )
+        self.openAIOAuthPath = OpenAIOAuthDirectAdapter.boundRootReadAuthPath(dataRoot: dataRoot)
         self.anthropicOAuthPath = dataRoot.appendingPathComponent("providers", isDirectory: true)
             .appendingPathComponent("anthropic_oauth_direct.json")
         self.xaiOAuthPath = XAIOAuthDirectAdapter.tokenPath(dataRoot: dataRoot)
