@@ -187,7 +187,7 @@ verify_signed_bundle_profile_identity() {
       "$profile_plist" \
       "Entitlements:com.apple.developer.team-identifier"
   )"
-  signed_entitlements="$(mktemp "${TMPDIR:-/tmp}/nativeagent-signed-entitlements.XXXXXX.plist")"
+  signed_entitlements="$(mktemp "${TMPDIR:-/tmp}/nativeagent-signed-entitlements.XXXXXX")"
   if ! codesign -d --entitlements :- "$bundle" >"$signed_entitlements" 2>/dev/null; then
     rm -f "$signed_entitlements"
     echo "could not read signed entitlements from $bundle" >&2

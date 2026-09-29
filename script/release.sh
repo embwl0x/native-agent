@@ -817,7 +817,7 @@ if [[ "$DRY_RUN" == "false" ]]; then
   fi
 
   if [[ "$NATIVEAGENT_RELEASE_SYNC_MODE" == "cloudkit" ]]; then
-    PROFILE_PREFLIGHT="$(mktemp "${TMPDIR:-/tmp}/nativeagent-release-profile.XXXXXX.plist")"
+    PROFILE_PREFLIGHT="$(mktemp "${TMPDIR:-/tmp}/nativeagent-release-profile.XXXXXX")"
     if ! decode_provisioning_profile "$NATIVEAGENT_PROVISIONING_PROFILE" "$PROFILE_PREFLIGHT"; then
       rm -f "$PROFILE_PREFLIGHT"
       echo "ERROR: public CloudKit provisioning profile could not be decoded." >&2
@@ -833,7 +833,7 @@ if [[ "$DRY_RUN" == "false" ]]; then
       exit 1
     fi
     GENERATED_PUBLIC_CLOUDKIT_ENTITLEMENTS="$(
-      mktemp "${TMPDIR:-/tmp}/nativeagent-release-entitlements.XXXXXX.plist"
+      mktemp "${TMPDIR:-/tmp}/nativeagent-release-entitlements.XXXXXX"
     )"
     if ! prepare_public_cloudkit_signing_entitlements \
       "$NATIVEAGENT_RELEASE_ENTITLEMENTS" \
