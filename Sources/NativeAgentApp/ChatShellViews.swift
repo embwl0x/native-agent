@@ -31,7 +31,7 @@ struct ShellRoomHeader: View {
     var body: some View {
         HStack(spacing: 8) {
             Text(name)
-                .font(ShellType.title)
+                .font(ShellType.bodyMedium.weight(.semibold))
                 .foregroundStyle(NativeAgentShell.text)
                 .lineLimit(1)
                 .accessibilityAddTraits(.isHeader)
@@ -105,8 +105,9 @@ struct ShellRoomHeader: View {
         // The shell baseline: 20 semibold in a 24pt-tall row, 22 down from the
         // title strip, puts her name on window y 72 with "Chat" and
         // "Conversations".
-        .padding(.top, 22)
-        .padding(.bottom, 10)
+        // User, 2026-10-04: a slim bar like Claude's, not a band over her chat.
+        .padding(.top, 6)
+        .padding(.bottom, 4)
     }
 }
 

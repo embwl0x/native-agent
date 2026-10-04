@@ -88,6 +88,14 @@ extension AppToolExecutor {
         if case .object(let fields)? = value { fields } else { [:] }
     }
 
+    /// Where a run stopped, as the notice says it: its labeled step, else the script line.
+    static func stopPlace(_ out: [String: JSONValue]) -> String {
+        let step = doorText(skillFields(out["hand_back"])["step"])
+        if !step.isEmpty { return step.hasPrefix("step") ? step : "step " + step }
+        let line = doorText(skillFields(out["stopped"])["line"])
+        return line.isEmpty ? "" : "line " + line
+    }
+
     /// Allowed though their page word is denied: provider.test only tests a
     /// connection and changes nothing.
     static let allowedInSkill: Set<String> = ["provider.test"]
@@ -377,7 +385,7 @@ extension AppToolExecutor {
             if let kept = try? await SwiftNativeSkillsClient(root: root).recordRun(
                 id: skill.id, runID: runID, digest: skill.digest, admission: skill.admission, fault: fault,
                 clean: fault == nil && out["status"] == .string("ok"), reason: reason.isEmpty ? Self.doorText(out["status"]) : reason,
-                step: Self.doorText(Self.skillFields(out["hand_back"])["step"]), inputHash: String(hash.prefix(16))) {
+                step: Self.stopPlace(out), inputHash: String(hash.prefix(16))) {
                 out["ladder"] = .object(["clean": .int(Int64(kept.clean)), "of": .int(3)])
                 await Self.queueSkillLines(kept.signals, root: root)
                 if kept.retired {

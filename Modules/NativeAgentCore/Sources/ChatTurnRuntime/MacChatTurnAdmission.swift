@@ -184,9 +184,10 @@ public extension MacChatTurnPresentationPort {
             // Item 5 (third conversation pass): an ordinary follow-up sent while
             // a turn is working no longer has to wait for it to finish. Offer it
             // to the running turn, which takes it at its next tool boundary —
-            // before it chooses another action. The offer owns it while pending;
-            // refused or stranded → it returns to the queue and runs exactly as
-            // it always did. Attachments are never steered: their
+            // before it chooses another action. It stays in the queue (the
+            // visible Next row, Steer and remove included) until the turn
+            // takes it; refused or stranded → it runs exactly as it always
+            // did. Attachments are never steered: their
             // bytes belong to a turn of their own.
             // The agent's own send is never folded into a running turn: it
             // would land there as User's words. Her queued sends do not keep
@@ -194,21 +195,20 @@ public extension MacChatTurnPresentationPort {
             if continuation == nil, origin == nil, sessionIsRunning,
                existingQueue.allSatisfy({ $0.origin != nil }), attachments.isEmpty,
                !hideUserBubble, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                // Transfer ownership before the actor hop: cleanup may restore
-                // a stranded offer before its acknowledgement reaches us.
-                removeQueuedChatTurn(turn.id, sessionId: targetSessionId)
                 Task { @MainActor in
                     let taken = await ChatTurnSteering.shared.offer(
                         ChatTurnSteering.Offer(id: turn.id, text: text),
                         sessionId: targetSessionId
-                    )
+                    ) {
+                        // Delivered (its transcript row is on disk): leave the queue.
+                        for (sid, turns) in self.macChatTurns.queuedBySession
+                        where turns.contains(where: { $0.id == turn.id }) {
+                            let left = turns.filter { $0.id != turn.id }
+                            self.macChatTurns.queuedBySession[sid] = left.isEmpty ? nil : left
+                        }
+                    }
                     if taken {
                         presentMacChatTurn(.status("Sent to the turn in progress"))
-                    } else {
-                        var turns = macChatTurns.queuedBySession[targetSessionId] ?? []
-                        turns.insert(turn, at: min(existingQueue.count, turns.count))
-                        macChatTurns.queuedBySession[targetSessionId] = turns
-                        await drainNextQueuedChatTurnIfPossible(sessionId: targetSessionId)
                     }
                 }
             }
@@ -313,13 +313,20 @@ public extension MacChatTurnPresentationPort {
             // A steering offer the turn ended before it could take is not lost:
             // it goes back to the head of the queue and runs as an ordinary
             // turn, which is exactly what it would have done before item 5.
+            // An unsaved offer is still queued unless it was removed or already
+            // started; a saved one (run id) left the queue and always returns.
             let stranded = await ChatTurnSteering.shared.takeStranded(sessionId: cleanupId)
             for offer in stranded.reversed() {
-                macChatTurns.queuedBySession[cleanupId, default: []].insert(
+                var turns = macChatTurns.queuedBySession[cleanupId] ?? []
+                let wasQueued = turns.contains { $0.id == offer.id }
+                guard wasQueued || offer.enqueuedRunID != nil else { continue }
+                turns.removeAll { $0.id == offer.id }
+                turns.insert(
                     QueuedChatTurn(id: offer.id, text: offer.text, attachments: [],
                                    hideUserBubble: false, enqueuedRunID: offer.enqueuedRunID),
                     at: 0
                 )
+                macChatTurns.queuedBySession[cleanupId] = turns
             }
             await drainNextQueuedChatTurnIfPossible(sessionId: cleanupId)
         }
@@ -395,6 +402,7 @@ public extension MacChatTurnPresentationPort {
 
     @MainActor
     func removeQueuedChatTurn(_ turnId: String, sessionId: String) {
+        Task { await ChatTurnSteering.shared.withdraw(id: turnId) }
         guard var turns = macChatTurns.queuedBySession[sessionId] else { return }
         turns.removeAll { $0.id == turnId }
         if turns.isEmpty {

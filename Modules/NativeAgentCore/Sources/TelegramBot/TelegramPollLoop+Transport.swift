@@ -184,6 +184,18 @@ extension TelegramPollLoop {
         )
     }
 
+    /// The same send without a sound or alert (Bot API `disable_notification`):
+    /// the text lands in the chat for context but does not ping the phone.
+    public static let defaultSendSilentMessage: @Sendable (String, TelegramDestination, String) async throws -> Void = { token, destination, text in
+        try await sendMessage(
+            token: token,
+            chatId: destination.chatId,
+            text: text,
+            threadId: destination.threadId,
+            silent: true
+        )
+    }
+
     /// Concrete ordinary-reply transport.  Kept separately from the closure
     /// default so a hermetic URLProtocol session can execute this exact request
     /// and validator path, including flood-control retry semantics.
@@ -192,6 +204,7 @@ extension TelegramPollLoop {
         chatId: Int,
         text: String,
         threadId: Int? = nil,
+        silent: Bool = false,
         // nil = the bounded reply session. `.shared` here overrode every bound
         // (7-day resource timeout), so a stalled send could hold the chat lane.
         session: URLSession? = nil,
@@ -213,6 +226,7 @@ extension TelegramPollLoop {
                         TelegramDestination(chatId: chatId, threadId: threadId)
                     )
                     body["text"] = chunk
+                    if silent { body["disable_notification"] = true }
                     return try JSONSerialization.data(withJSONObject: body)
                 }
             }

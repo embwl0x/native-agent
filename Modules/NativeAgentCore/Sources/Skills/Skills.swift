@@ -809,7 +809,7 @@ public final class SwiftNativeSkillsClient: SkillsClient {
                noted["stop"] != .string(repeated) {
                 noted["stop"] = .string(repeated)
                 let parts = repeated.split(separator: "@", maxSplits: 1).map(String.init)
-                signals.append(("\(name) stopped on \(parts[0])\(parts.count > 1 && !parts[1].isEmpty ? " at step \(parts[1])" : "") "
+                signals.append(("\(name) stopped on \(parts[0])\(parts.count > 1 && !parts[1].isEmpty ? " at \(parts[1])" : "") "
                     + "in 2 of its last 3 runs; upgrade it?", voices))
             }
             let lastClean = SkillMutation.pyStrOptional(row["lastCleanDigest"])

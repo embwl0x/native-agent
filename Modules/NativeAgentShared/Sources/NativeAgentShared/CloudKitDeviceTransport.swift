@@ -1173,7 +1173,8 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
                 try await self.performModifyRecords(op)
         }
         do {
-            try await withDeviceCKTimeoutThrowing("CloudKitDeviceTransport.setStatus", seconds: 3, onFailure: accountFailureReporter) {
+            // 2026-10-04: a cold-launch status write measured 4.6 s and landed; 3 s called it failed.
+            try await withDeviceCKTimeoutThrowing("CloudKitDeviceTransport.setStatus", seconds: 15, onFailure: accountFailureReporter) {
                 try await write.value
             }
         } catch is DeviceCKLandmineTimeout {

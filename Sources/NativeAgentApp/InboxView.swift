@@ -324,6 +324,8 @@ struct InboxStripView: View {
 
     @State private var selectedItem: InboxItemRecord?
     @State private var actionFlight = InboxRowActionFlight()
+    /// User, 2026-10-04: out of the way, and it stays out of the way.
+    @AppStorage("chat.notesRowHidden") private var hidden = false
 
     private var display: InboxStripDisplay {
         InboxStripDisplay(items: items)
@@ -331,7 +333,15 @@ struct InboxStripView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            if !display.isQuiet {
+            if !display.isQuiet, hidden {
+                Button("\(display.unreadCount) \(display.unreadCount == 1 ? "note" : "notes") · Show") { hidden = false }
+                    .buttonStyle(.plain)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .trailing)
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 4)
+            } else if !display.isQuiet {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 8) {
                         ForEach(display.visibleItems) { item in
@@ -347,11 +357,26 @@ struct InboxStripView: View {
                                 .padding(.vertical, 6)
                                 .background(.quaternary, in: RoundedRectangle(cornerRadius: 8))
                         }
+                        // One click clears the row: every note here is marked read
+                        // and stays in Notifications, nothing is lost.
+                        Button("Clear") {
+                            let ids = items.filter(\.isUnread).map(\.id)
+                            Task { for id in ids { try? await onAction(id, "read") } }
+                        }
+                        .buttonStyle(.plain)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 8)
+                        .help("Mark these read. They stay in Notifications.")
+                        Button("Hide") { hidden = true }
+                            .buttonStyle(.plain)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .help("Keep notes out of the way until you show them again.")
                     }
                     .padding(.horizontal, 16)
-                    .padding(.vertical, 8)
+                    .padding(.vertical, 6)
                 }
-                Divider()
             }
         }
         .sheet(item: $selectedItem) { item in

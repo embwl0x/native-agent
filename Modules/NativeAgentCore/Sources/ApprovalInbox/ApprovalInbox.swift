@@ -107,6 +107,11 @@ extension ApprovalRecord {
         return trimmed.isEmpty ? nil : trimmed
     }
 
+    /// Her own decision, filed here only so she can resolve it with her own
+    /// tool (`studio_canon_resolve`): never a card, note or button for the
+    /// person. The canon filer's action is the marker.
+    public var isAgentsOwnDecision: Bool { action == "studio.canon" }
+
     /// The conversation this approval's chat card was posted into, if any.
     public var chatCardSessionId: String? {
         guard case .object(let card)? = chatCard, case .string(let id)? = card["sessionId"],
@@ -1207,7 +1212,7 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
             // MacSyncActionRouter verifies the per-device signature and pairing.
             // User may answer any request from that phone, whoever raised it;
             // Agent alone decides her studio canon.
-            guard record.action != "studio.canon" else {
+            guard !record.isAgentsOwnDecision else {
                 throw ApprovalInboxError.resolutionNotAuthorized(
                     id: id, reason: "Agent decides her studio canon."
                 )

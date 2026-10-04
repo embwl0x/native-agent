@@ -6,6 +6,14 @@ Reverse-chronological. Each phase: 1–2 lines.
 
 ## Unreleased
 
+## 0.5.1 — the chat keeps its room (2026-10-04)
+
+- Send while busy shows the queued message with Steer and Remove again.
+- Slim header; the strip above chat hugs what is waiting; answered cards leave it; notes get Clear and a sticky Hide.
+- Approval cards: title, one line of why, details folded; send cards keep a To: line.
+- Full Mac keeps the agent's Mac control across restarts; its own canon decisions stay its own.
+- Mac-started replies reach Telegram and the phone silently; CloudKit status writes tolerate a slow first write.
+
 ## 0.5.0 — one brain, their own person (2026-10-04)
 
 ### One door

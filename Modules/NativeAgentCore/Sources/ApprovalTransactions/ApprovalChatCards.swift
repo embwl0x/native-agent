@@ -37,7 +37,7 @@ public enum ApprovalChatCards {
         quiet: Bool = false
     ) async -> Outcome {
         guard record.status == "pending", !record.chatCardDelivered,
-              record.action != "studio.canon",           // hers to decide
+              !record.isAgentsOwnDecision,               // hers to decide
               !hasTelegramPrompt(record),                // its turn's chat has buttons
               let anchor = record.chatCardSessionId ?? usersConversation(unless: record.chatOriginSessionId, dataRoot: dataRoot)
         else { return .skipped }

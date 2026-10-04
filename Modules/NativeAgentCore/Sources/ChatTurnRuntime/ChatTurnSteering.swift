@@ -45,6 +45,9 @@ public actor ChatTurnSteering {
     private var pending: [String: [Offer]] = [:]
     private var reserved: [String: [Offer]] = [:]
     private var stranded: [String: [Offer]] = [:]
+    /// Offer id → its owner's "the running turn has it now", run once when
+    /// the turn reserves it, so the send-next row stays visible until then.
+    private var deliveryHandlers: [String: @MainActor @Sendable () -> Void] = [:]
     public typealias Persister = @Sendable (String, String, String) async -> Bool
 
     struct OpenTurn {
@@ -113,7 +116,15 @@ public actor ChatTurnSteering {
         if let left = pending.removeValue(forKey: sessionId) {
             out.append(contentsOf: left)
         }
+        for offer in out { deliveryHandlers[offer.id] = nil }
         return out
+    }
+
+    /// The person removed this message from the queue before the turn took it.
+    public func withdraw(id: String) {
+        for key in pending.keys { pending[key]?.removeAll { $0.id == id } }
+        for key in stranded.keys { stranded[key]?.removeAll { $0.id == id } }
+        deliveryHandlers[id] = nil
     }
 
     /// Whether a turn is narrating this session RIGHT NOW.
@@ -135,12 +146,14 @@ public actor ChatTurnSteering {
     /// Offer a message to the session's running turn. `false` means it was not
     /// taken (no open turn, or the pending bound is reached) and the caller
     /// keeps it queued.
-    public func offer(_ offer: Offer, sessionId: String) -> Bool {
+    public func offer(_ offer: Offer, sessionId: String,
+                      onDelivered: (@MainActor @Sendable () -> Void)? = nil) -> Bool {
         guard open[sessionId] != nil else { return false }
         var queue = pending[sessionId] ?? []
         guard queue.count < Self.maxPending else { return false }
         queue.append(offer)
         pending[sessionId] = queue
+        deliveryHandlers[offer.id] = onDelivered
         return true
     }
 
@@ -164,11 +177,16 @@ public actor ChatTurnSteering {
             stranded[sessionId, default: []].append(contentsOf: queue)
             return []
         }
-        reserved[sessionId] = queue
+        // Each gets its attempt identity now, then leaves the visible queue
+        // before the save: from here only this turn or cleanup owns it, so a
+        // remove or Send next can't race the write.
+        reserved[sessionId] = queue.map { var offer = $0; offer.enqueuedRunID = UUID().uuidString; return offer }
+        for offer in queue {
+            if let handler = deliveryHandlers.removeValue(forKey: offer.id) { await handler() }
+        }
         for (index, offer) in queue.enumerated() {
             if Task.isCancelled || ChatCancelFlag.isRaised(cancelFlagPath) { return [] }
-            let runID = UUID().uuidString
-            reserved[sessionId]?[index].enqueuedRunID = runID
+            guard let runID = reserved[sessionId]?[index].enqueuedRunID else { return [] }
             let committed = await persist(sessionId, offer.text, runID)
             guard open[sessionId]?.token == turn.token else { return [] }
             guard committed else {

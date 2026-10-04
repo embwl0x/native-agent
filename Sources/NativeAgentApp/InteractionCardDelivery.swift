@@ -205,7 +205,10 @@ struct InteractionInboxCard: View {
     /// The card's inbox note id, or the original card itself (a chat mirror).
     let noteID: String
     var pinned: InteractionCardDelivery.Pointer? = nil
-    init(item: InboxItemRecord) { noteID = item.id }
+    /// Above the chat only what still needs an answer shows; a receipt
+    /// belongs in its conversation, never pinned over this one.
+    var hidesAnswered = false
+    init(item: InboxItemRecord) { noteID = item.id; hidesAnswered = true }
     init(mirrorOf pointer: InteractionCardDelivery.Pointer) {
         noteID = "interaction:\(pointer.interactionID)"
         pinned = pointer
@@ -215,22 +218,21 @@ struct InteractionInboxCard: View {
     @Environment(\.chatPageIsVisible) private var chatPageIsVisible
     @State private var binding = InlineInteractionChatBinding()
     @State private var pointer: InteractionCardDelivery.Pointer?
-    @State private var loadError: String?
+    @State private var loaded = false
 
     var body: some View {
         VStack(alignment: .leading) {
             if let pointer, let card = binding.cardsByRow.values.flatMap({ $0 })
-                .first(where: { $0.id == pointer.interactionID }) {
+                .first(where: { $0.id == pointer.interactionID }),
+               !(hidesAnswered && card.state.isTerminal) {
                 InlineCardView(model: card) { action in
                     binding.handle(card: card, action: action, appModel: appModel)
                 }
-            } else if let loadError {
-                Text(loadError).foregroundStyle(.orange)
-            } else if pointer != nil {
-                Text("This request is unavailable. Refresh Activity and try again.").foregroundStyle(.orange)
-            } else {
+                .padding(.bottom, hidesAnswered ? 8 : 0)
+            } else if !loaded {
                 ProgressView()
             }
+            // Loaded with no card: answered or gone, so nothing is left to show.
         }
         .sheet(item: Binding(get: { binding.connectorSheet }, set: { request in
             if request == nil { Task { await binding.connectorSheetClosed() } }
@@ -262,7 +264,8 @@ struct InteractionInboxCard: View {
                 }
                 pointer = origin
                 await binding.refresh(sessionID: origin.sessionID)
-            } catch { loadError = error.localizedDescription }
+            } catch {}
+            loaded = true
         }
         .onReceive(NotificationCenter.default.publisher(for: InlineInteractionWire.changedNotification)) { event in
             guard let pointer, event.object as? String == pointer.sessionID else { return }

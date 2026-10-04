@@ -185,7 +185,8 @@ enum NativeAgentApprovalNotifications {
         var cardRetries: [String: Int] = [:]
         await ApprovalRequestsLiveRefresh.observe(approvals: approvals) {
             do {
-                let rows = try await approvals.list()
+                // Her own decisions (her canon) get no note, button or ping.
+                let rows = try await approvals.list().filter { !$0.isAgentsOwnDecision }
                 let ids = Set(rows.map(\.id))
                 let pendingIDs = Set(rows.filter { $0.status == "pending" }.map(\.id))
                 let inbox = LiveNotificationInbox(path: LiveNotificationInbox.livePath(dataRoot: approvals.dataRoot))

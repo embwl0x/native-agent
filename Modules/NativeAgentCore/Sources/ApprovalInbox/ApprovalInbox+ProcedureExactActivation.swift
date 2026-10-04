@@ -24,12 +24,17 @@ extension SwiftNativeApprovalInbox {
         guard proposal.validates else {
             throw ProcedureExactActivationApprovalError.invalidProposal
         }
+        // Said to the person: what it is, why, and what changes. The exact
+        // binding stays in the payload and the preview (Details).
+        let name = proposal.procedureID
+            .replacingOccurrences(of: #"_v\d+$"#, with: "", options: .regularExpression)
+            .replacingOccurrences(of: "_", with: " ")
         return try await create(.object([
-            "title": .string("Activate exact deterministic Workshop routing"),
+            "title": .string("Run \(name) on its own from now on?"),
             "action": .string(Self.procedureExactActivationApprovalAction),
             "risk": .string("high"),
             "reason": .string(
-                "Approve automatic selection only for this exact typed operation, native implementation identity, reviewed artifact, and canonical evidence digest. TrustCenter, Workshop, tool dispatch, and verification remain authoritative; ambiguity falls back before admission."
+                "It has worked \(proposal.verifiedExecutionCount) times with no model needed, about \(proposal.p95ExecutionLatencyMilliseconds) ms each. When a request matches it exactly, I'd run it straight away; anything unclear still comes through me."
             ),
             "remoteResolvable": .bool(false),
             "localOnly": .bool(true),

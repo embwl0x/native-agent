@@ -250,7 +250,7 @@ final class ApprovalLoadState {
             return hasLoadedSnapshot ? "Approval refresh failed" : "Approval status unavailable"
         }
         guard hasLoadedSnapshot else { return "Checking approvals…" }
-        let count = approvals.filter { $0.status.lowercased() == "pending" }.count
+        let count = approvals.filter { $0.status.lowercased() == "pending" && !$0.isAgentsOwnDecision }.count
         return count == 0 ? "No actions need approval" : "\(count) \(count == 1 ? "action needs" : "actions need") approval"
     }
 
@@ -320,8 +320,11 @@ struct ApprovalsView: View {
         return pending.isEmpty ? "checkmark.shield.fill" : "exclamationmark.shield.fill"
     }
 
+    /// Her own decisions (her canon) are hers: no button here resolves them.
     private var pending: [ApprovalRecord] {
-        approvalLoadState.approvals.filter { $0.status.lowercased() == "pending" && (focusedID == nil || $0.id == focusedID) }
+        approvalLoadState.approvals.filter {
+            $0.status.lowercased() == "pending" && !$0.isAgentsOwnDecision && (focusedID == nil || $0.id == focusedID)
+        }
     }
 
     private var recent: [ApprovalRecord] {

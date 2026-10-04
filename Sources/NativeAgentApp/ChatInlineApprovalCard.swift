@@ -117,19 +117,20 @@ struct InlineApprovalCard: View {
     /// here that the approval itself does not already say.
     private var cardModel: InlineCardModel {
         let title = ChatShellApprovalCopy.title(displayContent)
-        let detail = ChatShellApprovalCopy.detail(displayContent)
+        let why = ChatShellApprovalCopy.why(displayContent)
+        let primary = ChatShellApprovalCopy.approve(for: message.content)
         var model = InlineCardModel(
             id: approvalId.isEmpty ? message.id : approvalId,
             kind: .confirm,
-            target: detail,
             title: title,
-            why: detail,
-            primaryLabel: ChatShellApprovalCopy.approve(for: message.content),
+            why: why,
+            primaryLabel: primary,
             secondaryLabel: ChatShellApprovalCopy.decline,
             consequence: ChatShellApprovalCopy.consequence(for: message.content),
             state: .pending,
-            detailsLabel: ChatShellApprovalCopy.showDraft,
-            detailsBody: draftBody
+            scopeLines: ChatShellApprovalCopy.recipient(displayContent).map { [$0] } ?? [],
+            detailsLabel: primary == "Send it" ? ChatShellApprovalCopy.showDraft : "Details",
+            detailsBody: ChatShellApprovalCopy.details(displayContent)
         )
         switch state {
         case .pending:
@@ -144,23 +145,13 @@ struct InlineApprovalCard: View {
             model.outcome = rejected
                 ? "Left alone — nothing was done"
                 : (decision == "approved" ? "Approved" : "Resolved")
-            model.outcomeMeta = detail.isEmpty ? nil : detail
+            model.outcomeMeta = why.isEmpty ? nil : why
         case .unavailable:
             model.state = .unknown
             model.outcome = "I couldn't check this request"
             model.outcomeMeta = "Nothing was decided"
         }
         return model
-    }
-
-    /// The rest of the request, once. The title already carries its first line,
-    /// so the disclosure never repeats it.
-    private var draftBody: String? {
-        let rest = message.content.split(separator: "\n", omittingEmptySubsequences: false)
-            .dropFirst()
-            .joined(separator: "\n")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        return rest.isEmpty ? nil : rest
     }
 
     private func resolve(_ decision: String) async {

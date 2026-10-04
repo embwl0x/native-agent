@@ -237,8 +237,9 @@ public enum DreamBackgroundWork {
     /// above her words, so the label travels with the proposal wherever the row
     /// is shown instead of living in one view's formatting.
     public static func remProposalPreview(_ row: REMProposalRow) -> String {
+        // Her words first: a card shows its first line, and the lesson is the point.
         guard let label = remSupportLabel(row) else { return row.proposalText }
-        return label + "\n" + row.proposalText
+        return row.proposalText + "\n" + label
     }
 
     private static func writeREMFullMacOutcome(

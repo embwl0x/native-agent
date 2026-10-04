@@ -51,8 +51,12 @@ struct InboxStripContainer: View {
     @State private var approvalError: String?
 
     /// A card already posted into the open conversation shows there, once.
+    /// Her own decisions (her canon) are hers: never a card here.
     private var stripApprovals: [ApprovalRecord] {
-        approvals.filter { !$0.chatCardDelivered || $0.chatCardSessionId != appModel.activeChatSessionId }
+        approvals.filter {
+            !$0.isAgentsOwnDecision
+                && (!$0.chatCardDelivered || $0.chatCardSessionId != appModel.activeChatSessionId)
+        }
     }
     private var stripCards: [InboxItemRecord] {
         items.filter { $0.source == InteractionCardDelivery.source && $0.chat_session_id != appModel.activeChatSessionId }
@@ -64,22 +68,23 @@ struct InboxStripContainer: View {
             Text(approvalError).foregroundStyle(.orange)
         }
         if !stripApprovals.isEmpty || !stripCards.isEmpty {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 8) {
-                    ForEach(stripApprovals) { approval in
+            // Hugs what it holds: an empty or answered set takes no room over her chat.
+            VStack(alignment: .leading, spacing: 0) {
+                ForEach(stripApprovals.prefix(2)) { approval in
+                    Group {
                         if ApprovalPayloadPreviewPresentation.canResolve(approval) {
                             InlineApprovalCard(message: approvalMessage(approval))
                         } else {
                             Text(ApprovalPayloadPreviewPresentation.unavailableText)
                         }
                     }
-                    ForEach(stripCards) { item in
-                        InteractionInboxCard(item: item)
-                    }
+                    .padding(.bottom, 8)
                 }
-                .padding(.horizontal, 16)
+                ForEach(stripCards.prefix(2)) { item in
+                    InteractionInboxCard(item: item)
+                }
             }
-            .frame(maxHeight: 260)
+            .padding(.horizontal, 16)
         }
         if let loadError {
             Label("Inbox unavailable: \(loadError)", systemImage: "exclamationmark.triangle")

@@ -44,10 +44,14 @@ struct LiveAgentBridgeCompletionSender: AgentBridgeCompletionSending {
   }
 
   let dataRoot: URL
+  /// Telegram text lands without a sound or alert (context, not a ping).
+  let silentTelegram: Bool
 
   init(dataRoot: URL = PersistenceCore.defaultDataRoot(),
+       silentTelegram: Bool = false,
        authorizeTelegramReply: (@Sendable (TelegramConfig, Int) -> Bool)? = nil) {
     self.dataRoot = dataRoot
+    self.silentTelegram = silentTelegram
     self.authorizeTelegramReply = authorizeTelegramReply
   }
 
@@ -195,8 +199,8 @@ struct LiveAgentBridgeCompletionSender: AgentBridgeCompletionSending {
       let destination = TelegramDestination(chatId: chatId, threadId: threadId)
       switch artifact.payload {
       case .text(let text):
-        try await TelegramPollLoop.defaultSendMessage(
-          config.botToken, destination, TelegramPollLoop.cleanedPlainText(text))
+        let send = silentTelegram ? TelegramPollLoop.defaultSendSilentMessage : TelegramPollLoop.defaultSendMessage
+        try await send(config.botToken, destination, TelegramPollLoop.cleanedPlainText(text))
       case .attachment(let attachment):
         guard let path = attachment.path else { throw DeliveryError.emptyCompletion }
         try await TelegramPollLoop.defaultSendPhoto(
@@ -325,8 +329,11 @@ struct LiveAgentBridgeCompletionSender: AgentBridgeCompletionSending {
 /// Mac, the phone or Slack (never an agent's, judged by the turn's user row),
 /// its reply goes to the Telegram chat bound to that session, and to the phone
 /// as a push unless the phone asked. A Telegram turn travels nowhere: Telegram
-/// already notifies his phone, and a second push doubled it. It runs off the
-/// completion signal, never inside a turn, so no door's stream waits on another.
+/// already notifies his phone, and a second push doubled it. User, 2026-10-04:
+/// a Mac turn means he is at the Mac, so its Telegram copy lands silently and
+/// the phone gets no push, only the transcript snapshot every completion
+/// already publishes. It runs off the completion signal, never inside a turn,
+/// so no door's stream waits on another.
 enum AnchorReplyMirror {
   private static let doors = ["app": "Mac", "chat": "Mac", "ios": "iPhone", "slack": "Slack"]
 
@@ -378,7 +385,7 @@ enum AnchorReplyMirror {
     // One claim per reply: the many completion signals of one turn mirror once.
     guard (try? await lifecycle.claim(deliveryId: deliveryId, requestDigest: digest, sessionId: sessionId)) == .start
     else { return }
-    if door != "iPhone" {
+    if door == "Slack" {
       let relay = await MainActor.run { NativeAgentEngine.liveDeviceSync.relay }
       await relay.sendICloudReplyPushNotification(text: text, sessionID: sessionId, correlationID: rowId, kind: "reply")
     }
@@ -395,7 +402,8 @@ enum AnchorReplyMirror {
       deliveryId: deliveryId, requestDigest: digest, text: "[\(door)]\n\(text)", attachments: [],
       route: AgentBridgeCompletionRoute(surface: "telegram", sessionId: sessionId,
                                         destinationId: telegram.chat, threadId: telegram.thread),
-      sender: LiveAgentBridgeCompletionSender(dataRoot: dataRoot, authorizeTelegramReply: { config, chatID in
+      sender: LiveAgentBridgeCompletionSender(dataRoot: dataRoot, silentTelegram: door == "Mac",
+                                              authorizeTelegramReply: { config, chatID in
         TelegramPollLoop.inboundAuthorizationDecision(
           allowedChatIds: config.allowedChatIds, allowedUserIds: config.allowedUserIds,
           chatId: chatID, fromUserId: chatID > 0 ? chatID : nil
